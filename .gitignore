@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Model weights
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.gguf
+
+# Logs
+logs/
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# AI tools
+.claude/
+.serena/
+.superpowers/
+.spec-workflow/
+
+# Cache
+.cache/
+.triton/
+
+# Temporary
+tmp/
+data/
+*.tmp
+
+# LongBench results
+LongBench/results_*/
+
+# Compiled extensions
+*.o
+*.a
