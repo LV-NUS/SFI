@@ -1,0 +1,468 @@
+from __future__ import annotations
+
+from typing import Dict, List, Optional, Sequence, Tuple
+
+import torch
+
+from patches.runtime_deps import require_runtime_dep
+from patches.sparse_utils import _selector_fixed_k_enabled
+
+_normalize_capture_layout_views = require_runtime_dep("_normalize_capture_layout_views")
+
+def _refresh_payload_views_key(
+    *,
+    step_context: object,
+    bound_meta: object,
+    layout: "StepCaptureLayout",
+    slot_list: Sequence[int],
+) -> Tuple[object, ...]:
+    row_key = getattr(layout, "slot_row_map_key", None)
+    if row_key is None:
+        row_list_cpu = getattr(layout, "row_list_cpu", None)
+        row_key = tuple(int(row) for row in row_list_cpu) if row_list_cpu is not None else tuple()
+    return (
+        int(getattr(step_context, "epoch", -1)),
+        int(getattr(step_context, "step_handle_id", -1)),
+        int(getattr(step_context, "step_handle_generation", -1)),
+        tuple(int(slot) for slot in slot_list),
+        tuple(int(row) for row in row_key),
+        tuple(getattr(bound_meta, "bound_meta_signature", tuple())),
+        id(bound_meta),
+    )
+
+
+def _refresh_payload_views_minimal_ready(layout: "StepCaptureLayout") -> bool:
+    return (
+        isinstance(getattr(layout, "kv_lengths", None), torch.Tensor)
+        and isinstance(getattr(layout, "seq_lens_batch", None), torch.Tensor)
+        and isinstance(getattr(layout, "seq_lens_batch_i32", None), torch.Tensor)
+        and isinstance(getattr(layout, "kv_len_per_row_i32", None), torch.Tensor)
+        and isinstance(getattr(layout, "slot_tensor_i32", None), torch.Tensor)
+        and isinstance(getattr(layout, "row_tensor_i32", None), torch.Tensor)
+        and isinstance(getattr(layout, "slot_tensor_cpu", None), torch.Tensor)
+        and isinstance(getattr(layout, "seq_lens_tensor_cpu", None), torch.Tensor)
+        and getattr(layout, "row_list_cpu", None) is not None
+        and getattr(layout, "seq_lens_cpu", None) is not None
+    )
+
+
+def _refresh_payload_views_ready(
+    *,
+    layout: "StepCaptureLayout",
+    slot_list: Sequence[int],
+    views_key: Tuple[object, ...],
+) -> bool:
+    live_lengths_key = getattr(layout, "live_lengths_key", None)
+    if live_lengths_key is None:
+        return False
+    layout_slot_list = getattr(layout, "slot_list", tuple())
+    slot_tuple = (
+        tuple(int(v) for v in layout_slot_list)
+        if layout_slot_list is not slot_list
+        else tuple(int(v) for v in layout_slot_list)
+    )
+    requested_slot_tuple = (
+        slot_tuple if layout_slot_list is slot_list else tuple(int(v) for v in slot_list)
+    )
+    if slot_tuple != requested_slot_tuple:
+        return False
+    if not _refresh_payload_views_minimal_ready(layout):
+        return False
+    if getattr(layout, "refresh_payload_views_key", None) == views_key:
+        return True
+    if not isinstance(live_lengths_key, tuple) or len(live_lengths_key) < 5:
+        return False
+    live_identity = tuple(int(v) for v in live_lengths_key[:3])
+    view_identity = tuple(int(v) for v in views_key[:3])
+    live_row_key = tuple(int(v) for v in live_lengths_key[4])
+    view_row_key = tuple(int(v) for v in views_key[4])
+    return live_identity == view_identity and live_row_key == view_row_key
+
+
+def _refresh_payload_views_from_layout(
+    layout: "StepCaptureLayout",
+) -> Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    List[int],
+    Tuple[int, ...],
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    return (
+        layout.kv_lengths,
+        layout.seq_lens_batch,
+        layout.kv_len_per_row_i32,
+        layout.row_list_cpu,
+        layout.seq_lens_cpu,
+        layout.slot_tensor_i32,
+        layout.slot_tensor_cpu,
+        layout.seq_lens_tensor_cpu,
+    )
+
+
+def prepare_prefill_capture_payload_impl(
+    *,
+    controller: "VLLMSparseController",
+    cache_key: int,
+    state: LayerState,
+    step_context: StepContext,
+    q: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    seqused_k: torch.Tensor,
+    chunk_query_lengths: torch.Tensor,
+    num_heads: int,
+    device: torch.device,
+    capture_plan: Optional[Dict[int, int]] = None,
+) -> Optional[
+    Tuple[
+        torch.Tensor,
+        Optional[torch.Tensor],
+        torch.Tensor,
+        torch.Tensor,
+        Optional[torch.Tensor],
+        torch.Tensor,
+        List[int],
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        List[int],
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        Tuple[int, ...],
+        Optional[torch.Tensor],
+        int,
+    ]
+]:
+    bound_meta = controller._require_step_bound_meta(
+        step_context=step_context,
+        stage="prefill payload",
+    )
+    plan_last_n_by_row = bound_meta.logits_last_n_by_row
+    plan_caps_by_row = bound_meta.logits_capacity_by_row
+    plan_max_last_n = max((int(v) for v in plan_last_n_by_row), default=0)
+    plan_max_kv = max((int(v) for v in plan_caps_by_row), default=0)
+    if capture_plan is None:
+        return None
+    slot_list = sorted(int(slot) for slot in capture_plan.keys())
+    if not slot_list:
+        return None
+    if plan_max_last_n <= 0 or plan_max_kv <= 0:
+        raise RuntimeError("prefill capture plan set but logits buffers not prepared")
+    global_layer_index = controller.layer_index_by_cache_key.get(cache_key, -1)
+    if global_layer_index < 0:
+        return None
+    layout = controller._get_step_capture_layout(
+        phase="prefill",
+        state=state,
+        step_context=step_context,
+        global_layer_index=global_layer_index,
+        slot_list=slot_list,
+        cu_seqlens_q=cu_seqlens_q,
+        seqused_k=seqused_k,
+        num_heads=num_heads,
+        device=device,
+        chunk_query_lengths=chunk_query_lengths,
+        prepared_only=bool(
+            getattr(controller, "_prefill_capture_meta_arena_enabled", False)
+        ),
+    )
+    if layout is None:
+        raise RuntimeError("prefill capture plan set but capture layout missing")
+    _, _, slot_in_chunk = controller._map_global_layer_to_capture_slot(global_layer_index)
+    kv_needed = int(plan_max_kv)
+    # 性能关键：selector 的 Triton log_s 内部把 K 当作 tl.constexpr（静态展开），
+    # 若每步都传不同的 kv_needed，会导致 chunk0 频繁触发新的 K specialization 编译/缓存 miss。
+    # 可选用固定 K（layout.kv_max，已按 bucket 对齐）来减少编译抖动；多出的 padded 区间会被 bounds/mask 屏蔽。
+    use_fixed_k = _selector_fixed_k_enabled()
+    kv_slice = int(layout.kv_max) if use_fixed_k else int(kv_needed)
+    capture_scores = layout.capture_scores[slot_in_chunk, : len(slot_list), :, :, :kv_slice]
+
+    # prefill capture：last_n 可能 >1，此时 kernel 输出的是 (log_f_pre, denom_f)。
+    # - 若 last_n==1：log_f == log_probs，无需 denom。
+    # - 若 last_n>1：selector 需要拿到 denom 才能恢复 log_probs（用于 cross-head mutex 等语义）。
+    #
+    # 注意：batch 内混合 last_n==1 与 last_n>1 时，kernel 对 last_n==1 行不保证写 denom；
+    # 必须显式把这些行的 denom 清零，避免复用 layout 时的 stale 值污染。
+    log_f_denoms: Optional[torch.Tensor] = None
+    # last_n==1：按约定必须传 None（selector 侧走 logits-only 的 log_softmax）
+    has_gt1 = any(int(v) > 1 for v in capture_plan.values()) if capture_plan else False
+    if has_gt1:
+        log_f_denoms = layout.log_f_denoms[slot_in_chunk, : len(slot_list)]
+    rows = layout.row_tensor
+    if rows.numel() == 0:
+        return None
+
+    (
+        kv_lengths_tensor,
+        seq_lens_batch,
+        kv_len_per_row_i32,
+        row_list_cpu,
+        seq_lens_cpu,
+        slot_tensor_i32,
+        self_slot_tensor_cpu,
+        self_seq_lens_tensor_cpu,
+    ) = _normalize_capture_layout_views(
+        layout=layout,
+        slot_list=slot_list,
+        seqused_k=seqused_k,
+        device=device,
+        step_context=step_context,
+        controller=controller,
+        state=state,
+    )
+    seq_lens_batch_i32 = getattr(layout, "seq_lens_batch_i32", None)
+    row_tensor_i32 = layout.row_tensor_i32
+    if row_tensor_i32 is None:
+        raise RuntimeError("prefill capture layout missing normalized row_tensor_i32")
+
+    return (
+        capture_scores,
+        log_f_denoms,
+        kv_lengths_tensor,
+        seq_lens_batch,
+        seq_lens_batch_i32,
+        layout.chunk_lengths if layout.chunk_lengths is not None else torch.zeros((len(slot_list),), device=device, dtype=torch.long),
+        layout.slot_list,
+        layout.slot_tensor,
+        slot_tensor_i32,
+        self_slot_tensor_cpu,
+        row_list_cpu if row_list_cpu is not None else [],
+        layout.row_tensor,
+        row_tensor_i32,
+        kv_len_per_row_i32,
+        seq_lens_cpu,
+        self_seq_lens_tensor_cpu,
+        int(slot_in_chunk),
+    )
+
+def prepare_refresh_capture_payload_impl(
+    *,
+    controller: "VLLMSparseController",
+    cache_key: int,
+    state: LayerState,
+    step_context: StepContext,
+    q: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    seqused_k: torch.Tensor,
+    slots_filter: Optional[Sequence[int]] = None,
+    slots_filter_sorted: bool = False,
+    layout: Optional["StepCaptureLayout"] = None,
+) -> Optional[
+    Tuple[
+        torch.Tensor,
+        Optional[torch.Tensor],
+        torch.Tensor,
+        torch.Tensor,
+        Optional[torch.Tensor],
+        List[int],
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        List[int],
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        Tuple[int, ...],
+        Optional[torch.Tensor],
+        int,
+    ]
+]:
+    bound_meta = controller._require_step_bound_meta(
+        step_context=step_context,
+        stage="refresh payload",
+    )
+    plan_last_n_by_row = bound_meta.logits_last_n_by_row
+    plan_caps_by_row = bound_meta.logits_capacity_by_row
+    plan_max_last_n = max((int(v) for v in plan_last_n_by_row), default=0)
+    plan_max_kv = max((int(v) for v in plan_caps_by_row), default=0)
+    if plan_max_last_n <= 0 or plan_max_kv <= 0:
+        raise RuntimeError(
+            "refresh payload requires prepared logits buffers; "
+            f"cache_key={int(cache_key)} epoch={int(getattr(step_context, 'epoch', -1))}"
+        )
+    step_authority = getattr(step_context, "step_authority", None)
+    if step_authority is None or step_authority.epoch != step_context.epoch:
+        raise RuntimeError(
+            "refresh payload requires step_authority single-source slot list; "
+            f"cache_key={int(cache_key)} epoch={int(getattr(step_context, 'epoch', -1))}"
+        )
+    authority_slot_list = step_authority.refresh_capture_slot_list
+    if not isinstance(authority_slot_list, tuple):
+        raise RuntimeError(
+            "refresh payload requires tuple refresh_capture_slot_list from step_authority"
+        )
+    if any(slot < 0 for slot in authority_slot_list):
+        raise RuntimeError(
+            "refresh payload requires non-negative refresh_capture_slot_list"
+        )
+    if not authority_slot_list:
+        raise RuntimeError(
+            "refresh payload missing refresh_capture_slot_list from StepAuthority; "
+            f"cache_key={int(cache_key)} epoch={int(getattr(step_context, 'epoch', -1))}"
+        )
+    slot_list: Sequence[int]
+    if slots_filter is None:
+        slot_list = authority_slot_list
+    elif slots_filter_sorted and slots_filter is authority_slot_list:
+        slot_list = authority_slot_list
+    else:
+        requested_slots = (
+            [int(slot) for slot in slots_filter]
+            if slots_filter_sorted
+            else sorted(int(slot) for slot in slots_filter)
+        )
+        requested_slot_set = set(requested_slots)
+        missing_slots = sorted(
+            int(slot) for slot in requested_slot_set if int(slot) not in authority_slot_list
+        )
+        if missing_slots:
+            raise RuntimeError(
+                "refresh payload slots_filter must be a subset of "
+                "step_authority.refresh_capture_slot_list"
+            )
+        slot_list = [
+            int(slot) for slot in authority_slot_list if int(slot) in requested_slot_set
+        ]
+    device = q.device
+    num_heads = q.shape[1]
+    global_layer_index = controller.layer_index_by_cache_key.get(cache_key, -1)
+    if global_layer_index < 0:
+        raise RuntimeError(
+            "refresh payload missing global layer index; "
+            f"cache_key={int(cache_key)} epoch={int(getattr(step_context, 'epoch', -1))}"
+        )
+    if layout is not None:
+        same_step_identity = (
+            int(layout.epoch) == int(step_context.epoch)
+            and int(getattr(layout, "step_handle_id", -1)) == int(step_context.step_handle_id)
+            and int(getattr(layout, "step_handle_generation", -1))
+            == int(step_context.step_handle_generation)
+        )
+        if same_step_identity and tuple(layout.slot_list) == tuple(slot_list):
+            # 复用同一步同子集 layout，避免每层重复 list(...) 物化。
+            slot_list = layout.slot_list
+        else:
+            layout = None
+    else:
+        slot_list = list(slot_list)
+    if not slot_list:
+        raise RuntimeError(
+            "refresh payload slot_list is empty after normalization; "
+            f"cache_key={int(cache_key)} epoch={int(getattr(step_context, 'epoch', -1))}"
+        )
+    if layout is None:
+        layout = controller._get_step_capture_layout(
+            phase="refresh",
+            state=state,
+            step_context=step_context,
+            global_layer_index=global_layer_index,
+            slot_list=slot_list,
+            cu_seqlens_q=cu_seqlens_q,
+            seqused_k=seqused_k,
+            num_heads=num_heads,
+            device=device,
+            chunk_query_lengths=None,
+        )
+    if layout is None:
+        raise RuntimeError(
+            "refresh payload capture layout unavailable; "
+            f"cache_key={int(cache_key)} epoch={int(getattr(step_context, 'epoch', -1))} "
+            f"slot_count={int(len(slot_list))}"
+        )
+    _, _, slot_in_chunk = controller._map_global_layer_to_capture_slot(global_layer_index)
+    kv_needed = int(plan_max_kv)
+    use_fixed_k = _selector_fixed_k_enabled()
+    kv_slice = int(layout.kv_max) if use_fixed_k else int(kv_needed)
+    capture_scores = layout.capture_scores[slot_in_chunk, : len(slot_list), :, :, :kv_slice]
+
+    # refresh(decode) 默认 last_n==1（见 prepare_step_logits_buffers）。
+    # B1：kernel 仅写 logits（fp16/fp32），selector 内部完成 log_softmax；
+    # 因此这里必须传 denom=None，避免任何额外广播减法/大张量物化。
+    log_f_denoms: Optional[torch.Tensor] = None
+    rows = layout.row_tensor
+    if rows.numel() == 0:
+        raise RuntimeError(
+            "refresh payload row_tensor is empty; "
+            f"cache_key={int(cache_key)} epoch={int(getattr(step_context, 'epoch', -1))} "
+            f"slot_count={int(len(slot_list))}"
+        )
+    if not step_context.seq_lens:
+        raise RuntimeError(
+            "capture payload missing seq_lens in strict path; "
+            f"(epoch={int(step_context.epoch)}, slots={len(slot_list)})"
+        )
+
+    refresh_views_key = _refresh_payload_views_key(
+        step_context=step_context,
+        bound_meta=bound_meta,
+        layout=layout,
+        slot_list=slot_list,
+    )
+    if _refresh_payload_views_ready(
+        layout=layout,
+        slot_list=slot_list,
+        views_key=refresh_views_key,
+    ):
+        layout.refresh_payload_views_key = refresh_views_key
+        (
+            kv_lengths_tensor,
+            seq_lens_batch,
+            kv_len_per_row_i32,
+            row_list_cpu,
+            seq_lens_cpu,
+            slot_tensor_i32,
+            self_slot_tensor_cpu,
+            self_seq_lens_tensor_cpu,
+        ) = _refresh_payload_views_from_layout(layout)
+    else:
+        (
+            kv_lengths_tensor,
+            seq_lens_batch,
+            kv_len_per_row_i32,
+            row_list_cpu,
+            seq_lens_cpu,
+            slot_tensor_i32,
+            self_slot_tensor_cpu,
+            self_seq_lens_tensor_cpu,
+        ) = _normalize_capture_layout_views(
+            layout=layout,
+            slot_list=slot_list,
+            seqused_k=seqused_k,
+            device=device,
+            step_context=step_context,
+            controller=controller,
+            state=state,
+        )
+        if _refresh_payload_views_minimal_ready(layout):
+            layout.refresh_payload_views_key = _refresh_payload_views_key(
+                step_context=step_context,
+                bound_meta=bound_meta,
+                layout=layout,
+                slot_list=slot_list,
+            )
+    seq_lens_batch_i32 = getattr(layout, "seq_lens_batch_i32", None)
+    row_tensor_i32 = layout.row_tensor_i32
+    if row_tensor_i32 is None:
+        raise RuntimeError("refresh capture layout missing normalized row_tensor_i32")
+    return (
+        capture_scores,
+        log_f_denoms,
+        kv_lengths_tensor,
+        seq_lens_batch,
+        seq_lens_batch_i32,
+        layout.slot_list,
+        layout.slot_tensor,
+        slot_tensor_i32,
+        self_slot_tensor_cpu,
+        row_list_cpu if row_list_cpu is not None else [],
+        layout.row_tensor,
+        row_tensor_i32,
+        kv_len_per_row_i32,
+        seq_lens_cpu,
+        self_seq_lens_tensor_cpu,
+        int(slot_in_chunk),
+    )

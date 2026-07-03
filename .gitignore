@@ -50,3 +50,7 @@ LongBench/results_*/
 # Compiled extensions
 *.o
 *.a
+
+# CUDA kernel edition
+third_party_upstreams/
+out/

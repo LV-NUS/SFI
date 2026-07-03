@@ -1,0 +1,877 @@
+from __future__ import annotations
+
+import atexit
+from functools import wraps
+from dataclasses import dataclass
+import importlib
+from importlib import util as importlib_util
+import json
+import mmap
+import os
+from pathlib import Path
+import struct
+from types import ModuleType
+from typing import Any, Callable
+import sys
+
+from patches.fa3_native.route_adapter import (
+    route_attention_launch,
+    route_attention_launch_from_attn_metadata,
+)
+from patches.vllm_compat import FLASH_ATTN_PROBE_MODULE_NAMES
+
+_FA3_ROUTE_TRACE_WRITER_PATH: str | None = None
+_FA3_ROUTE_TRACE_WRITER: Any | None = None
+
+
+def _close_fa3_route_trace_writer() -> None:
+    global _FA3_ROUTE_TRACE_WRITER
+    writer = _FA3_ROUTE_TRACE_WRITER
+    _FA3_ROUTE_TRACE_WRITER = None
+    if writer is None:
+        return
+    try:
+        writer.close()
+    except Exception:
+        pass
+
+
+atexit.register(_close_fa3_route_trace_writer)
+
+def _default_get_scheduler_metadata(*args, **kwargs):
+    return "vendored_scheduler_metadata"
+
+
+# [COMPACT-RECENT-STAGE-B 2026-07-03] compact_recent_attn_varlen_func bridge field
+# and its default stub deleted with the retired fwd_compact_recent host op.
+# The production attn_mode="compact_recent" umbrella (mixed_page/RRP route) is
+# unaffected; see patches/fa3_native/route_adapter.py.
+@dataclass(frozen=True)
+class VendoredFlashAttnBridge:
+    root: Path
+    package: ModuleType
+    interface_module: ModuleType
+    flash_attn_varlen_func: Callable[..., Any]
+    mixed_page_attn_varlen_func: Callable[..., Any]
+    get_scheduler_metadata: Callable[..., Any] = _default_get_scheduler_metadata
+
+
+@dataclass(frozen=True)
+class FlashAttnModuleSymbolsBackup:
+    flash_attn_varlen_func: object
+    get_scheduler_metadata: object
+
+
+@dataclass(frozen=True)
+class FlashAttentionForwardPatchBackup:
+    flash_attn_varlen_func: object
+    get_scheduler_metadata: object
+    forward: object
+
+
+_SPARSE_FA3_ROUTE_COUNTERS: dict[str, Any] = {
+    "actual_fwd_mixed_page_count": 0,
+    "resolved_row_ptr_fwd_mixed_page_count": 0,
+    "has_resolved_row_ptr_count": 0,
+    "page_resolver_kind_counts": {},
+}
+_ROUTE_COUNTER_MMAP_BYTES = 8 * 8
+_ROUTE_COUNTER_MMAP = None
+_ROUTE_COUNTER_MMAP_PATH = ""
+
+
+def reset_sparse_fa3_route_counters() -> None:
+    _SPARSE_FA3_ROUTE_COUNTERS["actual_fwd_mixed_page_count"] = 0
+    _SPARSE_FA3_ROUTE_COUNTERS["resolved_row_ptr_fwd_mixed_page_count"] = 0
+    _SPARSE_FA3_ROUTE_COUNTERS["has_resolved_row_ptr_count"] = 0
+    _SPARSE_FA3_ROUTE_COUNTERS["page_resolver_kind_counts"] = {}
+
+
+def get_sparse_fa3_route_counters(*, reset: bool = False) -> dict[str, Any]:
+    counters = {
+        "actual_fwd_mixed_page_count": int(
+            _SPARSE_FA3_ROUTE_COUNTERS.get("actual_fwd_mixed_page_count", 0) or 0
+        ),
+        "resolved_row_ptr_fwd_mixed_page_count": int(
+            _SPARSE_FA3_ROUTE_COUNTERS.get(
+                "resolved_row_ptr_fwd_mixed_page_count", 0
+            )
+            or 0
+        ),
+        "has_resolved_row_ptr_count": int(
+            _SPARSE_FA3_ROUTE_COUNTERS.get("has_resolved_row_ptr_count", 0) or 0
+        ),
+        "page_resolver_kind_counts": dict(
+            _SPARSE_FA3_ROUTE_COUNTERS.get("page_resolver_kind_counts", {}) or {}
+        ),
+    }
+    if reset:
+        reset_sparse_fa3_route_counters()
+    return counters
+
+
+def _record_sparse_fa3_mixed_page_route(
+    *,
+    page_resolver_kind: object,
+    has_resolved_row_ptr: bool,
+) -> None:
+    try:
+        kind = int(page_resolver_kind)
+    except (TypeError, ValueError):
+        kind = -1
+    _SPARSE_FA3_ROUTE_COUNTERS["actual_fwd_mixed_page_count"] = (
+        int(_SPARSE_FA3_ROUTE_COUNTERS.get("actual_fwd_mixed_page_count", 0) or 0)
+        + 1
+    )
+    if kind == 4:
+        _SPARSE_FA3_ROUTE_COUNTERS["resolved_row_ptr_fwd_mixed_page_count"] = (
+            int(
+                _SPARSE_FA3_ROUTE_COUNTERS.get(
+                    "resolved_row_ptr_fwd_mixed_page_count", 0
+                )
+                or 0
+            )
+            + 1
+        )
+    if bool(has_resolved_row_ptr):
+        _SPARSE_FA3_ROUTE_COUNTERS["has_resolved_row_ptr_count"] = (
+            int(_SPARSE_FA3_ROUTE_COUNTERS.get("has_resolved_row_ptr_count", 0) or 0)
+            + 1
+        )
+    kind_counts = _SPARSE_FA3_ROUTE_COUNTERS.setdefault(
+        "page_resolver_kind_counts",
+        {},
+    )
+    key = str(kind)
+    kind_counts[key] = int(kind_counts.get(key, 0) or 0) + 1
+    _bump_shared_route_counter(kind=kind, has_resolved_row_ptr=has_resolved_row_ptr)
+
+
+def _route_counter_mmap():
+    global _ROUTE_COUNTER_MMAP, _ROUTE_COUNTER_MMAP_PATH
+    path = os.environ.get("VLLM_SPARSE_FA3_ROUTE_COUNTER_MMAP", "")
+    if not path:
+        return None
+    if _ROUTE_COUNTER_MMAP is not None and path == _ROUTE_COUNTER_MMAP_PATH:
+        return _ROUTE_COUNTER_MMAP
+    if _ROUTE_COUNTER_MMAP is not None:
+        try:
+            _ROUTE_COUNTER_MMAP.close()
+        except Exception:
+            pass
+        _ROUTE_COUNTER_MMAP = None
+        _ROUTE_COUNTER_MMAP_PATH = ""
+    try:
+        counter_path = Path(path)
+        counter_path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(counter_path), os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            if os.path.getsize(str(counter_path)) < _ROUTE_COUNTER_MMAP_BYTES:
+                os.ftruncate(fd, _ROUTE_COUNTER_MMAP_BYTES)
+            _ROUTE_COUNTER_MMAP = mmap.mmap(fd, _ROUTE_COUNTER_MMAP_BYTES)
+            _ROUTE_COUNTER_MMAP_PATH = path
+            return _ROUTE_COUNTER_MMAP
+        finally:
+            os.close(fd)
+    except Exception:
+        return None
+
+
+def _bump_shared_route_counter(
+    *,
+    kind: int,
+    has_resolved_row_ptr: bool,
+) -> None:
+    mapping = _route_counter_mmap()
+    if mapping is None:
+        return
+    try:
+        values = list(struct.unpack_from("8q", mapping, 0))
+        values[0] += 1
+        if int(kind) == 4:
+            values[1] += 1
+        if bool(has_resolved_row_ptr):
+            values[2] += 1
+        if 0 <= int(kind) <= 4:
+            values[3 + int(kind)] += 1
+        struct.pack_into("8q", mapping, 0, *values)
+    except Exception:
+        return
+
+
+def wrap_mixed_page_route_counter(func: Callable[..., Any]) -> Callable[..., Any]:
+    if bool(getattr(func, "_sfi_sparse_fa3_route_counter", False)):
+        return func
+
+    @wraps(func)
+    def _counted_mixed_page_attn_varlen_func(*args: Any, **kwargs: Any) -> Any:
+        has_resolved_carrier = (
+            kwargs.get("resolved_page_table_row_ptr_u64") is not None
+            or kwargs.get("resolved_page_table_affine_i32") is not None
+            or kwargs.get("resolved_page_table_affine_base") is not None
+            or kwargs.get("resolved_page_table_affine_stride") is not None
+            or kwargs.get("resolved_page_table_affine_segment_pages") is not None
+            or kwargs.get("resolved_page_table_affine_second_base") is not None
+            or kwargs.get("resolved_page_table_affine_second_stride") is not None
+            or kwargs.get("resolved_page_table_affine_batch_stride") is not None
+        )
+        _record_sparse_fa3_mixed_page_route(
+            page_resolver_kind=kwargs.get("page_resolver_kind", -1),
+            has_resolved_row_ptr=has_resolved_carrier,
+        )
+        return func(*args, **kwargs)
+
+    setattr(_counted_mixed_page_attn_varlen_func, "_sfi_sparse_fa3_route_counter", True)
+    setattr(_counted_mixed_page_attn_varlen_func, "_sfi_route_counter_original", func)
+    return _counted_mixed_page_attn_varlen_func
+
+
+def append_fa3_route_trace(event: dict[str, Any]) -> None:
+    raw_path = os.environ.get("VLLM_SPARSE_FA3_ROUTE_TRACE_LOG")
+    if not raw_path:
+        return
+    global _FA3_ROUTE_TRACE_WRITER_PATH, _FA3_ROUTE_TRACE_WRITER
+    writer = _FA3_ROUTE_TRACE_WRITER
+    if (
+        writer is None
+        or bool(getattr(writer, "closed", False))
+        or _FA3_ROUTE_TRACE_WRITER_PATH != raw_path
+    ):
+        _close_fa3_route_trace_writer()
+        trace_path = Path(raw_path)
+        trace_path.parent.mkdir(parents=True, exist_ok=True)
+        writer = trace_path.open("a", encoding="utf-8", buffering=1)
+        _FA3_ROUTE_TRACE_WRITER_PATH = raw_path
+        _FA3_ROUTE_TRACE_WRITER = writer
+    payload = dict(event)
+    payload.setdefault("pid", os.getpid())
+    writer.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+def fa3_route_trace_enabled() -> bool:
+    return bool(os.environ.get("VLLM_SPARSE_FA3_ROUTE_TRACE_LOG"))
+
+
+def build_fa3_step_trace_event(
+    *,
+    step_authority: object,
+    step_context: object | None = None,
+    source: str,
+) -> dict[str, Any]:
+    req_ids = tuple(str(v) for v in getattr(step_authority, "req_ids", tuple()))
+    is_prefill_by_row = tuple(bool(v) for v in getattr(step_authority, "is_prefill_by_row", tuple()))
+    bootstrap_done_by_row = tuple(bool(v) for v in getattr(step_authority, "bootstrap_done_by_row", tuple()))
+    use_compact_by_row = tuple(bool(v) for v in getattr(step_authority, "use_compact_by_row", tuple()))
+    dispatch_logf_producer_by_row = tuple(
+        int(v) for v in getattr(step_authority, "dispatch_logf_producer_by_row", tuple())
+    )
+    logits_last_n_by_row = tuple(int(v) for v in getattr(step_authority, "logits_last_n_by_row", tuple()))
+    row_mode_by_row = tuple(int(v) for v in getattr(step_authority, "row_mode_by_row", tuple()))
+    layer_effective_refresh_by_row = tuple(
+        bool(v) for v in getattr(step_authority, "layer_effective_refresh_by_row", tuple())
+    )
+    batch_size = int(getattr(step_authority, "batch_size", len(req_ids)))
+    rows = min(
+        batch_size,
+        len(req_ids),
+        len(is_prefill_by_row),
+        len(bootstrap_done_by_row),
+        len(use_compact_by_row),
+        len(dispatch_logf_producer_by_row),
+        len(logits_last_n_by_row),
+        len(row_mode_by_row),
+        len(layer_effective_refresh_by_row),
+    )
+
+    return {
+        "event": "fa3_step_state",
+        "source": str(source),
+        "epoch": int(getattr(step_authority, "epoch", -1)),
+        "step_handle_id": int(getattr(step_authority, "step_handle_id", -1)),
+        "step_handle_generation": int(getattr(step_authority, "step_handle_generation", -1)),
+        "step_identity_token": int(getattr(step_context, "step_identity_token", 0) or 0),
+        "batch_size": int(batch_size),
+        "rows_traced": int(rows),
+        "req_ids": list(req_ids[:rows]),
+        "is_prefill_by_row": [bool(v) for v in is_prefill_by_row[:rows]],
+        "bootstrap_done_by_row": [bool(v) for v in bootstrap_done_by_row[:rows]],
+        "use_compact_by_row": [bool(v) for v in use_compact_by_row[:rows]],
+        "dispatch_logf_producer_by_row": [int(v) for v in dispatch_logf_producer_by_row[:rows]],
+        "logits_last_n_by_row": [int(v) for v in logits_last_n_by_row[:rows]],
+        "row_mode_by_row": [int(v) for v in row_mode_by_row[:rows]],
+        "layer_effective_refresh_by_row": [bool(v) for v in layer_effective_refresh_by_row[:rows]],
+        "prefill_row_count": sum(1 for v in is_prefill_by_row[:rows] if bool(v)),
+        "decode_row_count": sum(1 for v in is_prefill_by_row[:rows] if not bool(v)),
+        "bootstrap_done_row_count": sum(1 for v in bootstrap_done_by_row[:rows] if bool(v)),
+        "selected_row_count": sum(1 for v in use_compact_by_row[:rows] if bool(v)),
+        "capture_row_count": sum(1 for v in dispatch_logf_producer_by_row[:rows] if int(v) != 0),
+        "refresh_row_count": sum(1 for v in layer_effective_refresh_by_row[:rows] if bool(v)),
+    }
+
+
+def append_fa3_step_trace(event: dict[str, Any]) -> None:
+    raw_path = os.environ.get("VLLM_SPARSE_FA3_STEP_TRACE_LOG")
+    if not raw_path:
+        return
+    trace_path = Path(raw_path)
+    trace_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = dict(event)
+    payload.setdefault("pid", os.getpid())
+    with trace_path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+def fa3_step_trace_enabled() -> bool:
+    return bool(os.environ.get("VLLM_SPARSE_FA3_STEP_TRACE_LOG"))
+
+
+def _resolve_repo_root(repo_root: str | Path | None = None) -> Path:
+    if repo_root is None:
+        return Path(__file__).resolve().parents[2]
+    return Path(repo_root).resolve()
+
+
+def get_vendored_upstream_root(repo_root: str | Path | None = None) -> Path:
+    override = os.environ.get("VLLM_SPARSE_FA3_UPSTREAM_ROOT")
+    if override:
+        return Path(override).resolve()
+    return _resolve_repo_root(repo_root) / "third_party_upstreams" / "vllm-project-flash-attention"
+
+
+def _bridge_package_alias(root: Path) -> str:
+    stable_hash = abs(hash(str(root.resolve())))
+    return f"_fa3_native_worktree_bridge_{stable_hash:x}"
+
+
+def _load_module_from_file(
+    *,
+    module_name: str,
+    file_path: Path,
+    submodule_search_locations: list[str] | None = None,
+) -> ModuleType:
+    spec = importlib_util.spec_from_file_location(
+        module_name,
+        str(file_path),
+        submodule_search_locations=submodule_search_locations,
+    )
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot create import spec for {module_name} from {file_path}")
+    module = sys.modules.get(module_name)
+    if module is None:
+        module = importlib_util.module_from_spec(spec)
+        sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _ensure_bridge_package_shell(
+    *,
+    package_alias: str,
+    package_dir: Path,
+    package_init: Path,
+) -> ModuleType:
+    package = sys.modules.get(package_alias)
+    if package is None:
+        package = ModuleType(package_alias)
+        package.__file__ = str(package_init)
+        package.__package__ = package_alias
+        package.__path__ = [str(package_dir)]  # type: ignore[attr-defined]
+        sys.modules[package_alias] = package
+    return package
+
+
+def _interface_module_ready(interface_module: object | None) -> bool:
+    if interface_module is None:
+        return False
+    # [COMPACT-RECENT-STAGE-B 2026-07-03] compact_recent_attn_varlen_func removed
+    # from the readiness probe (deleted from the vendored interface).
+    required_attrs = (
+        "flash_attn_varlen_func",
+        "mixed_page_attn_varlen_func",
+        "get_scheduler_metadata",
+    )
+    return all(hasattr(interface_module, attr) for attr in required_attrs)
+
+
+def load_vendored_flash_attn_bridge(
+    *,
+    repo_root: str | Path | None = None,
+) -> VendoredFlashAttnBridge:
+    root = get_vendored_upstream_root(repo_root)
+    package_dir = root / "vllm_flash_attn"
+    package_init = package_dir / "__init__.py"
+    interface_path = package_dir / "flash_attn_interface.py"
+    package_alias = _bridge_package_alias(root)
+
+    root_str = str(root)
+    if root_str not in sys.path:
+        sys.path.insert(0, root_str)
+    package = _ensure_bridge_package_shell(
+        package_alias=package_alias,
+        package_dir=package_dir,
+        package_init=package_init,
+    )
+    interface_module = sys.modules.get(f"{package_alias}.flash_attn_interface")
+    if not _interface_module_ready(interface_module):
+        interface_module = _load_module_from_file(
+            module_name=f"{package_alias}.flash_attn_interface",
+            file_path=interface_path,
+        )
+    setattr(
+        package,
+        "flash_attn_varlen_func",
+        getattr(interface_module, "flash_attn_varlen_func"),
+    )
+    setattr(
+        package,
+        "get_scheduler_metadata",
+        getattr(interface_module, "get_scheduler_metadata"),
+    )
+    # [COMPACT-RECENT-STAGE-B 2026-07-03] compact_recent_attn_varlen_func package
+    # wiring deleted with the retired host op.
+    mixed_page_func = wrap_mixed_page_route_counter(
+        getattr(interface_module, "mixed_page_attn_varlen_func")
+    )
+    setattr(interface_module, "mixed_page_attn_varlen_func", mixed_page_func)
+    setattr(package, "mixed_page_attn_varlen_func", mixed_page_func)
+    setattr(package, "flash_attn_interface", interface_module)
+
+    return VendoredFlashAttnBridge(
+        root=root,
+        package=package,
+        interface_module=interface_module,
+        flash_attn_varlen_func=getattr(package, "flash_attn_varlen_func"),
+        mixed_page_attn_varlen_func=mixed_page_func,
+        get_scheduler_metadata=getattr(package, "get_scheduler_metadata"),
+    )
+
+
+def resolve_vendored_flash_attn_version(
+    bridge: VendoredFlashAttnBridge,
+    *,
+    requires_alibi: bool = False,
+) -> int | None:
+    is_supported = getattr(bridge.interface_module, "is_fa_version_supported", None)
+    if not callable(is_supported):
+        return None
+
+    requested_raw = os.environ.get("VLLM_FLASH_ATTN_VERSION")
+    candidate_versions: list[int]
+    if requested_raw not in (None, ""):
+        try:
+            requested_version = int(requested_raw)
+        except ValueError:
+            return None
+        if requested_version not in (2, 3, 4):
+            return None
+        if requires_alibi and requested_version in (3, 4):
+            return None
+        if requested_version == 4:
+            cute_interface = Path(bridge.root) / "flash_attn" / "cute" / "interface.py"
+            if cute_interface.exists():
+                return 4
+            return None
+        candidate_versions = [requested_version]
+    else:
+        candidate_versions = [4, 3, 2]
+
+    if requires_alibi:
+        candidate_versions = [version for version in candidate_versions if version not in (3, 4)]
+        if not candidate_versions:
+            candidate_versions = [2]
+
+    def _is_cuda_unavailable_error(exc: BaseException) -> bool:
+        msg = str(exc)
+        return any(
+            needle in msg
+            for needle in (
+                "No CUDA GPUs are available",
+                "Found no NVIDIA driver",
+                "Torch not compiled with CUDA enabled",
+                "libcudart functions unavailable",
+            )
+        )
+
+    for version in candidate_versions:
+        if version not in (2, 3, 4):
+            continue
+        try:
+            supported = bool(is_supported(version))
+        except (AssertionError, RuntimeError) as exc:
+            # Import-time probe patching should not hard fail just because this
+            # interpreter cannot initialize CUDA right now; an explicit request
+            # still needs to keep the vendored FA namespace wired up.
+            if requested_raw not in (None, "") and _is_cuda_unavailable_error(exc):
+                return version
+            continue
+        if supported:
+            return version
+    return None
+
+
+def build_vendored_get_flash_attn_version(
+    bridge: VendoredFlashAttnBridge,
+) -> Callable[..., int | None]:
+    def _get_flash_attn_version(
+        requires_alibi: bool = False,
+        head_size: int | None = None,
+    ) -> int | None:
+        return resolve_vendored_flash_attn_version(
+            bridge,
+            requires_alibi=requires_alibi,
+        )
+
+    return _get_flash_attn_version
+
+
+def _sparse_vendored_fa3_probe_requested() -> bool:
+    return bool(
+        os.environ.get("VLLM_SPARSE_CONTROLLER_JSON")
+        and os.environ.get("VLLM_SPARSE_FA3_UPSTREAM_ROOT")
+    )
+
+
+def should_install_vendored_flash_attn_probe_patch() -> bool:
+    flash_backend_probe = (
+        os.environ.get("VLLM_ATTENTION_BACKEND") == "FLASH_ATTN_VLLM_V1"
+        and os.environ.get("VLLM_FLASH_ATTN_VERSION") in ("3", "4")
+    )
+    return flash_backend_probe or _sparse_vendored_fa3_probe_requested()
+
+
+def _flash_backend_probe_requested() -> bool:
+    return (
+        os.environ.get("VLLM_ATTENTION_BACKEND") == "FLASH_ATTN_VLLM_V1"
+        and os.environ.get("VLLM_FLASH_ATTN_VERSION") in ("3", "4")
+    )
+
+
+def install_vendored_flash_attn_probe_patch(
+    *,
+    repo_root: str | Path | None = None,
+) -> dict[str, object]:
+    summary: dict[str, object] = {
+        "applied": False,
+        "requested_attn_backend": os.environ.get("VLLM_ATTENTION_BACKEND"),
+        "requested_flash_attn_version": os.environ.get("VLLM_FLASH_ATTN_VERSION"),
+        "sparse_fa3_requested": _sparse_vendored_fa3_probe_requested(),
+        "patched_modules": [],
+    }
+    flash_probe_requested = _flash_backend_probe_requested()
+    sparse_probe_requested = bool(summary["sparse_fa3_requested"])
+    if not flash_probe_requested and not sparse_probe_requested:
+        if summary["requested_attn_backend"] != "FLASH_ATTN_VLLM_V1":
+            summary["reason"] = "non_flash_backend"
+            return summary
+        if summary["requested_flash_attn_version"] not in ("3", "4"):
+            summary["reason"] = "unsupported_flash_attn_request"
+            return summary
+    bridge = load_vendored_flash_attn_bridge(repo_root=repo_root)
+    native_get_flash_attn_version = build_vendored_get_flash_attn_version(bridge)
+    resolved_flash_attn_version = native_get_flash_attn_version()
+    if resolved_flash_attn_version is None:
+        raise RuntimeError(
+            "vendored flash-attn probe patch could not resolve a supported version"
+        )
+
+    # Seed the legacy vLLM package path to the vendored FA bridge before any
+    # downstream import touches `vllm.vllm_flash_attn`.
+    sys.modules["vllm.vllm_flash_attn"] = bridge.package
+    sys.modules["vllm.vllm_flash_attn.flash_attn_interface"] = bridge.interface_module
+    setattr(bridge.package, "flash_attn_interface", bridge.interface_module)
+    vllm_mod = sys.modules.get("vllm")
+    if vllm_mod is not None:
+        setattr(vllm_mod, "vllm_flash_attn", bridge.package)
+
+    patched_modules: list[str] = []
+    for module_name in FLASH_ATTN_PROBE_MODULE_NAMES:
+        module = sys.modules.get(module_name)
+        if module is None:
+            try:
+                module = importlib.import_module(module_name)
+            except Exception:
+                continue
+        if not hasattr(module, "get_flash_attn_version"):
+            continue
+        module.get_flash_attn_version = native_get_flash_attn_version
+        patched_modules.append(module_name)
+
+    summary["applied"] = True
+    summary["bridge_root"] = str(bridge.root)
+    summary["patched_modules"] = patched_modules
+    summary["resolved_flash_attn_version"] = resolved_flash_attn_version
+    return summary
+
+
+def install_dense_fa3_route_trace_probe_patch() -> dict[str, object]:
+    summary: dict[str, object] = {
+        "applied": False,
+        "requested_attn_backend": os.environ.get("VLLM_ATTENTION_BACKEND"),
+        "requested_flash_attn_version": os.environ.get("VLLM_FLASH_ATTN_VERSION"),
+        "route_trace_log": os.environ.get("VLLM_SPARSE_FA3_ROUTE_TRACE_LOG", ""),
+    }
+    if not summary["route_trace_log"]:
+        summary["reason"] = "route_trace_log_missing"
+        return summary
+    if not _flash_backend_probe_requested():
+        summary["reason"] = "native_fa3_env_missing"
+        return summary
+    try:
+        from vllm.v1.attention.backends import flash_attn as v1_flash_attn
+        from vllm.v1.attention.backends import fa_utils
+    except Exception as exc:
+        summary["reason"] = f"flash_attn_import_failed:{type(exc).__name__}"
+        return summary
+    patched_modules: list[str] = []
+    already_patched: list[str] = []
+    for module in (fa_utils, v1_flash_attn):
+        module_name = getattr(module, "__name__", type(module).__name__)
+        original = getattr(module, "flash_attn_varlen_func", None)
+        if not callable(original):
+            continue
+        if bool(getattr(original, "_sm80_dense_fa3_symbol_trace_probe", False)):
+            already_patched.append(str(module_name))
+            continue
+
+        def _traced_flash_attn_varlen_func(
+            *args: Any,
+            __original: Callable[..., Any] = original,
+            __module_name: str = str(module_name),
+            __module_file: str = str(getattr(module, "__file__", "")),
+            **kwargs: Any,
+        ):
+            def _shape(value: Any) -> tuple[int, ...] | None:
+                if not hasattr(value, "shape"):
+                    return None
+                try:
+                    return tuple(int(dim) for dim in value.shape)
+                except Exception:
+                    return None
+
+            def _call_original() -> Any:
+                return __original(*args, **kwargs)
+
+            result = _call_original()
+            append_fa3_route_trace(
+                {
+                    "event": "flash_attn_varlen_func_call",
+                    "route": "flash_attn_varlen_func",
+                    "fa_version": kwargs.get("fa_version"),
+                    "symbol_module": __module_name,
+                    "symbol_file": __module_file,
+                    "probe": "dense_fa3_gate_d_native_symbol",
+                }
+            )
+            return result
+
+        setattr(
+            _traced_flash_attn_varlen_func,
+            "_sm80_dense_fa3_symbol_trace_probe",
+            True,
+        )
+        setattr(
+            _traced_flash_attn_varlen_func,
+            "_sm80_dense_fa3_symbol_trace_original",
+            original,
+        )
+        setattr(module, "flash_attn_varlen_func", _traced_flash_attn_varlen_func)
+        patched_modules.append(str(module_name))
+    summary["patched_modules"] = patched_modules
+    summary["already_patched_modules"] = already_patched
+    summary["applied"] = bool(patched_modules or already_patched)
+    if not summary["applied"]:
+        summary["reason"] = "flash_attn_varlen_func_missing"
+    return summary
+
+
+def unwrap_dense_original_flash_attention_forward(
+    forward: Callable[..., Any],
+) -> Callable[..., Any]:
+    current = forward
+    seen: set[int] = set()
+    while True:
+        marker = getattr(current, "_fa3_native_dense_original_forward", None)
+        if not callable(marker):
+            return current
+        marker_id = id(marker)
+        if marker is current or marker_id in seen:
+            return current
+        seen.add(id(current))
+        current = marker
+
+
+def _call_flash_attention_forward(
+    forward: Callable[..., Any],
+    self,
+    layer,
+    query,
+    key,
+    value,
+    kv_cache,
+    attn_metadata,
+    output,
+    output_scale,
+    output_block_scale,
+) -> Any:
+    if output_block_scale is None:
+        return forward(
+            self,
+            layer,
+            query,
+            key,
+            value,
+            kv_cache,
+            attn_metadata,
+            output,
+            output_scale,
+        )
+    return forward(
+        self,
+        layer,
+        query,
+        key,
+        value,
+        kv_cache,
+        attn_metadata,
+        output,
+        output_scale,
+        output_block_scale,
+    )
+
+
+def patch_flash_attn_module_symbols(
+    flash_attn_module: object,
+    bridge: VendoredFlashAttnBridge,
+) -> FlashAttnModuleSymbolsBackup:
+    backup = FlashAttnModuleSymbolsBackup(
+        flash_attn_varlen_func=getattr(flash_attn_module, "flash_attn_varlen_func"),
+        get_scheduler_metadata=getattr(flash_attn_module, "get_scheduler_metadata"),
+    )
+    setattr(flash_attn_module, "flash_attn_varlen_func", bridge.flash_attn_varlen_func)
+    setattr(flash_attn_module, "get_scheduler_metadata", bridge.get_scheduler_metadata)
+    return backup
+
+
+def build_patched_flash_attention_forward(
+    original_forward: Callable[..., Any],
+    *,
+    mixed_forward_impl: Callable[..., Any],
+) -> Callable[..., Any]:
+    dense_original_forward = unwrap_dense_original_flash_attention_forward(
+        original_forward
+    )
+    dense_route = route_attention_launch(
+        has_selected_consume=False,
+        has_capture=False,
+    )
+
+    def _patched_forward(
+        self,
+        layer,
+        query,
+        key,
+        value,
+        kv_cache,
+        attn_metadata,
+        output=None,
+        output_scale=None,
+        output_block_scale=None,
+    ):
+        if attn_metadata is None:
+            return _call_flash_attention_forward(
+                original_forward,
+                self,
+                layer,
+                query,
+                key,
+                value,
+                kv_cache,
+                attn_metadata,
+                output,
+                output_scale,
+                output_block_scale,
+            )
+
+        try:
+            from patches.patch_installer import resolve_live_fa3_launch_route
+
+            route = resolve_live_fa3_launch_route(attn_metadata=attn_metadata)
+        except ImportError:
+            # patch_installer 未装载的裸 fa3_native 形态才需要本地推导。
+            route = route_attention_launch_from_attn_metadata(attn_metadata)
+        if fa3_route_trace_enabled():
+            append_fa3_route_trace(
+                {
+                    "event": "flash_attention_forward",
+                    "route": route,
+                    "fa_version": getattr(self, "vllm_flash_attn_version", None),
+                    "impl_class": type(self).__name__,
+                }
+            )
+        carriers_updated = bool(
+            getattr(attn_metadata, "mixed_page_resolver_replay_carriers_updated", False)
+        )
+        graph_replay_expected = bool(
+            getattr(attn_metadata, "mixed_page_resolver_graph_replay_expected", False)
+        )
+        if route != dense_route and graph_replay_expected and not carriers_updated:
+            raise RuntimeError(
+                "mixed-page resolver CUDA graph replay requires in-place carrier update before cudagraph.replay()"
+            )
+        if route == dense_route:
+            return _call_flash_attention_forward(
+                original_forward,
+                self,
+                layer,
+                query,
+                key,
+                value,
+                kv_cache,
+                attn_metadata,
+                output,
+                output_scale,
+                output_block_scale,
+            )
+        return mixed_forward_impl(
+            self=self,
+            layer=layer,
+            query=query,
+            key=key,
+            value=value,
+            kv_cache=kv_cache,
+            attn_metadata=attn_metadata,
+            output=output,
+            output_scale=output_scale,
+            output_block_scale=output_block_scale,
+        )
+
+    setattr(
+        _patched_forward,
+        "_fa3_native_dense_original_forward",
+        dense_original_forward,
+    )
+    return _patched_forward
+
+
+def install_flash_attention_forward_patch(
+    flash_attn_module: object,
+    *,
+    bridge: VendoredFlashAttnBridge,
+    mixed_forward_impl: Callable[..., Any],
+) -> FlashAttentionForwardPatchBackup:
+    symbol_backup = patch_flash_attn_module_symbols(flash_attn_module, bridge)
+    impl_cls = getattr(flash_attn_module, "FlashAttentionImpl")
+    original_forward = getattr(impl_cls, "forward")
+    setattr(
+        impl_cls,
+        "forward",
+        build_patched_flash_attention_forward(
+            original_forward,
+            mixed_forward_impl=mixed_forward_impl,
+        ),
+    )
+    return FlashAttentionForwardPatchBackup(
+        flash_attn_varlen_func=symbol_backup.flash_attn_varlen_func,
+        get_scheduler_metadata=symbol_backup.get_scheduler_metadata,
+        forward=original_forward,
+    )
