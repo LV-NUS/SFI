@@ -1357,6 +1357,21 @@ def _copy_refresh_micro_profile_env_for_diagnostic(env: dict[str, str]) -> None:
             env["VLLM_SPARSE_REFRESH_MICRO_PROFILE_EVERY"] = str(every)
 
 
+def _copy_step_profile_env_for_diagnostic(env: dict[str, str]) -> None:
+    # VLLM_SPARSE_STEP_PROFILE 本体命中 _is_gate_d_trace_profile_key 的通配
+    # 清洗(_EVERY/_LOG/_DETAIL 尾缀不命中而幸存)——与 torch profiler 同款
+    # 回填:仅当调用方显式导出时透传,默认零行为。
+    for key in (
+        "VLLM_SPARSE_STEP_PROFILE",
+        "VLLM_SPARSE_STEP_PROFILE_DETAIL",
+        "VLLM_SPARSE_STEP_PROFILE_EVERY",
+        "VLLM_SPARSE_STEP_PROFILE_LOG",
+    ):
+        value = os.environ.get(key, "").strip()
+        if value:
+            env[key] = value
+
+
 def _copy_selector_profile_env_for_diagnostic(env: dict[str, str]) -> None:
     for key in SELECTOR_PIPELINE_CPU_PROFILE_ENV_KEYS:
         value = os.environ.get(key, "")
@@ -1674,6 +1689,7 @@ def _build_gate_d_sparse_env(
     _copy_mixed_page_kernel_profile_env_for_diagnostic(env)
     _copy_sparse_metadata_profile_env_for_diagnostic(env)
     _copy_torch_profiler_env_for_diagnostic(env)
+    _copy_step_profile_env_for_diagnostic(env)
     _apply_gate_d_backend_env(args, env)
     if _gate_d_backend(args) == BACKEND_FA4_SM100:
         env["VLLM_ATTENTION_BACKEND"] = "FLASH_ATTN_VLLM_V1"

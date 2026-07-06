@@ -792,7 +792,8 @@ class WaitDeciderMixin:
                 tracking.post_bridge_refresh_due_decode_step = int(
                     bridge_decode_step + catchup_delay
                 )
-                tracking.post_bridge_refresh_done = False
+                # [CREDIT-RETIRE 2026-07-07] post_bridge_refresh_done credit
+                # 状态机已退休;追赶票(due)机制保留。
             bridge_token_positions = [
                 int(pos)
                 for pos in list(getattr(tracking, "bridge_token_positions", []) or [])

@@ -1439,8 +1439,10 @@ class RequestTracking:
     bootstrap_publish_skipped_reason: str = ""
     # one-shot bridge 后的轻量 catch-up refresh；避免 compact cache 对
     # bridge 后生成 token 的更新完全依赖 sentence trigger 是否碰巧命中。
+    # [CREDIT-RETIRE 2026-07-07] post_bridge_refresh_done(credit 状态机)
+    # 已整机退休:其 done 标志被任何 FORCE_NOW+SENTENCE 世代完成误置,吞掉
+    # 其后的 interval 到点;计时校准由 last_decode_refresh_step 推进天然覆盖。
     post_bridge_refresh_due_decode_step: int = -1
-    post_bridge_refresh_done: bool = False
     last_refresh_step: int = -1
     # decode token计数（纯decode步，不含prompt）；首个decode token后变为>=0
     decode_step: int = -1

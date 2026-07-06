@@ -3213,12 +3213,12 @@ class SelectorComputeMixin:
                             == int(PendingReasonCode.COMPACT_THRESHOLD_CROSSED)
                         ):
                             tracking._was_short_dense = False
-                        if (
-                            pending_policy == int(PendingPolicy.FORCE_NOW)
-                            and pending_reason_code
-                            == int(PendingReasonCode.SENTENCE)
-                        ):
-                            tracking.post_bridge_refresh_done = True
+                        # [CREDIT-RETIRE 2026-07-07] 原此处对任何 FORCE_NOW+
+                        # SENTENCE 世代完成置 post_bridge_refresh_done=True——
+                        # 不检查是否 post-bridge 追赶世代,普通句世代也发
+                        # credit、吞掉其后的 interval 到点(实测静默主因之一)。
+                        # credit 状态机整机退休;interval 计时由上方
+                        # last_decode_refresh 推进天然重置,无需 credit。
                     else:
                         # 仅刷新了部分层时不得提前清 pending；下一步继续强制 dense 并补齐 refresh。
                         reason_code = int(

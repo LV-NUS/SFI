@@ -2943,7 +2943,7 @@ class VLLMSparseController(
         request_id: str,
         ready_compact: bool,
     ) -> bool:
-        self._ensure_request(request_id)
+        tracking = self._ensure_request(request_id)
         ticket = self._ensure_request_ticket(request_id)
         next_state = TicketState.READY_COMPACT if ready_compact else TicketState.NOT_READY
         changed = (
@@ -2961,6 +2961,23 @@ class VLLMSparseController(
         ticket.pending_ctrl_step = -1
         ticket.pending_policy = PendingPolicy.COALESCEABLE
         ticket.state = next_state
+        if ready_compact:
+            # [SCHED-RESIDUE-FIX 2026-07-07] ready_compact 清除 = 世代对该
+            # request 终局;scheduled_* 必须一并终局,否则 publish 时刻 GPU
+            # writer 未完(_update_selection_tracking 走 partial 分支置
+            # scheduled)、随后 plan 以 covered-by-ready-compact 清 ticket 的
+            # 请求会永久滞留 scheduled → inflight_refresh 恒真 → 该 request
+            # 的 sentence/interval 触发从此全部静默(bs8x12k 实测每请求首个
+            # sentence 世代后 interval_trigger_intents 恒 0)。正常完成路径
+            # (_update_selection_tracking final 分支)本就先清 scheduled 再
+            # 调本函数,此处幂等。
+            if (
+                int(getattr(tracking, "scheduled_decode_refresh_step", -1)) >= 0
+                or int(getattr(tracking, "scheduled_refresh_ctrl_step", -1)) >= 0
+            ):
+                tracking.scheduled_decode_refresh_step = -1
+                tracking.scheduled_refresh_ctrl_step = -1
+                changed = True
         return changed
 
     def acquire_global_slot(self, request_id: str) -> int:
@@ -4291,48 +4308,10 @@ class VLLMSparseController(
                 raise
             return int(ready_chunk) < int(_CAPTURE_CHUNK)
 
-        def _post_bridge_refresh_credit_active(
-            tracking_local: RequestTracking,
-            *,
-            decode_step_local: int,
-        ) -> bool:
-            if not bool(getattr(tracking_local, "post_bridge_refresh_done", False)):
-                return False
-            if interval <= 0 or decode_step_local < 0:
-                return False
-            last_decode_refresh_local = int(
-                getattr(tracking_local, "last_decode_refresh_step", -1)
-            )
-            if last_decode_refresh_local < 0:
-                return False
-            return (
-                int(decode_step_local) - last_decode_refresh_local
-            ) < int(interval)
-
-        def _post_bridge_refresh_credit_due(
-            tracking_local: RequestTracking,
-            *,
-            decode_step_local: int,
-        ) -> bool:
-            if not bool(getattr(tracking_local, "post_bridge_refresh_done", False)):
-                return False
-            if interval <= 0 or decode_step_local < 0:
-                return False
-            last_decode_refresh_local = int(
-                getattr(tracking_local, "last_decode_refresh_step", -1)
-            )
-            if last_decode_refresh_local < 0:
-                return False
-            return (
-                int(decode_step_local) - last_decode_refresh_local
-            ) >= int(interval)
-
-        def _reset_sentence_trigger_refresh_gap(
-            tracking_local: RequestTracking,
-        ) -> None:
-            trigger_local = getattr(tracking_local, "trigger", None)
-            if trigger_local is not None:
-                trigger_local.state.steps_since_refresh = 0
+        # [CREDIT-RETIRE 2026-07-07] _post_bridge_refresh_credit_active/_due
+        # 与 _reset_sentence_trigger_refresh_gap 已随 credit 状态机整机退休
+        # (见 sentence intent 落票处注记);gap 归零由世代完成路径
+        # (selector_compute_mixin 更新 tracking 时)统一执行。
 
         def _pending_refresh_covered_by_ready_compact(
             rid_local: str,
@@ -4650,50 +4629,13 @@ class VLLMSparseController(
                         continue
                     intent_reason = tracking.trigger_intent_reason or "trigger"
                     intent_reason_code = pending_reason_to_code(intent_reason)
-                    if (
-                        intent_reason_code == int(PendingReasonCode.SENTENCE)
-                        and _post_bridge_refresh_credit_active(
-                            tracking,
-                            decode_step_local=decode_step,
-                        )
-                    ):
-                        if update_state:
-                            self._clear_request_trigger_intent(request_id=rid)
-                            self._sentence_trigger_admission_post_bridge_credit_total = (
-                                int(
-                                    getattr(
-                                        self,
-                                        "_sentence_trigger_admission_post_bridge_credit_total",
-                                        0,
-                                    )
-                                )
-                                + 1
-                            )
-                        continue
-                    if (
-                        intent_reason_code == int(PendingReasonCode.SENTENCE)
-                        and _post_bridge_refresh_credit_due(
-                            tracking,
-                            decode_step_local=decode_step,
-                        )
-                    ):
-                        if update_state:
-                            self._clear_request_trigger_intent(request_id=rid)
-                            tracking.post_bridge_refresh_done = False
-                            tracking.last_decode_refresh_step = int(decode_step)
-                            _reset_sentence_trigger_refresh_gap(tracking)
-                            self._sentence_trigger_admission_post_bridge_credit_total = (
-                                int(
-                                    getattr(
-                                        self,
-                                        "_sentence_trigger_admission_post_bridge_credit_total",
-                                        0,
-                                    )
-                                )
-                                + 1
-                            )
-                        last_decode_refresh = int(decode_step)
-                        continue
+                    # [CREDIT-RETIRE 2026-07-07] post_bridge credit 状态机下线:
+                    # 原 credit_active/credit_due 两分支在此吸收/消费 sentence
+                    # intent。credit 的"计时校准"动机已由世代完成时的
+                    # last_decode_refresh 推进天然覆盖;其 done 标志被任何
+                    # FORCE_NOW+SENTENCE 世代完成误置(不限 post-bridge 追赶
+                    # 世代),使普通句世代后的 interval 到点被静默吞掉——隐式
+                    # 状态机横跨 4 文件,出错无法定位,按"兜底下线"方针整机退休。
                     intent_force_now = tracking.trigger_intent_force_now
                     if ticket.pending_refresh:
                         pending_step_cur = ticket.pending_decode_step
@@ -4783,9 +4725,10 @@ class VLLMSparseController(
                 and post_bridge_due >= 0
                 and last_decode_refresh >= post_bridge_due
             ):
+                # [CREDIT-RETIRE 2026-07-07] 追赶已由其它世代覆盖:只清 due,
+                # 不再发 credit(post_bridge_refresh_done 状态机已退休)。
                 if update_state:
                     tracking.post_bridge_refresh_due_decode_step = -1
-                    tracking.post_bridge_refresh_done = True
             elif (
                 (not workload_plan_replay_active)
                 and (not inflight_refresh)
@@ -4913,13 +4856,9 @@ class VLLMSparseController(
                 and decode_step >= 0
                 and (decode_step - last_decode_refresh) >= interval
             ):
-                if bool(getattr(tracking, "post_bridge_refresh_done", False)):
-                    if update_state:
-                        tracking.post_bridge_refresh_done = False
-                        tracking.last_decode_refresh_step = int(decode_step)
-                        _reset_sentence_trigger_refresh_gap(tracking)
-                    last_decode_refresh = int(decode_step)
-                    continue
+                # [CREDIT-RETIRE 2026-07-07] 原 post_bridge credit 在此吞掉
+                # interval 到点(推 last+continue),已随状态机退休——interval
+                # 到点一律按票面语义落票。
                 has_pending = bool(ticket.pending_refresh)
                 reason_cur = int(ticket.pending_reason_code)
                 pending_is_interval_cur = reason_cur == int(PendingReasonCode.INTERVAL)
