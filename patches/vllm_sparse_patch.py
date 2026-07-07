@@ -216,272 +216,10 @@ _CURRENT_UNIFIED_ATTENTION_MODE = "default"
 
 
 
-def _get_cached_logits_patch_i32_stepwise_from_cache(
-    cache: Dict[
-        Tuple[
-            int,
-            str,
-            int,
-            int,
-            int,
-            int,
-            int,
-            int,
-            Tuple[Tuple[int, ...], Tuple[int, ...]],
-            Tuple[object, ...],
-            Tuple[int, ...],
-        ],
-        Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-    ],
-    *,
-    epoch: int,
-    logits_rows: Sequence[int],
-    capsule_signature: Sequence[object],
-    row_index: torch.Tensor,
-    controller: Optional["VLLMSparseController"],
-    step_context: "StepContext",
-    cu_seqlens_q: torch.Tensor,
-    seqused_k: torch.Tensor,
-    kv_max: int,
-    device: torch.device,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """step-wise 生成/复用 (last_n,row_offset,capacity) 三坨小张量（controller=None 兜底路径）。
-
-    - last_n/capacity：语义真源为 StepBoundMeta（controller 级张量优先复用）
-    - q_len：来自 cu_seqlens_q（GPU，避免 Python list）
-    - kv_len：来自 seqused_k + capacity_tensor（GPU clamp）
-    """
-    rows_tuple = tuple(int(r) for r in logits_rows)
-    dev_index = int(device.index) if device.index is not None else -1
-    ptr_cu = int(cu_seqlens_q.data_ptr()) if cu_seqlens_q.numel() > 0 else 0
-    ptr_seq = int(seqused_k.data_ptr()) if seqused_k.numel() > 0 else 0
-    if controller is None:
-        raise RuntimeError("step-wise logits patch requires controller for bound-meta single-source")
-    bound_meta = controller._require_step_bound_meta(
-        step_context=step_context,
-        stage="step-wise logits patch",
-    )
-    plan_last_n_by_row = tuple(bound_meta.logits_last_n_by_row)
-    plan_cap_by_row = tuple(bound_meta.logits_capacity_by_row)
-    bound_sig = tuple(bound_meta.bound_meta_signature)
-    last_n_tensor: Optional[torch.Tensor] = None
-    cap_tensor: Optional[torch.Tensor] = None
-    plan_rows = max(len(plan_last_n_by_row), len(plan_cap_by_row))
-    if controller is not None:
-        _sit = int(step_context.step_identity_token)
-        ready_match = (
-            int(controller._step_logits_ready_token) == _sit
-            and getattr(controller, "_step_logits_ready_bound_signature", None) == bound_sig
-        )
-        decode_stage_match = (
-            int(controller._decode_logf_stage_token) == _sit
-            and getattr(controller, "_decode_logf_stage_bound_signature", None) == bound_sig
-        )
-        if ready_match or decode_stage_match:
-            ctrl_last_n = controller._decode_logits_last_n_i64
-            if (
-                isinstance(ctrl_last_n, torch.Tensor)
-                and ctrl_last_n.numel() >= plan_rows
-            ):
-                last_n_tensor = ctrl_last_n
-            ctrl_cap = controller._decode_logits_cap_i64
-            if (
-                isinstance(ctrl_cap, torch.Tensor)
-                and ctrl_cap.numel() >= plan_rows
-            ):
-                cap_tensor = ctrl_cap
-        if (
-            (last_n_tensor is None or cap_tensor is None)
-            and plan_last_n_by_row
-            and plan_cap_by_row
-        ):
-            tensor_cap = max(
-                int(controller.max_batch_size or 0),
-                int(plan_rows),
-            )
-            if (
-                controller._decode_logits_last_n_i64 is None
-                or controller._decode_logits_last_n_i64.device != device
-                or controller._decode_logits_last_n_i64.numel() < tensor_cap
-            ):
-                controller._decode_logits_last_n_i64 = torch.empty(
-                    (tensor_cap,),
-                    dtype=torch.long,
-                    device=device,
-                )
-            if (
-                controller._decode_logits_cap_i64 is None
-                or controller._decode_logits_cap_i64.device != device
-                or controller._decode_logits_cap_i64.numel() < tensor_cap
-            ):
-                controller._decode_logits_cap_i64 = torch.empty(
-                    (tensor_cap,),
-                    dtype=torch.long,
-                    device=device,
-                )
-            controller._decode_logits_last_n_i64[: len(plan_last_n_by_row)].copy_(
-                torch.as_tensor(plan_last_n_by_row, dtype=torch.long, device=device)
-            )
-            controller._decode_logits_cap_i64[: len(plan_cap_by_row)].copy_(
-                torch.as_tensor(plan_cap_by_row, dtype=torch.long, device=device)
-            )
-            controller._step_logits_ready_token = _sit
-            controller._step_logits_ready_input_signature = None
-            controller._step_logits_ready_bound_signature = bound_sig
-            last_n_tensor = controller._decode_logits_last_n_i64
-            cap_tensor = controller._decode_logits_cap_i64
-    if last_n_tensor is None and plan_last_n_by_row:
-        last_n_tensor = torch.as_tensor(plan_last_n_by_row, device=device, dtype=torch.long)
-    if cap_tensor is None and plan_cap_by_row:
-        cap_tensor = torch.as_tensor(plan_cap_by_row, device=device, dtype=torch.long)
-    ptr_last_n = int(last_n_tensor.data_ptr()) if last_n_tensor is not None and last_n_tensor.numel() > 0 else 0
-    ptr_cap = int(cap_tensor.data_ptr()) if cap_tensor is not None and cap_tensor.numel() > 0 else 0
-    capsule_sig_tuple = (
-        tuple(bound_meta.bound_meta_signature),
-        tuple(capsule_signature),
-    )
-    plan_sig_tuple: Tuple[Tuple[int, ...], Tuple[int, ...]] = (
-        tuple() if ptr_last_n != 0 else plan_last_n_by_row,
-        tuple() if ptr_cap != 0 else plan_cap_by_row,
-    )
-    key = (
-        int(epoch),
-        str(device.type),
-        dev_index,
-        int(kv_max),
-        ptr_cu,
-        ptr_seq,
-        ptr_last_n,
-        ptr_cap,
-        plan_sig_tuple,
-        capsule_sig_tuple,
-        rows_tuple,
-    )
-    cached = cache.get(key)
-    if cached is not None:
-        return cached
-
-    if last_n_tensor is None:
-        raise RuntimeError("step-wise logits patch requires bound_meta logits_last_n_by_row")
-    if cap_tensor is None:
-        raise RuntimeError("step-wise logits patch requires bound_meta logits_capacity_by_row")
-
-    if last_n_tensor.device != device:
-        last_n_tensor = last_n_tensor.to(device=device)
-    if cap_tensor.device != device:
-        cap_tensor = cap_tensor.to(device=device)
-    if cu_seqlens_q.device != device:
-        cu_seqlens_q = cu_seqlens_q.to(device=device)
-    if seqused_k.device != device:
-        seqused_k = seqused_k.to(device=device)
-
-    # last_n
-    last_n_i32 = last_n_tensor.index_select(0, row_index).to(dtype=torch.int32)
-
-    # q_len = cu[i+1] - cu[i]
-    row_index_plus1 = row_index + 1
-    q_end = cu_seqlens_q.index_select(0, row_index_plus1).to(dtype=torch.int32)
-    q_start = cu_seqlens_q.index_select(0, row_index).to(dtype=torch.int32)
-    q_len_i32 = q_end - q_start
-
-    # row_offsets = max(q_len - last_n, 0)
-    row_offsets_i32 = torch.clamp(q_len_i32 - last_n_i32, min=0)
-
-    # capacity = clamp(min(seqused_k, cap_tensor), 1, kv_max)
-    kv_len_i32 = seqused_k.index_select(0, row_index.to(seqused_k.device)).to(device=device, dtype=torch.int32)
-    cap_i32 = cap_tensor.index_select(0, row_index).to(dtype=torch.int32)
-    kv_len_i32 = torch.minimum(kv_len_i32, cap_i32)
-    caps_i32 = torch.clamp(kv_len_i32, min=1, max=int(kv_max)).to(dtype=torch.int32)
-
-    # Evict entries from previous epochs to prevent unbounded growth
-    # while avoiding the rebuild spike of clearing the entire cache.
-    if len(cache) > 64:
-        stale_keys = [k for k in cache if k[0] != epoch]
-        for k in stale_keys:
-            del cache[k]
-    cache[key] = (last_n_i32, row_offsets_i32, caps_i32)
-    return cache[key]
-
-def _get_global_decode_req_meta(
-    controller: Optional["VLLMSparseController"],
-    cache_key: int,
-) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-    bound_layer = _get_global_decode_bound_layer(controller, cache_key)
-    if bound_layer is None:
-        return None
-    return bound_layer.req_meta_i32, bound_layer.req_meta_i64
 
 
-def _get_global_decode_bound_layer(
-    controller: Optional["VLLMSparseController"],
-    cache_key: int,
-) -> Optional["BoundLayerMeta"]:
-    if controller is None:
-        return None
-    step_bound_meta = controller.step_bound_meta
-    if step_bound_meta is None:
-        return None
-    layer_index = controller.layer_index_by_cache_key.get(cache_key, -1)
-    if layer_index < 0:
-        return None
-    if layer_index >= len(step_bound_meta.layer_bound):
-        return None
-    _auth = controller.step_authority
-    if _auth is None:
-        return None
-    if step_bound_meta.epoch != int(_auth.epoch):
-        return None
-    batch_size = int(_auth.batch_size)
-    if int(step_bound_meta.batch_size) < batch_size:
-        return None
-    if (
-        step_bound_meta.step_handle_id != int(_auth.step_handle_id)
-        or step_bound_meta.step_handle_generation != int(_auth.step_handle_generation)
-    ):
-        return None
-    layer_bound = step_bound_meta.layer_bound[layer_index]
-    if layer_bound is None:
-        return None
-    req_meta_i32 = layer_bound.req_meta_i32
-    req_meta_i64 = layer_bound.req_meta_i64
-    if (
-        req_meta_i32.dim() != 2
-        or req_meta_i64.dim() != 2
-        or int(req_meta_i32.shape[0]) < batch_size
-        or int(req_meta_i64.shape[0]) < batch_size
-    ):
-        return None
-    return layer_bound
 
-def _get_global_prefill_req_meta(
-    controller: Optional["VLLMSparseController"],
-    cache_key: int,
-) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-    if controller is None:
-        return None
-    _auth = controller.step_authority
-    if _auth is None or _auth.is_decode_only:
-        return None
-    if controller.prefill_global_meta_epoch != _auth.epoch:
-        return None
-    if int(getattr(controller, "prefill_global_meta_handle_id", -1)) != int(
-        _auth.step_handle_id
-    ):
-        return None
-    if int(getattr(controller, "prefill_global_meta_handle_generation", -1)) != int(
-        _auth.step_handle_generation
-    ):
-        return None
-    req_meta_i32_all = controller.step_prefill_req_meta_i32_all
-    req_meta_i64_all = controller.step_prefill_req_meta_i64_all
-    if req_meta_i32_all is None or req_meta_i64_all is None:
-        return None
-    layer_index = controller.layer_index_by_cache_key.get(cache_key, -1)
-    if layer_index < 0:
-        return None
-    if layer_index >= req_meta_i32_all.shape[0] or layer_index >= req_meta_i64_all.shape[0]:
-        return None
-    return req_meta_i32_all[layer_index], req_meta_i64_all[layer_index]
+
 
 
 # -----------------------------------------------------------------------------
@@ -660,193 +398,6 @@ def _prepare_prefill_capture_payload(
         capture_plan=capture_plan,
     )
 
-def _prefill_update_key_norms(
-    *,
-    controller: "VLLMSparseController",
-    state: LayerState,
-    key_cache: torch.Tensor,
-    block_table: torch.Tensor,
-    slot_by_row: Sequence[int],
-    is_prefill_by_row: Sequence[bool],
-    chunk_len_by_row: Sequence[int],
-    context_kv_len_by_row: Sequence[int],
-    num_kv_heads: int,
-) -> None:
-    """在 prefill chunk 中增量更新 key_norms，避免 bootstrap 一次性全量计算导致抖动。"""
-    if not is_prefill_by_row:
-        return
-    if os.environ.get("VLLM_SPARSE_SKIP_PREFILL_KEY_NORMS", "0") == "1":
-        return  # DECISIVE isolation toggle for the bs8 async-prefill crash
-    slot_list: List[int] = []
-    row_list: List[int] = []
-    seq_lens: List[int] = []
-    for row, is_prefill in enumerate(is_prefill_by_row):
-        if not bool(is_prefill):
-            continue
-        if row >= len(slot_by_row):
-            continue
-        slot = int(slot_by_row[row])
-        if slot < 0:
-            continue
-        chunk_len = int(chunk_len_by_row[row]) if row < len(chunk_len_by_row) else 0
-        if chunk_len <= 0:
-            continue
-        total_len = int(context_kv_len_by_row[row]) if row < len(context_kv_len_by_row) else 0
-        slot_list.append(slot)
-        row_list.append(int(row))
-        seq_lens.append(max(0, int(total_len)))
-        # 预填充阶段只推进到“已看到的 tokens”，使用 chunk_len 累积。
-        # total_len 仅作为上限，避免意外超前推进。
-        # 注意：seq_lens 仅用于后续日志与容量计算。
-        # 实际 end_len 在下面按 cur + chunk_len 计算。
-    if not slot_list:
-        return
-    max_seq_len = max(seq_lens) if seq_lens else 0
-    max_slot = max(slot_list)
-    kv_stride_tokens = _align_up_int(int(max_seq_len), 256)
-    state.ensure_batch(max_slot + 1)
-    state.ensure_key_norms_arena(
-        stride_tokens=int(kv_stride_tokens),
-        required_slots=max_slot + 1,
-        num_kv_heads=int(num_kv_heads),
-        refresh_stream=controller.refresh_stream,
-        stride_floor=int(
-            getattr(controller, "_key_norms_stride_floor_mml", 0) or 0
-        ),
-    )
-    arena = state.key_norms_arena
-    if arena.numel() == 0:
-        return
-
-    slot_indices_cpu = torch.tensor(slot_list, dtype=torch.long)
-    row_indices_cpu = torch.tensor(row_list, dtype=torch.long)
-    # [KEY-NORMS-LEN-I32] 载体已 int32；CPU 端加法/clamp 的值域=token 计数
-    # ≤ kv_stride_tokens << 2^31，int32 算术安全——退休 int32→long→int32 往返
-    # （下游 cur/tgt staging 本就 int32）。
-    cur_cpu = state.key_norms_len.index_select(0, slot_indices_cpu)
-    chunk_len_cpu = torch.tensor(
-        [
-            int(chunk_len_by_row[row]) if row < len(chunk_len_by_row) else 0
-            for row in row_list
-        ],
-        dtype=torch.int32,
-    )
-    total_len_cpu = torch.tensor(
-        [
-            int(context_kv_len_by_row[row]) if row < len(context_kv_len_by_row) else 0
-            for row in row_list
-        ],
-        dtype=torch.int32,
-    )
-    tgt_cpu = cur_cpu + torch.clamp(chunk_len_cpu, min=0)
-    has_total_len = total_len_cpu > 0
-    if bool(has_total_len.any()):
-        tgt_cpu = torch.where(has_total_len, torch.minimum(tgt_cpu, total_len_cpu), tgt_cpu)
-    tgt_cpu = torch.clamp(tgt_cpu, max=int(kv_stride_tokens))
-    tgt_cpu = torch.maximum(tgt_cpu, cur_cpu)
-    delta_cpu = tgt_cpu - cur_cpu
-    max_delta = int(delta_cpu.max().item()) if delta_cpu.numel() > 0 else 0
-    if max_delta <= 0:
-        return
-
-    if key_cache.dim() < 4:
-        raise RuntimeError("prefill key_norms update requires 4D key_cache")
-    block_size = int(key_cache.shape[1]) if key_cache.dim() >= 2 else 0
-    head_dim = int(key_cache.shape[-1])
-    if block_size <= 0 or head_dim <= 0:
-        raise RuntimeError("prefill key_norms update requires valid block/head dims")
-
-    device = block_table.device
-    # [KEY-NORMS-ARENA-WAR 2026-07-03] 主流在此对 arena[slot, cur:tgt] 做预热覆
-    # 写,而上一次 async flush 的 selector 可能仍在 refresh_stream 上 pack 同一
-    # arena——本应由 chunk_done 排序,但该边是 BUF-keyed 且被 wait_decider 的
-    # flags==0 早退击穿(与已修 compact_arena 缺陷同类)。复用 compact 的
-    # always-wait ready 事件(flush 在 selector pack 之后 record 于
-    # refresh_stream,天然覆盖要护的读),独立 waited-gen 门控:每个新 flush 代
-    # 摊销一次 wait_event(流内信号量,~us,无 host 同步)。纯 decode/refresh 步
-    # 无预热写不达此处,黄金档零扰动;RAW 方向由无条件 chunk_ready 握手覆盖,
-    # 勿重复建边。
-    if getattr(device, "type", "") == "cuda":
-        _kn_evt = getattr(controller, "_compact_arena_ready_evt", None)
-        _kn_gen = int(getattr(controller, "_compact_arena_ready_gen", 0))
-        _kn_waited = int(getattr(controller, "_key_norms_arena_war_waited_gen", -1))
-        if (
-            _kn_evt is not None
-            and _kn_gen > _kn_waited
-            and not torch.cuda.is_current_stream_capturing()
-        ):
-            torch.cuda.current_stream(device=device).wait_event(_kn_evt)
-            controller._key_norms_arena_war_waited_gen = _kn_gen
-    layer_suffix = f"_layer{int(getattr(state, 'layer_index', -1))}"
-    key_ptrs_i64 = cached_sequence_to_device(
-        (int(key_cache.data_ptr()),),
-        device=device,
-        dtype=torch.int64,
-        cache_name=f"prefill_key_norms_key_ptrs_i64{layer_suffix}",
-        cache_owner=controller,
-        reuse_unchanged=True,
-    )
-    arena_ptrs_i64 = cached_sequence_to_device(
-        (int(arena.data_ptr()),),
-        device=device,
-        dtype=torch.int64,
-        cache_name=f"prefill_key_norms_arena_ptrs_i64{layer_suffix}",
-        cache_owner=controller,
-        reuse_unchanged=True,
-    )
-    start_i32 = cached_cpu_tensor_to_device(
-        cur_cpu.reshape(1, -1),
-        device=device,
-        dtype=torch.int32,
-        cache_name=f"prefill_key_norms_start_i32{layer_suffix}",
-        cache_owner=controller,
-    )
-    end_i32 = cached_cpu_tensor_to_device(
-        tgt_cpu.reshape(1, -1),
-        device=device,
-        dtype=torch.int32,
-        cache_name=f"prefill_key_norms_end_i32{layer_suffix}",
-        cache_owner=controller,
-    )
-    slot_i32 = cached_cpu_tensor_to_device(
-        slot_indices_cpu,
-        device=device,
-        dtype=torch.int32,
-        cache_name=f"prefill_key_norms_slot_i32{layer_suffix}",
-        cache_owner=controller,
-    )
-    row_indices = cached_cpu_tensor_to_device(
-        row_indices_cpu,
-        device=device,
-        dtype=torch.int32,
-        cache_name=f"prefill_key_norms_row_i32{layer_suffix}",
-        cache_owner=controller,
-    )
-    compute_key_norms_paged_batched_layers_delta_cuda(
-        key_ptrs=key_ptrs_i64,
-        out_ptrs=arena_ptrs_i64,
-        block_table=block_table,
-        start_lens=start_i32,
-        end_lens=end_i32,
-        slot_indices=slot_i32,
-        kv_dtype=key_cache.dtype,
-        out_dtype=arena.dtype,
-        head_dim=int(head_dim),
-        block_size=int(block_size),
-        key_strides=tuple(int(s) for s in key_cache.stride()),
-        out_strides=tuple(int(s) for s in arena.stride()),
-        max_delta=int(max_delta),
-        row_indices=row_indices,
-        scratch_norms=None,
-    )
-    # [KEY-NORMS-LEN-I32 2026-07-06] gpu mirror 死载体已退休（恒 None、
-    # write-only、零消费者）；载体统一 int32 后 tgt_cpu 本就 int32，.to 为
-    # 恒 no-op 保留兜底。
-    state.key_norms_len.index_copy_(
-        0,
-        slot_indices_cpu,
-        tgt_cpu.to(dtype=state.key_norms_len.dtype),
-    )
 
 def _prepare_refresh_capture_payload(
     *,
@@ -1090,13 +641,7 @@ def _cleanup_inactive_slots(state: LayerState, controller: Optional['VLLMSparseC
         return
 
 
-_RUN_UNIFIED_ATTENTION_DISPATCHER_IMPL = None
-
-
 _METADATA_BUILDER_IMPLS = None
-
-
-_PATCHED_UNIFIED_ATTENTION_IMPL = None
 
 
 _RUNTIME_WORKER_DEPS_BOUND = False
@@ -1108,16 +653,9 @@ _RUNTIME_WORKER_DEP_NAMES: Tuple[str, ...] = (
     # --- main-module internal functions ---
     "_build_layer_step_cache",
     "_cleanup_inactive_slots",
-    "_execute_refresh_post_kernel",
-    "_get_cached_logits_patch_i32_stepwise_from_cache",
-    "_get_global_decode_bound_layer",
-    "_get_global_decode_req_meta",
-    "_get_global_prefill_req_meta",
     "_normalize_capture_layout_views",
     "_prepare_prefill_capture_payload",
     "_prepare_refresh_capture_payload",
-    "_prefill_update_key_norms",
-    "_run_unified_attention_dispatcher",
 )
 
 def _bind_runtime_worker_deps() -> None:
@@ -1138,14 +676,6 @@ def _bind_runtime_worker_deps() -> None:
     _RUNTIME_WORKER_DEPS_BOUND = True
 
 
-def _load_patched_unified_attention_impl():
-    global _PATCHED_UNIFIED_ATTENTION_IMPL
-    if _PATCHED_UNIFIED_ATTENTION_IMPL is None:
-        _bind_runtime_worker_deps()
-        from patches.decode_runtime.unified_attention_worker import patched_unified_attention_impl
-
-        _PATCHED_UNIFIED_ATTENTION_IMPL = patched_unified_attention_impl
-    return _PATCHED_UNIFIED_ATTENTION_IMPL
 
 
 _PAYLOAD_BUILDER_IMPLS = None
@@ -1201,14 +731,10 @@ def _load_post_kernel_impls():
     if _POST_KERNEL_IMPLS is None:
         _bind_runtime_worker_deps()
         from patches.refresh_runtime.post_kernel_worker import (
-            execute_refresh_post_kernel_impl,
             build_layer_step_cache_impl,
         )
 
-        _POST_KERNEL_IMPLS = (
-            execute_refresh_post_kernel_impl,
-            build_layer_step_cache_impl,
-        )
+        _POST_KERNEL_IMPLS = build_layer_step_cache_impl
     return _POST_KERNEL_IMPLS
 
 
@@ -1262,122 +788,10 @@ def _load_metadata_builder_impls():
     return _METADATA_BUILDER_IMPLS
 
 
-def _load_run_unified_attention_dispatcher_impl():
-    global _RUN_UNIFIED_ATTENTION_DISPATCHER_IMPL
-    if _RUN_UNIFIED_ATTENTION_DISPATCHER_IMPL is None:
-        _bind_runtime_worker_deps()
-        from patches.refresh_runtime.kernel_dispatch import (
-            run_unified_attention_dispatcher_impl,
-        )
-
-        _RUN_UNIFIED_ATTENTION_DISPATCHER_IMPL = run_unified_attention_dispatcher_impl
-    return _RUN_UNIFIED_ATTENTION_DISPATCHER_IMPL
 
 
-def _run_unified_attention_dispatcher(
-    controller: 'VLLMSparseController',
-    state: LayerState,
-    cache_key: int,
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    out: torch.Tensor,
-    block_table: torch.Tensor,
-    cu_seqlens_q: torch.Tensor,
-    max_seqlen_q: int,
-    seqused_k: torch.Tensor,
-    max_seqlen_k: int,
-    softmax_scale: float,
-    softcap: float = 0.0,
-    alibi_slopes: Optional[torch.Tensor] = None,
-    window_size: Optional[Tuple[int, int]] = None,
-    k_descale: Optional[torch.Tensor] = None,
-    v_descale: Optional[torch.Tensor] = None,
-    request_ids: Sequence[str] = (),
-    step_context: Optional[StepContext] = None,
-    prefill_capture_plan: Optional[Dict[int, int]] = None,
-    chunk_query_lengths: Optional[torch.Tensor] = None,
-) -> Tuple[
-    Sequence[int],          # refresh_slots
-    Set[int],               # bootstrap_slots_set
-    bool,                   # profile_enabled
-    Optional[Dict[str, float]],  # profile_stats
-    Sequence[int],          # refresh_slot_list_for_payload
-    Optional["StepCaptureLayout"],  # refresh_layout
-]:
-    impl = _load_run_unified_attention_dispatcher_impl()
-    return impl(
-        controller=controller,
-        state=state,
-        cache_key=cache_key,
-        q=q,
-        k=k,
-        v=v,
-        out=out,
-        block_table=block_table,
-        cu_seqlens_q=cu_seqlens_q,
-        max_seqlen_q=max_seqlen_q,
-        seqused_k=seqused_k,
-        max_seqlen_k=max_seqlen_k,
-        softmax_scale=softmax_scale,
-        softcap=softcap,
-        alibi_slopes=alibi_slopes,
-        window_size=window_size,
-        k_descale=k_descale,
-        v_descale=v_descale,
-        request_ids=request_ids,
-        step_context=step_context,
-        prefill_capture_plan=prefill_capture_plan,
-        chunk_query_lengths=chunk_query_lengths,
-    )
 
 
-def _execute_refresh_post_kernel(
-    controller: "VLLMSparseController",
-    state: LayerState,
-    q: torch.Tensor,
-    cu_seqlens_q: torch.Tensor,
-    seqused_k: torch.Tensor,
-    key_cache: torch.Tensor,
-    value_cache: torch.Tensor,
-    block_table: torch.Tensor,
-    refresh_slots: Sequence[int],
-    bootstrap_slots_set: Set[int],
-    refresh_slot_list: Optional[Sequence[int]],
-    refresh_layout: Optional["StepCaptureLayout"],
-    step_context: Optional[StepContext],
-    *,
-    softmax_scale: float,
-    softcap: float,
-    window_size: Optional[Tuple[int, int]],
-    alibi_slopes: Optional[torch.Tensor],
-    k_descale: Optional[torch.Tensor],
-    profile_enabled: bool = False,
-    profile_stats: Optional[Dict[str, float]] = None,
-) -> None:
-    exec_impl, _ = _load_post_kernel_impls()
-    return exec_impl(
-        controller=controller,
-        state=state,
-        q=q,
-        cu_seqlens_q=cu_seqlens_q,
-        seqused_k=seqused_k,
-        key_cache=key_cache,
-        value_cache=value_cache,
-        block_table=block_table,
-        refresh_slots=refresh_slots,
-        bootstrap_slots_set=bootstrap_slots_set,
-        refresh_slot_list=refresh_slot_list,
-        refresh_layout=refresh_layout,
-        step_context=step_context,
-        softmax_scale=softmax_scale,
-        softcap=softcap,
-        window_size=window_size,
-        alibi_slopes=alibi_slopes,
-        k_descale=k_descale,
-        profile_enabled=profile_enabled,
-        profile_stats=profile_stats,
-    )
 
 # -----------------------------------------------------------------------------
 # Debug helpers
@@ -1408,7 +822,7 @@ def _build_layer_step_cache(
     # M5 Part B2 (2026-04-24): plumb step_bound_meta to the impl so the
     # per-layer bail-out can consult CompactRecentLaunchPlan.valid.
     # P12 lever-2 (2026-06-12): plumb precomputed_cache_key the same way.
-    _, build_impl = _load_post_kernel_impls()
+    build_impl = _load_post_kernel_impls()
     return build_impl(
         state=state,
         step_meta=step_meta,

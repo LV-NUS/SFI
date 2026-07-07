@@ -135,6 +135,11 @@ class CaptureRingMixin:
         self._rebuild_ptrs_cpu[name] = cpu
         gpu = self._rebuild_ptrs_gpu.get(name)
         if gpu is None or gpu.numel() != size or gpu.device != device:
+            if gpu is not None and gpu.is_cuda:
+                # [REBUILD-PTRS-GPU-REALLOC-UAF-FIX] P1:指针数组换代弃旧,
+                # writer gather(deferred replay 另一流)可持旧数组在飞。
+                # size=layers 稳态恒定=近死臂,族纯度收口。冷事件。
+                self._uaf_guard_record_streams_before_discard(gpu)
             gpu = torch.empty((size,), device=device, dtype=torch.int64)
             self._rebuild_ptrs_gpu[name] = gpu
         return cpu, gpu
@@ -228,6 +233,14 @@ class CaptureRingMixin:
             self._release_rebuild_ptr_cpu_buffer(name=name, cpu=cpu)
             return False
         stream = torch.cuda.current_stream(device=gpu.device)
+        # [REBUILD-PTRS-OVERWRITE-WAR-FIX] P1:签名变化原位覆写持久 GPU 指针
+        # 数组前,query-first 等 writer dispatch-done(R3 反向序同型)——
+        # deferred replay 在另一流可能仍按旧指针数组 gather。稳态零成本。
+        _wait_writer = getattr(
+            self, "_wait_writer_dispatch_done_before_stable_overwrite", None
+        )
+        if callable(_wait_writer):
+            _wait_writer()
         gpu.copy_(cpu, non_blocking=True)
         gpu.record_stream(stream)
         ready_event = torch.cuda.Event(enable_timing=False)

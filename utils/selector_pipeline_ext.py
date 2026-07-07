@@ -1136,8 +1136,8 @@ __global__ void fused_log_f_prior_kernel(
 
     int tid = threadIdx.x;
     for (int r = tid; r < R; r += blockDim.x) {
-        int32_t lo = row_lo[m * stride_lo_m + r * stride_lo_r];
-        int32_t hi = row_hi[m * stride_hi_m + r * stride_hi_r];
+        int32_t lo = row_lo[(int64_t)m * stride_lo_m + r * stride_lo_r];
+        int32_t hi = row_hi[(int64_t)m * stride_hi_m + r * stride_hi_r];
         row_lo_s[r] = lo;
         row_hi_s[r] = hi;
     }
@@ -1146,8 +1146,8 @@ __global__ void fused_log_f_prior_kernel(
     int token_lo = 0;
     int token_hi = 0;
     if (tid == 0) {
-        int lo = token_lo_ptr[m * stride_tlo_m];
-        int hi = token_hi_ptr[m * stride_thi_m];
+        int lo = token_lo_ptr[(int64_t)m * stride_tlo_m];
+        int hi = token_hi_ptr[(int64_t)m * stride_thi_m];
         if (lo < 0) {
             lo = 0;
         }
@@ -1176,7 +1176,7 @@ __global__ void fused_log_f_prior_kernel(
                 bool in_bounds = mask_k && (k >= lo) && (k < hi);
                 float val = min_val;
                 if (in_bounds) {
-                    val = static_cast<float>(scores[m * stride_scores_m + r * stride_scores_r + k * stride_scores_k]);
+                    val = static_cast<float>(scores[(int64_t)m * stride_scores_m + r * stride_scores_r + k * stride_scores_k]);
                 }
                 bool valid = in_bounds && (val > min_val);
                 float v = valid ? val : min_val;
@@ -1223,7 +1223,7 @@ __global__ void fused_log_f_prior_kernel(
     row_count = row_count_s;
     if (row_count <= 0.0f) {
         for (int k = tid; k < K; k += blockDim.x) {
-            out[m * K + k] = min_val;
+            out[(int64_t)m * K + k] = min_val;
         }
         return;
     }
@@ -1268,14 +1268,14 @@ __global__ void fused_log_f_prior_kernel(
                     }
                     float lp;
                     if (use_denom) {
-                        float lfp = static_cast<float>(scores[m * stride_scores_m + r * stride_scores_r + k * stride_scores_k]);
-                        float den = denom[m * stride_denom_m + r * stride_denom_r];
+                        float lfp = static_cast<float>(scores[(int64_t)m * stride_scores_m + r * stride_scores_r + k * stride_scores_k]);
+                        float den = denom[(int64_t)m * stride_denom_m + r * stride_denom_r];
                         if (!isfinite(lfp) || !isfinite(den)) {
                             continue;
                         }
                         lp = lfp - den;
                     } else {
-                        float val = static_cast<float>(scores[m * stride_scores_m + r * stride_scores_r + k * stride_scores_k]);
+                        float val = static_cast<float>(scores[(int64_t)m * stride_scores_m + r * stride_scores_r + k * stride_scores_k]);
                         if (!isfinite(val)) {
                             continue;
                         }
@@ -1300,14 +1300,14 @@ __global__ void fused_log_f_prior_kernel(
                     }
                     float lp;
                     if (use_denom) {
-                        float lfp = static_cast<float>(scores[m * stride_scores_m + r * stride_scores_r + k * stride_scores_k]);
-                        float den = denom[m * stride_denom_m + r * stride_denom_r];
+                        float lfp = static_cast<float>(scores[(int64_t)m * stride_scores_m + r * stride_scores_r + k * stride_scores_k]);
+                        float den = denom[(int64_t)m * stride_denom_m + r * stride_denom_r];
                         if (!isfinite(lfp) || !isfinite(den)) {
                             continue;
                         }
                         lp = lfp - den;
                     } else {
-                        float val = static_cast<float>(scores[m * stride_scores_m + r * stride_scores_r + k * stride_scores_k]);
+                        float val = static_cast<float>(scores[(int64_t)m * stride_scores_m + r * stride_scores_r + k * stride_scores_k]);
                         if (!isfinite(val)) {
                             continue;
                         }
@@ -1328,7 +1328,7 @@ __global__ void fused_log_f_prior_kernel(
                 }
             }
 
-            float kn = static_cast<float>(key_norms[m * stride_kn_m + k * stride_kn_k]);
+            float kn = static_cast<float>(key_norms[(int64_t)m * stride_kn_m + k * stride_kn_k]);
             kn = fmaxf(kn, eps);
             float log_pi = -gamma * logf(kn);
             float pos_norm = (static_cast<float>(k - token_lo)) * inv_denom_pos;
@@ -1347,9 +1347,9 @@ __global__ void fused_log_f_prior_kernel(
         }
 
         if (k < K) {
-            out[m * K + k] = in_bounds ? log_f : min_val;
+            out[(int64_t)m * K + k] = in_bounds ? log_f : min_val;
             if (log_r_cache != nullptr) {
-                log_r_cache[m * K + k] = log_r_raw;
+                log_r_cache[(int64_t)m * K + k] = log_r_raw;
             }
         }
         if (in_bounds && log_f > local_max_f) {
@@ -1368,15 +1368,15 @@ __global__ void fused_log_f_prior_kernel(
         if (k < token_lo || k >= token_hi) {
             continue;
         }
-        float log_f = out[m * K + k];
+        float log_f = out[(int64_t)m * K + k];
         if (log_f > min_val && max_f > min_val) {
             local_sum_f += expf(log_f - max_f);
         }
         float log_r_raw = min_val;
         if (log_r_cache != nullptr) {
-            log_r_raw = log_r_cache[m * K + k];
+            log_r_raw = log_r_cache[(int64_t)m * K + k];
         } else {
-            float kn = static_cast<float>(key_norms[m * stride_kn_m + k * stride_kn_k]);
+            float kn = static_cast<float>(key_norms[(int64_t)m * stride_kn_m + k * stride_kn_k]);
             kn = fmaxf(kn, eps);
             float log_pi = -gamma * logf(kn);
             float pos_norm = (static_cast<float>(k - token_lo)) * inv_denom_pos;
@@ -1412,16 +1412,16 @@ __global__ void fused_log_f_prior_kernel(
         if (k < token_lo || k >= token_hi) {
             continue;
         }
-        float log_f = out[m * K + k];
+        float log_f = out[(int64_t)m * K + k];
         float lp = min_val;
         if (log_f > min_val && denom_f > min_val) {
             lp = log_f - denom_f;
         }
         float log_r_raw = min_val;
         if (log_r_cache != nullptr) {
-            log_r_raw = log_r_cache[m * K + k];
+            log_r_raw = log_r_cache[(int64_t)m * K + k];
         } else {
-            float kn = static_cast<float>(key_norms[m * stride_kn_m + k * stride_kn_k]);
+            float kn = static_cast<float>(key_norms[(int64_t)m * stride_kn_m + k * stride_kn_k]);
             kn = fmaxf(kn, eps);
             float log_pi = -gamma * logf(kn);
             float pos_norm = (static_cast<float>(k - token_lo)) * inv_denom_pos;
@@ -1500,16 +1500,16 @@ __global__ void fused_log_f_prior_kernel(
         if (k < token_lo || k >= token_hi) {
             continue;
         }
-        float log_f = out[m * K + k];
+        float log_f = out[(int64_t)m * K + k];
         float lp = min_val;
         if (log_f > min_val && denom_f > min_val) {
             lp = log_f - denom_f;
         }
         float log_r_raw = min_val;
         if (log_r_cache != nullptr) {
-            log_r_raw = log_r_cache[m * K + k];
+            log_r_raw = log_r_cache[(int64_t)m * K + k];
         } else {
-            float kn = static_cast<float>(key_norms[m * stride_kn_m + k * stride_kn_k]);
+            float kn = static_cast<float>(key_norms[(int64_t)m * stride_kn_m + k * stride_kn_k]);
             kn = fmaxf(kn, eps);
             float log_pi = -gamma * logf(kn);
             float pos_norm = (static_cast<float>(k - token_lo)) * inv_denom_pos;
@@ -1530,7 +1530,7 @@ __global__ void fused_log_f_prior_kernel(
             log_r = log_r_raw - denom_r;
         }
         float fused_raw = log_add_exp(log_one_minus + lp, log_lambda + log_r);
-        out[m * K + k] = fused_raw;
+        out[(int64_t)m * K + k] = fused_raw;
         if (fused_raw > local_max_fused) {
             local_max_fused = fused_raw;
         }
@@ -1542,7 +1542,7 @@ __global__ void fused_log_f_prior_kernel(
         if (k < token_lo || k >= token_hi) {
             continue;
         }
-        float fused_raw = out[m * K + k];
+        float fused_raw = out[(int64_t)m * K + k];
         if (fused_raw > min_val && max_fused > min_val) {
             local_sum_fused += expf(fused_raw - max_fused);
         }
@@ -1553,11 +1553,11 @@ __global__ void fused_log_f_prior_kernel(
     // Pass 4: normalize fused.
     for (int k = tid; k < K; k += blockDim.x) {
         if (k < token_lo || k >= token_hi) {
-            out[m * K + k] = min_val;
+            out[(int64_t)m * K + k] = min_val;
             continue;
         }
-        float fused_raw = out[m * K + k];
-        out[m * K + k] = fused_raw - denom_fused;
+        float fused_raw = out[(int64_t)m * K + k];
+        out[(int64_t)m * K + k] = fused_raw - denom_fused;
     }
 }
 
@@ -1587,8 +1587,8 @@ __global__ void soft_nms_bounds_kernel(
     int n = nh / H;
     int h = nh - n * H;
 
-    int lo = token_lo[n * stride_lo_n + h * stride_lo_h];
-    int hi = token_hi[n * stride_hi_n + h * stride_hi_h];
+    int lo = token_lo[(int64_t)n * stride_lo_n + h * stride_lo_h];
+    int hi = token_hi[(int64_t)n * stride_hi_n + h * stride_hi_h];
     if (lo < 0) {
         lo = 0;
     }
@@ -1599,7 +1599,7 @@ __global__ void soft_nms_bounds_kernel(
     bool valid_k = (k < K);
     float score = 0.0f;
     if (valid_k) {
-        score = static_cast<float>(log_s[n * stride_s_n + h * stride_s_h + k * stride_s_k]);
+        score = static_cast<float>(log_s[(int64_t)n * stride_s_n + h * stride_s_h + k * stride_s_k]);
     }
     bool in_bounds = valid_k && (k >= lo) && (k < hi);
 
@@ -1614,7 +1614,7 @@ __global__ void soft_nms_bounds_kernel(
         if (idx >= 0 && idx < K) {
             bool in_bounds_off = (idx >= lo) && (idx < hi);
             if (in_bounds_off) {
-                val = static_cast<float>(log_s[n * stride_s_n + h * stride_s_h + idx * stride_s_k]);
+                val = static_cast<float>(log_s[(int64_t)n * stride_s_n + h * stride_s_h + idx * stride_s_k]);
             }
         }
         shm[i] = val;
@@ -1625,11 +1625,11 @@ __global__ void soft_nms_bounds_kernel(
         return;
     }
     if (!in_bounds) {
-        out[n * stride_s_n + h * stride_s_h + k * stride_s_k] = static_cast<scalar_t>(score);
+        out[(int64_t)n * stride_s_n + h * stride_s_h + k * stride_s_k] = static_cast<scalar_t>(score);
         return;
     }
     if (!isfinite(score)) {
-        out[n * stride_s_n + h * stride_s_h + k * stride_s_k] = static_cast<scalar_t>(score);
+        out[(int64_t)n * stride_s_n + h * stride_s_h + k * stride_s_k] = static_cast<scalar_t>(score);
         return;
     }
 
@@ -1645,7 +1645,7 @@ __global__ void soft_nms_bounds_kernel(
         delta = 0.0f;
     }
     float out_val = score - alpha * delta;
-    out[n * stride_s_n + h * stride_s_h + k * stride_s_k] = static_cast<scalar_t>(out_val);
+    out[(int64_t)n * stride_s_n + h * stride_s_h + k * stride_s_k] = static_cast<scalar_t>(out_val);
 }
 
 template <typename scalar_t, int BLOCK_K>
@@ -1680,8 +1680,8 @@ __global__ void cross_head_mutex_bounds_kernel(
     int* hi_s = lo_s + H;
     float* scores_s = reinterpret_cast<float*>(hi_s + H);
     for (int h = tid; h < H; h += blockDim.x) {
-        int lo = token_lo[n * stride_lo_n + h * stride_lo_h];
-        int hi = token_hi[n * stride_hi_n + h * stride_hi_h];
+        int lo = token_lo[(int64_t)n * stride_lo_n + h * stride_lo_h];
+        int hi = token_hi[(int64_t)n * stride_hi_n + h * stride_hi_h];
         if (lo < 0) {
             lo = 0;
         }
@@ -1701,7 +1701,7 @@ __global__ void cross_head_mutex_bounds_kernel(
     float inv_temp = 1.0f / temperature;
 
     for (int h = 0; h < H; ++h) {
-        float score = static_cast<float>(log_s[n * stride_s_n + h * stride_s_h + k * stride_s_k]);
+        float score = static_cast<float>(log_s[(int64_t)n * stride_s_n + h * stride_s_h + k * stride_s_k]);
         scores_s[h * BLOCK_K + tid] = score;
     }
 
@@ -1746,7 +1746,7 @@ __global__ void cross_head_mutex_bounds_kernel(
             float log_r = logf(fmaxf(r, eps));
             score = score + alpha_cross * log_r;
         }
-        out[n * stride_s_n + h * stride_s_h + k * stride_s_k] = static_cast<scalar_t>(score);
+        out[(int64_t)n * stride_s_n + h * stride_s_h + k * stride_s_k] = static_cast<scalar_t>(score);
     }
 }
 
@@ -1791,8 +1791,8 @@ __global__ void soft_nms_cross_head_bounds_kernel(
     float* tile_s = scores_s + static_cast<size_t>(H) * static_cast<size_t>(BLOCK_K);
 
     for (int h = tid; h < H; h += blockDim.x) {
-        int lo = token_lo[n * stride_lo_n + h * stride_lo_h];
-        int hi = token_hi[n * stride_hi_n + h * stride_hi_h];
+        int lo = token_lo[(int64_t)n * stride_lo_n + h * stride_lo_h];
+        int hi = token_hi[(int64_t)n * stride_hi_n + h * stride_hi_h];
         if (lo < 0) {
             lo = 0;
         }
@@ -1808,8 +1808,8 @@ __global__ void soft_nms_cross_head_bounds_kernel(
         int idx = base_k + i - pad;
         float val = -INFINITY;
         if (idx >= 0 && idx < K) {
-            int lo = token_lo[n * stride_lo_n + h * stride_lo_h];
-            int hi = token_hi[n * stride_hi_n + h * stride_hi_h];
+            int lo = token_lo[(int64_t)n * stride_lo_n + h * stride_lo_h];
+            int hi = token_hi[(int64_t)n * stride_hi_n + h * stride_hi_h];
             if (lo < 0) {
                 lo = 0;
             }
@@ -1817,7 +1817,7 @@ __global__ void soft_nms_cross_head_bounds_kernel(
                 hi = K;
             }
             if (idx >= lo && idx < hi) {
-                val = static_cast<float>(log_s[n * stride_s_n + h * stride_s_h + idx * stride_s_k]);
+                val = static_cast<float>(log_s[(int64_t)n * stride_s_n + h * stride_s_h + idx * stride_s_k]);
             }
         }
         tile_s[linear] = val;
@@ -1835,7 +1835,7 @@ __global__ void soft_nms_cross_head_bounds_kernel(
         int lo = lo_s[h];
         int hi = hi_s[h];
         bool in_bounds = (k >= lo) && (k < hi);
-        float score = static_cast<float>(log_s[n * stride_s_n + h * stride_s_h + k * stride_s_k]);
+        float score = static_cast<float>(log_s[(int64_t)n * stride_s_n + h * stride_s_h + k * stride_s_k]);
         if (in_bounds && isfinite(score)) {
             float pooled = -INFINITY;
             int tile_base = h * tile_len + tid;
@@ -1893,7 +1893,7 @@ __global__ void soft_nms_cross_head_bounds_kernel(
             float log_r = logf(fmaxf(r, eps));
             score = score + alpha_cross * log_r;
         }
-        out[n * stride_s_n + h * stride_s_h + k * stride_s_k] = static_cast<scalar_t>(score);
+        out[(int64_t)n * stride_s_n + h * stride_s_h + k * stride_s_k] = static_cast<scalar_t>(score);
     }
 }
 
@@ -2307,6 +2307,13 @@ torch::Tensor run_log_s(
         }
     }
     if (threads < block_k) {
+        threads = block_k;
+    }
+    // [LSE-SCAN-DOMAIN-FIX] P0-1:threads > block_k 时 tid∈[block_k,threads)
+    // 与下一 block 迭代重叠(k = block_start*block_k + tid 越域),半数 token
+    // 的 expf/count 双计 → lse 偏大污染 topk。扫描域必须=线程域,threads
+    // 恒 == block_k(K≥8192 档原 768>512 踩雷;K≤4096 档本就相等不受影响)。
+    if (threads > block_k) {
         threads = block_k;
     }
     const dim3 blocks(M);

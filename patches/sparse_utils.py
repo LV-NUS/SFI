@@ -433,6 +433,7 @@ def _get_row_index_tensor_from_cache(
     *,
     rows: Sequence[int],
     device: torch.device,
+    cache_owner=None,
 ) -> torch.Tensor:
     """返回 rows 对应的 GPU long tensor，使用外部 cache 复用 small tensor 分配。"""
     if not rows:
@@ -445,6 +446,20 @@ def _get_row_index_tensor_from_cache(
         cached = torch.tensor(rows_tuple, dtype=torch.long, device=device)
         # 防止 cache 无界增长（正常 batch<=32 且 rows 形态有限，基本不触发）
         if len(cache) > 128:
+            # [ROW-INDEX-CACHE-CLEAR-UAF-FIX] P2-b:clear 弃引用前三流守卫,
+            # 消费者(logits patch/index kernel)在主步与 flush(refresh_stream)
+            # 双上下文;rows 键随 decode 世代漂,长跑必触发(ROW-CACHE 同型)。
+            _streams = []
+            _rs = getattr(cache_owner, "refresh_stream", None)
+            if _rs is not None:
+                _streams.append(_rs)
+            for _cand in (torch.cuda.current_stream(), torch.cuda.default_stream()):
+                if all(_cand != s for s in _streams):
+                    _streams.append(_cand)
+            for _stale in cache.values():
+                if _stale.is_cuda:
+                    for _s in _streams:
+                        _stale.record_stream(_s)
             cache.clear()
         cache[key] = cached
     return cached

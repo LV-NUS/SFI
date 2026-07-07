@@ -1366,10 +1366,10 @@ class ResolvedRowPtrArena:
                         )
             else:
                 # EXACT existing full path (verbatim): fill_(-1) + full upload.
-                if __import__('os').environ.get('VLLM_SPARSE_WAR_SAFE_FILL','1')!='0' and page_count>0:  # _warsafe_tail
-                    self.row_table_i32[row_slice].fill_(int(pages[-1] if __import__('os').environ.get('VLLM_SPARSE_WAR_FILL_ALT')=='1' else pages[0]))
-                else:
-                    self.row_table_i32[row_slice].fill_(-1)
+                # [WAR-SAFE-FILL-RETIRED 2026-07-07] 尾列填 pages[0] 的兜底下线:
+                # 主凶(condense 行迁移×票快照过期)已终局收案,序保证由 WAR
+                # fence+chunk_done 门承担;越界读回 -1 fail-fast,不静默读合法页。
+                self.row_table_i32[row_slice].fill_(-1)
                 if page_count:
                     page_tensor = self.row_table_i32.new_tensor(pages)
                     self.row_table_i32[row_slice, :page_count].copy_(
@@ -1452,10 +1452,9 @@ class ResolvedRowPtrArena:
                 )
             row_start = batch_row * self.num_kv_heads
             row_slice = slice(row_start, row_start + self.num_kv_heads)
-            if __import__('os').environ.get('VLLM_SPARSE_WAR_SAFE_FILL','1')!='0' and page_count>0:  # _warsafe_tail
-                self.row_table_i32[row_slice].fill_(int(pages[-1] if __import__('os').environ.get('VLLM_SPARSE_WAR_FILL_ALT')=='1' else pages[0]))
-            else:
-                self.row_table_i32[row_slice].fill_(-1)
+            # [WAR-SAFE-FILL-RETIRED 2026-07-07] 兜底下线,同上臂:恢复 fill_(-1)
+            # fail-fast 语义。
+            self.row_table_i32[row_slice].fill_(-1)
             if page_count:
                 page_tensor = self.row_table_i32.new_tensor(list(pages))
                 self.row_table_i32[row_slice, :page_count].copy_(

@@ -344,6 +344,11 @@ class SelectorComputeMixin:
         cap = int(kv_len)
         cached = self._positions_i32_cache
         if cached is None or self._positions_i32_cache_device != device or self._positions_i32_cache_cap < cap:
+            if cached is not None and cached.is_cuda:
+                # [POSITIONS-CACHE-REALLOC-UAF-FIX] P2-d:容量出窗换代弃旧,
+                # 消费者(capture_row scatter/selector pipeline)双流上下文。
+                # 容量单调增长=冷事件。
+                self._uaf_guard_record_streams_before_discard(cached)
             # over-allocate to reduce realloc under growing kv_len
             new_cap = _align_up_int(cap, 256)
             cached = torch.arange(new_cap, device=device, dtype=torch.int32)
@@ -359,6 +364,9 @@ class SelectorComputeMixin:
         cap = int(kv_len)
         cached = self._positions_i64_cache
         if cached is None or self._positions_i64_cache_device != device or self._positions_i64_cache_cap < cap:
+            if cached is not None and cached.is_cuda:
+                # [POSITIONS-CACHE-REALLOC-UAF-FIX] P2-d:同族换代守卫。
+                self._uaf_guard_record_streams_before_discard(cached)
             new_cap = _align_up_int(cap, 256)
             cached = torch.arange(new_cap, device=device, dtype=torch.int64)
             self._positions_i64_cache = cached
@@ -377,6 +385,10 @@ class SelectorComputeMixin:
         cap = int(window)
         cached = self._tail_offsets_cache
         if cached is None or self._tail_offsets_cache_device != device or self._tail_offsets_cache_cap < cap:
+            if cached is not None and cached.is_cuda:
+                # [POSITIONS-CACHE-REALLOC-UAF-FIX] P2-d:同族换代守卫(view
+                # 的 record_stream 作用于底层 storage)。
+                self._uaf_guard_record_streams_before_discard(cached)
             new_cap = _align_up_int(cap, 64)
             window_idx = torch.arange(new_cap, device=device, dtype=torch.int32)
             # 存储 [new_cap-1, new_cap-2, ..., 1, 0]
@@ -391,7 +403,9 @@ class SelectorComputeMixin:
         return cached[..., start_idx:]
 
     def _get_row_index_tensor(self, *, rows: Sequence[int], device: torch.device) -> torch.Tensor:
-        return _get_row_index_tensor_from_cache(self._row_index_cache, rows=rows, device=device)
+        return _get_row_index_tensor_from_cache(
+            self._row_index_cache, rows=rows, device=device, cache_owner=self
+        )
 
 
     @staticmethod
@@ -603,6 +617,12 @@ class SelectorComputeMixin:
             or buf.shape[2] < shape[2]
             or buf.shape[3] < shape[3]
         ):
+            if buf is not None and buf.is_cuda:
+                # [SELECTOR-SHARED-SCRATCH-REALLOC-UAF-FIX] R5:共享 key_norms
+                # 载体被主流 drain-resolve 与 refresh_stream flush/deferred 双
+                # 上下文交替读写,同键换代弃旧时另一流可有在飞读者;prune 臂
+                # (_prune_selector_key_norms_cache)已守,替换臂补齐。冷事件。
+                self._uaf_guard_record_streams_before_discard(buf)
             buf = torch.empty(alloc_shape, device=device, dtype=dtype)
             if cache_key is not None:
                 self._selector_key_norms_all_cache[cache_key] = buf
@@ -831,6 +851,14 @@ class SelectorComputeMixin:
                     gpu_start_o[: shape[0], : shape[1]],
                     gpu_end_o[: shape[0], : shape[1]],
                 )
+        # [KEY-NORMS-DELTA-PINNED-H2D-WAR-FIX] R7:共享持久 pinned/GPU delta 对
+        # 即将被本世代覆写(host 写 pinned + copy_ 写 GPU dst),上一世代的
+        # non_blocking H2D 与 delta kernel 可能未决(pinned staging 同型撕裂)。
+        # 覆写者是 CPU 侧写,设备 wait 无法排它 → host 侧 query-first:稳态上一
+        # 世代(隔多步)早已完成=query 即过零成本;仅密集 flush 重叠窗真等。
+        _evt = getattr(self, "_selector_key_norms_delta_inflight_evt", None)
+        if _evt is not None and not _evt.query():
+            _evt.synchronize()
         cpu_start = self._selector_key_norms_delta_start_cpu
         if (
             cpu_start is None
@@ -859,6 +887,10 @@ class SelectorComputeMixin:
             or gpu_start.shape[1] < shape[1]
             or gpu_start.device != device
         ):
+            if gpu_start is not None and gpu_start.is_cuda:
+                # [SELECTOR-SHARED-SCRATCH-REALLOC-UAF-FIX] R5:delta GPU 载体
+                # 换代弃旧,消费者(delta kernel/H2D)可在另一流在飞。冷事件。
+                self._uaf_guard_record_streams_before_discard(gpu_start)
             gpu_start = torch.empty(shape, device=device, dtype=torch.int32)
             self._selector_key_norms_delta_start_gpu = gpu_start
         gpu_end = self._selector_key_norms_delta_end_gpu
@@ -869,6 +901,8 @@ class SelectorComputeMixin:
             or gpu_end.shape[1] < shape[1]
             or gpu_end.device != device
         ):
+            if gpu_end is not None and gpu_end.is_cuda:
+                self._uaf_guard_record_streams_before_discard(gpu_end)
             gpu_end = torch.empty(shape, device=device, dtype=torch.int32)
             self._selector_key_norms_delta_end_gpu = gpu_end
         return (
@@ -970,6 +1004,13 @@ class SelectorComputeMixin:
             or any(tuple(t.shape) != shape_3d for t in buffers[:4])
             or any(tuple(t.shape) != shape_2d for t in buffers[4:])
         ):
+            if isinstance(buffers, tuple):
+                # [SELECTOR-SHARED-SCRATCH-REALLOC-UAF-FIX] R5:bounds 六元组
+                # 换代弃旧;result.recent_start 等可为旧缓冲视图,deferred
+                # writer 在另一流晚读(消费链最长站点)。冷事件。
+                for _old in buffers:
+                    if isinstance(_old, torch.Tensor) and _old.is_cuda:
+                        self._uaf_guard_record_streams_before_discard(_old)
             buffers = (
                 torch.empty(shape_3d, device=device, dtype=torch.int32),
                 torch.empty(shape_3d, device=device, dtype=torch.int32),
@@ -1026,6 +1067,9 @@ class SelectorComputeMixin:
             or not buf.is_contiguous()
             or tuple(buf.shape) != shape
         ):
+            if buf is not None and buf.is_cuda:
+                # [SELECTOR-SHARED-SCRATCH-REALLOC-UAF-FIX] R5:同族换代守卫。
+                self._uaf_guard_record_streams_before_discard(buf)
             buf = torch.empty(shape, device=device, dtype=torch.float32)
             self._selector_log_r_cache_key = key
             self._selector_log_r_cache = buf
@@ -1081,6 +1125,11 @@ class SelectorComputeMixin:
             or not out.is_contiguous()
             or tuple(out.shape) != shape
         ):
+            if out is not None and out.is_cuda:
+                # [SELECTOR-SHARED-SCRATCH-REALLOC-UAF-FIX] R5:共享 selected
+                # 槽在双流间轮转(flush/deferred 无 override),换代弃旧守卫;
+                # 与 SELECTED-PRIVATE-OUT(pending 臂私有化)互补不重复。
+                self._uaf_guard_record_streams_before_discard(out)
             out = torch.empty(shape, device=device, dtype=torch.int32)
             self._selector_selected_indices_out_key = key
             self._selector_selected_indices_out = out
@@ -1584,6 +1633,11 @@ class SelectorComputeMixin:
             return scratch[:, :, :, :kv_needed]
 
         if getattr(self, "_log_f_workspace_key", None) != key:
+            _stale = getattr(self, "_log_f_scratch_workspace", None)
+            if _stale is not None and _stale.is_cuda:
+                # [SELECTOR-SHARED-SCRATCH-REALLOC-UAF-FIX] R5:key 漂移置 None
+                # 直弃共享 scratch,另一流消费者可在飞。冷事件。
+                self._uaf_guard_record_streams_before_discard(_stale)
             self._log_f_scratch_workspace = None
             self._log_f_workspace_key = key
 
@@ -1599,6 +1653,8 @@ class SelectorComputeMixin:
             or int(scratch.shape[3]) < int(kv_needed)
         )
         if need_alloc:
+            if scratch is not None and scratch.is_cuda:
+                self._uaf_guard_record_streams_before_discard(scratch)
             prev_kv = int(scratch.shape[3]) if scratch is not None and scratch.dim() == 4 else 0
             kv_alloc = max(int(kv_alloc), int(prev_kv))
             scratch = torch.empty((batch, num_heads, last_n, kv_alloc), device=device, dtype=torch.float32)
@@ -1671,12 +1727,23 @@ class SelectorComputeMixin:
             return pair
 
         if getattr(self, "_selector_pipeline_workspace_key", None) != key:
+            for _stale in (
+                getattr(self, "_selector_pipeline_workspace_a", None),
+                getattr(self, "_selector_pipeline_workspace_b", None),
+            ):
+                if _stale is not None and _stale.is_cuda:
+                    # [SELECTOR-SHARED-SCRATCH-REALLOC-UAF-FIX] R5:K 出窗置
+                    # None 直弃共享 workspace 对,另一流消费者可在飞。冷事件。
+                    self._uaf_guard_record_streams_before_discard(_stale)
             self._selector_pipeline_workspace_a = None
             self._selector_pipeline_workspace_b = None
             self._selector_pipeline_workspace_key = key
         ws_a = getattr(self, "_selector_pipeline_workspace_a", None)
         ws_b = getattr(self, "_selector_pipeline_workspace_b", None)
         if not _is_valid(ws_a) or not _is_valid(ws_b):
+            for _stale in (ws_a, ws_b):
+                if _stale is not None and _stale.is_cuda:
+                    self._uaf_guard_record_streams_before_discard(_stale)
             ws_a, ws_b = _alloc()
             self._selector_pipeline_workspace_a = ws_a
             self._selector_pipeline_workspace_b = ws_b

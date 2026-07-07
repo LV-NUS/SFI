@@ -571,6 +571,20 @@ def get_step_capture_layout_impl(
             return layout
 
         # 跨 step 或 row 映射变化：更新动态元数据（row_tensor/kv_lengths/chunk_lengths）
+        # [STEP-PREP-CHUNK-DONE-GATE] R6:组成变化覆写共享 layout 载体(slot/row
+        # 张量 out= 原位覆写 + live-lengths 重建)前,前置本 buf 的 chunk_done 设备
+        # 侧等待——上一世代 chunk 的 grouped producer 在 refresh_stream 上可能仍在
+        # 读旧载体(录制→执行毫秒窗;P0-4 coverage 双源同窗)。复用 wait_decider
+        # 现成机制:flags==0 早退 + (epoch,buf,chunk) 去重 + wait_event 纯设备侧,
+        # 稳态零开销、每 (buf,step) 至多一次;后续 dispatch 同键调用被去重跳过。
+        _wait_done = getattr(self, "_main_stream_wait_for_chunk_done", None)
+        if callable(_wait_done):
+            _wait_done(
+                buf_id=int(buf_id),
+                device=device,
+                chunk_id=int(chunk_id),
+                epoch=int(step_context.epoch),
+            )
         layout.epoch = step_context.epoch
         layout.step_handle_id = step_handle_id
         layout.step_handle_generation = step_handle_generation

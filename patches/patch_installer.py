@@ -62,10 +62,8 @@ from patches.fa3_native.compact_recent_contract import (
 )
 from patches.vllm_compat import (
     import_fa_utils_module,
-    import_triton_unified_attention_module,
 )
 
-_tua = import_triton_unified_attention_module()
 try:
     from vllm.logger import init_logger
 except Exception:
@@ -155,8 +153,6 @@ def _metadata_items_rrp_visible_source_fields(metadata_items: object) -> dict[st
 # Controller helpers and patched unified_attention
 # -----------------------------------------------------------------------------
 
-_ORIGINAL_UNIFIED_ATTENTION = _tua.unified_attention
-_ORIGINAL_V1_UNIFIED_ATTENTION = None
 _ORIGINAL_V1_FLASH_ATTN_VARLEN_FUNC = None
 _ORIGINAL_V1_FLASH_ATTN_FORWARD = None
 _ORIGINAL_V1_FLASH_ATTN_GET_SCHEDULER_METADATA = None
@@ -2208,8 +2204,6 @@ _DUMMY_RUN_PATCHED: bool = False
 _ORIGINAL_DUMMY_RUN = None
 _UPDATE_STATES_PATCHED: bool = False
 _ORIGINAL_UPDATE_STATES = None
-_METADATA_PATCHED: bool = False
-_ORIGINAL_TRITON_METADATA_BUILD = None
 _FLASH_METADATA_PATCHED: bool = False
 _ORIGINAL_FLASH_METADATA_BUILD = None
 _REQUEST_PATCHED: bool = False
@@ -4172,55 +4166,16 @@ def _patch_update_states() -> None:
     GPUModelRunner._update_states = _sparse_update_states  # type: ignore[assignment]
     _UPDATE_STATES_PATCHED = True
 
-def _patch_triton_metadata_builder() -> None:
-    global _METADATA_PATCHED, _ORIGINAL_TRITON_METADATA_BUILD
-    if _METADATA_PATCHED:
-        return
-    try:
-        from vllm.v1.attention.backends.triton_attn import TritonAttentionMetadataBuilder  # type: ignore[import]
-    except Exception:
-        _log.warning("Cannot import TritonAttentionMetadataBuilder for metadata patch, skipping")
-        return
-
-    original_build = TritonAttentionMetadataBuilder.build
-
-    def _patched_build(self, common_prefix_len, common_attn_metadata):  # type: ignore[override]
-        attn_metadata = original_build(self, common_prefix_len, common_attn_metadata)
-        controller = _GLOBAL_CONTROLLER or _ensure_controller()
-        if controller is not None:
-            binding = _resolve_metadata_step_binding(
-                controller=controller,
-                attn_metadata=attn_metadata,
-                common_attn_metadata=common_attn_metadata,
-            )
-            setattr(attn_metadata, "sparse_vllm_profile_step", binding.is_profile_step)
-            bind_fa3_native_attn_metadata_contracts(
-                attn_metadata=attn_metadata,
-                step_ctx=binding.step_ctx,
-                step_authority=binding.step_authority,
-                snapshot=binding.snapshot,
-            )
-            _maybe_build_step_decode_data_from_attn_metadata(
-                controller=controller,
-                attn_metadata=attn_metadata,
-                metadata_builder=self,
-            )
-        return attn_metadata
-
-    TritonAttentionMetadataBuilder.build = _patched_build  # type: ignore[assignment]
-    _ORIGINAL_TRITON_METADATA_BUILD = original_build
-    _METADATA_PATCHED = True
 
 
 def _patch_flash_metadata_builder() -> None:
     global _FLASH_METADATA_PATCHED, _ORIGINAL_FLASH_METADATA_BUILD
     if _FLASH_METADATA_PATCHED:
         return
-    try:
-        from vllm.v1.attention.backends.flash_attn import FlashAttentionMetadataBuilder  # type: ignore[import]
-    except Exception:
-        _log.warning("Cannot import FlashAttentionMetadataBuilder for metadata patch, skipping")
-        return
+    # [TRITON-LINE-RETIRED 2026-07-07] FA3-only 后 FlashAttentionMetadataBuilder
+    # 是唯一 builder:import 失败=环境坏,静默跳过等于隐性 fallback,升级
+    # fail-fast(无兜底铁律)。
+    from vllm.v1.attention.backends.flash_attn import FlashAttentionMetadataBuilder  # type: ignore[import]
 
     original_build = FlashAttentionMetadataBuilder.build
 
@@ -11798,82 +11753,8 @@ def _ensure_controller() -> Optional["VLLMSparseController"]:
     return controller
 
 
-def _bind_v1_unified_attention_or_raise(
-    target,
-    *,
-    stage: str,
-    dry_run: bool = False,
-) -> None:
-    try:
-        from vllm.v1.attention.backends import triton_attn as v1_triton
-    except Exception as exc:
-        raise RuntimeError(
-            f"v1 triton_attn hook install failed at {stage}: import error"
-        ) from exc
-    if dry_run:
-        try:
-            current = getattr(v1_triton, "unified_attention")
-        except Exception as exc:
-            raise RuntimeError(
-                f"v1 triton_attn hook install failed at {stage}: read error"
-            ) from exc
-        try:
-            v1_triton.unified_attention = current  # type: ignore[assignment]
-        except Exception as exc:
-            raise RuntimeError(
-                f"v1 triton_attn hook install failed at {stage}: assign error"
-            ) from exc
-        if v1_triton.unified_attention is not current:
-            raise RuntimeError(
-                f"v1 triton_attn hook install failed at {stage}: verify error"
-            )
-        return
-    try:
-        v1_triton.unified_attention = target  # type: ignore[assignment]
-    except Exception as exc:
-        raise RuntimeError(
-            f"v1 triton_attn hook install failed at {stage}: assign error"
-        ) from exc
-    if v1_triton.unified_attention is not target:
-        raise RuntimeError(
-            f"v1 triton_attn hook install failed at {stage}: verify error"
-        )
 
 
-def _commit_unified_attention_pair_or_raise(target, *, stage: str) -> None:
-    _bind_v1_unified_attention_or_raise(
-        target, stage=f"{stage}:preflight", dry_run=True
-    )
-    try:
-        from vllm.v1.attention.backends import triton_attn as v1_triton
-    except Exception as exc:
-        raise RuntimeError(
-            f"v1 triton_attn hook install failed at {stage}: import error"
-        ) from exc
-
-    old_tua_unified_attention = _tua.unified_attention
-    old_v1_unified_attention = v1_triton.unified_attention
-    committed_tua = False
-    committed_v1 = False
-    try:
-        _tua.unified_attention = target  # type: ignore[assignment]
-        committed_tua = True
-        _bind_v1_unified_attention_or_raise(target, stage=f"{stage}:commit")
-        committed_v1 = True
-        if _tua.unified_attention is not target:
-            raise RuntimeError(
-                f"v1 triton_attn hook install failed at {stage}: verify _tua error"
-            )
-        if v1_triton.unified_attention is not target:
-            raise RuntimeError(
-                f"v1 triton_attn hook install failed at {stage}: verify v1 error"
-            )
-    except Exception:
-        if committed_tua:
-            _tua.unified_attention = old_tua_unified_attention  # type: ignore[assignment]
-        if committed_v1:
-            v1_triton.unified_attention = old_v1_unified_attention  # type: ignore[assignment]
-        raise
 
 
 def _set_unified_attention_mode(mode: str) -> None:
@@ -11886,7 +11767,18 @@ def _set_unified_attention_mode(mode: str) -> None:
 
 
 def _install_patch() -> None:
-    global _PATCH_INSTALLED, _ORIGINAL_V1_UNIFIED_ATTENTION
+    # [TRITON-LINE-RETIRED 2026-07-07] TRITON_ATTN sparse 线已在 main 下线,
+    # 由专门 triton branch 承载;此处为三条安装路径(apply/env/lazy 重入)
+    # 的唯一咽喉,设起即 fail-fast,无回退。env 未设时不拦(vLLM 自动选
+    # FLASH_ATTN)。
+    _backend = os.environ.get("VLLM_ATTENTION_BACKEND", "")
+    if _backend.startswith("TRITON"):
+        raise RuntimeError(
+            "TRITON_ATTN sparse line retired on main; use the dedicated "
+            "triton branch. Main is FA3-only (FLASH_ATTN_VLLM_V1). "
+            "No fallback."
+        )
+    global _PATCH_INSTALLED
     if _PATCH_INSTALLED:
         _patch_compact_page_residency_core()
         return
@@ -11896,11 +11788,6 @@ def _install_patch() -> None:
     _patch_gpu_ubatch_wrapper_for_sparse_cudagraph()
     _patch_compact_page_residency_core()
     try:
-        from vllm.v1.attention.backends import triton_attn as v1_triton
-        _ORIGINAL_V1_UNIFIED_ATTENTION = v1_triton.unified_attention
-        _commit_unified_attention_pair_or_raise(
-            _patched_unified_attention, stage="_install_patch"
-        )
         _patch_flash_attention_forward_and_helpers()
         _PATCH_INSTALLED = True
         import patches.vllm_sparse_patch as _main
@@ -11910,50 +11797,6 @@ def _install_patch() -> None:
         raise
 
 
-def _patched_unified_attention(
-    q,
-    k,
-    v,
-    out,
-    cu_seqlens_q,
-    max_seqlen_q,
-    seqused_k,
-    max_seqlen_k,
-    softmax_scale,
-    causal,
-    window_size,
-    block_table,
-    softcap,
-    q_descale,
-    k_descale,
-    v_descale,
-    alibi_slopes=None,
-):
-    # 全局强制 dense：直接走原生 unified_attention，绕过所有稀疏调度逻辑。
-    _impl = getattr(_patched_unified_attention, "_cached_impl", None)
-    if _impl is None:
-        from patches.vllm_sparse_patch import _load_patched_unified_attention_impl
-        _impl = _load_patched_unified_attention_impl()
-        _patched_unified_attention._cached_impl = _impl
-    return _impl(
-        q=q,
-        k=k,
-        v=v,
-        out=out,
-        cu_seqlens_q=cu_seqlens_q,
-        max_seqlen_q=max_seqlen_q,
-        seqused_k=seqused_k,
-        max_seqlen_k=max_seqlen_k,
-        softmax_scale=softmax_scale,
-        causal=causal,
-        window_size=window_size,
-        block_table=block_table,
-        softcap=softcap,
-        q_descale=q_descale,
-        k_descale=k_descale,
-        v_descale=v_descale,
-        alibi_slopes=alibi_slopes,
-    )
 
 
 def _run_selected_no_capture_mixed_forward(
@@ -14176,7 +14019,6 @@ def _install_controller_patch_transaction(
     try:
         controller = _set_controller(config)
         _install_patch()
-        _patch_triton_metadata_builder()
         _patch_flash_metadata_builder()
         return controller
     except Exception:
@@ -14235,7 +14077,6 @@ def disable_vllm_sparse_patch() -> None:
     global _GLOBAL_CONTROLLER, _PATCH_INSTALLED
     global _PREPARE_PATCHED, _ORIGINAL_PREPARE_INPUTS
     global _DUMMY_RUN_PATCHED, _ORIGINAL_DUMMY_RUN
-    global _METADATA_PATCHED, _ORIGINAL_TRITON_METADATA_BUILD
     global _FLASH_METADATA_PATCHED, _ORIGINAL_FLASH_METADATA_BUILD
     global _REQUEST_PATCHED, _ORIGINAL_APPEND_OUTPUT_TOKEN_IDS
     global _KV_INIT_PATCHED, _ORIGINAL_INIT_KV_CACHE
@@ -14243,7 +14084,7 @@ def disable_vllm_sparse_patch() -> None:
     global _UBATCH_WRAPPER_PATCHED, _ORIGINAL_UBATCH_WRAPPER_CALL
     global _CUDAGRAPH_WRAPPER_PATCHED, _ORIGINAL_CUDAGRAPH_WRAPPER_CALL
     global _UPDATE_STATES_PATCHED, _ORIGINAL_UPDATE_STATES
-    global _ORIGINAL_V1_UNIFIED_ATTENTION, _ORIGINAL_V1_FLASH_ATTN_VARLEN_FUNC
+    global _ORIGINAL_V1_FLASH_ATTN_VARLEN_FUNC
     global _ORIGINAL_V1_FLASH_ATTN_FORWARD, _ORIGINAL_V1_FLASH_ATTN_GET_SCHEDULER_METADATA
     global _ORIGINAL_V1_FLASH_ATTN_GET_FLASH_ATTN_VERSION
     global _ORIGINAL_FA_UTILS_FLASH_ATTN_VARLEN_FUNC, _ORIGINAL_FA_UTILS_GET_SCHEDULER_METADATA
@@ -14278,15 +14119,6 @@ def disable_vllm_sparse_patch() -> None:
             raise
     _CUDAGRAPH_WRAPPER_PATCHED = False
     _ORIGINAL_CUDAGRAPH_WRAPPER_CALL = None
-    _tua.unified_attention = _ORIGINAL_UNIFIED_ATTENTION  # type: ignore[assignment]
-    if _ORIGINAL_V1_UNIFIED_ATTENTION is not None:
-        try:
-            from vllm.v1.attention.backends import triton_attn as v1_triton
-            v1_triton.unified_attention = _ORIGINAL_V1_UNIFIED_ATTENTION  # type: ignore[assignment]
-        except Exception:
-            _log.error("Failed to restore v1 unified_attention during patch uninstall")
-            raise
-    _ORIGINAL_V1_UNIFIED_ATTENTION = None
     if _ORIGINAL_V1_FLASH_ATTN_VARLEN_FUNC is not None:
         try:
             from vllm.v1.attention.backends import flash_attn as v1_flash_attn
@@ -14353,15 +14185,6 @@ def disable_vllm_sparse_patch() -> None:
             raise
     _DUMMY_RUN_PATCHED = False
     _ORIGINAL_DUMMY_RUN = None
-    if _METADATA_PATCHED and _ORIGINAL_TRITON_METADATA_BUILD is not None:
-        try:
-            from vllm.v1.attention.backends.triton_attn import TritonAttentionMetadataBuilder  # type: ignore[import]
-            TritonAttentionMetadataBuilder.build = _ORIGINAL_TRITON_METADATA_BUILD  # type: ignore[assignment]
-        except Exception:
-            _log.error("Failed to restore TritonAttentionMetadataBuilder.build during patch uninstall")
-            raise
-    _METADATA_PATCHED = False
-    _ORIGINAL_TRITON_METADATA_BUILD = None
     if _FLASH_METADATA_PATCHED and _ORIGINAL_FLASH_METADATA_BUILD is not None:
         try:
             from vllm.v1.attention.backends.flash_attn import FlashAttentionMetadataBuilder  # type: ignore[import]

@@ -1001,6 +1001,17 @@ def compute_alpha_selection_batched_impl(
         _stacked_end_gpu = _stacked_end_gpu_buf
         _stacked_start_gpu.copy_(_stacked_start_cpu, non_blocking=True)
         _stacked_end_gpu.copy_(_stacked_end_cpu, non_blocking=True)
+        # [KEY-NORMS-DELTA-PINNED-H2D-WAR-FIX] R7:共享持久 delta 对的 H2D 在飞
+        # 事件;下一世代覆写 pinned/GPU dst 前在 _ensure_..._delta_buffers 入口
+        # query-first 等待。仅共享臂记录(override=per-pending fresh 免疫)。
+        if not isinstance(
+            getattr(self, "_selector_key_norms_delta_buffer_override", None), dict
+        ):
+            _delta_evt = getattr(self, "_selector_key_norms_delta_inflight_evt", None)
+            if _delta_evt is None:
+                _delta_evt = torch.cuda.Event(enable_timing=False)
+                self._selector_key_norms_delta_inflight_evt = _delta_evt
+            _delta_evt.record(torch.cuda.current_stream(device=device))
         if not _slots_contiguous:
             _idx_gpu = cached_cpu_tensor_to_device(
                 slot_indices_cpu,
@@ -1092,6 +1103,16 @@ def compute_alpha_selection_batched_impl(
             scratch_norms=key_norms_all,
         )
         self._record_event_safe(profile_key_norms_delta_evt1, device)
+        # [KEY-NORMS-DELTA-PINNED-H2D-WAR-FIX] R7:delta kernel 消费 GPU 对之后
+        # 再次 record 同一事件=栅栏前移,下一世代覆写前等到 kernel 读完。
+        if not isinstance(
+            getattr(self, "_selector_key_norms_delta_buffer_override", None), dict
+        ):
+            _delta_evt = getattr(self, "_selector_key_norms_delta_inflight_evt", None)
+            if _delta_evt is None:
+                _delta_evt = torch.cuda.Event(enable_timing=False)
+                self._selector_key_norms_delta_inflight_evt = _delta_evt
+            _delta_evt.record(torch.cuda.current_stream(device=device))
         if profile_detail and t_key_norms_direct_launch0_ns is not None:
             profile_cpu_key_norms_direct_launch_us = (
                 time.perf_counter_ns() - t_key_norms_direct_launch0_ns

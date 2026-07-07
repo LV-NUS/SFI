@@ -792,11 +792,20 @@ __global__ void gather_compact_kv_into_arena_kernel(
             int64_t src_base_v = src_token * flat_v_stride0 + (int64_t)head * flat_v_stride1;
             int64_t dst_base = dst_token * compact_k_stride0 + (int64_t)head * compact_k_stride1;
             int64_t dst_base_v = dst_token * compact_v_stride0 + (int64_t)head * compact_v_stride1;
-            for (int d = tid; d < head_dim; d += blockDim.x) {
-                dst_k[dst_base + (int64_t)d * compact_k_stride2] =
-                    src_k[src_base + (int64_t)d * flat_k_stride2];
-                dst_v[dst_base_v + (int64_t)d * compact_v_stride2] =
-                    src_v[src_base_v + (int64_t)d * flat_v_stride2];
+            // [GATHER-VEC8] d-loop 8xbf16 向量化:host 实现体 TORCH_CHECK 钉死
+            // head_dim%8==0 && 各 stride2==1 && token/head stride 8 对齐(生产
+            // 恒真,违约 fail-fast 不降级);uint4=8xbf16 单指令搬运。src/dst
+            // base 为 8 的整数倍元素偏移 + tensor base 256B 对齐 → 16B 对齐。
+            {
+                const uint4* src_k_vec = reinterpret_cast<const uint4*>(src_k + src_base);
+                uint4* dst_k_vec = reinterpret_cast<uint4*>(dst_k + dst_base);
+                const uint4* src_v_vec = reinterpret_cast<const uint4*>(src_v + src_base_v);
+                uint4* dst_v_vec = reinterpret_cast<uint4*>(dst_v + dst_base_v);
+                const int vecs = head_dim >> 3;
+                for (int vi = tid; vi < vecs; vi += blockDim.x) {
+                    dst_k_vec[vi] = src_k_vec[vi];
+                    dst_v_vec[vi] = src_v_vec[vi];
+                }
             }
         }
         // Write compact_pos[head, dst_token] = pos after invalid-selection fallback.
@@ -906,11 +915,20 @@ __global__ void gather_compact_kv_into_arena_tiled_kernel(
             int64_t src_base_v = src_token * flat_v_stride0 + (int64_t)head * flat_v_stride1;
             int64_t dst_base = dst_token * compact_k_stride0 + (int64_t)head * compact_k_stride1;
             int64_t dst_base_v = dst_token * compact_v_stride0 + (int64_t)head * compact_v_stride1;
-            for (int d = tid; d < head_dim; d += blockDim.x) {
-                dst_k[dst_base + (int64_t)d * compact_k_stride2] =
-                    src_k[src_base + (int64_t)d * flat_k_stride2];
-                dst_v[dst_base_v + (int64_t)d * compact_v_stride2] =
-                    src_v[src_base_v + (int64_t)d * flat_v_stride2];
+            // [GATHER-VEC8] d-loop 8xbf16 向量化:host 实现体 TORCH_CHECK 钉死
+            // head_dim%8==0 && 各 stride2==1 && token/head stride 8 对齐(生产
+            // 恒真,违约 fail-fast 不降级);uint4=8xbf16 单指令搬运。src/dst
+            // base 为 8 的整数倍元素偏移 + tensor base 256B 对齐 → 16B 对齐。
+            {
+                const uint4* src_k_vec = reinterpret_cast<const uint4*>(src_k + src_base);
+                uint4* dst_k_vec = reinterpret_cast<uint4*>(dst_k + dst_base);
+                const uint4* src_v_vec = reinterpret_cast<const uint4*>(src_v + src_base_v);
+                uint4* dst_v_vec = reinterpret_cast<uint4*>(dst_v + dst_base_v);
+                const int vecs = head_dim >> 3;
+                for (int vi = tid; vi < vecs; vi += blockDim.x) {
+                    dst_k_vec[vi] = src_k_vec[vi];
+                    dst_v_vec[vi] = src_v_vec[vi];
+                }
             }
         }
         if (tid == 0) {
@@ -1130,11 +1148,20 @@ __global__ void gather_compact_kv_into_arena_tiled_autolen_kernel(
             int64_t src_base_v = src_token * flat_v_stride0 + (int64_t)head * flat_v_stride1;
             int64_t dst_base = dst_token * compact_k_stride0 + (int64_t)head * compact_k_stride1;
             int64_t dst_base_v = dst_token * compact_v_stride0 + (int64_t)head * compact_v_stride1;
-            for (int d = tid; d < head_dim; d += blockDim.x) {
-                dst_k[dst_base + (int64_t)d * compact_k_stride2] =
-                    src_k[src_base + (int64_t)d * flat_k_stride2];
-                dst_v[dst_base_v + (int64_t)d * compact_v_stride2] =
-                    src_v[src_base_v + (int64_t)d * flat_v_stride2];
+            // [GATHER-VEC8] d-loop 8xbf16 向量化:host 实现体 TORCH_CHECK 钉死
+            // head_dim%8==0 && 各 stride2==1 && token/head stride 8 对齐(生产
+            // 恒真,违约 fail-fast 不降级);uint4=8xbf16 单指令搬运。src/dst
+            // base 为 8 的整数倍元素偏移 + tensor base 256B 对齐 → 16B 对齐。
+            {
+                const uint4* src_k_vec = reinterpret_cast<const uint4*>(src_k + src_base);
+                uint4* dst_k_vec = reinterpret_cast<uint4*>(dst_k + dst_base);
+                const uint4* src_v_vec = reinterpret_cast<const uint4*>(src_v + src_base_v);
+                uint4* dst_v_vec = reinterpret_cast<uint4*>(dst_v + dst_base_v);
+                const int vecs = head_dim >> 3;
+                for (int vi = tid; vi < vecs; vi += blockDim.x) {
+                    dst_k_vec[vi] = src_k_vec[vi];
+                    dst_v_vec[vi] = src_v_vec[vi];
+                }
             }
         }
         if (copy_token && tid == 0) {
@@ -1232,6 +1259,16 @@ void gather_compact_kv_into_arena_ptrs(
     TORCH_CHECK(persist_len.size(0) == L && persist_len.size(1) == B,
                 "persist_len must be [L, B]");
 
+    // [GATHER-VEC8] 向量化合同(违约 fail-fast,不降级):
+    TORCH_CHECK(head_dim % 8 == 0, "gather vec8: head_dim must be a multiple of 8");
+    TORCH_CHECK(flat_k_stride2 == 1 && flat_v_stride2 == 1 &&
+                compact_k_stride2 == 1 && compact_v_stride2 == 1,
+                "gather vec8: last-dim strides must be 1 (contiguous head_dim)");
+    TORCH_CHECK(flat_k_stride0 % 8 == 0 && flat_k_stride1 % 8 == 0 &&
+                flat_v_stride0 % 8 == 0 && flat_v_stride1 % 8 == 0 &&
+                compact_k_stride0 % 8 == 0 && compact_k_stride1 % 8 == 0 &&
+                compact_v_stride0 % 8 == 0 && compact_v_stride1 % 8 == 0,
+                "gather vec8: token/head strides must be 8-element aligned");
     dim3 grid(L * B, H_kv);
     dim3 block(128);
     auto stream = at::cuda::getCurrentCUDAStream();
@@ -1362,6 +1399,16 @@ void gather_compact_kv_into_arena_ptrs_tiled(
     const int token_tiles = std::max<int>(
         1,
         (active_tokens_i32 + safe_tile_tokens - 1) / safe_tile_tokens);
+    // [GATHER-VEC8] 向量化合同(违约 fail-fast,不降级):
+    TORCH_CHECK(head_dim % 8 == 0, "gather vec8: head_dim must be a multiple of 8");
+    TORCH_CHECK(flat_k_stride2 == 1 && flat_v_stride2 == 1 &&
+                compact_k_stride2 == 1 && compact_v_stride2 == 1,
+                "gather vec8: last-dim strides must be 1 (contiguous head_dim)");
+    TORCH_CHECK(flat_k_stride0 % 8 == 0 && flat_k_stride1 % 8 == 0 &&
+                flat_v_stride0 % 8 == 0 && flat_v_stride1 % 8 == 0 &&
+                compact_k_stride0 % 8 == 0 && compact_k_stride1 % 8 == 0 &&
+                compact_v_stride0 % 8 == 0 && compact_v_stride1 % 8 == 0,
+                "gather vec8: token/head strides must be 8-element aligned");
     dim3 grid(L * B, H_kv, token_tiles);
     dim3 block(128);
     auto stream = at::cuda::getCurrentCUDAStream();
@@ -1491,6 +1538,16 @@ void gather_compact_kv_into_arena_ptrs_tiled_autolen_impl(
     const int token_tiles = std::max<int>(
         1,
         (active_tokens_i32 + safe_tile_tokens - 1) / safe_tile_tokens);
+    // [GATHER-VEC8] 向量化合同(违约 fail-fast,不降级):
+    TORCH_CHECK(head_dim % 8 == 0, "gather vec8: head_dim must be a multiple of 8");
+    TORCH_CHECK(flat_k_stride2 == 1 && flat_v_stride2 == 1 &&
+                compact_k_stride2 == 1 && compact_v_stride2 == 1,
+                "gather vec8: last-dim strides must be 1 (contiguous head_dim)");
+    TORCH_CHECK(flat_k_stride0 % 8 == 0 && flat_k_stride1 % 8 == 0 &&
+                flat_v_stride0 % 8 == 0 && flat_v_stride1 % 8 == 0 &&
+                compact_k_stride0 % 8 == 0 && compact_k_stride1 % 8 == 0 &&
+                compact_v_stride0 % 8 == 0 && compact_v_stride1 % 8 == 0,
+                "gather vec8: token/head strides must be 8-element aligned");
     dim3 grid(L * B, H_kv, token_tiles);
     dim3 block(128);
     auto stream = at::cuda::getCurrentCUDAStream();
