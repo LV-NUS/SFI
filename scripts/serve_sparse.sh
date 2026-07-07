@@ -12,8 +12,10 @@
 #                     1536-2048 = throughput setting.
 #   SLOTS     [8]     max concurrent sparse requests (size to your batch needs)
 #   BLOCKS    [auto]  compact blocks per slot (16 tokens each); must satisfy
-#                     BLOCKS >= K_HEAD/16, so it defaults to
-#                     max(144, K_HEAD/16) and only needs overriding to trade
+#                     BLOCKS >= ceil(align_up(sink + K_HEAD, 112) / 16)
+#                     (112 = FA3 kBlockN tile; the runtime validator enforces
+#                     the same bound at startup). Defaults to
+#                     max(112, that bound) and only needs overriding to trade
 #                     resident-KV footprint (SLOTS x BLOCKS x 16 tokens)
 #   REFRESH_INTERVAL [96]   dense-refresh cadence in decode steps
 #   MML       [32768] --max-model-len (prompt+generation budget per request)
@@ -39,10 +41,17 @@ FA_ROOT="${VLLM_SPARSE_FA3_UPSTREAM_ROOT:-${SFI_ROOT}/third_party_upstreams/vllm
 
 K_HEAD="${K_HEAD:-4096}"
 SLOTS="${SLOTS:-8}"
-BLOCKS_MIN=$(( (K_HEAD + 15) / 16 ))
-BLOCKS="${BLOCKS:-$(( BLOCKS_MIN > 144 ? BLOCKS_MIN : 144 ))}"
+SINK=4
+# Mirror the runtime validator (validate_compact_page_stride_capacity):
+# required tokens = align_up(sink + k_head, 112) (FA3 kBlockN tile), then
+# blocks = ceil(required / 16). The old K_HEAD/16 formula missed sink and the
+# 112 alignment, so e.g. K_HEAD=4096 passed here (256) but the runtime
+# validator raised at startup (needs 259).
+BLOCKS_ALIGNED_TOKENS=$(( ((SINK + K_HEAD + 111) / 112) * 112 ))
+BLOCKS_MIN=$(( (BLOCKS_ALIGNED_TOKENS + 15) / 16 ))
+BLOCKS="${BLOCKS:-$(( BLOCKS_MIN > 112 ? BLOCKS_MIN : 112 ))}"
 if (( BLOCKS < BLOCKS_MIN )); then
-  echo "ERROR: BLOCKS=${BLOCKS} cannot hold K_HEAD=${K_HEAD} selections (need >= ${BLOCKS_MIN})" >&2
+  echo "ERROR: BLOCKS=${BLOCKS} cannot hold sink=${SINK} + K_HEAD=${K_HEAD} selections (need >= ${BLOCKS_MIN})" >&2
   exit 2
 fi
 REFRESH_INTERVAL="${REFRESH_INTERVAL:-96}"
@@ -80,7 +89,7 @@ export VLLM_SPARSE_CONTROLLER_JSON=$(cat <<JSON
   "compact_blocks_per_slot": ${BLOCKS},
   "k_min": 32,
   "k_max": null,
-  "sink": 4,
+  "sink": ${SINK},
   "recent": 256,
   "refresh_interval": ${REFRESH_INTERVAL},
   "refresh_coalesce_window": 0,

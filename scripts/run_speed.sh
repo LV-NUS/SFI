@@ -54,7 +54,7 @@ case "${TIER}" in
 esac
 MAX_NEW="${MAX_NEW:-256}"
 REFRESH_INTERVAL="${REFRESH_INTERVAL:-96}"
-BLOCKS="${BLOCKS:-144}"
+BLOCKS="${BLOCKS:-112}"
 TP="${TP:-1}"
 TP_ARGS=()
 if [[ "${TP}" -gt 1 ]]; then
