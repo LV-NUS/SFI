@@ -70,6 +70,11 @@ def _load_ext(*, force: bool = False) -> Optional[torch.nn.Module]:
                 "refresh_static_materialize",
                 "step_recent_patch",
                 "gather_compact_kv_into_arena_ptrs_tiled_autolen",
+                # [ABI-GUARD-PROD-SYMBOLS] 生产实际消费的两个入口也必须在:
+                # 残留"有 autolen 无 skip_unchanged"的历史 .so 会被静默信任,
+                # 直到 selection_worker 取符号才远端 RuntimeError。
+                "gather_compact_kv_into_arena_ptrs_tiled_autolen_skip_unchanged",
+                "gather_compact_kv_into_arena_ptrs_tiled",
             )
         ):
             _MODULE = prebuilt
@@ -540,6 +545,13 @@ std::vector<torch::Tensor> refresh_static_materialize_cuda(
     TORCH_CHECK(request_block_table.size(0) == batch_size, "request_block_table batch mismatch");
     TORCH_CHECK(request_refresh_generation.size(0) == batch_size, "request_refresh_generation batch mismatch");
     TORCH_CHECK(final_page_table.size(0) == batch_size * num_kv_heads, "final_page_table row mismatch");
+    // [STATIC-COLS-BOUND] kernel writes static_cols = sink + middle_count
+    // columns with only middle_count <= middle_slots checked device-side; a
+    // config where sink + middle_slots exceeds the final table width would
+    // silently spill across rows (the Python reference shape-errors instead).
+    TORCH_CHECK(
+        sink_page_slots + static_cast<int64_t>(middle_slots) <= final_page_table.size(1),
+        "sink_page_slots + middle_slots exceeds final_page_table columns");
 
     auto materialize_status = torch::zeros({batch_size}, final_page_table.options());
     auto applied_refresh_generation = torch::zeros({batch_size}, request_refresh_generation.options());
@@ -995,6 +1007,30 @@ __global__ void gather_compact_kv_into_arena_tiled_autolen_kernel(
     int slot = slot_tensor[b];
     int64_t slot_offset_tokens = (int64_t)slot * (int64_t)stride_tokens;
     int max_block = block_table_cols > 0 ? block_table_cols - 1 : 0;
+    int seq_len_b = seq_lens[b];
+    // [GATHER-OOB-TRAP 2026-07-07] fail-fast at the first scene instead of
+    // wild reads/writes into neighbour memory (no clamp, no fallback):
+    //  - dst bound: a poisoned slot would make dst_token index compact K/V/pos
+    //    out of the per-layer arena (compact_pos_per_layer_tokens was passed
+    //    but never checked before).
+    //  - coverage: grid.z is sized from the HOST-side kv_lens snapshot; if the
+    //    GPU-side seq_lens disagrees upward, tail tokens are silently never
+    //    written — turn that two-source drift into a first-scene signal.
+    if (tid == 0) {
+        if (slot < 0 ||
+            slot_offset_tokens + (int64_t)total_tokens >
+                (int64_t)compact_pos_per_layer_tokens) {
+            printf("SFI_GATHER_OOB dst: layer=%d b=%d slot=%d total=%d cap=%d\n",
+                   layer, b, slot, total_tokens, compact_pos_per_layer_tokens);
+            __trap();
+        }
+        if (tile == 0 &&
+            (int64_t)total_tokens > (int64_t)gridDim.z * (int64_t)tile_tokens) {
+            printf("SFI_GATHER_OOB cover: layer=%d b=%d total=%d tiles=%d tile=%d\n",
+                   layer, b, total_tokens, (int)gridDim.z, tile_tokens);
+            __trap();
+        }
+    }
     constexpr int kMaxSharedTileTokens = 128;
     __shared__ int shared_pos[kMaxSharedTileTokens];
     __shared__ int shared_copy[kMaxSharedTileTokens];
@@ -1061,11 +1097,34 @@ __global__ void gather_compact_kv_into_arena_tiled_autolen_kernel(
             copy_token = old_pos != pos;
         }
         if (copy_token) {
+            // [GATHER-OOB-TRAP] pos is a logical token position and MUST point
+            // at an existing token of THIS request: sink pos==t<s_len,
+            // selected pos in [0, recent_start), ordinal fallback < total.
+            // A pos outside [0, seq_len) is a poisoned selected_indices value
+            // (e.g. a leaked masked pick); the old block_idx clamp would
+            // silently read the block-table tail (unallocated garbage block
+            // ids -> wild reads). Fail fast with a fingerprint instead.
+            if (pos < 0 || pos >= seq_len_b) {
+                printf(
+                    "SFI_GATHER_OOB pos: layer=%d b=%d head=%d t=%d pos=%d seq=%d\n",
+                    layer, b, head, t, pos, seq_len_b);
+                __trap();
+            }
             int pos_safe = valid ? pos : 0;
             int block_idx = pos_safe / page_size;
             int offset = pos_safe - block_idx * page_size;
             if (block_idx > max_block) block_idx = max_block;
             int block_id = btable[row * block_table_stride0 + block_idx * block_table_stride1];
+            // [GATHER-OOB-TRAP] sanitizer 终审:replay 内本 kernel 的 src 读越
+            // 下界 = btable 该列值为负(-1 负寻址)。毒列坐标 fail-fast 落盘:
+            // row/block_idx/pos/seq 直接指认写侧(republish/materialize/初始态)。
+            if (block_id < 0) {
+                printf(
+                    "SFI_GATHER_OOB blkid: layer=%d b=%d head=%d t=%d pos=%d "
+                    "seq=%d row=%d bidx=%d blkid=%d\n",
+                    layer, b, head, t, pos, seq_len_b, row, block_idx, block_id);
+                __trap();
+            }
             int64_t src_token = (int64_t)block_id * (int64_t)page_size + (int64_t)offset;
             int64_t src_base = src_token * flat_k_stride0 + (int64_t)head * flat_k_stride1;
             int64_t src_base_v = src_token * flat_v_stride0 + (int64_t)head * flat_v_stride1;

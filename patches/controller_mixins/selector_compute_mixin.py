@@ -1109,6 +1109,55 @@ class SelectorComputeMixin:
         broadcast) is copied row-by-row; otherwise ``row_tensor_first`` is
         broadcast.
         """
+        return self._ensure_writer_stable_row_impl(
+            layers=layers,
+            batch=batch,
+            device=device,
+            row_tensor_first=row_tensor_first,
+            per_layer_rows=per_layer_rows,
+        )
+
+    def _uaf_guard_record_streams_before_discard(self, tensor) -> None:
+        """[R4 公共守卫] 弃引用/换代前对三个潜在消费流 record_stream:
+        rebuild/writer 链在主流 drain 与 refresh_stream off-loop 双上下文交替,
+        弃旧 storage 时另一流可能有在飞读者(graph 烤旧 ptr/launch args 持引用/
+        non_blocking copy 未决);record_stream 让 allocator 等全部流进度再回收。
+        仅换代/清缓存冷事件调用,零热路径开销。"""
+        streams = []
+        rs = getattr(self, "refresh_stream", None)
+        if rs is not None:
+            streams.append(rs)
+        for cand in (torch.cuda.current_stream(), torch.cuda.default_stream()):
+            if all(cand != s for s in streams):
+                streams.append(cand)
+        for s in streams:
+            tensor.record_stream(s)
+
+    def _wait_writer_dispatch_done_before_stable_overwrite(self) -> None:
+        """[WRITER-STABLE-OVERWRITE-WAR-FIX 2026-07-07] R3 守卫,sanitizer 终审
+        定谳的 4B illegal 主凶修:100/100 Invalid read 全部落在 writer graph
+        REPLAY 内 gather kernel 的 src KV 读(cuda.cu:808),地址=大分配前方
+        24KB=block_id≈-1 的负寻址——stable 四单例(row/seq_lens/slot/selected)
+        被跨上下文覆写撕裂(drain 主流与 off-loop refresh_stream 交替 rebuild,
+        上次 writer replay/eager 在另一流在飞时,本次 copy_ 原位覆写同一
+        buffer),撕裂 seq_lens 使 autolen 超长→btable 读未分配列(-1)→负寻址;
+        pos trap 与 autolen 同源撕裂值=天然盲区。#9-KEY v3 latch 只护"本次
+        copy→本次 replay"的正向序,本守卫补反向序:覆写前设备侧等待最近一次
+        writer dispatch 完成。稳态 replay 早已完成=query 即过(零成本);重叠
+        窗=当前流 wait_event(设备侧,无 host 阻塞),无 fallback。"""
+        evt = getattr(self, "_writer_dispatch_done_evt", None)
+        if evt is not None and not evt.query():
+            torch.cuda.current_stream().wait_event(evt)
+
+    def _ensure_writer_stable_row_impl(
+        self,
+        *,
+        layers: int,
+        batch: int,
+        device: torch.device,
+        row_tensor_first: torch.Tensor,
+        per_layer_rows,
+    ) -> torch.Tensor:
         device = torch.device(device)
         if device.type == "cuda" and device.index is None:
             device = torch.device("cuda", torch.cuda.current_device())
@@ -1129,6 +1178,10 @@ class SelectorComputeMixin:
         )
         if need_realloc:
             cap = need if buf is None else max(need, int(buf.numel()))
+            if buf is not None:
+                # [WRITER-STABLE-REALLOC-UAF-FIX 2026-07-07] 与 selected 的
+                # SELECTED-STABLE-REALLOC-UAF-FIX 同族同窗(R2):弃旧前三流守卫。
+                self._uaf_guard_record_streams_before_discard(buf)
             buf = torch.empty((cap,), device=device, dtype=torch.int32)
             self._selector_writer_row_tensor_all = buf
             self._selector_writer_row_tensor_all_key = key
@@ -1139,6 +1192,7 @@ class SelectorComputeMixin:
         # Contiguous [layers, batch] prefix view over the flat capacity buffer:
         # stable data_ptr within capacity, row stride == batch (matches OFF).
         view = buf[:need].view(int(layers), int(batch))
+        self._wait_writer_dispatch_done_before_stable_overwrite()
         if per_layer_rows is not None and len(per_layer_rows) == int(layers):
             for layer_idx in range(int(layers)):
                 src = per_layer_rows[layer_idx]
@@ -1187,6 +1241,9 @@ class SelectorComputeMixin:
         )
         if need_realloc:
             cap = need if buf is None else max(need, int(buf.numel()))
+            if buf is not None:
+                # [WRITER-STABLE-REALLOC-UAF-FIX 2026-07-07] R2 三流守卫。
+                self._uaf_guard_record_streams_before_discard(buf)
             buf = torch.empty((cap,), device=device, dtype=torch.int32)
             self._selector_writer_seq_lens_all = buf
             self._selector_writer_seq_lens_all_key = key
@@ -1198,6 +1255,7 @@ class SelectorComputeMixin:
         src_i32 = src[: int(batch)]
         if src_i32.dtype != torch.int32:
             src_i32 = src_i32.to(dtype=torch.int32)
+        self._wait_writer_dispatch_done_before_stable_overwrite()
         view.copy_(src_i32, non_blocking=True)
         return view
 
@@ -1240,6 +1298,9 @@ class SelectorComputeMixin:
         )
         if need_realloc:
             cap = need if buf is None else max(need, int(buf.numel()))
+            if buf is not None:
+                # [WRITER-STABLE-REALLOC-UAF-FIX 2026-07-07] R2 三流守卫。
+                self._uaf_guard_record_streams_before_discard(buf)
             buf = torch.empty((cap,), device=device, dtype=torch.int32)
             self._selector_writer_slot_tensor_all = buf
             self._selector_writer_slot_tensor_all_key = key
@@ -1251,6 +1312,7 @@ class SelectorComputeMixin:
         src_i32 = src[: int(batch)]
         if src_i32.dtype != torch.int32:
             src_i32 = src_i32.to(dtype=torch.int32)
+        self._wait_writer_dispatch_done_before_stable_overwrite()
         out.copy_(src_i32, non_blocking=True)
         return out
 
@@ -1304,6 +1366,26 @@ class SelectorComputeMixin:
         )
         if need_realloc:
             cap = need if buf is None else max(need, int(buf.numel()))
+            if buf is not None:
+                # [SELECTED-STABLE-REALLOC-UAF-FIX 2026-07-07] 容量增长弃旧
+                # storage 前对全部潜在消费流 record_stream:在飞 deferred writer
+                # (graph replay 烤旧 data_ptr / eager launch args 持旧引用)与
+                # 跨流 stable copy_ 可能未决;直接 GC 让 allocator 只按创建流序
+                # 复用/解映射(expandable segment)= illegal address。4B bs8
+                # 错峰 batch 1→8 使 need 波动→本分支反复触发;0.6b bs2 恒定批
+                # 从不触发(批组成选择性来源)。realloc 是冷事件,零热路径开销。
+                _uaf_guard_streams = []
+                _rs = getattr(self, "refresh_stream", None)
+                if _rs is not None:
+                    _uaf_guard_streams.append(_rs)
+                for _cand in (
+                    torch.cuda.current_stream(),
+                    torch.cuda.default_stream(),
+                ):
+                    if all(_cand != s for s in _uaf_guard_streams):
+                        _uaf_guard_streams.append(_cand)
+                for _s in _uaf_guard_streams:
+                    buf.record_stream(_s)
             buf = torch.empty((cap,), device=device, dtype=torch.int32)
             self._selector_writer_selected_all = buf
             self._selector_writer_selected_all_key = key
@@ -1317,6 +1399,7 @@ class SelectorComputeMixin:
         src_i32 = src
         if src_i32.dtype != torch.int32:
             src_i32 = src_i32.to(dtype=torch.int32)
+        self._wait_writer_dispatch_done_before_stable_overwrite()
         out.copy_(src_i32)
         return out
 

@@ -176,6 +176,53 @@ _ORIGINAL_UBATCH_WRAPPER_CALL = None
 _CUDAGRAPH_WRAPPER_PATCHED: bool = False
 _ORIGINAL_CUDAGRAPH_WRAPPER_CALL = None
 _SERIALIZED_CONFIG_ENV = "VLLM_SPARSE_CONTROLLER_JSON"
+# [EVT-BISECT 2026-07-07] 4B illegal 归因量具:每步两枚事件(drain 后/replay 后)
+# 非阻塞 query 夹逼 sticky error 的毒源段。默认关=零开销;开=每步 2 次
+# Event.record+若干 query(µs 级),不 sync 不扰时序。frontier 打印:
+# last_ok 与 first_err 之间提交的段=嫌疑区间。
+_EVT_BISECT_ENABLED = os.environ.get("VLLM_SPARSE_EVT_BISECT", "0") == "1"
+_EVT_BISECT_RING: "deque" = deque()
+_EVT_BISECT_LAST_OK: list = ["<none>"]
+_EVT_BISECT_STEP: list = [0]
+
+
+def _evt_bisect_mark(label: str, controller=None) -> None:
+    if not _EVT_BISECT_ENABLED:
+        return
+    if label == "post_drain":
+        _EVT_BISECT_STEP[0] += 1
+    snap = ""
+    if controller is not None:
+        try:
+            pend = len(getattr(controller, "_pending_refresh_rebuilds", ()) or ())
+            grouped = getattr(
+                controller, "_pending_refresh_grouped_async_records", None
+            )
+            grp = len(grouped) if grouped else 0
+            snap = f" pend={pend} grp={grp}"
+        except Exception:
+            snap = " snap_err"
+    tagged = f"{label}@{_EVT_BISECT_STEP[0]}{snap}"
+    while _EVT_BISECT_RING:
+        old_label, old_ev = _EVT_BISECT_RING[0]
+        try:
+            done = old_ev.query()
+        except RuntimeError as exc:
+            recent = " | ".join(lbl for lbl, _ in list(_EVT_BISECT_RING)[:6])
+            print(
+                "SFI_EVT_BISECT frontier: last_ok="
+                f"{_EVT_BISECT_LAST_OK[0]} first_err={old_label} "
+                f"ring_head=[{recent}] err={exc}",
+                flush=True,
+            )
+            raise
+        if not done:
+            break
+        _EVT_BISECT_LAST_OK[0] = old_label
+        _EVT_BISECT_RING.popleft()
+    ev = torch.cuda.Event()
+    ev.record(torch.cuda.current_stream())
+    _EVT_BISECT_RING.append((tagged, ev))
 _REPLAY_REFRESH_ENQUEUE_PROFILE_DETAIL_CACHED = (
     os.environ.get("VLLM_SPARSE_REPLAY_REFRESH_ENQUEUE_PROFILE_DETAIL", "0") == "1"
 )
@@ -9228,6 +9275,12 @@ def _enqueue_full_cudagraph_refresh_payloads_after_replay(
             )
     batched_inflight_commit_noted = False
     first_payload_slot_req_ids: Optional[tuple[str, ...]] = None
+    # [ROW-SNAPSHOT-CARRIER 2026-07-07] 票自带提交时刻 block_table 快照(attn
+    # kernel tail_fill_page"表满合法页不变量"同款哲学):payload 的 row_list 与
+    # 表内容取自同一时刻,vLLM condense 行迁移从此与在飞票彻底无关——gather
+    # 收集的 KV 本就是提交时刻的,映射同时刻语义更正确。每世代每源表 clone
+    # 一次(~32KB D2D,全层共享,µs 级);is_latest 的行号对账退化为纯防线。
+    _btable_snapshot_by_ptr: Dict[int, torch.Tensor] = {}
     for ordinal, cache_key_raw in enumerate(layer_keys):
         _stage_inc("layer_count")
         cache_key = int(cache_key_raw)
@@ -9266,6 +9319,14 @@ def _enqueue_full_cudagraph_refresh_payloads_after_replay(
         block_table = getattr(state, "_sfi_replay_block_table", None)
         if not isinstance(block_table, torch.Tensor):
             block_table = getattr(controller, "_worker_block_table", None)
+        if isinstance(block_table, torch.Tensor):
+            # [ROW-SNAPSHOT-CARRIER] 世代级快照(循环外 dict,per 源表一次)。
+            _bt_key = int(block_table.data_ptr())
+            _bt_snap = _btable_snapshot_by_ptr.get(_bt_key)
+            if _bt_snap is None:
+                _bt_snap = block_table.clone()
+                _btable_snapshot_by_ptr[_bt_key] = _bt_snap
+            block_table = _bt_snap
         q = getattr(state, "_sfi_replay_q", None)
         cu_seqlens_q = getattr(state, "_sfi_replay_cu_seqlens_q", None)
         layer_seqused_k = seqused_k if isinstance(seqused_k, torch.Tensor) else getattr(
@@ -10237,6 +10298,7 @@ def _patch_cuda_graph_wrapper_for_sparse_cudagraph() -> None:
                                     _release_refresh_producer_after_decode_if_pending(
                                         controller
                                     )
+                        _evt_bisect_mark("pre_drain", controller)
                         if _full_cudagraph_replay_refresh_defer_to_deadline_enabled(
                             controller
                         ):
@@ -10247,6 +10309,7 @@ def _patch_cuda_graph_wrapper_for_sparse_cudagraph() -> None:
                                 controller=controller,
                                 profile_path=profile_path,
                             )
+                        _evt_bisect_mark("post_drain", controller)
                         _t_prebound_mark_ns = _full_cudagraph_pre_timing_start(
                             profile_pre_timing
                         )
@@ -10261,6 +10324,7 @@ def _patch_cuda_graph_wrapper_for_sparse_cudagraph() -> None:
                                 prevalidated_rrp_graph_state is not None
                             ),
                         )
+                        _evt_bisect_mark("post_prebind", controller)
                         _full_cudagraph_pre_timing_add(
                             profile_pre_timing,
                             "pre_prebound_mark_us",
@@ -10406,6 +10470,7 @@ def _patch_cuda_graph_wrapper_for_sparse_cudagraph() -> None:
             _end_full_cudagraph_replay_cuda_event(profile_cuda_event_sample)
             if refresh_enabled or release_pending:
                 _release_refresh_producer_after_decode_if_pending(controller)
+        _evt_bisect_mark("post_replay", controller)
         # GPU-side WAR gate: record an event on the launch stream AFTER the decode graph,
         # so the next step's descriptor rewrite can wait on it (build stream wait_event),
         # ordering the rewrite strictly after the prior graph's FA4 producer reads. No CPU block.
@@ -10505,6 +10570,7 @@ def _patch_cuda_graph_wrapper_for_sparse_cudagraph() -> None:
                     "_mixed_page_full_cudagraph_last_replay_refresh_stage_profile",
                     None,
                 )
+            _evt_bisect_mark("post_deferred", controller)
             profile_refresh_stage_profile = getattr(
                 controller,
                 "_mixed_page_full_cudagraph_last_replay_refresh_stage_profile",

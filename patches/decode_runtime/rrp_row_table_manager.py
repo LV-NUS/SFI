@@ -1051,54 +1051,44 @@ class RrpRowTableManager:
             )
             return
         if seqused_k_i32.device.type == "cuda":
-            staging_cpu = self._seqused_staging_cpu_i32
-            if (
-                not isinstance(staging_cpu, torch.Tensor)
-                or staging_cpu.device.type != "cpu"
-                or staging_cpu.dtype != torch.int32
-                or int(staging_cpu.numel()) < batch_size
-            ):
-                try:
-                    staging_cpu = torch.empty(
-                        (batch_size,),
-                        dtype=torch.int32,
-                        device="cpu",
-                        pin_memory=True,
-                    )
-                except RuntimeError:
-                    staging_cpu = torch.empty(
-                        (batch_size,),
-                        dtype=torch.int32,
-                        device="cpu",
-                    )
-                self._seqused_staging_cpu_i32 = staging_cpu
-            staging_cpu[:batch_size].copy_(
+            # [SEQUSED-STAGING-INDEPENDENT 2026-07-07] 原 manager 级单例
+            # pinned/GPU staging 对与 seq_lens/slot 共享 staging 同族第六处:
+            # pinned 单例每步被 host copy_ 覆写,而上一步的 non_blocking H2D
+            # 可能未决(WAR 撕裂,批2 pinned staging 根修先例同型);GPU 侧
+            # 容量换代直接替换引用零 record_stream(UAF 臂)。修同款:每次
+            # 独立小分配(bs×4B,allocator 缓存命中 µs 级),局部引用持有到
+            # copy 入队,零共享零 WAR 窗;值语义不变。
+            try:
+                staging_cpu = torch.empty(
+                    (batch_size,),
+                    dtype=torch.int32,
+                    device="cpu",
+                    pin_memory=True,
+                )
+            except RuntimeError:
+                staging_cpu = torch.empty(
+                    (batch_size,),
+                    dtype=torch.int32,
+                    device="cpu",
+                )
+            staging_cpu.copy_(
                 torch.as_tensor(
                     row_values[:batch_size],
                     dtype=torch.int32,
                     device="cpu",
                 )
             )
-
-            staging_gpu = self._seqused_staging_gpu_i32
-            if (
-                not isinstance(staging_gpu, torch.Tensor)
-                or staging_gpu.device != seqused_k_i32.device
-                or staging_gpu.dtype != torch.int32
-                or int(staging_gpu.numel()) < batch_size
-            ):
-                staging_gpu = torch.empty(
-                    (batch_size,),
-                    dtype=torch.int32,
-                    device=seqused_k_i32.device,
-                )
-                self._seqused_staging_gpu_i32 = staging_gpu
-            staging_gpu[:batch_size].copy_(
-                staging_cpu[:batch_size],
+            staging_gpu = torch.empty(
+                (batch_size,),
+                dtype=torch.int32,
+                device=seqused_k_i32.device,
+            )
+            staging_gpu.copy_(
+                staging_cpu,
                 non_blocking=True,
             )
             target.copy_(
-                staging_gpu[:batch_size].reshape(batch_size, 1).expand(
+                staging_gpu.reshape(batch_size, 1).expand(
                     batch_size,
                     num_kv_heads,
                 ),

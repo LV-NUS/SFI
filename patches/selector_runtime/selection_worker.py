@@ -26,7 +26,6 @@ from patches.sparse_constants import (
     _WRITER_TOKEN_TILE_CACHED,
 )
 from patches.sparse_types import SelectorBatchPayload, continuous_producer_enabled
-from patches.cpu_gpu_staging import cached_sequence_to_device
 
 # [REBUILD-H2D-STAGING 2026-07-05] rebuild 提交路径的三个小张量原用
 # `torch.tensor(list, device=cuda)` 构造——pageable 源的 H2D 是同步拷贝
@@ -40,7 +39,11 @@ from patches.cpu_gpu_staging import cached_sequence_to_device
 # 这些张量只是同流 copy_ 的瞬时 src——复用无 deferred 消费者腐蚀面。
 # row_list 错峰下可按层不同,用有界值键 dict（命中即免 H2D）而非单槽 staging。
 _REBUILD_ROW_TENSOR_CACHE_ATTR = "_rebuild_row_tensor_value_cache"
-_REBUILD_ROW_TENSOR_CACHE_MAX = 32
+# [ROW-CACHE-CLEAR-UAF-FIX] env 旋钮化:调小可放大 clear 频率做归因复现
+# (黄金 0.6b 世代 ~6 从不触发默认上界,4B 长跑世代 ~百级必反复触发)。
+_REBUILD_ROW_TENSOR_CACHE_MAX = int(
+    os.environ.get("VLLM_SPARSE_REBUILD_ROW_CACHE_MAX", "32")
+)
 
 
 
@@ -99,6 +102,17 @@ def _new_pinned_i32_tensor(values: tuple) -> torch.Tensor:
     """[SEQLENS-STAGING-UAF-FIX] 每世代一次的独立 pinned 小张量(bs×4B),
     供 deferred writer 路径做非阻塞 H2D 源——不入任何共享 staging 缓存。"""
     t = torch.tensor(values, dtype=torch.int32)
+    try:
+        return t.pin_memory()
+    except RuntimeError:
+        return t
+
+
+def _new_pinned_i64_tensor(values: tuple) -> torch.Tensor:
+    """[SLOT-STAGING-UAF-FIX] 同上 i32 版:每世代一次的独立 pinned 小张量
+    (bs×8B),供 deferred writer 路径的 slot 输入做非阻塞 H2D 源——不入任何
+    共享 staging 缓存。"""
+    t = torch.tensor(values, dtype=torch.long)
     try:
         return t.pin_memory()
     except RuntimeError:
@@ -345,6 +359,31 @@ def rebuild_compact_slots_batched_layers_from_selection_impl(
             setattr(self, _REBUILD_ROW_TENSOR_CACHE_ATTR, _row_cache)
         elif len(_row_cache) > _REBUILD_ROW_TENSOR_CACHE_MAX:
             # 防御上界:批组成高频变化时防无界增长;清空后本世代重建（miss 一次）。
+            # [ROW-CACHE-CLEAR-UAF-FIX 2026-07-07] 弃引用前对每条目做双流
+            # record_stream:上方注释的旧安全前提"释放后 allocator 同流
+            # (refresh_stream 上下文)复用受流序保护"已被 deferred-drain 主流化
+            # 打破——本函数(条目创建与 stable copy_ 消费)在主流 drain 与
+            # refresh_stream off-loop 两种流上下文交替执行,条目创建流与在飞
+            # 消费流可以不同;clear 直接 GC 时 allocator 只按创建流序回收,
+            # 另一流的未决读者读到被复用/解映射(expandable segment 收缩)的
+            # storage = illegal address。row_list 随 decode 推进每世代都是新
+            # 值键→4B 长跑必反复触发本分支,黄金 0.6b 世代 ~6 从不触发,
+            # 与"仅 4B 崩"的模型选择性一致。record_stream 覆盖两个可能的
+            # 消费流,让 allocator 等其进度;仅 clear 时执行(稀有),µs 级。
+            # 覆盖集={refresh_stream, 当前流, default 流}:body 的两种执行
+            # 上下文是主流 drain(decode 前向流,常规=default)与 refresh_stream
+            # off-loop,消费只发生在这两类流;clear 时当前流只是其一,三者取
+            # 并集防"clear 在 off-loop 而主流仍有未决 src 读"的反向窗。
+            _uaf_guard_streams = []
+            _rs = getattr(self, "refresh_stream", None)
+            if _rs is not None:
+                _uaf_guard_streams.append(_rs)
+            for _cand in (torch.cuda.current_stream(), torch.cuda.default_stream()):
+                if all(_cand != s for s in _uaf_guard_streams):
+                    _uaf_guard_streams.append(_cand)
+            for _stale_row_t in _row_cache.values():
+                for _s in _uaf_guard_streams:
+                    _stale_row_t.record_stream(_s)
             _row_cache.clear()
         _row_tensor_by_key: Dict[Tuple[int, ...], torch.Tensor] = _row_cache
     else:
@@ -426,11 +465,18 @@ def rebuild_compact_slots_batched_layers_from_selection_impl(
     # slot_tensor/slot_tensor_i32(per-batch 复用 buffer 的 live 视图,错峰
     # bootstrap 下一行 flush 原位覆写;writer 为 deferred 消费者,脏 slot=
     # compact KV 写进错误 slot 的 arena 行,跨序列静默腐蚀)。
-    # [REBUILD-H2D-STAGING] staging 化不破此合同:值仍恒取自 slot_list 快照,
-    # 值键命中=承载同值的缓存张量(稳态 slot_list 恒定,全程零 H2D 零流阻塞);
-    # graph ON 下 writer 消费 _ensure_selector_writer_slot_tensor_all stable
-    # buffer,本张量只是同流 copy_ 的瞬时 src。OFF 逃生旋钮回退原独立分配
-    # （OFF 下游 long→int32 cast 虽恒新分配,仍与 seq_lens 同姿态防御）。
+    # [SLOT-STAGING-UAF-FIX 2026-07-07] 原 [REBUILD-H2D-STAGING] 共享 staging
+    # (cache_name="swk_rebuild_slot_tensor")与 seq_lens 同族同拆:其安全前提
+    # "copy 后无 deferred 读者"同样被 deferred-drain 主流化打破——共享 GPU
+    # stage 容量换代直接替换引用(旧 storage 无 record_stream 即 GC),单 WAR
+    # 事件只护 H2D 不护跨流消费;4B bs8x12k bootstrap 错峰 batch 翻倍换代窗
+    # 与 seq_lens 雷同窗,且毒 slot 直接喂 gather kernel 的 dst 寻址
+    # (dst_token=slot*stride+t 写 + dst_pos OOB 读)=illegal address 嫌疑#1。
+    # 修同款:独立 pinned 小分配(bs×8B/世代)非阻塞 H2D,局部引用持有至
+    # stable copy_ 入队,零共享零 WAR 窗;值语义不变(仍恒取自 slot_list
+    # 快照)。graph ON 下 writer 消费 _ensure_selector_writer_slot_tensor_all
+    # stable buffer,本张量只是同流 copy_ 的瞬时 src。OFF 逃生旋钮回退原
+    # 独立分配（OFF 下游 long→int32 cast 虽恒新分配,仍同姿态防御）。
     # [DUAL-GEN-L2a-B] gather writer 的物理写目标=备用半区 sub-slot(单代=
     # slot 逐位)。slot_tensor 仅有两个消费者(ptr_gather_args 写偏移+profile
     # data_ptr),逻辑记账全走 rebuild_slots_ref,故构造点值变换即安全。
@@ -454,14 +500,13 @@ def rebuild_compact_slots_batched_layers_from_selection_impl(
             for s in slot_list
         ]
     if _ASYNC_PRODUCER_WRITER_GRAPH_CACHED:
-        slot_tensor = cached_sequence_to_device(
-            writer_slot_values,
-            dtype=torch.long,
-            device=device,
-            cache_name="swk_rebuild_slot_tensor",
-            cache_owner=self,
-            reuse_unchanged=True,
+        _slot_cpu_pin = _new_pinned_i64_tensor(
+            tuple(int(s) for s in writer_slot_values)
         )
+        slot_tensor = torch.empty(
+            (len(writer_slot_values),), device=device, dtype=torch.long
+        )
+        slot_tensor.copy_(_slot_cpu_pin, non_blocking=True)
     else:
         slot_tensor = torch.tensor(writer_slot_values, device=device, dtype=torch.long)
     slot_tensor_i32_ref = None
@@ -1017,6 +1062,57 @@ def rebuild_compact_slots_batched_layers_from_selection_impl(
             *writer_launch_args
         )
 
+    if os.environ.get("VLLM_SPARSE_WRITER_INPUT_BTABLE_CHECK") == "1":
+        # [诊断档,默认关] launch 前 host 侧断言 btable 有效区非负。graph/eager
+        # trap 后 CUDA printf 缓冲丢失拿不到坐标,这里用 python 栈+完整值取证;
+        # 若本检查通过而 kernel 仍 trap = 毒写发生在 launch~执行窗内(跨流并发
+        # 写实锤)。同步 D2H 仅诊断档开销。
+        for _ci, _info in enumerate(layer_infos):
+            _pl = _info[0]
+            _rows = [int(r) for r in _pl.row_list]
+            _bt_host = block_table_ref[_rows].cpu()
+            for _bi, _r in enumerate(_rows):
+                _need = (
+                    max(0, int(seq_lens_cpu_ref[_bi])) + int(block_size_ref) - 1
+                ) // int(block_size_ref)
+                _need = min(_need, int(block_table_cols))
+                if _need <= 0:
+                    continue
+                _vals = _bt_host[_bi, :_need]
+                _mn = int(_vals.min().item())
+                if _mn < 0:
+                    _col = int((_vals < 0).nonzero()[0].item())
+                    _wt = getattr(self, "_worker_block_table", None)
+                    _wt_ptr = (
+                        int(_wt.data_ptr()) if isinstance(_wt, torch.Tensor) else 0
+                    )
+                    _wt_row_head = (
+                        _wt[_r, :4].cpu().tolist()
+                        if isinstance(_wt, torch.Tensor) and _r < int(_wt.shape[0])
+                        else None
+                    )
+                    raise RuntimeError(
+                        "SFI_BTABLE_PRECHECK layer_pos=%d layer_idx=%s b=%d row=%d "
+                        "col=%d blkid=%d need=%d seq=%d bt_ptr=0x%x wt_ptr=0x%x "
+                        "same_table=%s bt_row_head=%s wt_row_head=%s bt_shape=%s"
+                        % (
+                            _ci,
+                            getattr(getattr(_pl, "state", None), "layer_index", -1),
+                            _bi,
+                            _r,
+                            _col,
+                            _mn,
+                            _need,
+                            int(seq_lens_cpu_ref[_bi]),
+                            int(block_table_ref.data_ptr()),
+                            _wt_ptr,
+                            bool(int(block_table_ref.data_ptr()) == _wt_ptr),
+                            _bt_host[_bi, :4].tolist(),
+                            _wt_row_head,
+                            tuple(block_table_ref.shape),
+                        )
+                    )
+
     if not _ASYNC_PRODUCER_WRITER_GRAPH_CACHED:
         _eager_writer_launch()
     else:
@@ -1078,6 +1174,17 @@ def rebuild_compact_slots_batched_layers_from_selection_impl(
             ),
         )
 
+    # [WRITER-STABLE-OVERWRITE-WAR-FIX 2026-07-07] R3 record 端:writer 发射
+    # (eager/replay/capture 任一臂)后在当前流记录 dispatch-done 事件;下一次
+    # rebuild(可能在另一流上下文)覆写 stable 四单例前 wait 此事件,补上
+    # "上次 replay→本次 copy" 的反向序(#9-KEY v3 latch 只护正向序)。
+    # 4B illegal 主凶终审:sanitizer 100/100 Invalid read 于 replay 内 gather
+    # 的 src 读(btable 列 -1 负寻址)=撕裂 stable 输入所致。
+    _dispatch_done_evt = getattr(self, "_writer_dispatch_done_evt", None)
+    if _dispatch_done_evt is None:
+        _dispatch_done_evt = torch.cuda.Event()
+        self._writer_dispatch_done_evt = _dispatch_done_evt
+    _dispatch_done_evt.record(torch.cuda.current_stream())
 
     # 方案 G2 优化：stride_tokens_int 跨层一致，在循环外预计算
     stride_tokens_int = stride_tokens_ref

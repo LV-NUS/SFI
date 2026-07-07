@@ -137,6 +137,9 @@ from patches.sparse_types import (
 if TYPE_CHECKING:
     from patches.sparse_types import BoundLayerMeta
 from patches.step_authority import StepAuthority
+from patches.fa_sparse_runtime.compact_recent_alignment import (
+    compact_slot_offset_tokens,
+)
 from patches.layer_state import LayerState
 from patches.sparse_constants import (
     _CAPTURE_CHUNK,
@@ -1019,6 +1022,26 @@ def _cleanup_inactive_slots(state: LayerState, controller: Optional['VLLMSparseC
                 pos_buf = state.compact_pos[slot]
                 if pos_buf is not None:
                     pos_buf.fill_(-1)
+                # [DUAL-GEN-RELEASE-POS-ALLGENS 2026-07-07] 上面的视图只覆盖
+                # 当前 read_gen 半区;双代下 writer 物理写目标是写代半区
+                # sub-slot,其 pos 残留(旧请求)不被清 → 新请求首次 flush 的
+                # sink 区 old_pos==t==new pos → skip_unchanged 跳拷 → 读到旧
+                # 请求的 sink KV(跨请求静默泄漏)。修=释放时清该 slot 的全部
+                # gen 半区(gen_stride 由 arena shape 自洽推导;单代路径
+                # gen_count==1 不进此分支,行为逐位不变)。
+                _gen_count = compact_gen_count()
+                _arena_pos = getattr(state, "compact_arena_pos", None)
+                _stride = int(getattr(state, "compact_stride_tokens", 0) or 0)
+                if _gen_count > 1 and _arena_pos is not None and _stride > 0:
+                    _gen_stride = int(_arena_pos.shape[1]) // int(_gen_count)
+                    for _gen in range(int(_gen_count)):
+                        _off = compact_slot_offset_tokens(
+                            slot=int(slot),
+                            stride_tokens=_stride,
+                            read_gen=int(_gen),
+                            gen_stride_tokens=_gen_stride,
+                        )
+                        _arena_pos.narrow(1, _off, _stride).fill_(-1)
             # F10: 清零 compact 元数据，防止新请求复用 slot 时继承残留值
             if slot < len(state.compact_capacity):
                 state.compact_capacity[slot] = 0

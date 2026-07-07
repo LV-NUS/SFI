@@ -2295,6 +2295,9 @@ torch::Tensor run_log_s(
     int threads = 256;
     if (const char* env = std::getenv("VLLM_SPARSE_SELECTOR_LOGS_THREADS")) {
         int parsed = std::atoi(env);
+        // [THREADS-WARP-ALIGN] non-multiple-of-32 blockDim would make the
+        // full-mask __shfl_down_sync reductions UB in the last warp.
+        parsed &= ~31;
         if (parsed >= 64 && parsed <= 1024) {
             threads = parsed;
         }
@@ -2425,13 +2428,22 @@ torch::Tensor post_topk(
     int64_t slice_start,
     int64_t slice_end);
 
+// [POST-TOPK-VALUE-SENTINEL 2026-07-07] count-cutoff kernel now ALSO applies
+// the value-sentinel: a picked column whose topk VALUE is the finite min_val
+// mask (v <= -3.0e38) is an in-row "no valid candidate" pick (row has fewer
+// finite candidates than k_eff, e.g. capacity==0 rows -> row_hi==1), and its
+// index MUST NOT leak into selected_indices — the writer's sel<0 sentinel
+// protocol is the only downstream guard. Rows with enough finite candidates
+// are bit-identical to the old kernel (every picked v is finite).
 __global__ void post_topk_i64_to_i32_out_kernel(
     const int64_t* __restrict__ topk,
+    const float* __restrict__ topk_vals,
     int32_t* __restrict__ out,
     int64_t rows,
     int64_t k_eff,
     int64_t k_head,
     int32_t start) {
+    const float MIN_VAL_THRESHOLD = -3.0e38f;
     int64_t total = rows * k_head;
     int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
@@ -2440,7 +2452,10 @@ __global__ void post_topk_i64_to_i32_out_kernel(
         int64_t col = idx - row * k_head;
         int32_t value = -1;
         if (col < k_eff) {
-            value = static_cast<int32_t>(topk[row * k_eff + col] + start);
+            float v = topk_vals[row * k_eff + col];
+            if (v > MIN_VAL_THRESHOLD) {
+                value = static_cast<int32_t>(topk[row * k_eff + col] + start);
+            }
         }
         out[idx] = value;
     }
@@ -2571,6 +2586,7 @@ torch::Tensor post_topk(
     int64_t slice_len = range_valid ? (end - start) : K;
     int64_t k_eff = k_head < slice_len ? k_head : slice_len;
     auto topk_res = scores.topk(k_eff, -1, true, false);
+    auto topk_vals_f32 = std::get<0>(topk_res).contiguous();
     auto topk_i64 = std::get<1>(topk_res).contiguous();
     if (selected_indices_out_opt.has_value()) {
         auto out = selected_indices_out_opt.value();
@@ -2595,6 +2611,7 @@ torch::Tensor post_topk(
             auto stream = at::cuda::getCurrentCUDAStream();
             post_topk_i64_to_i32_out_kernel<<<blocks, threads, 0, stream>>>(
                 topk_i64.data_ptr<int64_t>(),
+                topk_vals_f32.data_ptr<float>(),
                 out.data_ptr<int32_t>(),
                 rows,
                 k_eff,
@@ -2608,6 +2625,10 @@ torch::Tensor post_topk(
     if (range_valid && start > 0) {
         topk.add_(static_cast<int>(start));
     }
+    // [POST-TOPK-VALUE-SENTINEL] non-out fallback mirrors the out-path kernel:
+    // min_val-masked picks map to -1 (same -3.0e38 threshold), keeping the two
+    // paths byte-identical.
+    topk.masked_fill_(topk_vals_f32.le(-3.0e38f), -1);
     if (k_eff < k_head) {
         auto out = torch::full(
             {topk.size(0), topk.size(1), topk.size(2), k_head},

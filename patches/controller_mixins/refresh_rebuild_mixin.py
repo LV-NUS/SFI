@@ -443,13 +443,41 @@ class RefreshRebuildMixin:
         pid = pending.pending_id
         finished_req_ids = self._finished_req_ids_step
         request_states = self.request_states
-        for rid in req_ids:
+        # [ROW-REMAP-PENDING-RETIRE 2026-07-07] 行迁移对账载体:批内任何 req
+        # 完成都会让 vLLM condense 迁移"存活" req 的 block_table 行,pending
+        # 世代的 row_list 快照随之过期(实证:PRECHECK b=1 快照行 7 整行 -1,
+        # 该 req 已被迁走;finished 检查不命中因为毒票 req 全部存活)。对账
+        # =快照行 vs 每步冻结的权威映射 _worker_batch_id_to_idx;不一致即
+        # 作废整票(现成 drop_non_latest 终局路径清理),下次触发按新行重建。
+        _row_map = getattr(self, "_worker_batch_id_to_idx", None)
+        _payloads = getattr(pending, "payloads", None) or ()
+        _row_snapshot = (
+            tuple(getattr(_payloads[0], "row_list", ()) or ()) if _payloads else ()
+        )
+        for _ri, rid in enumerate(req_ids):
             if not rid or _is_free_slot_id(rid):
                 continue
-            if rid in finished_req_ids:
-                continue
-            if rid not in request_states:
-                continue
+            if rid in finished_req_ids or rid not in request_states:
+                # [FINISHED-REQ-PENDING-RETIRE 2026-07-07] 4B illegal 真根因
+                # 终局修:req 完成/退场 = 其 block_table 行即刻易主(vLLM 行
+                # 迁移/复用),pending 世代的 row_list/seq_lens 快照随之过期。
+                # 此前这两类 req 被"豁免检查"(continue),含毒票照常
+                # due-submit,writer gather 按旧行号读到易主/未填充行(实证:
+                # PRECHECK b=1 row=7 整行 -1 → block_id 负寻址 illegal;决定论
+                # step≈EOS 步)。终局语义=完成即作废整票(与"提交即终局"合同
+                # 一致),调用方现成 drop_non_latest 路径负责清理;存活 req 的
+                # freshness 由下次触发重建。零新路径零兜底。
+                return False
+            if isinstance(_row_map, dict):
+                _cur_row = _row_map.get(str(rid))
+                if _cur_row is None:
+                    # 不在当前批映射 = 已退场/迁出,票作废。
+                    return False
+                if _ri < len(_row_snapshot) and int(_row_snapshot[_ri]) != int(
+                    _cur_row
+                ):
+                    # 行迁移:快照行 != 当前权威行,票作废(ROW-REMAP)。
+                    return False
             key = RefreshRebuildMixin._pending_refresh_rebuild_req_key(
                 rid,
                 target_layer_start=int(getattr(pending, "target_layer_start", -1)),
@@ -1740,6 +1768,19 @@ class RefreshRebuildMixin:
             prev_profile_active = bool(getattr(self, "_refresh_profile_active", False))
             if profile_detail and not prev_profile_active:
                 self._refresh_profile_active = True
+            # [SELECTED-PRIVATE-OUT 2026-07-07] pending 路径的 selected_indices
+            # 私有化:共享单槽 _selector_selected_indices_out 会被下一次同 shape
+            # selector run 原地覆写,而本 result 的 selected 要活到 deferred
+            # writer 消费(OFF 臂直接持引用;ON 臂 stable copy_ 可能跨流未决)
+            # ——replay-refresh 路径已有同款防护(_apply_with_private_selected_
+            # indices_out),pending 路径此前漏包=4B bs8 illegal address 毒源之一。
+            # 只私有化 selected 一槽:其余 scratch(bounds/workspace/key_norms)
+            # 均为 run 内消费无 deferred 读者,保持共享复用零额外分配;selected
+            # 私有分配为每世代一次 allocator 缓存命中(µs 级),零热路径开销。
+            _sel_out_override_prev = getattr(
+                self, "_selector_selected_indices_out_override", None
+            )
+            self._selector_selected_indices_out_override = {}
             try:
                 result = self._apply_alpha_selector_batched_fused(
                     payloads,
@@ -1747,6 +1788,7 @@ class RefreshRebuildMixin:
                     update_tracking=False,
                 )
             finally:
+                self._selector_selected_indices_out_override = _sel_out_override_prev
                 if profile_detail and not prev_profile_active:
                     self._refresh_profile_active = prev_profile_active
             if profile_t0_ns is not None and profile_deferred:
