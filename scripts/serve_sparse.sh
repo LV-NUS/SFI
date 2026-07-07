@@ -100,7 +100,7 @@ export VLLM_SPARSE_CONTROLLER_JSON=$(cat <<JSON
   "trigger": {
     "refresh_interval": ${REFRESH_INTERVAL},
     "enable_sentence_triggers": true,
-    "min_refresh_gap": 16,
+    "min_refresh_gap": 24,
     "sentence_cooldown": 2
   }
 }
