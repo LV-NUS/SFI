@@ -137,6 +137,26 @@ def cached_sequence_to_device(
         ):
             gpu_stage_reused = False
             old_cap = int(cached_gpu.numel()) if isinstance(cached_gpu, torch.Tensor) else 0
+            if isinstance(cached_gpu, torch.Tensor) and cached_gpu.device.type == "cuda":
+                # [STAGING-SWAP-UAF-GUARD 2026-07-07] R1 单点收口:容量换代弃旧
+                # GPU stage 前对三个潜在消费流 record_stream——rebuild/selector
+                # 链在主流 drain 与 refresh_stream off-loop 双上下文交替,旧
+                # stage 可能仍是另一流未决 copy/kernel 的 src(seq_lens/slot 两
+                # 雷同款前提被打破);直接 GC 让 allocator 按创建流序复用/解映射
+                # = 脏读/illegal。冷事件(容量翻倍增长),零热路径开销;pinned
+                # CPU 侧由 CachingHostAllocator 自动挂事件,无需守卫。
+                _guard_streams = []
+                _rs = getattr(cache_owner, "refresh_stream", None)
+                if _rs is not None:
+                    _guard_streams.append(_rs)
+                for _cand in (
+                    torch.cuda.current_stream(),
+                    torch.cuda.default_stream(),
+                ):
+                    if all(_cand != s for s in _guard_streams):
+                        _guard_streams.append(_cand)
+                for _s in _guard_streams:
+                    cached_gpu.record_stream(_s)
             capacity = max(capacity, old_cap * 2, 1)
             cached_gpu = torch.empty((capacity,), device=device, dtype=dtype)
             _cache_set(

@@ -461,6 +461,11 @@ class CaptureRingMixin:
             capture_rows_i32 = inv.index_select(0, row_index.to(device=device))
             capture_rows = capture_rows_i32.to(dtype=torch.int64)
             if len(self._capture_rows_cache) > 128:
+                # [CAPTURE-ROWS-CLEAR-UAF-GUARD 2026-07-07] 与 ROW-CACHE-CLEAR
+                # 同族(P2-9):弃引用前三流守卫,消费者=writer ptrs 乘加(双上
+                # 下文);冷事件零热开销。
+                for _stale_t in self._capture_rows_cache.values():
+                    self._uaf_guard_record_streams_before_discard(_stale_t)
                 self._capture_rows_cache.clear()
             self._capture_rows_cache[cache_key] = capture_rows
         return capture_rows

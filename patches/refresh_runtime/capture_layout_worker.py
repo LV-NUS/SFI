@@ -465,6 +465,14 @@ def get_step_capture_layout_impl(
         row_key_changed = layout.slot_row_map_key != row_key
         if row_key_changed and getattr(self, "_capture_rows_cache", None) is not None:
             # row 映射变化时，清空 ptr cache，避免复用旧的 capture_row 索引
+            # [CAPTURE-ROWS-CLEAR-UAF-GUARD 2026-07-07] P2-9 高频臂(错峰下
+            # row_key 常变):弃引用前三流守卫,防另一上下文在飞读者。
+            _guard = getattr(
+                self, "_uaf_guard_record_streams_before_discard", None
+            )
+            if callable(_guard):
+                for _stale_t in self._capture_rows_cache.values():
+                    _guard(_stale_t)
             self._capture_rows_cache.clear()
         _mark_phase("reuse_rows")
 
