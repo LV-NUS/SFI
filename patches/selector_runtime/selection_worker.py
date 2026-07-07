@@ -95,6 +95,16 @@ def _rebuild_ptr_buffer_name(
 
 
 
+def _new_pinned_i32_tensor(values: tuple) -> torch.Tensor:
+    """[SEQLENS-STAGING-UAF-FIX] 每世代一次的独立 pinned 小张量(bs×4B),
+    供 deferred writer 路径做非阻塞 H2D 源——不入任何共享 staging 缓存。"""
+    t = torch.tensor(values, dtype=torch.int32)
+    try:
+        return t.pin_memory()
+    except RuntimeError:
+        return t
+
+
 def rebuild_compact_slots_batched_layers_from_selection_impl(
     self,
     payloads: Sequence[SelectorBatchPayload],
@@ -236,14 +246,24 @@ def rebuild_compact_slots_batched_layers_from_selection_impl(
     # 且 split-release 使 writer 延到次步 launch——staging 复用=跨世代脏读 race,
     # 故 OFF 保持原每世代独立分配（正确性优先,该旋钮不追性能）。
     if _ASYNC_PRODUCER_WRITER_GRAPH_CACHED:
-        seq_lens_tensor_ref = cached_sequence_to_device(
-            tuple(max(0, int(seq_lens_cpu_ref[i])) for i in range(batch)),
-            dtype=torch.int32,
-            device=device,
-            cache_name="swk_rebuild_seq_lens_ref",
-            cache_owner=self,
-            reuse_unchanged=True,
+        # [SEQLENS-STAGING-UAF-FIX 2026-07-07] 原共享 staging(cache_name=
+        # "swk_rebuild_seq_lens_ref")的安全前提"copy 后无 deferred 读者"已被
+        # deferred-writer 架构打破:本函数整体在 deferred drain(主流)执行,
+        # 而共享 GPU stage 的容量换代直接替换引用(旧 storage 无 record_stream
+        # 即被 GC),单 WAR 事件只护 H2D 不护跨流消费——4B bs8x12k bootstrap
+        # 错峰世代密集时 deferred 窗跨换代点 → 读已释放 storage = illegal
+        # address(CUDA_LAUNCH_BLOCKING 血栈钉在下游 view.copy_(src))。
+        # 修:本站点弃共享 staging,独立 pinned 小分配(bs×4B/世代,µs 级)
+        # 非阻塞 H2D。src/GPU 张量均由本函数局部引用持有到全部消费(persistent
+        # copy_)入队之后;释放后 caching allocator 的 stream-aware 复用保证
+        # 同流序安全,无跨流读者——零共享零 WAR 窗,值语义与快照来源不变。
+        _seq_cpu_pin = _new_pinned_i32_tensor(
+            tuple(max(0, int(seq_lens_cpu_ref[i])) for i in range(batch))
         )
+        seq_lens_tensor_ref = torch.empty(
+            (batch,), device=device, dtype=torch.int32
+        )
+        seq_lens_tensor_ref.copy_(_seq_cpu_pin, non_blocking=True)
     else:
         seq_lens_tensor_ref = torch.tensor(
             [max(0, int(seq_lens_cpu_ref[i])) for i in range(batch)],

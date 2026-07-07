@@ -188,7 +188,12 @@ def _stage_meta_rows(
     # H2D-completion event per slot; a slot is rewritten only after ITS event
     # has completed (a ring-depth of transfers earlier -- in practice already
     # done, so the sync is a ~1us no-op and the pipeline never stalls).
-    ring_depth = 4
+    # [ASYNC-HIDE 2026-07-07] 4→16: 稳态 refresh 走 direct-capture 跳过本段,
+    # 但 chunked prefill(远端 4B 常态配方)每片×每层仍经此环——host 连发领先
+    # GPU >4 槽时 WAR 护栏(evt.synchronize)变真实节流。加深环让护栏在连发
+    # 窗内不再命中(hide 而非 wait);每槽 KB 级 pinned+GPU 元数据,×4 可忽略,
+    # 撕裂防线语义不变。
+    ring_depth = 16
     slots_attr = f"_fa3_capture_postprocess_{cache_name}_ring"
     state = getattr(cache_owner, slots_attr, None) if cache_owner is not None else None
     if not isinstance(state, dict) or state.get("key") != key:

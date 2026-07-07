@@ -1458,6 +1458,12 @@ class RequestTracking:
     lease_rearm_decode_step: int = -1
     # 短上下文标记（原为动态 setattr，提升为正式字段以配合 slots=True）
     _was_short_dense: bool = False
+    # [TP-DET-TRIGGER 2026-07-07] 在飞世代的读侧镜像:票在 enqueue commit 点
+    # 转 consumed(决策面),但读侧闸(dense-consume 防 torn-read/short_dense
+    # crossing 保护)需要 reason/policy 存续到 GPU 终局——commit 写入,
+    # selector publish final(读侧终局)清除。决策路径禁止消费。
+    inflight_reason_code: int = -1
+    inflight_policy: int = -1
     # TP>1 sentence trigger: 已 feed 给 trigger 的 decode observed 计数
     _trig_fed: int = 0
 

@@ -39,6 +39,7 @@ from typing import (
 
 import torch
 
+from patches.request_intent_ticket import PendingPolicy, PendingReasonCode
 from patches.refresh_runtime.producer_workspace import (
     build_refresh_producer_work_item,
 )
@@ -2060,8 +2061,20 @@ class RefreshRebuildMixin:
         # the skip-wait set so the in-capture ptr lookup does NOT wait_event.
         self._prepare_rebuild_ptr_ready_events_for_capture(device=device)
         try:
-            with torch.cuda.graph(graph, pool=mempool, stream=self.refresh_stream):
-                _replay_body()
+            # [ASYNC-CAPTURE 2026-07-07 B-1] 手动 capture_begin/end 替代
+            # ``with torch.cuda.graph(...)``:其 __enter__ 做全设备
+            # torch.cuda.synchronize()+empty_cache()(~26ms 级全机停顿,decode
+            # 主流被迫排空;empty_cache 还把 allocator 缓存段清光,后续两侧分配
+            # 重新 cudaMalloc)。捕获正确性只需捕获流自身空闲——收窄为
+            # refresh_stream.synchronize();mempool 显式传入,无需 empty_cache。
+            # 捕获内容与 with 版逐字节相同。
+            self.refresh_stream.synchronize()
+            with torch.cuda.stream(self.refresh_stream):
+                graph.capture_begin(pool=mempool)
+                try:
+                    _replay_body()
+                finally:
+                    graph.capture_end()
         finally:
             self._clear_rebuild_ptr_capture_wait_satisfied()
         # #9-KEY v5: per-key cache insert (state may be None / legacy shape).
@@ -4129,6 +4142,37 @@ class RefreshRebuildMixin:
                 pending_ctrl_step = self.step_context_epoch
             tracking.scheduled_decode_refresh_step = pending_step
             tracking.scheduled_refresh_ctrl_step = pending_ctrl_step
+            # [TP-DET-TRIGGER 2026-07-07] 决策终局提交点化(TP>1 NCCL 发散根修):
+            # 触发线的全部决策状态在 enqueue 成功的 commit 点一次性终局——该点
+            # 是纯 host 同步路径(方案 B single-writer),对所有 TP rank 逐 step
+            # 决定论。原先 last 推进/trigger 计时归零/清票发生在 selector publish
+            # 或 covered-by-ready-compact(依赖 GPU writer 完成时机,per-rank
+            # 异步),使 sentence/interval 触发决策跨 rank 发散 → 集合发散挂死。
+            # GPU 完成从此只服务读侧路由(off-rail/compact),不进决策。
+            pending_policy_commit = int(ticket.pending_policy)
+            pending_reason_commit = int(ticket.pending_reason_code)
+            # 读侧在飞镜像:reason/policy 存续到 publish final(读侧闸消费:
+            # dense-consume 防 torn-read + short_dense crossing 保护)。
+            tracking.inflight_reason_code = pending_reason_commit
+            tracking.inflight_policy = pending_policy_commit
+            tracking.last_refresh_step = self.step_context_epoch
+            tracking.last_decode_refresh_step = int(pending_step)
+            trigger = getattr(tracking, "trigger", None)
+            if trigger is not None:
+                trigger.state.steps_since_refresh = 0
+            if (
+                pending_policy_commit == int(PendingPolicy.FORCE_NOW)
+                or pending_reason_commit
+                == int(PendingReasonCode.COMPACT_THRESHOLD_CROSSED)
+            ):
+                tracking._was_short_dense = False
+            # 票转 consumed:决策面生命周期在提交点闭合(ready_compact=False
+            # 不触碰刚写入的 scheduled_*;scheduled 转为读侧/观测语义,其读侧
+            # 清除仍在 publish final——读路由允许 per-rank 时序,近似语义)。
+            self._clear_request_pending_refresh(
+                request_id=req_id,
+                ready_compact=False,
+            )
             self._step_refresh_commit_written_req_ids.add(req_id)
 
     def _step_refresh_nonempty(self) -> bool:
@@ -4187,6 +4231,9 @@ class RefreshRebuildMixin:
                 continue
             tracking.scheduled_refresh_ctrl_step = -1
             tracking.scheduled_decode_refresh_step = -1
+            # [TP-DET-TRIGGER] lease 重排=世代作废,读侧在飞镜像同步清除。
+            tracking.inflight_reason_code = -1
+            tracking.inflight_policy = -1
             try:
                 cur_decode = int(tracking.decode_step) if tracking.decode_step is not None else -1
             except Exception:

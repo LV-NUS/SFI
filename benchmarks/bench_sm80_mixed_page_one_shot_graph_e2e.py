@@ -2207,12 +2207,17 @@ def _interval_trigger_requirement_satisfied(
     interval_trigger_intents: int,
     refresh_trigger_intents: int,
 ) -> bool:
+    # [INTERVAL-GATE-DYNAMIC 2026-07-07 口径变更] interval 是兜底节拍：任何
+    # reason 的世代完成都会推进 last_decode_refresh（selector_compute 世代
+    # 终局归零 per-req 计时，跨 reason 成立——用户设计合同），sentence 密集时
+    # interval intent 趋零是健康形态而非缺陷。判据改判"触发线活着"：全 reason
+    # 意图总数 ≥ bs×(max_new//interval) 节拍下界。refresh-on（无 sentence）下
+    # 总数≈interval 数，与旧主判据等价；trigger/full-open 下取代旧 fallback
+    # （旧逻辑最终也落到同一比较）。旧静态主判据（interval 单项≥期望）在
+    # sentence 重置语义下系统性误报红（4B 实测），故退休。
     if int(expected_interval_trigger_intents) <= 0:
         return True
-    if int(interval_trigger_intents) >= int(expected_interval_trigger_intents):
-        return True
-    if not _producer_mode_requires_sentence_trigger(producer_mode):
-        return False
+    del producer_mode, interval_trigger_intents  # 保留签名（观测字段照旧输出）
     return int(refresh_trigger_intents) >= int(expected_interval_trigger_intents)
 
 

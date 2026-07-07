@@ -19,6 +19,7 @@ from patches.buffer_allocator_backends import AllocatorBackend, resolve_allocato
 from patches.buffer_lease_protocol import BufferLease, BufferLeaseRegistry, LeaseKind
 from patches.page_kv_residency import CompactMetadataBuffers, CompactPageResidency
 from patches.sparse_cache import _get_cached_empty_tensor
+from patches.sparse_constants import _DYNAMIC_ENV
 from patches.sparse_constants import _FREE_SLOT_ID, _is_free_slot_id
 from patches.selector_runtime.entry import run_selector_step
 
@@ -35,8 +36,16 @@ _FNV64_OFFSET_BASIS = 1469598103934665603
 _FNV64_PRIME = 1099511628211
 
 
+# [F2] trace path 进程内不变：import-time 缓存；pytest/显式动态档 live 读。
+_SELECTED_READY_TRACE_PATH_CACHED = os.environ.get(
+    "VLLM_SPARSE_SELECTED_READY_TRACE_LOG", ""
+).strip()
+
+
 def _selected_ready_trace_path() -> str:
-    return os.environ.get("VLLM_SPARSE_SELECTED_READY_TRACE_LOG", "").strip()
+    if _DYNAMIC_ENV:
+        return os.environ.get("VLLM_SPARSE_SELECTED_READY_TRACE_LOG", "").strip()
+    return _SELECTED_READY_TRACE_PATH_CACHED
 
 
 def _append_selected_ready_trace(event: dict[str, object]) -> None:
@@ -57,12 +66,25 @@ def _mix_u64(sig: int, value: int) -> int:
     return sig_u64 & _U64_MASK
 
 
+# rid→hash64 纯函数 memo：签名重算占 align slow-path 的 ~85%（逐字节 FNV），
+# rid 字符串不可变故结果恒同；容量上限防 serve 长跑无界增长（清空仅触发重算）。
+_STR_HASH64_MEMO: Dict[str, int] = {}
+_STR_HASH64_MEMO_CAP = 65536
+
+
 def _stable_str_hash64(value: str) -> int:
+    cached = _STR_HASH64_MEMO.get(value)
+    if cached is not None:
+        return cached
     h = _FNV64_OFFSET_BASIS
     for byte in value.encode("utf-8"):
         h ^= int(byte)
         h = (h * _FNV64_PRIME) & _U64_MASK
-    return h & _U64_MASK
+    h &= _U64_MASK
+    if len(_STR_HASH64_MEMO) >= _STR_HASH64_MEMO_CAP:
+        _STR_HASH64_MEMO.clear()
+    _STR_HASH64_MEMO[value] = h
+    return h
 
 
 def _stable_slot_signature64(
@@ -455,16 +477,19 @@ class LayerState:
         self.sparse_selected_middle_pages[slot_i] = pages_i32
         self.sparse_selected_middle_counts[slot_i] = counts_i32
         self.sparse_request_refresh_generation[slot_i] = int(refresh_generation)
-        _append_selected_ready_trace(
-            {
-                "event": "record_sparse_selected_middle",
-                "slot": slot_i,
-                "refresh_generation": int(refresh_generation),
-                "layer_index": int(getattr(self, "layer_index", -1)),
-                "counts": [int(v) for v in counts_i32.detach().to("cpu").tolist()],
-                "width": int(pages_i32.shape[1]),
-            }
-        )
+        # [F2] 调用点先查门控：trace 关闭（生产默认）时省掉 dict 构造，尤其是
+        # counts 的 GPU→CPU 同步拷贝（每世代每层一次的流阻塞税）。
+        if _selected_ready_trace_path():
+            _append_selected_ready_trace(
+                {
+                    "event": "record_sparse_selected_middle",
+                    "slot": slot_i,
+                    "refresh_generation": int(refresh_generation),
+                    "layer_index": int(getattr(self, "layer_index", -1)),
+                    "counts": [int(v) for v in counts_i32.detach().to("cpu").tolist()],
+                    "width": int(pages_i32.shape[1]),
+                }
+            )
 
         counts_cpu = [int(v) for v in counts_i32.detach().cpu().tolist()]
         first_count = counts_cpu[0] if counts_cpu else 0
@@ -537,11 +562,22 @@ class LayerState:
         required_slots: int,
         num_kv_heads: int,
         refresh_stream: Optional[torch.cuda.Stream] = None,
+        stride_floor: Optional[int] = None,
     ) -> None:
         """确保 key_norms_arena 可覆盖 required_slots 与 stride_tokens（按需扩容，保留旧数据）。"""
         stride = max(0, int(stride_tokens))
-        if _KEY_NORMS_STRIDE_FLOOR > 0 and stride > 0:
-            stride = max(stride, int(_KEY_NORMS_STRIDE_FLOOR))
+        # [KEY-NORMS-MML-CAP 2026-07-07] floor 语义=一次分配到顶、热路径永不
+        # realloc(防跨流 UAF race)。"顶"由调用方按 max_model_len 对齐值传入
+        # (prebuild 时 authoritative,同 capture arena 的 kv_max_cap 模式)——
+        # ctx 永不超 MML,race 防护语义不变;env 262144 仅兜 MML 未知窗(如
+        # 直调测试),避免 4B 12k 形态 21×/64k 形态 4× 的纯浪费(GB 级)。
+        floor_eff = (
+            int(stride_floor)
+            if stride_floor is not None and int(stride_floor) > 0
+            else int(_KEY_NORMS_STRIDE_FLOOR)
+        )
+        if floor_eff > 0 and stride > 0:
+            stride = max(stride, floor_eff)
         slots = max(0, int(required_slots))
         if stride <= 0 or slots <= 0 or num_kv_heads <= 0:
             return

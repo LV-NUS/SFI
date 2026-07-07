@@ -1489,10 +1489,6 @@ class WaitDeciderMixin:
         if not self._async_refresh_enabled():
             need_wait, reason = False, "async_disabled"
             return need_wait, reason
-        stage = f"{str(path_tag)}_wait_probe" if path_tag else "wait_probe"
-        if _is_stream_capturing_or_raise(stage=stage):
-            need_wait, reason = False, "stream_capturing"
-            return need_wait, reason
 
         ep = int(epoch)
         buf = int(buf_id) % int(_CAPTURE_IN_FLIGHT)
@@ -1503,6 +1499,13 @@ class WaitDeciderMixin:
         # read it directly to skip the per-step RefreshDecision/[]+normalize alloc.
         if not (has_pending or has_blockers):
             need_wait, reason = False, "no_pending_no_blockers"
+            return need_wait, reason
+        # [E9] capturing 探测（CUDA driver API ~1-2µs）后置到零工作早退之后：
+        # 稳态无 pending 的每层调用不再付探测税。capture 中恰逢无 pending 时
+        # 仅 reason 字符串不同（no_pending_no_blockers），need_wait 全路径不变。
+        stage = f"{str(path_tag)}_wait_probe" if path_tag else "wait_probe"
+        if _is_stream_capturing_or_raise(stage=stage):
+            need_wait, reason = False, "stream_capturing"
             return need_wait, reason
 
         flags = 0

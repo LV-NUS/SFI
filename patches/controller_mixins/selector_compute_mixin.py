@@ -3169,85 +3169,29 @@ class SelectorComputeMixin:
                 if 0 <= slot < len(first_state.batch_request_ids):
                     req_id = first_state.batch_request_ids[slot]
                     tracking = self._ensure_request(req_id)
-                    ticket = self._ensure_request_ticket(req_id)
-                    # 异步 refresh：用"计划时刻"的 decode_step 更新 last_decode_refresh_step
+                    # [TP-DET-TRIGGER 2026-07-07] 决策终局已全部提交点化
+                    # (enqueue commit single-writer,决定论):last 推进/trigger
+                    # 计时归零/清票/_was_short_dense 翻转不再发生于 publish——
+                    # publish 时机依赖 GPU writer 完成(per-rank 异步),曾使
+                    # partial/final 分叉把非确定时序注入触发决策 → TP>1 各 rank
+                    # 决策发散 → NCCL 集合发散挂死。此处仅保留:
+                    #   1) slot_req_steps(per-layer state 的 refresh 步标记);
+                    #   2) 读侧终局:全层 ready 且 publish final 时清 scheduled_*
+                    #      = off-rail/dense-consume 路由的解除点(读路由允许
+                    #      per-rank 时序,近似语义;决策路径不再消费该状态)。
                     planned = int(getattr(tracking, "scheduled_decode_refresh_step", -1))
-                    pending_step_latched = (
-                        int(ticket.pending_decode_step)
-                        if ticket.pending_refresh and int(ticket.pending_decode_step) >= 0
-                        else -1
-                    )
                     if planned >= 0:
                         req_req_step = planned
-                    elif pending_step_latched >= 0:
-                        req_req_step = pending_step_latched
                     else:
                         req_req_step = int(tracking.decode_step) if tracking.decode_step is not None else -1
                     slot_req_steps[slot] = req_req_step
-                    # 更新 tracking（只执行一次，不是每个 layer）
-                    tracking.last_refresh_step = self.step_context_epoch
-                    tracking.last_decode_refresh_step = req_req_step
-                    # 同步 trigger 计数器：coalescing 拉入的 request 其 trigger
-                    # 未曾 fire（steps_since_refresh 未归零），导致下一步 trigger
-                    # 再次触发 interval，产生多余的双重 refresh。
-                    if getattr(tracking, "trigger", None) is not None:
-                        tracking.trigger.state.steps_since_refresh = 0
                     all_layers_compact_ready = self._request_compact_ready_all_layers(req_id)
                     publish_final_for_req = _pending_refresh_rebuild_publish_is_final(req_id)
                     if all_layers_compact_ready and publish_final_for_req:
-                        pending_policy = int(
-                            ticket.pending_policy
-                        )
-                        pending_reason_code = int(
-                            ticket.pending_reason_code
-                        )
                         tracking.scheduled_decode_refresh_step = -1
                         tracking.scheduled_refresh_ctrl_step = -1
-                        pending_cleared = self._clear_request_pending_refresh(
-                            request_id=req_id,
-                            ready_compact=True,
-                        ) or bool(pending_cleared)
-                        if (
-                            pending_policy == int(PendingPolicy.FORCE_NOW)
-                            or pending_reason_code
-                            == int(PendingReasonCode.COMPACT_THRESHOLD_CROSSED)
-                        ):
-                            tracking._was_short_dense = False
-                        # [CREDIT-RETIRE 2026-07-07] 原此处对任何 FORCE_NOW+
-                        # SENTENCE 世代完成置 post_bridge_refresh_done=True——
-                        # 不检查是否 post-bridge 追赶世代,普通句世代也发
-                        # credit、吞掉其后的 interval 到点(实测静默主因之一)。
-                        # credit 状态机整机退休;interval 计时由上方
-                        # last_decode_refresh 推进天然重置,无需 credit。
-                    else:
-                        # 仅刷新了部分层时不得提前清 pending；下一步继续强制 dense 并补齐 refresh。
-                        reason_code = int(
-                            ticket.pending_reason_code
-                        )
-                        reason = pending_reason_code_to_text(reason_code)
-                        if reason_code == int(PendingReasonCode.NONE):
-                            reason = "compact_not_ready"
-                        pending_step = int(ticket.pending_decode_step)
-                        if pending_step < 0:
-                            pending_step = int(req_req_step)
-                        if (
-                            int(getattr(tracking, "scheduled_decode_refresh_step", -1)) < 0
-                            and pending_step >= 0
-                        ):
-                            tracking.scheduled_decode_refresh_step = int(pending_step)
-                        if int(getattr(tracking, "scheduled_refresh_ctrl_step", -1)) < 0:
-                            pending_ctrl_step = int(ticket.pending_ctrl_step)
-                            if pending_ctrl_step < 0:
-                                pending_ctrl_step = int(self.step_context_epoch)
-                            tracking.scheduled_refresh_ctrl_step = int(pending_ctrl_step)
-                        self._set_request_pending_refresh(
-                            request_id=req_id,
-                            reason=reason,
-                            decode_step=int(pending_step),
-                            pending_policy=int(
-                                ticket.pending_policy
-                            ),
-                        )
+                        tracking.inflight_reason_code = -1
+                        tracking.inflight_policy = -1
         elif phase != "decode" and first_state is not None:
             # prefill 的 request-facing 提交边界不在 selector tracking。
             # bootstrap_pending / bootstrap_done 统一由 flush 成功后的 finalize boundary

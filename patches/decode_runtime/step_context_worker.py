@@ -62,10 +62,12 @@ _PSC_BSKIP_ASSERT = os.environ.get("VLLM_SPARSE_PSC_BSKIP_ASSERT", "0") == "1"
 _DEFER_BOOTSTRAP_PRODUCER_CACHED = (
     os.environ.get("VLLM_SPARSE_DEFER_BOOTSTRAP_PRODUCER", "0") == "1"
 )
-# SKIP keeps NO default to stay byte-exact with the original
-# os.environ.get(...) == "1" (None on absence).
+# [PERF-05 默认开 2026-07-07] decode-only 步跳过 prefill capture 预约默认启用：
+# decode-only ⇒ 候选恒空（prefill 行才进 candidates），missing_reservation 不注册
+# 进 reservations_by_identity、返回值被调用方丢弃、count_miss=False 计数不漂——
+# 跳过与执行逐位等价（TP_SPEED_AUDIT PERF-05 对抗验证）。显式 =0 恢复旧行为。
 _SKIP_DECODE_PREFILL_RESERVE_CACHED = (
-    os.environ.get("VLLM_SPARSE_SKIP_DECODE_PREFILL_RESERVE") == "1"
+    os.environ.get("VLLM_SPARSE_SKIP_DECODE_PREFILL_RESERVE", "1") != "0"
 )
 
 
@@ -747,14 +749,24 @@ def prepare_step_context_impl(
                             f"threshold crossing pending requires decode_step>=0 for request {rid!r}"
                         )
                     ticket = self._ensure_request_ticket(rid)
+                    # [TP-DET-TRIGGER] 票 commit 后由读侧在飞镜像承载 FORCE_NOW
+                    # 存续(至 publish final);crossing 保护不得因票提前清而重复
+                    # 落票或提前放开。
+                    _inflight_force_now = (
+                        int(getattr(tracking, "inflight_policy", -1))
+                        == int(PendingPolicy.FORCE_NOW)
+                    )
                     if (
-                        (not ticket.pending_refresh)
-                        or ticket.pending_policy
-                        != PendingPolicy.FORCE_NOW
-                        or ticket.pending_decode_step < 0
+                        (not _inflight_force_now)
+                        and (
+                            (not ticket.pending_refresh)
+                            or ticket.pending_policy
+                            != PendingPolicy.FORCE_NOW
+                            or ticket.pending_decode_step < 0
+                        )
                     ):
                         mark_threshold_crossing(ticket=ticket, decode_step=crossing_step)
-                    # crossing 命中后保持 short-dense 保护，直到 refresh ack 真正清票。
+                    # crossing 命中后保持 short-dense 保护，直到世代读侧终局。
                     tracking._was_short_dense = True
                 else:
                     if was_short:
@@ -764,6 +776,9 @@ def prepare_step_context_impl(
                             and ticket.pending_refresh
                             and ticket.pending_policy
                             == PendingPolicy.FORCE_NOW
+                        ) or (
+                            int(getattr(tracking, "inflight_policy", -1))
+                            == int(PendingPolicy.FORCE_NOW)
                         ):
                             tracking._was_short_dense = True
                         else:
@@ -1277,20 +1292,24 @@ def prepare_step_context_impl(
             step_envelope_v2=step_envelope_v2,
         )
     # 清理 prefill 批次（按 step epoch）
+    # [PERF-08] mask 守卫：入队与全部清扫点都同步维护 chunk_mask（入队处有
+    # duplicate 双向断言），mask==0 ⇒ 槽位已全 None，稳态 decode 免 56 次列表写。
     self.step_prefill_epoch = self.step_context_epoch
     for buf_id, bucket in enumerate(self.step_prefill_chunk_payloads):
-        for idx in range(_CAPTURE_CHUNK):
-            bucket[idx] = None
-        self.step_prefill_chunk_mask[buf_id] = 0
+        if self.step_prefill_chunk_mask[buf_id]:
+            for idx in range(_CAPTURE_CHUNK):
+                bucket[idx] = None
+            self.step_prefill_chunk_mask[buf_id] = 0
     # layer dispatch 进度归零（防止上一步残留）
     self.layer_dispatch_epoch = self.step_context_epoch
     self.layer_dispatch_cursor = 0
     self.layer_dispatch_layer_count = len(self.layer_cache_keys)
     self.step_refresh_epoch = self.step_context_epoch
     for buf_id, bucket in enumerate(self.step_refresh_chunk_payloads):
-        for idx in range(_CAPTURE_CHUNK):
-            bucket[idx] = None
-        self.step_refresh_chunk_mask[buf_id] = 0
+        if self.step_refresh_chunk_mask[buf_id]:
+            for idx in range(_CAPTURE_CHUNK):
+                bucket[idx] = None
+            self.step_refresh_chunk_mask[buf_id] = 0
     # ⚠️ 重要：不要在每个 step 开始时清空 capture_layout_ring。
     # 原因：
     # - refresh_stream 异步流水线可能仍在消费上一 step 的 capture buffers；
@@ -1564,7 +1583,7 @@ def prepare_step_context_impl(
     self.reset_prefill_capture_arena_step_metrics()
     if not (
         (
-            (os.environ.get("VLLM_SPARSE_SKIP_DECODE_PREFILL_RESERVE") == "1")
+            (os.environ.get("VLLM_SPARSE_SKIP_DECODE_PREFILL_RESERVE", "1") != "0")
             if _DYNAMIC_ENV
             else _SKIP_DECODE_PREFILL_RESERVE_CACHED
         )

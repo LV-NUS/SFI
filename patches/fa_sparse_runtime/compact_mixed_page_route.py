@@ -14,6 +14,7 @@ from patches.fa3_native.mixed_page_graph_descriptor import (
     ResolverGraphDescriptor,
 )
 from patches.fa3_native.runtime_bridge import validate_mixed_page_resolver_replay
+from patches.sparse_constants import _DYNAMIC_ENV
 from patches.fa_sparse_runtime.compact_mixed_page_overlay import (
     CompactMixedPageOverlay,
 )
@@ -26,17 +27,37 @@ _ROUTE_TRACE_ENV = "VLLM_SPARSE_FA3_ROUTE_TRACE_LOG"
 _OVERLAY_TRACE_ENV = "VLLM_SPARSE_COMPACT_MIXED_PAGE_OVERLAY_TRACE"
 
 
-def _reject_tensor_value(name: str, value: object) -> None:
+def _contains_tensor_value(value: object) -> bool:
+    if isinstance(value, torch.Tensor):
+        return True
+    if isinstance(value, dict):
+        return any(
+            _contains_tensor_value(key) or _contains_tensor_value(item)
+            for key, item in value.items()
+        )
+    if isinstance(value, (list, tuple)):
+        return any(_contains_tensor_value(item) for item in value)
+    return False
+
+
+def _reject_tensor_value_slow(name: str, value: object) -> None:
     if isinstance(value, torch.Tensor):
         raise ValueError(f"{name} must be CPU-owned metadata, not torch.Tensor")
     if isinstance(value, dict):
         for index, (key, item) in enumerate(value.items()):
-            _reject_tensor_value(f"{name}.key[{index}]", key)
-            _reject_tensor_value(f"{name}.value[{index}]", item)
+            _reject_tensor_value_slow(f"{name}.key[{index}]", key)
+            _reject_tensor_value_slow(f"{name}.value[{index}]", item)
         return
     if isinstance(value, (list, tuple)):
         for index, item in enumerate(value):
-            _reject_tensor_value(f"{name}[{index}]", item)
+            _reject_tensor_value_slow(f"{name}[{index}]", item)
+
+
+def _reject_tensor_value(name: str, value: object) -> None:
+    # [E2 残余] f-string 惰性化：成功路径（每 layer 大量元素）零字符串构造，
+    # 仅命中 tensor 时重扫一遍生成与旧实现逐字相同的精确路径报错。
+    if _contains_tensor_value(value):
+        _reject_tensor_value_slow(name, value)
 
 
 def _as_int(name: str, value: object) -> int:
@@ -171,12 +192,24 @@ def _env_enabled(name: str) -> bool:
     return bool(os.environ.get(name, "").strip())
 
 
+# [E5] trace 开关生产默认关且进程内不变：import-time 缓存免每 layer 2 次
+# os.environ.get（~0.4µs/层）；pytest/显式动态档走 live 读（tests 有 monkeypatch）。
+_OVERLAY_TRACE_ENABLED_CACHED = bool(
+    os.environ.get(_OVERLAY_TRACE_ENV, "").strip()
+)
+_ROUTE_TRACE_ENABLED_CACHED = bool(os.environ.get(_ROUTE_TRACE_ENV, "").strip())
+
+
 def _overlay_trace_enabled() -> bool:
-    return _env_enabled(_OVERLAY_TRACE_ENV)
+    if _DYNAMIC_ENV:
+        return _env_enabled(_OVERLAY_TRACE_ENV)
+    return _OVERLAY_TRACE_ENABLED_CACHED
 
 
 def _route_trace_enabled() -> bool:
-    return _env_enabled(_ROUTE_TRACE_ENV)
+    if _DYNAMIC_ENV:
+        return _env_enabled(_ROUTE_TRACE_ENV)
+    return _ROUTE_TRACE_ENABLED_CACHED
 
 
 def _append_trace(step_bound_meta: object, event: dict[str, object]) -> None:
@@ -806,23 +839,25 @@ def run_compact_mixed_page_overlay_route(
     fa_version = _bridge_flash_attn_version(bridge)
     mixed_page_backend = _mixed_page_backend_label(fa_version)
 
-    _append_trace(
-        step_bound_meta,
-        {
-            "route": "compact_mixed_page_overlay",
-            "layer": layer_index,
-            "mode": route_mode,
-            "fa_version": int(fa_version),
-            "backend": mixed_page_backend,
-            "overlay_width": overlay_width,
-            "page_table_rows_rewritten": page_table_rows_rewritten,
-            "length_rows_rewritten": length_rows_rewritten,
-            "page_resolver_kind": int(resolver_kwargs["page_resolver_kind"]),
-            "graph_replay_carriers": bool(
-                resolver_kwargs.get("graph_replay_carriers", False)
-            ),
-        },
-    )
+    # [E5] 调用点先查门控：trace 关闭（生产默认）时省掉每 layer 11 键 dict 构造。
+    if _overlay_trace_enabled():
+        _append_trace(
+            step_bound_meta,
+            {
+                "route": "compact_mixed_page_overlay",
+                "layer": layer_index,
+                "mode": route_mode,
+                "fa_version": int(fa_version),
+                "backend": mixed_page_backend,
+                "overlay_width": overlay_width,
+                "page_table_rows_rewritten": page_table_rows_rewritten,
+                "length_rows_rewritten": length_rows_rewritten,
+                "page_resolver_kind": int(resolver_kwargs["page_resolver_kind"]),
+                "graph_replay_carriers": bool(
+                    resolver_kwargs.get("graph_replay_carriers", False)
+                ),
+            },
+        )
 
     result = bridge.mixed_page_attn_varlen_func(
         q=q,

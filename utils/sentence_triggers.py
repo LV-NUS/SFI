@@ -64,6 +64,16 @@ class RefreshTriggerState:
     awaiting_sentence_start: bool = False
 
 
+# [TP-DET-TRIGGER 2026-07-07] planner 决定论挡板与 token-time trigger 共用的
+# 全局 min_gap 默认(用户设计合同:任意两次 refresh ≥ min_refresh_gap,跨
+# reason)。trigger 缺席时(refresh-on 纯 interval 形态)planner 侧 fallback
+# 到此值,保证挡板不因 sentence 关闭而失效。
+# [MIN-GAP-24 2026-07-07 用户拍板] 16→24:句触发过密意义不大,per-req 触发
+# 均值控制在 16-32 token/世代(4B 实测 gap=16 时 18-26,提到 24 把均值推入
+# 区间上半,直接降 refresh 频率=速度回收的显式口径旋钮,不靠隐式状态机)。
+DEFAULT_MIN_REFRESH_GAP = 24
+
+
 @dataclass
 class RefreshTriggerConfig:
     refresh_interval: int = 256
@@ -72,7 +82,7 @@ class RefreshTriggerConfig:
     pair_end_tokens: Set[Tuple[int, int]] = field(default_factory=lambda: set(DEFAULT_PAIR_ENDERS))
     start_exclude_tokens: Set[int] = field(default_factory=lambda: {198, 271})  # Qwen3: \n=198, \n\n=271
     sentence_cooldown: int = 2  # 触发后跳过的 decode 步数，防止重复触发
-    min_refresh_gap: int = 16  # 相邻刷新之间至少间隔的 decode 步数
+    min_refresh_gap: int = DEFAULT_MIN_REFRESH_GAP  # 相邻刷新之间至少间隔的 decode 步数
     # Trigger policy ablation (Exp #8). "punctuation_tmax" = default (sentence
     # triggers + step-time interval). The others REPLACE the trigger schedule
     # (use refresh_interval as the period N): "fixed_periodic" fires at step%N==0,

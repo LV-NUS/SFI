@@ -830,6 +830,9 @@ def compute_alpha_selection_batched_impl(
                     required_slots=_required_slots,
                     num_kv_heads=_num_kv_heads_int,
                     refresh_stream=self.refresh_stream,
+                    stride_floor=int(
+                        getattr(self, "_key_norms_stride_floor_mml", 0) or 0
+                    ),
                 )
             arena = st.key_norms_arena
             if arena.numel() == 0:
@@ -863,6 +866,9 @@ def compute_alpha_selection_batched_impl(
                     required_slots=_required_slots,
                     num_kv_heads=_num_kv_heads_int,
                     refresh_stream=self.refresh_stream,
+                    stride_floor=int(
+                        getattr(self, "_key_norms_stride_floor_mml", 0) or 0
+                    ),
                 )
             arena = st.key_norms_arena
             if arena.numel() == 0:

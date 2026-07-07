@@ -54,7 +54,7 @@ from patches.refresh_runtime.capture_live_lengths import (
 )
 from patches.cpu_gpu_staging import cached_cpu_tensor_to_device, cached_sequence_to_device
 from utils.selector_key_norms_ext import compute_key_norms_paged_batched_layers_delta_cuda
-from utils.sentence_triggers import RefreshTrigger
+from utils.sentence_triggers import DEFAULT_MIN_REFRESH_GAP, RefreshTrigger
 
 from patches.runtime_contracts import StepSemanticSnapshot
 from patches.runtime_state import StepRuntimeState
@@ -65,8 +65,17 @@ from patches.step_decode_pipeline import (
 from patches.decode_runtime.plan_builder import build_decode_reuse_order_decision
 
 
+# [F2] trace path 进程内不变：import-time 缓存；pytest/显式动态档 live 读
+# （_DYNAMIC_ENV 于下方 sparse_constants 块引入，运行时解析）。
+_SELECTED_READY_TRACE_PATH_CACHED = os.environ.get(
+    "VLLM_SPARSE_SELECTED_READY_TRACE_LOG", ""
+).strip()
+
+
 def _selected_ready_trace_path() -> str:
-    return os.environ.get("VLLM_SPARSE_SELECTED_READY_TRACE_LOG", "").strip()
+    if _DYNAMIC_ENV:
+        return os.environ.get("VLLM_SPARSE_SELECTED_READY_TRACE_LOG", "").strip()
+    return _SELECTED_READY_TRACE_PATH_CACHED
 
 
 def _append_selected_ready_trace(event: dict[str, object]) -> None:
@@ -132,6 +141,7 @@ from patches.layer_state import LayerState
 from patches.sparse_constants import (
     _CAPTURE_CHUNK,
     _CAPTURE_IN_FLIGHT,
+    _DYNAMIC_ENV,
     compact_gen_count,
     _FORCE_COMPACT_OFF_CACHED,
     _FORCE_DENSE_CACHED,
@@ -697,6 +707,9 @@ def _prefill_update_key_norms(
         required_slots=max_slot + 1,
         num_kv_heads=int(num_kv_heads),
         refresh_stream=controller.refresh_stream,
+        stride_floor=int(
+            getattr(controller, "_key_norms_stride_floor_mml", 0) or 0
+        ),
     )
     arena = state.key_norms_arena
     if arena.numel() == 0:
@@ -1015,15 +1028,17 @@ def _cleanup_inactive_slots(state: LayerState, controller: Optional['VLLMSparseC
                 state.compact_pad_zeroed_len[slot] = -1
             # Task 10: cleanup 必须撤销 slot 绑定的 selected truth，避免同一步 slot 复用
             # 继承旧请求的 selected middle / refresh generation。
-            _append_selected_ready_trace(
-                {
-                    "event": "revoke_slot_selected_truth",
-                    "request_id": str(rid),
-                    "slot": int(slot),
-                    "layer_index": int(getattr(state, "layer_index", -1)),
-                    "finished_ids": [str(v) for v in sorted(finished_ids)],
-                }
-            )
+            # [F2] 调用点先查门控：trace 关闭时省掉 sorted+str 列表与 dict 构造。
+            if _selected_ready_trace_path():
+                _append_selected_ready_trace(
+                    {
+                        "event": "revoke_slot_selected_truth",
+                        "request_id": str(rid),
+                        "slot": int(slot),
+                        "layer_index": int(getattr(state, "layer_index", -1)),
+                        "finished_ids": [str(v) for v in sorted(finished_ids)],
+                    }
+                )
             _revoke_slot_selected_truth(state, slot=int(slot))
         if changed:
             # Task 10: cleanup 之后，旧请求的 selected/launch truth 不能继续参与后续 decode route。
@@ -2978,6 +2993,9 @@ class VLLMSparseController(
                 tracking.scheduled_decode_refresh_step = -1
                 tracking.scheduled_refresh_ctrl_step = -1
                 changed = True
+            # [TP-DET-TRIGGER] 读侧在飞镜像随终局清除。
+            tracking.inflight_reason_code = -1
+            tracking.inflight_policy = -1
         return changed
 
     def acquire_global_slot(self, request_id: str) -> int:
@@ -4189,6 +4207,41 @@ class VLLMSparseController(
             # short 阶段仅放行 crossing 的 FORCE_NOW refresh。
             return not _is_threshold_crossing_force_pending(ticket_local)
 
+        def _refresh_gap_blocked(
+            tracking_local: RequestTracking,
+            decode_step_local: int,
+        ) -> bool:
+            # [TP-DET-TRIGGER 2026-07-07] 决定论触发挡板:自上次提交(enqueue
+            # commit 点推进 last_decode_refresh_step,票面计划步)起
+            # min_refresh_gap 步内不触发/不拉入——替代原 inflight(scheduled/
+            # GPU-writer 完成时序)挡板。输入全部 TP-rank 一致(step/提交历史),
+            # 与用户设计合同同构(任意两次 refresh ≥ min_refresh_gap,跨 reason)。
+            trigger_local = getattr(tracking_local, "trigger", None)
+            if trigger_local is not None:
+                gap_local = max(
+                    0,
+                    int(
+                        getattr(
+                            trigger_local.config,
+                            "min_refresh_gap",
+                            DEFAULT_MIN_REFRESH_GAP,
+                        )
+                        or 0
+                    ),
+                )
+            else:
+                # refresh-on(纯 interval)形态 trigger 缺席:挡板不可失效,
+                # fallback 全局默认(lease/coalesce 线依赖它防重复提交)。
+                gap_local = DEFAULT_MIN_REFRESH_GAP
+            if gap_local <= 0 or decode_step_local < 0:
+                return False
+            last_local = int(
+                getattr(tracking_local, "last_decode_refresh_step", -1) or -1
+            )
+            if last_local < 0:
+                return False
+            return (decode_step_local - last_local) < gap_local
+
         def _sentence_intent_covered_by_existing_pending(
             rid_local: str,
             tracking_local: RequestTracking,
@@ -4205,19 +4258,23 @@ class VLLMSparseController(
                 return False
             if int(ticket_local.pending_reason_code) != int(PendingReasonCode.INTERVAL):
                 return False
-            if self._request_compact_ready_all_layers(rid_local):
-                return False
+            # [TP-DET-TRIGGER] 票在提交点即转 consumed,存在的 INTERVAL 票必为
+            # defer 残留(未提交)——sentence 一律并入;原判定读 GPU writer 完成
+            # 态(per-rank 异步,决策禁用)已移除。
             return True
 
         def _has_interval_pending_not_ready(
             rid_local: str,
             ticket_local: RequestIntentTicket,
         ) -> bool:
+            del rid_local
             if not ticket_local.pending_refresh:
                 return False
-            if int(ticket_local.pending_reason_code) != int(PendingReasonCode.INTERVAL):
-                return False
-            return not self._request_compact_ready_all_layers(rid_local)
+            # [TP-DET-TRIGGER] 同上:有 INTERVAL 票(defer 残留)即跳过 coalesce
+            # 拉入,不查 GPU ready。
+            return int(ticket_local.pending_reason_code) == int(
+                PendingReasonCode.INTERVAL
+            )
 
         def _has_sentence_refresh_due_at_target(
             rid_local: str,
@@ -4259,7 +4316,9 @@ class VLLMSparseController(
             )
             if due_step < 0:
                 return -1
-            if not self._request_compact_ready_all_layers(rid_local):
+            # [TP-DET-TRIGGER] 原此处读 GPU writer 完成态作为拉入前置(per-rank
+            # 异步,决策禁用)→ 换决定论 gap 挡板(提交历史):gap 内不拉入。
+            if _refresh_gap_blocked(tracking_local, decode_step_local):
                 return -1
             last_decode_refresh_local = int(
                 getattr(tracking_local, "last_decode_refresh_step", -1)
@@ -4313,34 +4372,10 @@ class VLLMSparseController(
         # (见 sentence intent 落票处注记);gap 归零由世代完成路径
         # (selector_compute_mixin 更新 tracking 时)统一执行。
 
-        def _pending_refresh_covered_by_ready_compact(
-            rid_local: str,
-            tracking_local: RequestTracking,
-            ticket_local: RequestIntentTicket,
-        ) -> bool:
-            if not ticket_local.pending_refresh:
-                return False
-            if (
-                int(ticket_local.pending_reason_code)
-                == int(PendingReasonCode.COMPACT_NOT_READY)
-            ):
-                return self._request_compact_ready_all_layers(rid_local)
-            if (
-                int(ticket_local.pending_reason_code)
-                == int(PendingReasonCode.TRIGGER)
-                and int(getattr(tracking_local, "trigger_intent_decode_step", -1)) < 0
-                and not bool(getattr(tracking_local, "lease_rearm", False))
-            ):
-                return self._request_compact_ready_all_layers(rid_local)
-            pending_step_local = int(ticket_local.pending_decode_step)
-            if pending_step_local < 0:
-                return False
-            last_decode_refresh_local = int(
-                getattr(tracking_local, "last_decode_refresh_step", -1)
-            )
-            if last_decode_refresh_local < pending_step_local:
-                return False
-            return self._request_compact_ready_all_layers(rid_local)
+        # [TP-DET-TRIGGER 2026-07-07] _pending_refresh_covered_by_ready_compact
+        # 已随 covered 清票段整体退休:票在 enqueue commit 点转 consumed,不再
+        # 存在"挂着等 GPU writer 完成"的票形态(其判定读 GPU 完成态,是 TP>1
+        # 决策发散根之一)。
 
         def _pending_rebuild_ticket_decode_step(
             rid_local: str,
@@ -4432,9 +4467,18 @@ class VLLMSparseController(
         ) -> bool:
             if not pending_rebuild_inflight_local:
                 return False
+            # [TP-DET-TRIGGER] 票在 commit 转 consumed;在飞窗的 reason/policy
+            # 由读侧镜像(commit 写/publish final 清)承载——防 torn-read 的
+            # dense 闸不得因票提前清除而失效(4B 实测 illegal address 教训)。
             if ticket_local.pending_refresh:
                 reason_code_local = int(ticket_local.pending_reason_code)
                 policy_local = int(ticket_local.pending_policy)
+            else:
+                reason_code_local = int(
+                    getattr(tracking_local, "inflight_reason_code", -1)
+                )
+                policy_local = int(getattr(tracking_local, "inflight_policy", -1))
+            if reason_code_local >= 0 or policy_local >= 0:
                 if reason_code_local == int(PendingReasonCode.LEASE_REARM):
                     # [DUAL-GEN-L2b] 容量重排可能整体 reset 旧代内容,
                     # 双代不豁免。
@@ -4595,15 +4639,19 @@ class VLLMSparseController(
                         pending_reason_code = int(ticket.pending_reason_code)
 
             # token-time trigger intent 在 step 边界统一落票，避免 token-time 直接写 ticket。
+            # [TP-DET-TRIGGER 2026-07-07] 旧 intent 吸收判定决定论化:原判定
+            # `inflight ∧ scheduled_decode ≥ intent_step`(GPU 完成时序决定
+            # inflight/scheduled 存续,per-rank 异步)→ 等价替换为
+            # `intent_step ≤ last_decode_refresh_step`(last 在提交点=票面计划
+            # 步,与原 scheduled 同值,但推进时刻决定论)。语义不变:已提交世代
+            # 的计划步覆盖了不晚于它的句边界。
+            _intent_step_probe = int(tracking.trigger_intent_decode_step)
             if (
                 (not workload_plan_replay_active)
-                and inflight_refresh
-                and _sentence_intent_covered_by_inflight_refresh(
-                    rid,
-                    tracking,
-                    ticket,
-                    pending_rebuild_inflight,
-                )
+                and _intent_step_probe >= 0
+                and pending_reason_to_code(tracking.trigger_intent_reason or "none")
+                == int(PendingReasonCode.SENTENCE)
+                and last_decode_refresh >= _intent_step_probe
             ):
                 if update_state:
                     self._clear_request_trigger_intent(request_id=rid)
@@ -4613,7 +4661,7 @@ class VLLMSparseController(
                         else "_sentence_trigger_admission_coalesced_inflight_total"
                     )
                     _record_sentence_trigger_admission_coalesced(detail_counter_attr)
-            if (not workload_plan_replay_active) and not inflight_refresh:
+            if not workload_plan_replay_active:
                 intent_step = tracking.trigger_intent_decode_step
                 if intent_step >= 0:
                     if _sentence_intent_covered_by_existing_pending(
@@ -4679,7 +4727,9 @@ class VLLMSparseController(
                         self._clear_request_trigger_intent(request_id=rid)
 
             # lease 异常恢复意图由 planner 统一落票（单写者）：默认 FORCE_NOW。
-            if not inflight_refresh and tracking.lease_rearm:
+            # [TP-DET-TRIGGER] gap 挡板替代 inflight 挡:顺手斩断远端 64k
+            # lease_rearm↔interval 拉锯风暴(gap 内不再重复 rearm 提交)。
+            if (not _refresh_gap_blocked(tracking, decode_step)) and tracking.lease_rearm:
                 lease_step = tracking.lease_rearm_decode_step
                 if lease_step < 0:
                     lease_step = decode_step
@@ -4731,7 +4781,7 @@ class VLLMSparseController(
                     tracking.post_bridge_refresh_due_decode_step = -1
             elif (
                 (not workload_plan_replay_active)
-                and (not inflight_refresh)
+                and (not _refresh_gap_blocked(tracking, decode_step))
                 and post_bridge_due >= 0
                 and decode_step >= post_bridge_due
                 and not ticket.pending_refresh
@@ -4747,54 +4797,14 @@ class VLLMSparseController(
                 if update_state:
                     tracking.post_bridge_refresh_due_decode_step = -1
 
-            # INTERVAL pending 三态处理：
-            # 1) all_layers_compact_ready → 清票；
-            # 2) 部分层未 ready → 保留票但不加入 refresh_set（避免每步重复 refresh），
-            #    同时规范 pending_policy 为 COALESCEABLE；
-            # 3) 非 INTERVAL pending（SENTENCE 等）→ 走 elif 正常 materialize。
+            # [TP-DET-TRIGGER 2026-07-07] 票段决定论化:票在 enqueue commit 点
+            # 即转 consumed(不再挂着等 GPU writer 完成)。此处仍见到票 = defer
+            # 残留(allow_materialize=False 的空转步落票)或本步刚落——一律按
+            # 决定论 gap 挡板决定是否 materialize;原 covered-by-ready-compact
+            # 清票与 INTERVAL not-ready 保票三态(均读 GPU 完成态,per-rank
+            # 异步,TP>1 决策发散根)整段退休。
             if ticket.pending_refresh:
-                if _pending_refresh_covered_by_ready_compact(rid, tracking, ticket):
-                    pending_cleared = _queue_clear_pending_refresh(
-                        request_id=rid,
-                        ready_compact=True,
-                    ) or pending_cleared
-                    ticket = tickets_plan_by_req[rid]
-                    continue
-                pending_reason_code_cur = ticket.pending_reason_code
-                pending_is_interval = (
-                    pending_reason_code_cur == PendingReasonCode.INTERVAL
-                )
-                if pending_is_interval:
-                    all_layers_compact_ready = self._request_compact_ready_all_layers(rid)
-                    if all_layers_compact_ready:
-                        pending_cleared = _queue_clear_pending_refresh(
-                            request_id=rid,
-                            ready_compact=True,
-                        ) or pending_cleared
-                        ticket = tickets_plan_by_req[rid]
-                    else:
-                        req_pending_step = (
-                            ticket.pending_decode_step
-                            if ticket.pending_decode_step >= 0
-                            else decode_step
-                        )
-                        if req_pending_step >= 0 and (
-                            ticket.pending_policy != PendingPolicy.COALESCEABLE
-                            or ticket.pending_decode_step < 0
-                        ):
-                            _queue_set_pending_refresh(
-                                request_id=rid,
-                                reason_code=PendingReasonCode.INTERVAL,
-                                decode_step=req_pending_step,
-                                pending_policy=PendingPolicy.COALESCEABLE,
-                                pending_ctrl_step=(
-                                    ticket.pending_ctrl_step
-                                    if ticket.pending_ctrl_step >= 0
-                                    else self.step_context_epoch
-                                ),
-                            )
-                            ticket = tickets_plan_by_req[rid]
-                elif not inflight_refresh:
+                if not _refresh_gap_blocked(tracking, decode_step):
                     req_pending_step = (
                         ticket.pending_decode_step
                         if ticket.pending_decode_step >= 0
@@ -4849,9 +4859,10 @@ class VLLMSparseController(
                         pending_reason_code = ticket.pending_reason_code
 
             # interval 基于 request 自身的 decode 步数，避免跨 request 污染。
+            # [TP-DET-TRIGGER] inflight 门删除:判定自身(decode_step-last≥
+            # interval,last=提交点票面步)已决定论且蕴含 min_gap(interval≥gap)。
             if (
-                (not inflight_refresh)
-                and (not workload_plan_replay_active)
+                (not workload_plan_replay_active)
                 and interval > 0
                 and decode_step >= 0
                 and (decode_step - last_decode_refresh) >= interval
@@ -4902,11 +4913,12 @@ class VLLMSparseController(
             for rid in request_ids:
                 if rid in refresh_set:
                     continue
-                if inflight_by_req.get(rid, False):
+                tracking = tracking_by_req[rid]
+                # [TP-DET-TRIGGER] inflight 过滤 → 决定论 gap 过滤。
+                if _refresh_gap_blocked(tracking, decode_step_by_req.get(rid, -1)):
                     continue
                 if _is_short_dense_blocked(rid):
                     continue
-                tracking = tracking_by_req[rid]
                 decode_step = int(tracking.decode_step) if tracking.decode_step is not None else -1
                 last_decode_refresh = int(tracking.last_decode_refresh_step) if tracking.last_decode_refresh_step is not None else -1
                 if decode_step < 0 or last_decode_refresh < 0:
@@ -4920,7 +4932,12 @@ class VLLMSparseController(
                 refresh_set.update(
                     rid
                     for rid in request_ids
-                    if (not inflight_by_req.get(rid, False))
+                    if (
+                        not _refresh_gap_blocked(
+                            tracking_by_req[rid],
+                            decode_step_by_req.get(rid, -1),
+                        )
+                    )
                     and (not _is_short_dense_blocked(rid))
                 )
                 coalesced = True
@@ -4960,7 +4977,10 @@ class VLLMSparseController(
             for rid in request_ids:
                 if rid in refresh_set:
                     continue
-                if inflight_by_req.get(rid, False):
+                # [TP-DET-TRIGGER] inflight 过滤 → 决定论 gap 过滤。
+                if _refresh_gap_blocked(
+                    tracking_by_req[rid], decode_step_by_req.get(rid, -1)
+                ):
                     continue
                 if _is_short_dense_blocked(rid):
                     continue
@@ -5061,10 +5081,15 @@ class VLLMSparseController(
                     )
 
         if refresh_set:
+            # [TP-DET-TRIGGER] 终审过滤 inflight → 决定论 gap。
             refresh_set = {
                 rid
                 for rid in refresh_set
-                if (not inflight_by_req.get(rid, False))
+                if (
+                    not _refresh_gap_blocked(
+                        tracking_by_req[rid], decode_step_by_req.get(rid, -1)
+                    )
+                )
                 or (
                     workload_plan_replay_active
                     and rid in replay_forced_refresh_set
@@ -5093,7 +5118,11 @@ class VLLMSparseController(
                 for rid in request_ids
                 if rid in refresh_set
                 and (
-                    (not inflight_by_req.get(rid, False))
+                    (
+                        not _refresh_gap_blocked(
+                            tracking_by_req[rid], decode_step_by_req.get(rid, -1)
+                        )
+                    )
                     or (
                         workload_plan_replay_active
                         and rid in replay_forced_refresh_set

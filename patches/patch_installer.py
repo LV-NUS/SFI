@@ -24,6 +24,7 @@ import atexit
 import json
 import math
 import os
+import sys
 import threading
 import time
 from collections import deque
@@ -232,6 +233,10 @@ _FULL_CUDAGRAPH_REPLAY_CUDA_EVENT_ROWS: List[dict] = []
 _FULL_CUDAGRAPH_REPLAY_CUDA_EVENT_PATH = ""
 _FULL_CUDAGRAPH_REPLAY_CUDA_EVENT_REGISTERED = False
 _FA3_ROUTE_TRACE_LOG_CACHED = os.environ.get("VLLM_SPARSE_FA3_ROUTE_TRACE_LOG", "")
+# [TPX-D5] 裸名 VLLM_FA3_ROUTE_TRACE_LOG（prepare 步长取证）也是进程内不变开关。
+_FA3_ROUTE_TRACE_LOG_RAW_CACHED = bool(
+    str(os.environ.get("VLLM_FA3_ROUTE_TRACE_LOG", "")).strip()
+)
 _BOOTSTRAP_BRIDGE_GRAPH_POLICY_CACHED = os.environ.get(
     "VLLM_SPARSE_BOOTSTRAP_BRIDGE_GRAPH_POLICY",
     "",
@@ -3368,14 +3373,11 @@ def _patch_prepare_inputs() -> None:
 
     _orig_prepare_raw_for_split = GPUModelRunner._prepare_inputs  # type: ignore[attr-defined]
 
+    # [PREP-FWD-SPLIT-RETIRE 2026-07-07] VLLM_SPARSE_PREP_FWD_SPLIT 计时残码整删：
+    # 汇聚字典 _PREP_FWD_SPLIT_US 全仓无定义亦无消费者（开 env 即 NameError），
+    # 关闭时每步白付 1-4 次 os.environ.get——从未生效的观测探针。
     def original_prepare(self, *a, **k):
-        if os.environ.get("VLLM_SPARSE_PREP_FWD_SPLIT") != "1":
-            return _orig_prepare_raw_for_split(self, *a, **k)
-        _t = time.perf_counter()
-        try:
-            return _orig_prepare_raw_for_split(self, *a, **k)
-        finally:
-            _PREP_FWD_SPLIT_US["core"] = (time.perf_counter() - _t) * 1e6
+        return _orig_prepare_raw_for_split(self, *a, **k)
 
     def _sparse_prepare_inputs(self, scheduler_output, num_scheduled_tokens=None):
         controller = _GLOBAL_CONTROLLER or _ensure_controller()
@@ -3507,8 +3509,13 @@ def _patch_prepare_inputs() -> None:
                     _log.warning("Failed to read num_computed_tokens_cpu from input_batch", exc_info=True)
                     raise
 
-                parallel_config = getattr(getattr(self, "vllm_config", None), "parallel_config", None)
-                tp_size = int(getattr(parallel_config, "tensor_parallel_size", 1) or 1)
+                # [TPX-D5] tp_size 是 engine 生命周期常量：首步解析后缓存到 runner，
+                # 免每步双层 getattr 链（同 step_context_worker._cached_tp_size 先例）。
+                tp_size = getattr(self, "_sfi_cached_tp_size", None)
+                if tp_size is None:
+                    parallel_config = getattr(getattr(self, "vllm_config", None), "parallel_config", None)
+                    tp_size = int(getattr(parallel_config, "tensor_parallel_size", 1) or 1)
+                    self._sfi_cached_tp_size = tp_size
                 prompt_array = getattr(self.input_batch, "num_prompt_tokens", None)
                 index_map = getattr(self.input_batch, "req_id_to_index", None)
                 if not isinstance(req_ids, list):
@@ -3562,8 +3569,12 @@ def _patch_prepare_inputs() -> None:
                     # seq_len（=computed + scheduled）用于本步 metadata（同 req_ids 顺序）
                     scheduled = int(num_scheduled_tokens[i]) if i < len(num_scheduled_tokens) else 0
                     seq_lens[i] = computed + scheduled
-                route_trace_enabled = bool(
-                    str(os.environ.get("VLLM_FA3_ROUTE_TRACE_LOG", "")).strip()
+                # [TPX-D5] 取证开关进程内不变：生产走 import-time 缓存，
+                # pytest/显式动态档 live 读。
+                route_trace_enabled = (
+                    bool(str(os.environ.get("VLLM_FA3_ROUTE_TRACE_LOG", "")).strip())
+                    if _DYNAMIC_ENV
+                    else _FA3_ROUTE_TRACE_LOG_RAW_CACHED
                 )
                 if route_trace_enabled:
                     from patches.fa3_native.install import append_fa3_route_trace
@@ -3611,8 +3622,6 @@ def _patch_prepare_inputs() -> None:
                     and prompt_array is not None
                     and num_tokens_no_spec_cpu is not None
                 ):
-                    import numpy as _np
-
                     # 热路径预算（O(1)/请求）：悬挂占位符 ≤ stash 深度(4) 且必然
                     # 聚在已写区尾部（vLLM 每 async 步恰写一个、FIFO 修复恰消一
                     # 个），故只扫 6 元素尾窗；prompt 长度直接查 num_prompt_tokens
@@ -3637,13 +3646,25 @@ def _patch_prepare_inputs() -> None:
                                 "decode unsupported with sparse TP async); rerun "
                                 "with --sync-scheduling"
                             )
+                        # [TPX-D1] 档级一次 numpy 零拷贝视图：torch CPU 标量索引
+                        # ~3.3µs/请求 vs 视图索引 ~0.1µs（event 已就绪后才读，
+                        # 无同步语义变化）。意外形态（非 CPU tensor 等）回退原对象，
+                        # 由既有 per-请求 try 兜底。
+                        try:
+                            _ids_view = (
+                                _ids_cpu.numpy()
+                                if hasattr(_ids_cpu, "numpy")
+                                else _ids_cpu
+                            )
+                        except Exception:
+                            _ids_view = _ids_cpu
                         for _rid, _prev_idx in _prev_map.items():
                             _cur = index_map.get(str(_rid))
                             if _cur is None:
                                 continue
                             _cur = int(_cur)
                             try:
-                                _tok = int(_ids_cpu[int(_prev_idx), 0])
+                                _tok = int(_ids_view[int(_prev_idx), 0])
                             except Exception:
                                 continue
                             if _tok < 0:
@@ -3654,11 +3675,13 @@ def _patch_prepare_inputs() -> None:
                             if _row_end <= _p_len:
                                 continue
                             _lo = _p_len if _row_end - _p_len < 6 else _row_end - 6
-                            _seg = _np.asarray(token_ids_cpu[_cur, _lo:_row_end])
-                            _neg = _np.flatnonzero(_seg < 0)
-                            if _neg.size == 0:
-                                continue  # resume 重建的全实值行：无待修位
-                            token_ids_cpu[_cur, _lo + int(_neg[0])] = _tok
+                            # [TPX-D2] 找最老 -1 槽位首个命中即写：≤6 元素硬界窗，
+                            # 逐标量扫 ~0.5µs vs asarray+flatnonzero 三调度 ~2.4µs；
+                            # 无 -1（resume 重建全实值行）则不写，与旧语义等价。
+                            for _j in range(_lo, _row_end):
+                                if token_ids_cpu[_cur, _j] < 0:
+                                    token_ids_cpu[_cur, _j] = _tok
+                                    break
                         _stash.popleft()
                 # Step-wise bind: always point controller to current input_batch
                 # token source to avoid stale references across steps/engines.
@@ -3702,7 +3725,6 @@ def _patch_prepare_inputs() -> None:
 
                 controller.tp_size = tp_size
 
-                _psc_t = time.perf_counter()
                 controller.prepare_step_context(
                     req_ids=req_ids,
                     num_scheduled_tokens=num_scheduled_tokens,
@@ -3713,8 +3735,6 @@ def _patch_prepare_inputs() -> None:
                     num_computed_tokens=computed_tokens,
                     step_ticket=step_ticket,
                 )
-                if os.environ.get("VLLM_SPARSE_PREP_FWD_SPLIT") == "1":
-                    _PREP_FWD_SPLIT_US["psc"] = (time.perf_counter() - _psc_t) * 1e6
             else:
                 controller.prepare_step_context(
                     req_ids=[],
@@ -3756,14 +3776,11 @@ def _patch_prepare_inputs() -> None:
                     builder0 = None
                     if hasattr(self, "attn_metadata_builders") and self.attn_metadata_builders:
                         builder0 = self.attn_metadata_builders[0]
-                    _mb_t = time.perf_counter()
                     _maybe_build_step_decode_data_from_attn_metadata(
                         controller=controller,
                         attn_metadata=attn_metadata_obj,
                         metadata_builder=builder0,
                     )
-                    if os.environ.get("VLLM_SPARSE_PREP_FWD_SPLIT") == "1":
-                        _PREP_FWD_SPLIT_US["mb"] = (time.perf_counter() - _mb_t) * 1e6
 
                     _update_sparse_native_visible_k_from_current_delta(
                         controller=controller,
@@ -3778,16 +3795,7 @@ def _patch_prepare_inputs() -> None:
                         )
         return result
 
-    def _sparse_prepare_inputs_split(self, *a, **k):
-        if os.environ.get("VLLM_SPARSE_PREP_FWD_SPLIT") != "1":
-            return _sparse_prepare_inputs(self, *a, **k)
-        _t = time.perf_counter()
-        try:
-            return _sparse_prepare_inputs(self, *a, **k)
-        finally:
-            _PREP_FWD_SPLIT_US["total"] = (time.perf_counter() - _t) * 1e6
-
-    GPUModelRunner._prepare_inputs = _sparse_prepare_inputs_split  # type: ignore[assignment]
+    GPUModelRunner._prepare_inputs = _sparse_prepare_inputs  # type: ignore[assignment]
     _ORIGINAL_PREPARE_INPUTS = original_prepare
     _PREPARE_PATCHED = True
 
@@ -3909,6 +3917,12 @@ def _prebuild_capture_buffers(runner, controller) -> None:
     # resident capture_scores/log_f_denoms tensors). Cap first so the window=1 bucket
     # is built at exactly kv_max_bucket (arena head-stride byte-match).
     arena = getattr(controller, "prefill_capture_meta_arena", None)
+    # [KEY-NORMS-MML-CAP] key_norms arena 的 stride 顶=MML 对齐值,与 capture
+    # arena kv_max_cap 同点 authoritative 注入(此处 max_model_len 已知)。
+    try:
+        controller._key_norms_stride_floor_mml = int(kv_max_bucket)
+    except Exception:
+        pass
     if arena is not None:
         try:
             arena.kv_max_cap_bucket = int(kv_max_bucket)
@@ -13978,10 +13992,35 @@ def _patch_flash_attention_forward_and_helpers() -> None:
             v1_flash_attn.flash_attn_varlen_func = sfi_flash_gateway  # type: ignore[assignment]
         if old_fa_utils_flash is not None:
             fa_utils.flash_attn_varlen_func = sfi_flash_gateway  # type: ignore[assignment]
+        # [SM80-SCHED-NONE-FIX 2026-07-07] SM80 上 FA3 AOT scheduler 不存在:
+        # 官方 _vllm_fa3_C 与 vendored so 的 prepare_varlen_num_blocks 均为
+        # SM90-only TU(hopper/flash_prepare_scheduler.cu),SM80 调用即
+        # cudaErrorNoKernelImageForDevice(209)。FULL cudagraph 下 vLLM builder
+        # 在 capture 内首调它 → capture 被毒化 → replay illegal address
+        # (4B bs8x12k 实锤,compute-sanitizer 栈钉死;kind4 双补丁当年按形态
+        # 局部绕过,存在覆盖盲区)。终极语义化修复(单一路径,无兜底):
+        # scheduler_metadata 在 SM80 恒 None → builder 走非 AOT else 分支
+        # (原生完备,kind4 黄金已证数值合法)。三个消费名字空间统一替换,含
+        # backend 模块文件头 from-import 的局部名(绑定早于 patch install,
+        # 仅替换源模块属性够不着——本崩的直接盲区)。
+        def _sm80_get_scheduler_metadata_none(*_args, **_kwargs):
+            return None
+
         if old_fa_utils_scheduler is not None:
-            fa_utils.get_scheduler_metadata = bridge.get_scheduler_metadata  # type: ignore[assignment]
+            fa_utils.get_scheduler_metadata = _sm80_get_scheduler_metadata_none  # type: ignore[assignment]
         if old_v1_scheduler is not None:
-            v1_flash_attn.get_scheduler_metadata = bridge.get_scheduler_metadata  # type: ignore[assignment]
+            v1_flash_attn.get_scheduler_metadata = _sm80_get_scheduler_metadata_none  # type: ignore[assignment]
+        _v1_fa_backend_mod = sys.modules.get("vllm.v1.attention.backends.flash_attn")
+        old_backend_scheduler = getattr(
+            _v1_fa_backend_mod, "get_scheduler_metadata", None
+        )
+        old_backend_varlen = getattr(
+            _v1_fa_backend_mod, "flash_attn_varlen_func", None
+        )
+        if old_backend_scheduler is not None:
+            _v1_fa_backend_mod.get_scheduler_metadata = _sm80_get_scheduler_metadata_none  # type: ignore[union-attr]
+        if old_backend_varlen is not None:
+            _v1_fa_backend_mod.flash_attn_varlen_func = sfi_flash_gateway  # type: ignore[union-attr]
         if old_fa_utils_get_version is not None:
             fa_utils.get_flash_attn_version = native_get_flash_attn_version  # type: ignore[assignment]
         if old_v1_get_version is not None:
@@ -14007,6 +14046,10 @@ def _patch_flash_attention_forward_and_helpers() -> None:
             v1_flash_attn.get_scheduler_metadata = old_v1_scheduler  # type: ignore[assignment]
         if old_v1_get_version is not None:
             v1_flash_attn.get_flash_attn_version = old_v1_get_version  # type: ignore[assignment]
+        if _v1_fa_backend_mod is not None and old_backend_scheduler is not None:
+            _v1_fa_backend_mod.get_scheduler_metadata = old_backend_scheduler  # type: ignore[union-attr]
+        if _v1_fa_backend_mod is not None and old_backend_varlen is not None:
+            _v1_fa_backend_mod.flash_attn_varlen_func = old_backend_varlen  # type: ignore[union-attr]
         if metadata_builder_cls is not None and old_full_cudagraph_supported is not None:
             metadata_builder_cls.full_cudagraph_supported = old_full_cudagraph_supported  # type: ignore[assignment]
         impl_cls.forward = old_forward  # type: ignore[assignment]
