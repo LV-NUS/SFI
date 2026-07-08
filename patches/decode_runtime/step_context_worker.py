@@ -50,9 +50,11 @@ _PERSISTENT_BATCH_ENABLED = os.environ.get("VLLM_SPARSE_PERSISTENT_BATCH", "0") 
 # === VLLM_SPARSE_PSC_BSKIP: steady-step pure-derivation (B) reuse gate ===
 # Skip the 4 pure-derivation B blocks of prepare_step_context_impl on a
 # no-change decode step, reuse cached B outputs, re-stamp currency into the
-# reused dataclasses. All side-effecting A statements still run. Gate OFF by
-# default; OFF => verbatim full build (these reads are a single bool each).
-_PSC_BSKIP_ENABLED = os.environ.get("VLLM_SPARSE_PSC_BSKIP", "0") == "1"
+# reused dataclasses. All side-effecting A statements still run.
+# [PSC-BSKIP 转正 2026-07-08 用户拍板] 影子断言期(batch5)全绿后默认开:
+# 命中即复用;显式 =0 恢复全量构建;ASSERT=1 为影子对照诊断档(全量构建+
+# 逐字段对照)。REUSE 子闸=影子期脚手架,已退休。
+_PSC_BSKIP_ENABLED = os.environ.get("VLLM_SPARSE_PSC_BSKIP", "1") != "0"
 _PSC_BSKIP_ASSERT = os.environ.get("VLLM_SPARSE_PSC_BSKIP_ASSERT", "0") == "1"
 
 # === Phased env cache for OFF-by-default per-step diagnostic reads ===
@@ -952,53 +954,47 @@ def prepare_step_context_impl(
     _psc_bskip_use = False
     _psc_key = None
     if _PSC_BSKIP_ENABLED:
-        try:
-            _psc_rows = tuple(
-                (
-                    bool(is_prefill_by_row_list[_r]),
-                    bool(bootstrap_done_list[_r]) if _r < len(bootstrap_done_list) else False,
-                    bool((self.request_states.get(req_ids_tuple[_r]) or None) is not None
-                         and getattr(self.request_states.get(req_ids_tuple[_r]),
-                                     '_was_short_dense', False)),
-                )
-                for _r in range(num_reqs)
+        # [GUARD-NO-SWALLOW] key 构建全为纯派生;失败=真 bug,不再吞成全量
+        # 构建(影子期脚手架退休)。
+        _psc_rows = tuple(
+            (
+                bool(is_prefill_by_row_list[_r]),
+                bool(bootstrap_done_list[_r]) if _r < len(bootstrap_done_list) else False,
+                bool((self.request_states.get(req_ids_tuple[_r]) or None) is not None
+                     and getattr(self.request_states.get(req_ids_tuple[_r]),
+                                 '_was_short_dense', False)),
             )
-            _psc_key = (
-                req_ids_tuple,
-                _psc_rows,
-                q_lens,
-                tuple(bool(v) for v in refresh_row_mask),
-                tuple(int(v) for v in refresh_mode_by_row),
-                refresh_rows,
-                bool(step_refresh_nonempty),
-                bool(bootstrap_done),
-                force_dense_while_inflight_by_row,
-                refresh_reqs,
-                slot_by_row,
-                int(self._refresh_layer_group_event_idx & 1),
-                getattr(self, '_interval_merge_policy', 'delta1'),
-                tuple(int(_sl) // 8 for _sl in seq_lens_tuple),
-            )
-            _psc_cached = getattr(self, '_psc_bskip_cache', None)
-            # Reuse only when the key matches AND the cached step was a pure
-            # steady decode: no refresh AND no logf capture (=> B's seq-len-
-            # dependent outputs are all empty/zero, so reuse stays exact while
-            # seq_lens grow). See DESIGN NOTE 1.
-            if (
-                _psc_cached is not None
-                and _psc_cached.get('key') == _psc_key
-                and _psc_cached.get('steady_eligible') is True
-            ):
-                _psc_bskip_use = True
-                if _PSC_BSKIP_ASSERT:
-                    _psc_full_build = True
-                elif os.environ.get("VLLM_SPARSE_PSC_BSKIP_REUSE") == "1":
-                    _psc_full_build = False
-                else:
-                    _psc_full_build = not _PSC_BSKIP_ASSERT
-        except Exception:
-            _psc_full_build = True
-            _psc_bskip_use = False
+            for _r in range(num_reqs)
+        )
+        _psc_key = (
+            req_ids_tuple,
+            _psc_rows,
+            q_lens,
+            tuple(bool(v) for v in refresh_row_mask),
+            tuple(int(v) for v in refresh_mode_by_row),
+            refresh_rows,
+            bool(step_refresh_nonempty),
+            bool(bootstrap_done),
+            force_dense_while_inflight_by_row,
+            refresh_reqs,
+            slot_by_row,
+            int(self._refresh_layer_group_event_idx & 1),
+            getattr(self, '_interval_merge_policy', 'delta1'),
+            tuple(int(_sl) // 8 for _sl in seq_lens_tuple),
+        )
+        _psc_cached = getattr(self, '_psc_bskip_cache', None)
+        # Reuse only when the key matches AND the cached step was a pure
+        # steady decode: no refresh AND no logf capture (=> B's seq-len-
+        # dependent outputs are all empty/zero, so reuse stays exact while
+        # seq_lens grow). See DESIGN NOTE 1.
+        if (
+            _psc_cached is not None
+            and _psc_cached.get('key') == _psc_key
+            and _psc_cached.get('steady_eligible') is True
+        ):
+            _psc_bskip_use = True
+            # [PSC-BSKIP 转正] 命中即复用;ASSERT=1 影子档保持全量构建+对照。
+            _psc_full_build = bool(_PSC_BSKIP_ASSERT)
     # === end content-key ===
     if _psc_full_build:
         row_mode_by_row_list = scratch.row_mode_by_row

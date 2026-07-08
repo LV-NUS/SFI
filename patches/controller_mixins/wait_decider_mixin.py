@@ -221,7 +221,6 @@ class WaitDeciderMixin:
             return True
         return not WaitDeciderMixin._bootstrap_producer_publishable_for_bridge(
             tracking=tracking,
-            require_event_query=False,
         )
 
     def _request_bridge_token_budget_remaining(self, rid: str) -> bool:
@@ -242,7 +241,6 @@ class WaitDeciderMixin:
             return True
         return not WaitDeciderMixin._bootstrap_producer_publishable_for_bridge(
             tracking=tracking,
-            require_event_query=False,
         )
 
     def _mark_bridge_decode_metadata_accepted(
@@ -702,41 +700,35 @@ class WaitDeciderMixin:
         return int(required_mask)
 
     @staticmethod
-    def _bootstrap_request_events_ready(*, tracking: object) -> bool:
+    def _bootstrap_request_events_submitted(*, tracking: object) -> bool:
+        """[BOOTSTRAP-PUBLISH-SUBMIT-FINAL] 事件已提交=可发布(提交即终局)。
+
+        原 query() 形态(GPU 完成锚)是 TP-DET 同族发散源:每 rank 完成时刻
+        不同 → publish 步分叉 → 批组成/collective 计划分叉 → NCCL 楔死
+        (32k×TP2×双代 bootstrap 长世代窗实证)。决策只看提交态(rank 不变),
+        内容正确性由发布点设备侧 wait_event 排序承担。
+        """
         pending_events = getattr(tracking, "bootstrap_pending_events", None)
         if pending_events is None:
             return False
         events = tuple(pending_events)
         if not events:
             return False
-        for evt in events:
-            if evt is None:
-                return False
-            if not bool(evt.query()):
-                return False
-        return True
+        return all(evt is not None for evt in events)
 
     @staticmethod
-    def _bootstrap_producer_publishable_for_bridge(
-        *,
-        tracking: object,
-        require_event_query: bool,
-    ) -> bool:
+    def _bootstrap_producer_publishable_for_bridge(*, tracking: object) -> bool:
+        """结构判(无 GPU query):producer 链已提交且 final_event 已发布。
+
+        [SUBMIT-FINAL] require_event_query=True 臂(final_event.query())全树
+        零调用+GPU 完成锚发散源,随根修下线。
+        """
         ready_state = getattr(tracking, "producer_ready_state", None)
         if ready_state is None:
             if getattr(tracking, "deferred_producer_job", None) is not None:
                 return False
             return True
-
-        final_event = getattr(ready_state, "final_event", None)
-        if final_event is None:
-            return False
-        if not bool(require_event_query):
-            return True
-        query = getattr(final_event, "query", None)
-        if not callable(query):
-            return True
-        return bool(query())
+        return getattr(ready_state, "final_event", None) is not None
 
     def _mark_bootstrap_request_ready(
         self,
@@ -750,7 +742,9 @@ class WaitDeciderMixin:
         if commit_log:
             commit_compact_meta = getattr(self, "_commit_compact_meta_log_entries", None)
             if callable(commit_compact_meta):
-                commit_compact_meta(tuple(commit_log))
+                commit_compact_meta(
+                    tuple(commit_log), source=f"bootstrap_ready:{rid}"
+                )
                 commit_log.clear()
         tracking.bootstrap_done = True
         tracking.bootstrap_pending = False
@@ -859,12 +853,14 @@ class WaitDeciderMixin:
         self._bootstrap_pending_request_ids.discard(rid)
 
     def _publish_ready_bootstrap_requests_at_step_boundary(self, *, epoch: int) -> None:
-        """在 step 边界按 request-local completion token 提升真正 ready 的请求。
+        """在 step 边界按"提交即终局"提升 bootstrap 请求(request-wise)。
 
         设计约束：
         - prefill 完成后的 selected-ready 是 request-wise，而不是全局 buf-wise；
-        - 只查询该 request 最后一次 prefill finalize 绑定的 completion token；
-        - 不依赖 selected materialization probe，不做 host-side rebuild。
+        - [BOOTSTRAP-PUBLISH-SUBMIT-FINAL 2026-07-08] 发布决策只看事件已提交
+          (rank 不变,TP-DET 同族合同);内容正确性=发布点主流 wait_event 对
+          producer 事件排序(one-shot graph 路径同语义先例),零 host 同步;
+        - 不依赖 selected materialization probe,不做 host-side rebuild。
         """
         ep = int(epoch)
         if ep < 0 or not self._bootstrap_pending_request_ids:
@@ -889,7 +885,9 @@ class WaitDeciderMixin:
                     "bridge_budget_not_exhausted",
                 )
                 continue
-            if not WaitDeciderMixin._bootstrap_request_events_ready(tracking=tracking):
+            if not WaitDeciderMixin._bootstrap_request_events_submitted(
+                tracking=tracking
+            ):
                 continue
             ready_state = getattr(tracking, "producer_ready_state", None)
             if ready_state is not None:
@@ -905,8 +903,21 @@ class WaitDeciderMixin:
                     raise RuntimeError(
                         "producer ready state is invalid for bootstrap publish"
                     ) from exc
-                if hasattr(ready_state, "event_query_used_for_publish"):
-                    ready_state.event_query_used_for_publish = True
+            # [BOOTSTRAP-PUBLISH-SUBMIT-FINAL] 设备侧排序:主流 wait_event 对
+            # 全部 producer 事件排序,后续消费 kernel(含 graph replay)天然
+            # 后序——publish 不再等 GPU 完成,内容也不可能被读到半成品。
+            if torch.cuda.is_available():
+                if _is_stream_capturing_or_raise(
+                    stage="bootstrap_publish_submit_final"
+                ):
+                    raise RuntimeError(
+                        "bootstrap step-boundary publish entered during CUDA "
+                        "graph capture; device-side ordering cannot be "
+                        "recorded here"
+                    )
+                _publish_stream = torch.cuda.current_stream()
+                for _evt in tuple(tracking.bootstrap_pending_events):
+                    _publish_stream.wait_event(_evt)
             self._mark_bootstrap_request_ready(
                 rid=rid,
                 tracking=tracking,

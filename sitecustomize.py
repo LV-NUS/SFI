@@ -37,6 +37,256 @@ if os.environ.get("VLLM_IGNORE_DUPLICATE_TRANSFORMERS_CONFIGS", "1") == "1":
     except Exception:
         pass
 
+# [WEDGE-FORENSICS 2026-07-08] env 门控诊断钩(铁律允许的诊断期取证工具,
+# 默认关):设 VLLM_SPARSE_FAULTHANDLER_DIR=<dir> 后,每个 python 进程(含
+# vLLM worker)注册 SIGUSR1→faulthandler 全线程栈 dump 到 <dir>/<pid>.stack
+# (追加式,可多次采样),不杀进程——用于 ptrace 被禁机器上的活体楔死取证。
+# [WEDGE-FORENSICS] 姊妹钩:VLLM_SPARSE_STDERR_TEE_DIR=<dir> → 把本进程
+# fd2(stderr,含 C 层/NCCL/device printf/__trap 指纹)dup 到 <dir>/<pid>.err
+# 落盘——bench 管道在楔死强杀时会吞掉 child stderr,此钩保证原发异常必留痕。
+_tee_dir = os.environ.get("VLLM_SPARSE_STDERR_TEE_DIR", "")
+if _tee_dir:
+    os.makedirs(_tee_dir, exist_ok=True)
+    _tee_fd = os.open(
+        os.path.join(_tee_dir, f"{os.getpid()}.err"),
+        os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+        0o644,
+    )
+    # 只重定向 fd2:异常 traceback 与 NCCL/C 层错误走 stderr。fd1(stdout)
+    # 承载 EngineCore↔client 的 route_counters/summary IPC,不能动(dup 走会
+    # 令 gate 恒报 continuous_refresh_reqs_missing)。
+    # [2026-07-08 修] 此前只 open 未 dup2,钩子从未生效(.err 恒 0 字节,
+    # 由此得出的"楔死态无异常"结论作废)。dup2 后 fd2 全量落盘。
+    os.dup2(_tee_fd, 2)
+
+_fh_dir = os.environ.get("VLLM_SPARSE_FAULTHANDLER_DIR", "")
+if _fh_dir:
+    import faulthandler
+    import signal
+
+    os.makedirs(_fh_dir, exist_ok=True)
+    _fh_file = open(
+        os.path.join(_fh_dir, f"{os.getpid()}.stack"), "a", buffering=1
+    )
+    _fh_file.write(f"=== pid={os.getpid()} argv={sys.argv[:3]} ===\n")
+    faulthandler.enable(file=_fh_file, all_threads=True)
+    if hasattr(signal, "SIGUSR1"):
+        faulthandler.register(
+            signal.SIGUSR1, file=_fh_file, all_threads=True, chain=False
+        )
+
+# [WEDGE-FORENSICS 2026-07-08] 三号钩:VLLM_SPARSE_STEP_LEDGER_DIR=<dir> →
+# 每个 vLLM worker 进程写 <dir>/<pid>.ledger 逐步账本(execute_model BEGIN/END/EXC
+# + eager all-reduce 计数器 + cudagraph replay 计数器 + busy_loop 退出/shutdown 行,
+# 行缓冲落盘)。用途:TP 楔死取证——diff 两 rank 账本找首个分叉步;账本 mtime 兼作
+# 活性信号(区分"慢"与"楔死")。同时给 vllm logger 挂 <dir>/<pid>.vllmlog 文件
+# handler:vLLM 默认日志走 stdout(被 bench IPC 管道吞),worker_busy_loop 的
+# "WorkerProc hit an exception."(非 output rank 异常被静默 continue,是 TP 集合
+# 序列 desync 的直接机器)必须留痕。诊断钩默认关,不改任何行为。
+_ledger_dir = os.environ.get("VLLM_SPARSE_STEP_LEDGER_DIR", "")
+if _ledger_dir:
+    try:
+        import json as _sfi_lg_json
+        import logging as _sfi_lg_logging
+        import time as _sfi_lg_time
+        import traceback as _sfi_lg_traceback
+
+        os.makedirs(_ledger_dir, exist_ok=True)
+        _sfi_lg_file = open(
+            os.path.join(_ledger_dir, f"{os.getpid()}.ledger"), "a", buffering=1
+        )
+        _sfi_lg_counters = {"ar_total": 0, "ar_nccl": 0, "cgw_replay": 0, "cgw_other": 0}
+        _sfi_lg_seq = {"n": 0}
+
+        def _sfi_lg_write(payload):
+            payload["ts"] = _sfi_lg_time.time()
+            payload["pid"] = os.getpid()
+            _sfi_lg_file.write(
+                _sfi_lg_json.dumps(payload, sort_keys=True, default=str) + "\n"
+            )
+
+        _sfi_lg_write({"event": "ledger_open", "argv": sys.argv[:3]})
+
+        # vllm logger → 文件 handler(逮 stdout 日志里的吞异常)
+        _sfi_lg_handler = _sfi_lg_logging.FileHandler(
+            os.path.join(_ledger_dir, f"{os.getpid()}.vllmlog")
+        )
+        _sfi_lg_handler.setLevel(_sfi_lg_logging.INFO)
+        _sfi_lg_handler.setFormatter(
+            _sfi_lg_logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+        )
+        _sfi_lg_logging.getLogger("vllm").addHandler(_sfi_lg_handler)
+
+        from vllm.compilation.cuda_graph import CUDAGraphWrapper as _sfi_lg_CGW
+        from vllm.config import CUDAGraphMode as _sfi_lg_CGMode
+        from vllm.distributed.device_communicators.cuda_communicator import (
+            CudaCommunicator as _sfi_lg_CudaComm,
+        )
+        from vllm.distributed.device_communicators.pynccl import (
+            PyNcclCommunicator as _sfi_lg_PyNccl,
+        )
+        from vllm.forward_context import (
+            get_forward_context as _sfi_lg_get_fc,
+            is_forward_context_available as _sfi_lg_fc_avail,
+        )
+        from vllm.v1.executor import multiproc_executor as _sfi_lg_mpe
+        from vllm.v1.worker import worker_base as _sfi_lg_wb
+
+        if not getattr(_sfi_lg_CudaComm.all_reduce, "_sfi_lg_patch", False):
+            _sfi_lg_orig_cc_ar = _sfi_lg_CudaComm.all_reduce
+
+            def _sfi_lg_cc_ar(self, input_):
+                _sfi_lg_counters["ar_total"] += 1
+                return _sfi_lg_orig_cc_ar(self, input_)
+
+            _sfi_lg_cc_ar._sfi_lg_patch = True
+            _sfi_lg_CudaComm.all_reduce = _sfi_lg_cc_ar
+
+        if not getattr(_sfi_lg_PyNccl.all_reduce, "_sfi_lg_patch", False):
+            _sfi_lg_orig_nccl_ar = _sfi_lg_PyNccl.all_reduce
+
+            def _sfi_lg_nccl_ar(self, in_tensor, *args, **kwargs):
+                _sfi_lg_counters["ar_nccl"] += 1
+                return _sfi_lg_orig_nccl_ar(self, in_tensor, *args, **kwargs)
+
+            _sfi_lg_nccl_ar._sfi_lg_patch = True
+            _sfi_lg_PyNccl.all_reduce = _sfi_lg_nccl_ar
+
+        if not getattr(_sfi_lg_CGW.__call__, "_sfi_lg_patch", False):
+            _sfi_lg_orig_cgw_call = _sfi_lg_CGW.__call__
+
+            def _sfi_lg_cgw_call(self, *args, **kwargs):
+                is_replay = False
+                try:
+                    if _sfi_lg_fc_avail():
+                        fc = _sfi_lg_get_fc()
+                        if (
+                            getattr(fc, "cudagraph_runtime_mode", None)
+                            == _sfi_lg_CGMode.FULL
+                            and getattr(self, "runtime_mode", None)
+                            == _sfi_lg_CGMode.FULL
+                        ):
+                            entries = getattr(self, "concrete_cudagraph_entries", {})
+                            bd = getattr(fc, "batch_descriptor", None)
+                            entry = (
+                                entries.get(bd)
+                                if bd is not None and hasattr(entries, "get")
+                                else None
+                            )
+                            is_replay = bool(
+                                entry is not None
+                                and getattr(entry, "cudagraph", None) is not None
+                            )
+                except Exception:
+                    pass
+                _sfi_lg_counters["cgw_replay" if is_replay else "cgw_other"] += 1
+                return _sfi_lg_orig_cgw_call(self, *args, **kwargs)
+
+            _sfi_lg_cgw_call._sfi_lg_patch = True
+            _sfi_lg_CGW.__call__ = _sfi_lg_cgw_call
+
+        if not getattr(_sfi_lg_wb.WorkerWrapperBase.execute_model, "_sfi_lg_patch", False):
+            _sfi_lg_orig_wb_exec = _sfi_lg_wb.WorkerWrapperBase.execute_model
+
+            def _sfi_lg_sched_summary(sched):
+                out = {}
+                try:
+                    v = getattr(sched, "total_num_scheduled_tokens", None)
+                    if v is not None:
+                        out["tokens"] = int(v)
+                    nst = getattr(sched, "num_scheduled_tokens", None)
+                    if isinstance(nst, dict):
+                        out["reqs"] = len(nst)
+                    fin = getattr(sched, "finished_req_ids", None)
+                    if fin is not None:
+                        out["finished"] = len(fin)
+                except Exception:
+                    pass
+                return out
+
+            def _sfi_lg_wb_exec(self, scheduler_output, *args, **kwargs):
+                seq = _sfi_lg_seq["n"]
+                _sfi_lg_seq["n"] += 1
+                rec = {
+                    "event": "exec_begin",
+                    "seq": seq,
+                    "rank": int(getattr(self, "rpc_rank", -1)),
+                }
+                rec.update(_sfi_lg_sched_summary(scheduler_output))
+                rec.update(_sfi_lg_counters)
+                _sfi_lg_write(rec)
+                t0 = _sfi_lg_time.perf_counter_ns()
+                try:
+                    result = _sfi_lg_orig_wb_exec(self, scheduler_output, *args, **kwargs)
+                except BaseException as exc:
+                    rec = {
+                        "event": "exec_exc",
+                        "seq": seq,
+                        "exc_type": type(exc).__name__,
+                        "exc_msg": str(exc)[:2000],
+                        "tb_tail": _sfi_lg_traceback.format_exc()[-4000:],
+                        "dur_us": (_sfi_lg_time.perf_counter_ns() - t0) / 1000.0,
+                    }
+                    rec.update(_sfi_lg_counters)
+                    _sfi_lg_write(rec)
+                    raise
+                rec = {
+                    "event": "exec_end",
+                    "seq": seq,
+                    "dur_us": (_sfi_lg_time.perf_counter_ns() - t0) / 1000.0,
+                    "output_type": type(result).__name__,
+                }
+                rec.update(_sfi_lg_counters)
+                _sfi_lg_write(rec)
+                return result
+
+            _sfi_lg_wb_exec._sfi_lg_patch = True
+            _sfi_lg_wb.WorkerWrapperBase.execute_model = _sfi_lg_wb_exec
+
+        if not getattr(_sfi_lg_mpe.WorkerProc.worker_busy_loop, "_sfi_lg_patch", False):
+            _sfi_lg_orig_busy = _sfi_lg_mpe.WorkerProc.worker_busy_loop
+
+            def _sfi_lg_busy(self):
+                _sfi_lg_write(
+                    {"event": "busy_loop_enter", "rank": int(getattr(self, "rank", -1))}
+                )
+                try:
+                    return _sfi_lg_orig_busy(self)
+                except BaseException as exc:
+                    _sfi_lg_write(
+                        {
+                            "event": "busy_loop_exit",
+                            "rank": int(getattr(self, "rank", -1)),
+                            "exc_type": type(exc).__name__,
+                            "exc_msg": str(exc)[:500],
+                        }
+                    )
+                    raise
+                finally:
+                    _sfi_lg_file.flush()
+
+            _sfi_lg_busy._sfi_lg_patch = True
+            _sfi_lg_mpe.WorkerProc.worker_busy_loop = _sfi_lg_busy
+
+        if not getattr(_sfi_lg_mpe.WorkerProc.shutdown, "_sfi_lg_patch", False):
+            _sfi_lg_orig_wp_shutdown = _sfi_lg_mpe.WorkerProc.shutdown
+
+            def _sfi_lg_wp_shutdown(self):
+                rec = {
+                    "event": "worker_shutdown",
+                    "rank": int(getattr(self, "rank", -1)),
+                }
+                rec.update(_sfi_lg_counters)
+                _sfi_lg_write(rec)
+                return _sfi_lg_orig_wp_shutdown(self)
+
+            _sfi_lg_wp_shutdown._sfi_lg_patch = True
+            _sfi_lg_mpe.WorkerProc.shutdown = _sfi_lg_wp_shutdown
+    except Exception as exc:
+        raise SystemExit(
+            f"sitecustomize step-ledger diagnostic failed: {exc}"
+        ) from exc
+
 site_log_enabled = os.environ.get("VLLM_SPARSE_SITE_LOG", "0") == "1"
 fa4_dense_gateway_requested = (
     os.environ.get("VLLM_SPARSE_FA4_DENSE_GATEWAY") == "1"
@@ -997,8 +1247,17 @@ if os.environ.get("VLLM_GPU_EXECUTE_PHASE_TIMING_LOG"):
                 return
             record.setdefault("pid", int(os.getpid()))
             record.setdefault("ts_ns", int(_sfi_gpu_time.time_ns()))
+            flush_now = False
             with _sfi_gpu_phase_lock:
                 _sfi_gpu_phase_records.append(record)
+                # [2026-07-08] multiproc worker 经 os._exit 退出不跑 atexit,
+                # 纯 atexit flush 在 TP>1 worker 里永远得到空文件(此前只在
+                # in-proc 形态用过)。加尺寸触发批量落盘(~每 512 条一次
+                # append,幅度=几十步一次,不在单步内引入等待)。
+                if len(_sfi_gpu_phase_records) >= 512:
+                    flush_now = True
+            if flush_now:
+                _sfi_gpu_flush()
 
         def _sfi_gpu_flush():
             if not _sfi_gpu_phase_log:

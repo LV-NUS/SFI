@@ -4122,6 +4122,46 @@ class VLLMSparseController(
                     # 世代),使普通句世代后的 interval 到点被静默吞掉——隐式
                     # 状态机横跨 4 文件,出错无法定位,按"兜底下线"方针整机退休。
                     intent_force_now = tracking.trigger_intent_force_now
+                    # [SENTENCE-INTERVAL-SPACING 2026-07-08 用户拍板 v2"冲突的
+                    # 部分要丢弃,refresh 不是无限排队"] 间距冲突的句边界意图
+                    # =当场丢弃(清意图+计数),不顺延不排队:下一个满足间距的
+                    # **真句边界**才触发,interval 陈旧上界仍是兜底节拍。v1 的
+                    # 顺延语义会让旧边界在间距到期补发=节奏钉在间距地板上且
+                    # 票面步陈旧,已按用户口径废弃。注:token-time 句边界意图
+                    # 一律带 force_now=True(=物化优先级,非补票标记),间距闸不
+                    # 豁免 force_now;bridge 追赶票走独立 post_bridge 臂不经
+                    # 此闸;"并入既有 pending"(零新增世代)不受限。输入全为
+                    # 决定论量(步数/提交历史/config),TP-rank 不变。
+                    _sentence_drop = False
+                    if (
+                        (not ticket.pending_refresh)
+                        and intent_reason_code == int(PendingReasonCode.SENTENCE)
+                        and decode_step >= 0
+                        and last_decode_refresh >= 0
+                    ):
+                        _trigger_cfg_local = getattr(tracking, "trigger", None)
+                        _gap_floor = int(
+                            getattr(
+                                getattr(_trigger_cfg_local, "config", None),
+                                "min_refresh_gap",
+                                DEFAULT_MIN_REFRESH_GAP,
+                            )
+                            or 0
+                        )
+                        _sentence_spacing = max(
+                            _gap_floor,
+                            (interval // 2) if interval > 0 else 0,
+                        )
+                        if (
+                            _sentence_spacing > 0
+                            and (decode_step - last_decode_refresh)
+                            < _sentence_spacing
+                        ):
+                            _sentence_drop = True
+                            if update_state:
+                                _record_sentence_trigger_admission_coalesced(
+                                    "_sentence_trigger_admission_dropped_spacing_total"
+                                )
                     if ticket.pending_refresh:
                         pending_step_cur = ticket.pending_decode_step
                         if pending_step_cur < 0:
@@ -4147,7 +4187,21 @@ class VLLMSparseController(
                                 else self.step_context_epoch
                             ),
                         )
-                    else:
+                    elif not _sentence_drop:
+                        # [SENTENCE-INTERVAL-SPACING 2026-07-08 用户拍板"sentence/
+                        # interval 配合 min_gap 不能打架"] 新建 SENTENCE pending
+                        # 的专属间距=max(min_gap, interval//2):此前 intent 入队
+                        # 无间距检查、pending 在全局 gap 到期即物化→句号密集语料
+                        # 下 sentence 以 min_gap 地板节奏开火(12k 实测 126 发/512
+                        # 步≈每 32 步一世代,触发密度×每世代成本=TP>1 倒挂主因),
+                        # 对 acc 无增益。派生间距语义:sentence 世代已在提交点复位
+                        # interval 计时(last_decode_refresh 跨 reason 推进),故
+                        # sentence 只作为"至多把周期刷新提前一倍频"的机会主义
+                        # 刷新;interval 陈旧上界与 min_gap 反爆发地板合同不变。
+                        # 顺延=意图保留不清除(下步自然重评,更新的句边界覆盖旧
+                        # 意图),该 rid 的 interval/lease_rearm 兜底节拍照常;
+                        # FORCE_NOW(bridge 补票)与"并入既有 pending"(零新增世代
+                        # 成本)不受此限。输入全为决定论量,TP-rank 不变。
                         _queue_set_pending_refresh(
                             request_id=rid,
                             reason_code=intent_reason_code,
@@ -4159,7 +4213,10 @@ class VLLMSparseController(
                             ),
                             pending_ctrl_step=self.step_context_epoch,
                         )
-                    ticket = tickets_plan_by_req[rid]
+                    if not _sentence_drop:
+                        ticket = tickets_plan_by_req[rid]
+                    # [SPACING v2] 丢弃与准入一律清意图(丢弃=作废该句边界,
+                    # 无排队;下一个满足间距的真句边界重新置意图)。
                     if update_state:
                         self._clear_request_trigger_intent(request_id=rid)
 

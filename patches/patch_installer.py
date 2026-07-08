@@ -3667,15 +3667,37 @@ def _patch_prepare_inputs() -> None:
                     # 聚在已写区尾部（vLLM 每 async 步恰写一个、FIFO 修复恰消一
                     # 个），故只扫 6 元素尾窗；prompt 长度直接查 num_prompt_tokens
                     # 数组，零每步分配。
-                    while _stash:
+                    # [HARVEST-FIXED-LAG 2026-07-08] 消费"除最新一档外"全部档。
+                    # 原 [TP-DET-HARVEST-COUNT] 把 query→break 改成必消到空,
+                    # rank 无关性正确,但最新档的 D2H 上游=本批 forward+采样:
+                    # async 调度下 step N 的 prepare 与 step N-1 的 GPU 并行,
+                    # 等最新档=把流水线重叠吃成串行(TP2 12k 实测 prepare 空洞
+                    # p50 9.35ms 的主嫌)。改档龄判据:len-1 是 len 的纯函数、
+                    # stash 每 async 步两 rank 锁步各进一档→消费数 rank 无关
+                    # (决定论与必消到空同强);老档事件在上一步墙钟内已完成=
+                    # 稳态零阻塞。语义=修复滞后 1→2 步:evaluate 侧本就按实值
+                    # 前缀喂入(vllm_sparse_patch "实值前缀截断"合同:尾部 -1
+                    # 容忍,水位只推已喂部分),-1 回填 6 元素尾窗容纳 stash 深
+                    # 度 4≥2。query/synchronize 臂保留=正确性护栏(老档理应已
+                    # 完成,GPU 极端落后时正确等待,绝不读半成品缓冲)。
+                    while len(_stash) > 1:
                         _ids_cpu, _ready_evt, _prev_map = _stash[0]
                         if _ready_evt is not None:
-                            try:
-                                _evt_ready = bool(_ready_evt.query())
-                            except Exception:
-                                _evt_ready = True
-                            if not _evt_ready:
-                                break  # 保序：最老一档未就绪则整体推迟到下一步
+                            # [TP-DET-HARVEST-COUNT 2026-07-08] 本步消档数必须
+                            # rank 无关。原 `if not query(): break` 以 per-rank
+                            # 的 D2H 完成态决定喂几个 token：两 rank 完成时刻不同
+                            # → 喂入 token 数分叉 → sentence 触发票落在不同 decode
+                            # 步 → refresh 组成分叉 → TP all_reduce 序列长度分叉 →
+                            # 对端 NCCL 永久 spin 楔死(32k×TP2×双代 blocking 态
+                            # 实证；与 TP-DET-TRIGGER / BOOTSTRAP-PUBLISH-SUBMIT-
+                            # FINAL 同族=决策读了 GPU 完成态)。根修:query-first
+                            # 后必消——未就绪则 host 等(稳态上一步早已完成=query
+                            # 即过零成本),while 恒消到 stash 空=rank 无关的确定
+                            # 终止条件,两 rank 每步喂入 token 前缀逐位相同。
+                            # [GUARD-NO-SWALLOW] query/synchronize 失败自然抛(无
+                            # try),绝不吞成假就绪(=读半成品缓冲=TP 静默错 token)。
+                            if not _ready_evt.query():
+                                _ready_evt.synchronize()
                         if (
                             hasattr(_ids_cpu, "shape")
                             and len(getattr(_ids_cpu, "shape", ())) == 2
@@ -4052,6 +4074,67 @@ def _prebuild_capture_buffers(runner, controller) -> None:
     setattr(controller, "_capture_prebuilt", True)
 
 
+_EXP4_PREFLIGHT_LATCHED = False
+
+
+def _custom_allreduce_is_live(parallel_config: object) -> bool:
+    """True when vLLM custom all-reduce will IPC-register graph buffers at capture end."""
+    try:
+        from vllm.distributed.parallel_state import get_tp_group  # type: ignore[import]
+
+        ca = getattr(get_tp_group(), "ca_comm", None)
+        if ca is None:
+            return False
+        return not bool(getattr(ca, "disabled", False))
+    except Exception:
+        # parallel_state 内省不可用(版本形态差异)时退到配置旗标——方向更严:
+        # 预检宁可多拦(报错给出关 AR 的操作口),不可漏拦撞 capture 收尾的
+        # 隐晦崩溃。
+        return not bool(getattr(parallel_config, "disable_custom_all_reduce", True))
+
+
+def _exp4_capture_alloc_preflight(runner: object) -> None:
+    """[EXP4-RUNTIME-PREFLIGHT] expandable_segments × custom-AR 图注册互斥预检。
+
+    expandable_segments(cuMemMap 后端)分配无 cudaIpcGetMemHandle;vLLM custom
+    all-reduce 在 capture 收尾 register_graph_buffers 按 IPC handle 注册图内
+    AR 缓冲 → TP>1 + custom AR + graph capture + expandable = "invalid
+    argument"(远端 exp4 根因,2026-07-06 本地实证)。脚本层(发布仓
+    run_speed.sh)已默认 TP>1 关 expandable;本预检是随 runtime 走的启动器
+    无关守卫:capture 前 fail-fast 出可操作信息。冷路径:进程内至多完整
+    评估一次(条件均为进程静态)。
+    """
+    global _EXP4_PREFLIGHT_LATCHED
+    if _EXP4_PREFLIGHT_LATCHED:
+        return
+    _EXP4_PREFLIGHT_LATCHED = True
+    vllm_config = getattr(runner, "vllm_config", None)
+    parallel_config = getattr(vllm_config, "parallel_config", None)
+    if parallel_config is None:
+        parallel_config = getattr(runner, "parallel_config", None)
+    tp_size = int(getattr(parallel_config, "tensor_parallel_size", 1) or 1)
+    if tp_size <= 1:
+        return
+    alloc_conf = ",".join(
+        os.environ.get(name, "")
+        for name in ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_ALLOC_CONF")
+    )
+    if "expandable_segments:True" not in alloc_conf:
+        return
+    if not _custom_allreduce_is_live(parallel_config):
+        return
+    raise RuntimeError(
+        "E_EXP4_EXPANDABLE_CUSTOM_AR_CAPTURE: TP>1 + custom all-reduce + CUDA "
+        "graph capture with PYTORCH_(CUDA_)ALLOC_CONF expandable_segments:True. "
+        "cuMemMap-backed allocations expose no cudaIpc handles, so custom-AR "
+        "register_graph_buffers fails with 'invalid argument' at capture end "
+        "(remote exp4 root cause, locally reproduced 2026-07-06). Fix one of: "
+        "unset expandable_segments for TP>1 (release run_speed.sh default), "
+        "disable custom AR (--disable-custom-all-reduce or "
+        "VLLM_SPARSE_FORCE_DISABLE_CUSTOM_AR=1), or run with enforce_eager."
+    )
+
+
 def _patch_dummy_run() -> None:
     global _DUMMY_RUN_PATCHED, _ORIGINAL_DUMMY_RUN
     if _DUMMY_RUN_PATCHED:
@@ -4086,11 +4169,12 @@ def _patch_dummy_run() -> None:
             return original_dummy_run(self, *args, **kwargs)
         previous_depth = int(getattr(controller, "_vllm_dummy_run_depth", 0) or 0)
         setattr(controller, "_vllm_dummy_run_depth", previous_depth + 1)
-        setattr(
-            controller,
-            "_vllm_dummy_run_context",
-            _dummy_run_context_from_call(args, kwargs),
-        )
+        _dummy_ctx = _dummy_run_context_from_call(args, kwargs)
+        setattr(controller, "_vllm_dummy_run_context", _dummy_ctx)
+        # [EXP4-RUNTIME-PREFLIGHT] capture 型 dummy_run 即将录图:在 capture
+        # 开始前拦下 expandable×custom-AR 致命组合(见 helper docstring)。
+        if bool(_dummy_ctx.get("is_graph_capturing")):
+            _exp4_capture_alloc_preflight(self)
         # PHASE-2B de-legacy: latch the real cudagraph mode so steady-state gates
         # engage compact without VLLM_SPARSE_ATTENTION_IN_CUDAGRAPH. Run-level sticky
         # (only ever set True, never cleared) so a later PIECEWISE prefill dummy-run
@@ -7334,11 +7418,6 @@ def _mark_prebound_rrp_full_cudagraph_replay(
             import torch as _war_torch
             if _war_torch.cuda.is_available():
                 _war_torch.cuda.current_stream().wait_event(_war_evt)
-                try:
-                    if _war_sc._RRP_WAR_PROBE_N[0] < 200:
-                        pass
-                except Exception:
-                    pass
 
     _t_state_ns = _full_cudagraph_pre_timing_start(profile_pre_timing)
     if state is None:
@@ -10456,23 +10535,15 @@ def _patch_cuda_graph_wrapper_for_sparse_cudagraph() -> None:
         if _war_armed:
             import torch as _war_torch
             if _war_torch.cuda.is_available():
-                _war_mode = os.environ.get("VLLM_SPARSE_RRP_WAR_FENCE_MODE", "event")
-                if _war_mode == "event":
-                    _evt = _war_sc._RRP_WAR_FENCE_EVT[0]
-                    if _evt is None:
-                        _evt = _war_torch.cuda.Event()
-                        _war_sc._RRP_WAR_FENCE_EVT[0] = _evt
-                    _evt.record(_war_torch.cuda.current_stream())
-                    try:
-                        if _war_sc._RRP_WAR_PROBE_N[0] < 60:
-                            _war_sc._RRP_WAR_PROBE_N[0] += 1
-                            pass
-                    except Exception:
-                        pass
-                elif _war_mode == "stream":
-                    _war_torch.cuda.current_stream().synchronize()
-                else:
-                    _war_torch.cuda.synchronize()
+                # [DEBUG-RUINS-RETIRE 2026-07-08] 调试期三态旋钮
+                # (VLLM_SPARSE_RRP_WAR_FENCE_MODE: stream/device 全同步备用臂)
+                # 与 _RRP_WAR_PROBE_N 探针残渣一并下线:event 单路径已金测,
+                # 备用同步臂=过期无效兜底(全仓零引用零测试)。
+                _evt = _war_sc._RRP_WAR_FENCE_EVT[0]
+                if _evt is None:
+                    _evt = _war_torch.cuda.Event()
+                    _war_sc._RRP_WAR_FENCE_EVT[0] = _evt
+                _evt.record(_war_torch.cuda.current_stream())
         # Cut A: run the deferred writer-ready commit now (post-replay), BEFORE
         # the deferred-replay drain + post-replay enqueue below -- those mutate /
         # coalesce / re-register _pending_refresh_rebuilds, so the commit
@@ -11322,7 +11393,10 @@ def _patch_gpu_ubatch_wrapper_for_sparse_cudagraph() -> None:
     _UBATCH_WRAPPER_PATCHED = True
 
 
-_ASYNC_SAMPLED_STASH_MAX = 4
+# [HARVEST-FIXED-LAG 2026-07-08] 4→5:消费改"留最新一档"后稳态残留 0→1,
+# 同样的"连续 push 无排水窗"容忍度需 +1 补偿(守卫语义不变=修复通道断流即炸)。
+# -1 回填 6 元素尾窗按 6>5 仍覆盖满深度。
+_ASYNC_SAMPLED_STASH_MAX = 5
 _ORIGINAL_SET_ASYNC_SAMPLED_TOKEN_IDS = None
 
 
@@ -11766,6 +11840,73 @@ def _set_unified_attention_mode(mode: str) -> None:
 
 
 
+def _patch_worker_busy_loop_tp_exception_failfast() -> None:
+    """[TP-EXC-FAILFAST 2026-07-08] 非 output-rank worker 异常改为大声即死。
+
+    vLLM WorkerProc.worker_busy_loop 对 execute 异常按 output_rank 过滤:
+    非 output rank 只 logger.exception(默认流向 stdout,被 bench IPC 管道
+    吞)后 ``continue``。TP>1 下该 rank 已放弃本步剩余 collectives,对端
+    rank 永久卡在 all_reduce(NCCL kernel 自旋 100%,pynccl 不在 c10d
+    watchdog 覆盖面)——32k×TP2×双代楔死案的"楔死机器"(step-ledger 活体
+    实证:rank1 flip-parity 断言开火被吞→rank0 卡 o_proj AR)。任何单
+    rank 的步内异常在 TP>1 下都不可恢复(集合序列已错位),静默续跑=
+    坏值继续产生;唯一正确形态=异常全文写 stderr 后 os._exit,vLLM 的
+    worker 死亡监测随即终止全家,失败快而可见。output rank 保留原生
+    FAILURE 上报路径(engine 拿得到原始异常,原生即 loud)。
+    忠实复刻 vllm019-cu126 的循环体+单臂改动;与 step-ledger 诊断钩共存
+    时本替换覆盖其 busy_loop 包装(exec_exc/worker_shutdown 账本行不受
+    影响,楔死取证不依赖 busy_loop_exit 行)。
+    """
+    try:
+        from vllm.v1.executor import multiproc_executor as _mpe
+    except Exception:
+        return
+    if getattr(_mpe.WorkerProc.worker_busy_loop, "_sfi_tp_exc_failfast", False):
+        return
+
+    import os as _os
+    import sys as _sys
+    import traceback as _tb
+    from functools import partial as _partial
+
+    import cloudpickle as _cloudpickle
+
+    def worker_busy_loop(self):
+        assert self.rpc_broadcast_mq is not None
+        while True:
+            method, args, kwargs, output_rank = self.rpc_broadcast_mq.dequeue(
+                indefinite=True
+            )
+            try:
+                if isinstance(method, str):
+                    func = getattr(self.worker, method)
+                elif isinstance(method, bytes):
+                    func = _partial(_cloudpickle.loads(method), self.worker)
+                output = func(*args, **kwargs)
+            except Exception as e:
+                if hasattr(e, "add_note"):
+                    e.add_note(_tb.format_exc())
+                _mpe.logger.exception("WorkerProc hit an exception.")
+                if output_rank is None or self.rank == output_rank:
+                    self.handle_output(e)
+                    continue
+                # [TP-EXC-FAILFAST] vLLM 原生此处 continue=静默吞掉。
+                _sys.stderr.write(
+                    "[SFI TP-EXC-FAILFAST] non-output-rank worker exception "
+                    f"(rank={getattr(self, 'rank', '?')}) would be swallowed "
+                    "by vLLM and desync TP collectives; dying loudly instead:\n"
+                    + _tb.format_exc()
+                )
+                _sys.stderr.flush()
+                _os._exit(70)
+
+            if output_rank is None or self.rank == output_rank:
+                self.handle_output(output)
+
+    worker_busy_loop._sfi_tp_exc_failfast = True
+    _mpe.WorkerProc.worker_busy_loop = worker_busy_loop
+
+
 def _install_patch() -> None:
     # [TRITON-LINE-RETIRED 2026-07-07] TRITON_ATTN sparse 线已在 main 下线,
     # 由专门 triton branch 承载;此处为三条安装路径(apply/env/lazy 重入)
@@ -11778,6 +11919,7 @@ def _install_patch() -> None:
             "triton branch. Main is FA3-only (FLASH_ATTN_VLLM_V1). "
             "No fallback."
         )
+    _patch_worker_busy_loop_tp_exception_failfast()
     global _PATCH_INSTALLED
     if _PATCH_INSTALLED:
         _patch_compact_page_residency_core()

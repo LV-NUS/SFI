@@ -61,11 +61,10 @@ def _wait_stage_h2d_evt(
     evt = _cache_get(stage_cache=stage_cache, cache_owner=cache_owner, key=key)
     if evt is None:
         return
-    try:
-        if not evt.query():
-            evt.synchronize()
-    except Exception:
-        pass
+    # [GUARD-NO-SWALLOW] query/synchronize 失败时继续=在 H2D 在飞时覆写
+    # pinned 缓冲（本守卫要防的 WAR 撕裂本身），必须炸。
+    if not evt.query():
+        evt.synchronize()
 
 
 def _record_stage_h2d_evt(
@@ -77,11 +76,10 @@ def _record_stage_h2d_evt(
 ) -> None:
     if device.type != "cuda":
         return
-    try:
-        evt = torch.cuda.Event(enable_timing=False)
-        evt.record(torch.cuda.current_stream(device=device))
-    except Exception:
-        return
+    # [GUARD-NO-SWALLOW] record 失败时静默返回=下次 wait 无事件可等（守卫
+    # 整体失效、无声放行覆写），必须炸。
+    evt = torch.cuda.Event(enable_timing=False)
+    evt.record(torch.cuda.current_stream(device=device))
     _cache_set(stage_cache=stage_cache, cache_owner=cache_owner, key=key, value=evt)
 
 

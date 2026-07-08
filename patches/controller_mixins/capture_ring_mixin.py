@@ -29,6 +29,7 @@ import torch
 
 from patches.buffer_lease_protocol import BufferLease, BufferLeaseRegistry, LeaseKind
 from patches.sparse_constants import _CAPTURE_CHUNK, _CAPTURE_IN_FLIGHT
+from patches.sparse_utils import _is_stream_capturing_or_raise
 
 _log = logging.getLogger(__name__)
 _REBUILD_PTRS_CPU_FREE_MAX_PER_NAME = max(2, 2 * int(_CAPTURE_IN_FLIGHT))
@@ -110,8 +111,9 @@ class CaptureRingMixin:
                 try:
                     ready = bool(pending_event.query())
                 except Exception:
+                    # [GUARD-NO-SWALLOW] 假不就绪=pinned 池永不回收+事件失效被掩盖。
                     _log.warning("rebuild pointer staging event query failed for name=%s", name, exc_info=True)
-                    ready = False
+                    raise
                 if ready:
                     if pending_cpu.is_pinned():
                         self._release_rebuild_ptr_cpu_buffer(
@@ -236,11 +238,9 @@ class CaptureRingMixin:
         # [REBUILD-PTRS-OVERWRITE-WAR-FIX] P1:签名变化原位覆写持久 GPU 指针
         # 数组前,query-first 等 writer dispatch-done(R3 反向序同型)——
         # deferred replay 在另一流可能仍按旧指针数组 gather。稳态零成本。
-        _wait_writer = getattr(
-            self, "_wait_writer_dispatch_done_before_stable_overwrite", None
-        )
-        if callable(_wait_writer):
-            _wait_writer()
+        # [直调] 方法由 SelectorComputeMixin 恒定组合提供;软绑定缺失=守卫
+        # 静默不跑,组合错误必须炸。
+        self._wait_writer_dispatch_done_before_stable_overwrite()
         gpu.copy_(cpu, non_blocking=True)
         gpu.record_stream(stream)
         ready_event = torch.cuda.Event(enable_timing=False)
@@ -607,7 +607,9 @@ class CaptureRingMixin:
                 try:
                     ready = bool(evt.query())
                 except Exception:
-                    ready = False
+                    # [GUARD-NO-SWALLOW] 假不就绪=退休桶永不释放（静默泄漏）。
+                    _log.warning("arena retired-bucket chunk_done_evt.query() failed", exc_info=True)
+                    raise
             if ready:
                 reclaimed += 1  # drop ref -> free (record_stream already gated allocator reuse)
             else:
@@ -623,11 +625,11 @@ class CaptureRingMixin:
         the high-water one always fits), so release them async-safely. Off hot path;
         never runs during graph capture. Keeps the arena bounded to the actual
         high-water (no accumulation)."""
-        try:
-            if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
-                return 0
-        except Exception:
-            pass
+        # [GUARD-NO-SWALLOW] capture 态查询失败若吞掉则会在 capture 内 prune/free。
+        if torch.cuda.is_available() and _is_stream_capturing_or_raise(
+            stage="prune_superseded_arena_buckets"
+        ):
+            return 0
         arena = getattr(self, "prefill_capture_meta_arena", None)
         if arena is None:
             return 0

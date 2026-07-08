@@ -410,7 +410,7 @@ def main(argv: list[str] | None = None) -> int:
         "sample_count_rrp": len(rrp_samples),
         "root_git_revision": _git_revision(REPO_ROOT),
         "latest_sm100_patch_sha256": _sha256(
-            REPO_ROOT / "kernel_patches/sfi_fa4_sm100_cute.patch"
+            REPO_ROOT / "patches/fa4_cute_sm100/upstream_recovery/latest-sm100-cute-compact-recent-current.patch"
         ),
     }
     record.update(device_info)

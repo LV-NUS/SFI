@@ -235,10 +235,20 @@ if _CAPTURE_REDUCE_GROUP > 0 and (_CAPTURE_CHUNK % _CAPTURE_REDUCE_GROUP) != 0:
 # Refresh stream management
 # ---------------------------------------------------------------------------
 # [DUAL-GEN-L2] compact 双代读:重建写备用半区、旧代照读、writer_done 后原子
-# 切代(行不再因 INFLIGHT 退 rail)。默认关=单代现状逐位;开时 lease/arena
-# 容量 ×2(KVB 预算须按 2×lease 复核)。L2a=切代机制(行为逐位等价),
-# L2b=INFLIGHT dense 闸退役(行为变更,黄金重锚定)分级放量。
-_COMPACT_DUAL_GEN_CACHED = os.environ.get("VLLM_SPARSE_COMPACT_DUAL_GEN", "0") == "1"
+# 切代(行不再因 INFLIGHT 退 rail)。开时 lease/arena 容量 ×2(KVB 预算须按
+# 2×lease 复核;发布仓 run_speed.sh 预检公式已 ×gen_count)。
+# [DUAL-GEN 转正 2026-07-08 用户拍板] 默认开:INFLIGHT dense-rail 兜底轨随之
+# 不再被走(4B bs8×12k 同卡单变量:TP1 262.4→299.4 +14.1%/TP2 286.1→331.8
+# +16%,中位步 21.3→12.7ms=dense 轨移除直接形态;07-06"12k 净负"为旧触发语义
+# 账)。曾挡默认的两案处置:
+#   ①双代×TP>1×32k 楔死——**已破案收案**(交接 §10:重绑继承层间错代
+#     read_gen×vLLM 吞非 output-rank 异常;[DUAL-GEN-REBIND-NORMALIZE]+
+#     [TP-EXC-FAILFAST] 根修后 blocking 32k×TP2 ×8=0 楔死/0 parity);
+#   ②双代 ×2 lease 在 32k×TP1 需 KVB≥41GiB=40G 卡容量壁——物理约束非 bug,
+#     标准四档 tier 均已复核可容双代;该形态跑 =0 单代档或加大 KVB,
+#     run_speed 预检公式(×gen_count)会先警。
+# 显式 =0 为单代诊断档。
+_COMPACT_DUAL_GEN_CACHED = os.environ.get("VLLM_SPARSE_COMPACT_DUAL_GEN", "1") != "0"
 
 
 def compact_gen_count() -> int:
@@ -506,8 +516,7 @@ _RRP_GRAPH_DONE_EVTS = {}  # {stream_id: CUDA event} per-stream WAR gate
 # overwrite). Shared between the post-graph RECORD (patch_installer) and the next
 # step's data-build WAIT (metadata_builder) so they need no common object identity.
 _RRP_WAR_FENCE_EVT = [None]     # latest CUDA event recorded after a decode FULL graph
-_RRP_WAR_FENCE_ARMED = [False]
-_RRP_WAR_PROBE_N = [0]  # diag  # whether the fence is armed (bootstrap window only)
+_RRP_WAR_FENCE_ARMED = [False]  # armed only in the bootstrap window
 _ROW_MODE_LOG_F_PREFILL = 2
 _ROW_MODE_LOG_F_REFRESH = 3
 

@@ -74,7 +74,19 @@ fi
 # for other models: layers x kv_heads x head_dim x 2 (K,V) x dtype_bytes.
 KV_TOKEN_BYTES="${KV_TOKEN_BYTES:-$((147456 / TP))}"
 if [[ "${MODE}" == "sparse" ]]; then
-  LEASE_BYTES=$((BS * BLOCKS * 16 * KV_TOKEN_BYTES))
+  # Dual-generation compact read (VLLM_SPARSE_COMPACT_DUAL_GEN=1) leases a
+  # spare half-arena per slot: the runtime reserves slots*blocks*GEN blocks,
+  # so the preflight must count the same factor or it under-estimates the
+  # lease by 2x and green-lights shapes that silently serialize.
+  # Mirror the RUNTIME default (dual-gen PROMOTED default ON 2026-07-08:
+  # the TP>1 32k wedge is fixed at the root — see handoff §10; the 32k TP1
+  # x2-lease capacity wall is a physical constraint, run =0 there or raise
+  # KVB; all four standard tiers hold dual-gen at TP1).
+  GEN_COUNT=2
+  if [[ "${VLLM_SPARSE_COMPACT_DUAL_GEN:-1}" == "0" ]]; then
+    GEN_COUNT=1
+  fi
+  LEASE_BYTES=$((BS * BLOCKS * 16 * KV_TOKEN_BYTES * GEN_COUNT))
   CAP_TOKENS_PER_REQ=$(((KVB - LEASE_BYTES) / (KV_TOKEN_BYTES * BS)))
   NEED_TOKENS_PER_REQ=$((CTX + MAX_NEW))
   if ((CAP_TOKENS_PER_REQ < NEED_TOKENS_PER_REQ)); then
@@ -84,7 +96,7 @@ if [[ "${MODE}" == "sparse" ]]; then
 WARNING: sparse KV pool too small for this shape — expect the vLLM scheduler
 to serialize the batch (decode steps ~2x, decode_tps ~1/2, mid-run prefill
 recompute). The pool must hold full KV + compact-page lease:
-  compact lease      = ${BS} slots x ${BLOCKS} blocks x 16 x ${KV_TOKEN_BYTES} B = ${LEASE_BYTES} B
+  compact lease      = ${BS} slots x ${BLOCKS} blocks x 16 x ${KV_TOKEN_BYTES} B x ${GEN_COUNT} gen = ${LEASE_BYTES} B
   cap_tokens_per_req = (KVB - lease) / (${KV_TOKEN_BYTES} x ${BS}) = ${CAP_TOKENS_PER_REQ}
   needed per request = CTX + MAX_NEW = ${NEED_TOKENS_PER_REQ}
 Fix: KVB >= ~${KVB_SUGGEST_GIB} GiB (KVB=$((KVB_SUGGEST_GIB * 1073741824))),

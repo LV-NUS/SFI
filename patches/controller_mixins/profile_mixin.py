@@ -539,7 +539,12 @@ class ProfileMixin:
                         return None
                 return float(evt0.elapsed_time(evt1))
             except Exception:
-                _log.warning("CUDA event elapsed_time failed", exc_info=True)
+                # [WARN-ONCE 2026-07-08] 纯观测计时失败(teardown 期事件对等)
+                # 曾按次带全栈刷屏(单 run 实测 ×108 条 traceback 污染取证
+                # 现场);首例留全栈,后续静默返 None(值语义不变)。
+                if not getattr(self, "_evt_ms_warned_once", False):
+                    self._evt_ms_warned_once = True
+                    _log.warning("CUDA event elapsed_time failed", exc_info=True)
                 return None
 
         def _evt_pairs_ms(

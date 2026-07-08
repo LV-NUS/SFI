@@ -888,9 +888,19 @@ __global__ void gather_compact_kv_into_arena_tiled_kernel(
     int64_t slot_offset_tokens = (int64_t)slot * (int64_t)stride_tokens;
     int max_block = block_table_cols > 0 ? block_table_cols - 1 : 0;
 
-    for (int t = token_start; t < token_end; ++t) {
+    int tile_count = token_end - token_start;
+
+    // [GATHER-TOKEN-PARALLEL T2 2026-07-08] tile 内 (token×vec) 扁平并行:128
+    // 线程从 16 活跃提到满占用,输出逐位等价(每 (t,vi) 单写手)。
+    // 相1:每 token 恰由一个线程译码 pos→(clamp)block_id→src_token 存 shared,
+    // 并由同一线程写 dst_pos(旧代码为 tid==0 串行写;单写手、值不变)。
+    // 容量合同:host launcher TORCH_CHECK 钉死 safe_tile_tokens<=128。
+    constexpr int kMaxSharedTileTokens = 128;
+    __shared__ long long shared_src_token[kMaxSharedTileTokens];
+
+    for (int local_t = tid; local_t < tile_count; local_t += blockDim.x) {
+        int t = token_start + local_t;
         int pos;                              // LOGICAL pos; invalid selected entries fall back to middle order.
-        bool valid = true;
         if (t < s_len) {
             pos = t;
         } else {
@@ -903,39 +913,40 @@ __global__ void gather_compact_kv_into_arena_tiled_kernel(
                 pos = sel;
             }
         }
-        int pos_safe = valid ? pos : 0;
-        int block_idx = pos_safe / page_size;
-        int offset = pos_safe - block_idx * page_size;
+        int block_idx = pos / page_size;
+        int offset = pos - block_idx * page_size;
         if (block_idx > max_block) block_idx = max_block;
         int block_id = btable[row * block_table_stride0 + block_idx * block_table_stride1];
+        shared_src_token[local_t] =
+            (long long)block_id * (long long)page_size + (long long)offset;
         int64_t dst_token = slot_offset_tokens + (int64_t)t;
-        if (valid) {
-            int64_t src_token = (int64_t)block_id * (int64_t)page_size + (int64_t)offset;
-            int64_t src_base = src_token * flat_k_stride0 + (int64_t)head * flat_k_stride1;
-            int64_t src_base_v = src_token * flat_v_stride0 + (int64_t)head * flat_v_stride1;
-            int64_t dst_base = dst_token * compact_k_stride0 + (int64_t)head * compact_k_stride1;
-            int64_t dst_base_v = dst_token * compact_v_stride0 + (int64_t)head * compact_v_stride1;
-            // [GATHER-VEC8] d-loop 8xbf16 向量化:host 实现体 TORCH_CHECK 钉死
-            // head_dim%8==0 && 各 stride2==1 && token/head stride 8 对齐(生产
-            // 恒真,违约 fail-fast 不降级);uint4=8xbf16 单指令搬运。src/dst
-            // base 为 8 的整数倍元素偏移 + tensor base 256B 对齐 → 16B 对齐。
-            {
-                const uint4* src_k_vec = reinterpret_cast<const uint4*>(src_k + src_base);
-                uint4* dst_k_vec = reinterpret_cast<uint4*>(dst_k + dst_base);
-                const uint4* src_v_vec = reinterpret_cast<const uint4*>(src_v + src_base_v);
-                uint4* dst_v_vec = reinterpret_cast<uint4*>(dst_v + dst_base_v);
-                const int vecs = head_dim >> 3;
-                for (int vi = tid; vi < vecs; vi += blockDim.x) {
-                    dst_k_vec[vi] = src_k_vec[vi];
-                    dst_v_vec[vi] = src_v_vec[vi];
-                }
-            }
-        }
-        if (tid == 0) {
-            int64_t pos_idx =
-                (int64_t)head * compact_pos_stride_head + dst_token * compact_pos_stride_tok;
-            dst_pos[pos_idx] = pos;
-        }
+        int64_t pos_idx =
+            (int64_t)head * compact_pos_stride_head + dst_token * compact_pos_stride_tok;
+        dst_pos[pos_idx] = pos;
+    }
+    __syncthreads();
+
+    // 相2:(token×vec) 扁平拷贝,每 (t,vi) 恰由一个线程搬运一次。
+    // [GATHER-VEC8] d-loop 8xbf16 向量化:host 实现体 TORCH_CHECK 钉死
+    // head_dim%8==0 && 各 stride2==1 && token/head stride 8 对齐(生产
+    // 恒真,违约 fail-fast 不降级);uint4=8xbf16 单指令搬运。src/dst
+    // base 为 8 的整数倍元素偏移 + tensor base 256B 对齐 → 16B 对齐。
+    const int vecs = head_dim >> 3;
+    for (int w = tid; w < tile_count * vecs; w += blockDim.x) {
+        int local_t = w / vecs;
+        int vi = w - local_t * vecs;
+        int64_t src_token = (int64_t)shared_src_token[local_t];
+        int64_t dst_token = slot_offset_tokens + (int64_t)(token_start + local_t);
+        int64_t src_base = src_token * flat_k_stride0 + (int64_t)head * flat_k_stride1;
+        int64_t src_base_v = src_token * flat_v_stride0 + (int64_t)head * flat_v_stride1;
+        int64_t dst_base = dst_token * compact_k_stride0 + (int64_t)head * compact_k_stride1;
+        int64_t dst_base_v = dst_token * compact_v_stride0 + (int64_t)head * compact_v_stride1;
+        const uint4* src_k_vec = reinterpret_cast<const uint4*>(src_k + src_base);
+        uint4* dst_k_vec = reinterpret_cast<uint4*>(dst_k + dst_base);
+        const uint4* src_v_vec = reinterpret_cast<const uint4*>(src_v + src_base_v);
+        uint4* dst_v_vec = reinterpret_cast<uint4*>(dst_v + dst_base_v);
+        dst_k_vec[vi] = src_k_vec[vi];
+        dst_v_vec[vi] = src_v_vec[vi];
     }
 }
 
@@ -1052,6 +1063,12 @@ __global__ void gather_compact_kv_into_arena_tiled_autolen_kernel(
     constexpr int kMaxSharedTileTokens = 128;
     __shared__ int shared_pos[kMaxSharedTileTokens];
     __shared__ int shared_copy[kMaxSharedTileTokens];
+    // [GATHER-TOKEN-PARALLEL T2 2026-07-08] tile 内 (token×vec) 扁平并行:128
+    // 线程从 16 活跃提到满占用,输出逐位等价(每 (t,vi) 单写手)。相1 每 token
+    // 单线程完成:pos 译码→(skip_unchanged)读旧 dst_pos→判 copy_token→trap
+    // 校验(仅 copy_token,与旧串行一致)→src_token 译码存 shared→写 dst_pos
+    // 新值(仅 copy_token;旧代码为 tid==0 写,单写手、值与读旧→写新顺序不变)。
+    __shared__ long long shared_src_token[kMaxSharedTileTokens];
     const bool use_shared_tile_decode = tile_count <= kMaxSharedTileTokens;
 
     if (use_shared_tile_decode) {
@@ -1080,9 +1097,71 @@ __global__ void gather_compact_kv_into_arena_tiled_autolen_kernel(
             }
             shared_pos[local_t] = pos;
             shared_copy[local_t] = copy_token ? 1 : 0;
+            if (copy_token) {
+                // [GATHER-OOB-TRAP] pos is a logical token position and MUST point
+                // at an existing token of THIS request: sink pos==t<s_len,
+                // selected pos in [0, recent_start), ordinal fallback < total.
+                // A pos outside [0, seq_len) is a poisoned selected_indices value
+                // (e.g. a leaked masked pick); the old block_idx clamp would
+                // silently read the block-table tail (unallocated garbage block
+                // ids -> wild reads). Fail fast with a fingerprint instead.
+                if (pos < 0 || pos >= seq_len_b) {
+                    printf(
+                        "SFI_GATHER_OOB pos: layer=%d b=%d head=%d t=%d pos=%d seq=%d\n",
+                        layer, b, head, t, pos, seq_len_b);
+                    __trap();
+                }
+                int block_idx = pos / page_size;
+                int offset = pos - block_idx * page_size;
+                if (block_idx > max_block) block_idx = max_block;
+                int block_id = btable[row * block_table_stride0 + block_idx * block_table_stride1];
+                // [GATHER-OOB-TRAP] sanitizer 终审:replay 内本 kernel 的 src 读越
+                // 下界 = btable 该列值为负(-1 负寻址)。毒列坐标 fail-fast 落盘:
+                // row/block_idx/pos/seq 直接指认写侧(republish/materialize/初始态)。
+                if (block_id < 0) {
+                    printf(
+                        "SFI_GATHER_OOB blkid: layer=%d b=%d head=%d t=%d pos=%d "
+                        "seq=%d row=%d bidx=%d blkid=%d\n",
+                        layer, b, head, t, pos, seq_len_b, row, block_idx, block_id);
+                    __trap();
+                }
+                shared_src_token[local_t] =
+                    (long long)block_id * (long long)page_size + (long long)offset;
+                dst_pos[pos_idx] = pos;
+            }
         }
         __syncthreads();
+
+        // 相2:(token×vec) 扁平拷贝,skip 的 token 整体跳过;每 (t,vi) 恰由
+        // 一个线程搬运一次。
+        // [GATHER-VEC8] d-loop 8xbf16 向量化:host 实现体 TORCH_CHECK 钉死
+        // head_dim%8==0 && 各 stride2==1 && token/head stride 8 对齐(生产
+        // 恒真,违约 fail-fast 不降级);uint4=8xbf16 单指令搬运。src/dst
+        // base 为 8 的整数倍元素偏移 + tensor base 256B 对齐 → 16B 对齐。
+        const int vecs = head_dim >> 3;
+        for (int w = tid; w < tile_count * vecs; w += blockDim.x) {
+            int local_t = w / vecs;
+            if (!shared_copy[local_t]) continue;
+            int vi = w - local_t * vecs;
+            int64_t src_token = (int64_t)shared_src_token[local_t];
+            int64_t dst_token = slot_offset_tokens + (int64_t)(token_start + local_t);
+            int64_t src_base = src_token * flat_k_stride0 + (int64_t)head * flat_k_stride1;
+            int64_t src_base_v = src_token * flat_v_stride0 + (int64_t)head * flat_v_stride1;
+            int64_t dst_base = dst_token * compact_k_stride0 + (int64_t)head * compact_k_stride1;
+            int64_t dst_base_v = dst_token * compact_v_stride0 + (int64_t)head * compact_v_stride1;
+            const uint4* src_k_vec = reinterpret_cast<const uint4*>(src_k + src_base);
+            uint4* dst_k_vec = reinterpret_cast<uint4*>(dst_k + dst_base);
+            const uint4* src_v_vec = reinterpret_cast<const uint4*>(src_v + src_base_v);
+            uint4* dst_v_vec = reinterpret_cast<uint4*>(dst_v + dst_base_v);
+            dst_k_vec[vi] = src_k_vec[vi];
+            dst_v_vec[vi] = src_v_vec[vi];
+        }
+        return;
     }
+
+    // [GATHER-TOKEN-PARALLEL T2 2026-07-08] tile_count > kMaxSharedTileTokens
+    // 的大瓦片路径(生产不可达,host 生产 tile_tokens=16):原串行整段原样保留,
+    // 其内的 use_shared_tile_decode 分支在此恒为 false。
 
     for (int t = token_start; t < token_end; ++t) {
         int pos;
@@ -1396,6 +1475,10 @@ void gather_compact_kv_into_arena_ptrs_tiled(
     const int max_grid_z = 65535;
     const int min_tile_for_grid_z = (active_tokens_i32 + max_grid_z - 1) / max_grid_z;
     const int safe_tile_tokens = std::max<int>(requested_tile_tokens, min_tile_for_grid_z);
+    // [GATHER-TOKEN-PARALLEL T2 2026-07-08] 相1 shared src_token 译码容量合同
+    // (kMaxSharedTileTokens=128):违约 fail-fast,不降级;生产 tile_tokens=16 恒真。
+    TORCH_CHECK(safe_tile_tokens <= 128,
+                "gather tiled: tile_tokens exceeds shared decode cap (128)");
     const int token_tiles = std::max<int>(
         1,
         (active_tokens_i32 + safe_tile_tokens - 1) / safe_tile_tokens);

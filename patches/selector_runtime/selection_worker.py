@@ -483,6 +483,29 @@ def rebuild_compact_slots_batched_layers_from_selection_impl(
     # write_gen 取 first.state(commit 按 pending 全层同批翻代,层间一致)。
     writer_slot_values = slot_list
     if compact_gen_count() > 1:
+        # [DUAL-GEN-REBIND-NORMALIZE 2026-07-08] 楔死案根修(出生点):slot 重绑
+        # (bootstrap)时先把该 slot 的 read_gen 在本批全部层归一为 0,再算写
+        # 偏移。跨 req 生命周期的"部分世代落地"(req 完成→在飞世代部分 chunk
+        # 票已 commit 翻代、余票被 is_latest 正确作废)让层间 read_gen 错开;
+        # 旧 req 退场后该错开无内容语义,但新 req 的 bootstrap 若继承它:写
+        # 偏移取 first.state(下方注释明言依赖"全层同批翻代,层间一致")而
+        # commit 按各层现值翻代→32k×TP2 取证实锤 28/8 chunk 边界错代+parity
+        # 断言单 rank 开火(非 output rank 异常被 vLLM 吞→TP collective
+        # desync 楔死)。重绑=世代计数重启:归一后全层写 half1、commit 翻至
+        # 1,决定论且 rank 无关;首次 bootstrap 全 0=无操作,黄金/双代 12k
+        # 判据零扰动。生命周期内的部分落地(下代按层追平)不经此路,语义照旧。
+        _rebind_slots = set()
+        for _bs in bootstrap_slots_by_layer:
+            if _bs:
+                _rebind_slots.update(int(v) for v in _bs)
+        if _rebind_slots:
+            for _p in payloads:
+                _rg_norm = getattr(_p.state, "compact_read_gen", None)
+                if _rg_norm is None:
+                    continue
+                for _rebind_slot in _rebind_slots:
+                    if 0 <= _rebind_slot < len(_rg_norm):
+                        _rg_norm[_rebind_slot] = 0
         _dg_residency = getattr(first.state, "compact_page_residency", None)
         if _dg_residency is None:
             raise RuntimeError(

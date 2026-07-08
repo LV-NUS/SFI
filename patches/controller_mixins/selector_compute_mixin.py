@@ -79,6 +79,7 @@ from patches.sparse_utils import (
     _align_up_int,
     _get_row_index_tensor_from_cache,
     _get_selector_batch_ext,
+    _is_stream_capturing_or_raise,
 )
 try:
     from vllm.logger import init_logger
@@ -663,18 +664,13 @@ class SelectorComputeMixin:
             cap = 1
         if len(cache) <= cap:
             return
-        try:
-            if bool(torch.cuda.is_current_stream_capturing()):
-                return  # never free during capture; prune on a later eager call
-        except Exception:
-            pass
-        cur = None
-        try:
-            dev = torch.device(device)
-            if dev.type == "cuda":
-                cur = torch.cuda.current_stream(device=dev)
-        except Exception:
-            cur = None
+        # [GUARD-NO-SWALLOW] capture 态查询失败若吞掉则会在 capture 内 free
+        # （本函数要防的事故本身）；流解析失败若吞成 cur=None 则跳过
+        # record_stream=异步 UAF。两者都必须炸。
+        if _is_stream_capturing_or_raise(stage="selector_key_norms_cache_prune"):
+            return  # never free during capture; prune on a later eager call
+        dev = torch.device(device)
+        cur = torch.cuda.current_stream(device=dev) if dev.type == "cuda" else None
         refresh_stream = getattr(self, "refresh_stream", None)
         valid_keys = getattr(self, "_selector_key_norms_all_valid_cache_keys", None)
         for key in list(cache.keys()):
@@ -693,10 +689,9 @@ class SelectorComputeMixin:
                 if cur is not None:
                     old.record_stream(cur)
                 if refresh_stream is not None:
-                    try:
-                        old.record_stream(refresh_stream)
-                    except Exception:
-                        pass
+                    # [GUARD-NO-SWALLOW] refresh_stream 是 selector/writer 异步
+                    # 消费流；record 失败若吞掉=弃旧无延迟释放护栏=跨流 UAF。
+                    old.record_stream(refresh_stream)
             del old
 
     def _selector_key_norms_active_buffer_valid(self) -> bool:
@@ -1195,7 +1190,19 @@ class SelectorComputeMixin:
         writer dispatch 完成。稳态 replay 早已完成=query 即过(零成本);重叠
         窗=当前流 wait_event(设备侧,无 host 阻塞),无 fallback。"""
         evt = getattr(self, "_writer_dispatch_done_evt", None)
-        if evt is not None and not evt.query():
+        if evt is None:
+            return
+        # [R3-CAPTURE-BOUNDARY-ASSERT] stable 载体原位覆写在 graph capture 内
+        # 构造不可达(覆写只发生在 rebuild eager 段;capture 内 query 本身即
+        # 非法)——可执行断言替代论证,给出可定位错误而非 cudaErrorStream
+        # CaptureUnsupported 的隐晦形态。evt 存在即 CUDA 已活跃,查询安全。
+        if _is_stream_capturing_or_raise(stage="writer_stable_overwrite_gate"):
+            raise RuntimeError(
+                "writer stable-carrier overwrite entered during CUDA graph "
+                "capture; dispatch-done gate cannot serialize here "
+                "(unreachable by construction — investigate the capture path)"
+            )
+        if not evt.query():
             torch.cuda.current_stream().wait_event(evt)
 
     def _ensure_writer_stable_row_impl(

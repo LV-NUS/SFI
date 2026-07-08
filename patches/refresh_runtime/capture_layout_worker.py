@@ -18,7 +18,7 @@ from patches.refresh_runtime.capture_live_lengths import (
     refresh_capture_layout_live_lengths,
 )
 from patches.sparse_types import StepCaptureLayout
-from patches.sparse_utils import _align_up_int
+from patches.sparse_utils import _align_up_int, _is_stream_capturing_or_raise
 
 
 
@@ -577,14 +577,26 @@ def get_step_capture_layout_impl(
         # 读旧载体(录制→执行毫秒窗;P0-4 coverage 双源同窗)。复用 wait_decider
         # 现成机制:flags==0 早退 + (epoch,buf,chunk) 去重 + wait_event 纯设备侧,
         # 稳态零开销、每 (buf,step) 至多一次;后续 dispatch 同键调用被去重跳过。
-        _wait_done = getattr(self, "_main_stream_wait_for_chunk_done", None)
-        if callable(_wait_done):
-            _wait_done(
-                buf_id=int(buf_id),
-                device=device,
-                chunk_id=int(chunk_id),
-                epoch=int(step_context.epoch),
+        # [R6-CAPTURE-BOUNDARY-ASSERT] 组成变化分支在 graph capture 内构造不可达
+        # (组成重建只发生在 step-prep eager 段);wait 帮手在 capture 态会静默
+        # return(服务其他合法 capture 调用方),故此处若真在 capture 内走到,
+        # 共享 layout 覆写将失去 chunk_done 门保护——可执行断言替代论证。
+        if device.type == "cuda" and _is_stream_capturing_or_raise(
+            stage="step_prep_composition_change_gate"
+        ):
+            raise RuntimeError(
+                "step-prep composition-change branch entered during CUDA graph "
+                "capture; chunk_done gate cannot protect the shared layout here "
+                "(unreachable by construction — investigate the capture path)"
             )
+        # [直调] 方法由 WaitDeciderMixin 恒定组合提供;软绑定缺失=R6 门静默
+        # 不跑(录制→执行毫秒窗回归),组合错误必须炸。
+        self._main_stream_wait_for_chunk_done(
+            buf_id=int(buf_id),
+            device=device,
+            chunk_id=int(chunk_id),
+            epoch=int(step_context.epoch),
+        )
         layout.epoch = step_context.epoch
         layout.step_handle_id = step_handle_id
         layout.step_handle_generation = step_handle_generation

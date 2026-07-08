@@ -383,7 +383,15 @@ def flush_prefill_batches_impl(
                 self._flush_compact_meta_commit_log_by_buf = commit_logs
             elif len(commit_logs) < target_size:
                 commit_logs.extend([] for _ in range(target_size - len(commit_logs)))
-            commit_logs[int(buf)] = list(flush_compact_meta_commit_log)
+            # [FLUSH-META-LOG-QUEUE 2026-07-08] 槽内容从"单轮(覆写)"改为
+            # "轮队列(追加)"。旧形态下,同 buf 在上一轮尚未被 step-prep 消费
+            # 前再次 stage(环深 2<每世代 3 chunk 的复用节奏下可达)会静默丢
+            # 整轮 slot_meta/pad/翻代提交:单代=旧 kv_len 配新内容的 torn
+            # 世代;双代=部分层永不翻代(楔死案同族毒源,层间 read_gen 错开)。
+            # 不能 merge 成一轮:同层同 slot 双翻会误触 [DUAL-GEN-LAYER-PARITY]
+            # 守卫;消费端按轮序分批 commit,GPU 序由"消费前 wait 最新
+            # chunk_done"覆盖(更早轮同流更早完成)。
+            commit_logs[int(buf)].append(list(flush_compact_meta_commit_log))
 
         lastn1_direct_count = 0
         gt1_reduce_count = 0

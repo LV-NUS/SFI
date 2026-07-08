@@ -1820,6 +1820,8 @@ class RefreshRebuildMixin:
     def _commit_compact_meta_log_entries(
         self,
         commit_log: Sequence[Dict[str, object]],
+        *,
+        source: str = "?",
     ) -> None:
         def _reset_compact_slot_metadata(state: "LayerState", slot: int) -> None:
             if slot < 0 or slot >= state.batch_size:
@@ -1844,6 +1846,38 @@ class RefreshRebuildMixin:
                 int(slot),
             )
 
+        # [DUAL-GEN-LAYER-PARITY] 本 commit 轮的 slot→落代账本(跨层一致性)。
+        self._dual_gen_flip_parity_by_slot = {}
+        # [DUAL-GEN-PARITY-FORENSICS 2026-07-08] commit 轮审计环:每轮记
+        # (来源, 各 entry 的 layer_index+flip_slots)。违例时把近 16 轮历史
+        # +全层 read_gen[slot] 快照带进异常消息,一次定名分叉形态(块状丢轮
+        # =flush 暂存覆写型 / 单层双翻=double-append 型)。纯诊断,健康路径
+        # 仅每 flip 轮一次 O(entries) 追加。
+        _audit_ring = getattr(self, "_dual_gen_commit_audit", None)
+        if _audit_ring is None:
+            from collections import deque
+
+            _audit_ring = deque(maxlen=16)
+            self._dual_gen_commit_audit = _audit_ring
+        _audit_round: Dict[str, object] = {
+            "src": str(source),
+            "n": len(tuple(commit_log)),
+            "entries": [],
+        }
+        _audit_pushed = False
+
+        def _dual_gen_read_gen_table(slot: int) -> str:
+            rows = []
+            for _ck in getattr(self, "layer_cache_keys", ()):  # 层序稳定
+                _st = self.layer_states.get(_ck)
+                if _st is None:
+                    continue
+                _rg = getattr(_st, "compact_read_gen", None)
+                _li = int(getattr(_st, "layer_index", -1))
+                if _rg is not None and 0 <= slot < len(_rg):
+                    rows.append(f"L{_li}:{int(_rg[slot])}")
+            return ",".join(rows)
+
         for entry in tuple(commit_log):
             state = entry["state"]
             if str(entry.get("phase", "")) == "refresh":
@@ -1856,6 +1890,16 @@ class RefreshRebuildMixin:
             # 顺序自洽。关态恒空 tuple=零行为。
             _flip_slots = tuple(entry.get("dual_gen_flip_slots", tuple()))
             if _flip_slots:
+                if not _audit_pushed:
+                    _audit_ring.append(_audit_round)
+                    _audit_pushed = True
+                _audit_round["entries"].append(
+                    (
+                        int(getattr(entry["state"], "layer_index", -1)),
+                        str(entry.get("phase", "")),
+                        tuple(int(s) for s in _flip_slots),
+                    )
+                )
                 from patches.fa_sparse_runtime.compact_recent_alignment import (
                     compact_slot_offset_tokens,
                 )
@@ -1872,13 +1916,37 @@ class RefreshRebuildMixin:
                 _arena_k = state.compact_arena_k
                 _arena_v = state.compact_arena_v
                 _arena_pos = state.compact_arena_pos
+                _seen_flip_slots: set = set()
                 for _raw_slot in _flip_slots:
                     _slot = int(_raw_slot)
                     if _slot < 0 or _slot >= len(state.compact_read_gen):
                         raise RuntimeError(
                             f"dual-gen flip slot {_slot} out of read_gen range"
                         )
+                    # [DUAL-GEN-FLIP-UNIQUE] 同一 commit entry 内 slot 重复
+                    # 翻两次=读回旧半区(静默 stale),必须炸。
+                    if _slot in _seen_flip_slots:
+                        raise RuntimeError(
+                            f"dual-gen flip slot {_slot} duplicated in one "
+                            "commit entry (double flip reads stale half)"
+                        )
+                    _seen_flip_slots.add(_slot)
                     _new_gen = 1 - int(state.compact_read_gen[_slot])
+                    # [DUAL-GEN-LAYER-PARITY] 同一 commit 轮内各层对同 slot 的
+                    # 落代必须一致;层间错代=部分层读旧半区(静默 stale)。
+                    _parity = self._dual_gen_flip_parity_by_slot
+                    _prev_gen = _parity.setdefault(_slot, _new_gen)
+                    if _prev_gen != _new_gen:
+                        raise RuntimeError(
+                            f"dual-gen flip parity violation at slot {_slot}: "
+                            f"layer entries land gen {_prev_gen} vs {_new_gen}; "
+                            f"offending layer_index="
+                            f"{int(getattr(state, 'layer_index', -1))}; "
+                            f"read_gen[slot] by layer: "
+                            f"{_dual_gen_read_gen_table(_slot)}; "
+                            f"recent flip commit rounds (oldest->newest): "
+                            f"{list(_audit_ring)}"
+                        )
                     state.compact_read_gen[_slot] = _new_gen
                     _off = compact_slot_offset_tokens(
                         slot=_slot,
@@ -1922,7 +1990,9 @@ class RefreshRebuildMixin:
         if not commit_log:
             pending.compact_meta_commit_log = None
             return
-        self._commit_compact_meta_log_entries(tuple(commit_log))
+        self._commit_compact_meta_log_entries(
+            tuple(commit_log), source="pending_rebuild"
+        )
         pending.compact_meta_commit_log = None
 
     def _commit_flush_compact_meta_for_buf(self, buf_id: int) -> None:
@@ -1930,12 +2000,19 @@ class RefreshRebuildMixin:
         if not isinstance(commit_logs, list) or not commit_logs:
             return
         buf = int(buf_id) % len(commit_logs)
-        commit_log = commit_logs[buf]
-        if not commit_log:
+        # [FLUSH-META-LOG-QUEUE 2026-07-08] 槽=轮队列(见 flush_worker stage
+        # 侧注释:覆写形态会静默丢整轮 slot_meta/翻代提交)。按 stage 顺序
+        # 逐轮 commit,轮边界保持=parity 守卫语义不变。
+        rounds = commit_logs[buf]
+        if not rounds:
             commit_logs[buf] = []
             return
         commit_logs[buf] = []
-        self._commit_compact_meta_log_entries(tuple(commit_log))
+        for round_idx, commit_log in enumerate(rounds):
+            if commit_log:
+                self._commit_compact_meta_log_entries(
+                    tuple(commit_log), source=f"flush_buf{buf}#{round_idx}"
+                )
 
     # ------------------------------------------------------------------
     # ASYNC_PRODUCER_WRITER_GRAPH (task #9): captured writer-graph dispatcher.

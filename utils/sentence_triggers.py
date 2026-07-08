@@ -161,8 +161,14 @@ class RefreshTrigger:
                 fire = (self._rng.random() < (1.0 / float(n)))
             elif policy == "disabled":
                 fire = (int(step) == 0)
-            else:  # unknown policy -> safe: bootstrap only
-                fire = (int(step) == 0)
+            else:
+                # [GUARD-NO-SWALLOW] 未知策略静默降级成 bootstrap-only 会让
+                # 消融实验带着错拼写跑完并产出错数据;必须炸。
+                raise ValueError(
+                    f"unknown refresh trigger policy {policy!r}; expected one of "
+                    "'punctuation_tmax', 'fixed_periodic', 'random_periodic', "
+                    "'disabled'"
+                )
             reason = policy if fire else "none"
             if fire:
                 state.steps_since_refresh = 0
