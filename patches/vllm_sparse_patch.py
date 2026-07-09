@@ -149,9 +149,6 @@ from patches.sparse_constants import (
     _FORCE_COMPACT_OFF_CACHED,
     _FORCE_DENSE_CACHED,
     _FREE_SLOT_ID,
-    _GATHER_QOS_CACHED,
-    _GATHER_QOS_NUM_STAGES_CACHED,
-    _GATHER_QOS_NUM_WARPS_CACHED,
     _REBUILD_PHYSICAL_BLOCK_SORT_CACHED,
     _REFRESH_MICRO_PROFILE_CACHED,
     _RELEASE_ON_IDLE_CACHED,
@@ -1386,6 +1383,8 @@ class VLLMSparseController(
                     torch.cuda.synchronize()
         if self._pending_refresh_rebuilds:
             for pending in self._pending_refresh_rebuilds:
+                # [SELECTED-OUT-RING] 整批丢弃绕过 clear 漏斗:逐个释放环槽。
+                self._selected_out_ring_release_pending_slot(pending)
                 req_ids = self._normalize_refresh_req_ids(pending.req_ids)
                 if req_ids:
                     self._resolve_refresh_lease(
@@ -1941,9 +1940,6 @@ class VLLMSparseController(
             flush_micro_profile_summary_fn=_flush_micro_profile_summary,
             refresh_profile_pending_cls=_RefreshProfilePending,
             make_selector_fast_signature_fn=_make_selector_fast_signature,
-            gather_qos_cached=bool(_GATHER_QOS_CACHED),
-            gather_qos_num_warps_cached=int(_GATHER_QOS_NUM_WARPS_CACHED),
-            gather_qos_num_stages_cached=int(_GATHER_QOS_NUM_STAGES_CACHED),
             rebuild_physical_block_sort_cached=bool(_REBUILD_PHYSICAL_BLOCK_SORT_CACHED),
         )
 
@@ -2734,6 +2730,9 @@ class VLLMSparseController(
         self._should_refresh_cache_step = -1
         self._should_refresh_cache_nonce = -1
         self._should_refresh_cache.clear()
+        # [SELECTED-OUT-RING] 全量 reset 绕过 clear 漏斗:逐个释放环槽。
+        for _srr_pending in self._pending_refresh_rebuilds:
+            self._selected_out_ring_release_pending_slot(_srr_pending)
         self._pending_refresh_rebuilds = deque()
         self._pending_refresh_rebuild_by_req.clear()
         self._pending_refresh_rebuild_id = 0
@@ -2856,8 +2855,28 @@ class VLLMSparseController(
 
     def _request_compact_ready_all_layers(self, req_id: str) -> bool:
         """Whether request may consume compact buffers on every registered layer."""
+        # [PENDING-FUNNEL-DEBUG 2026-07-09 临时取证探针,破案后拆] 读门 verdict:
+        # False 采样 1/32 记首个失败层(reason),True 必记(稀有转折事件)。
+        _funnel_dbg = os.environ.get("VLLM_SPARSE_PENDING_FUNNEL_DEBUG_LOG", "")
+
+        def _funnel_note(verdict: bool, reason: str) -> bool:
+            if _funnel_dbg:
+                n = getattr(self, "_funnel_ready_probe_n", 0) + 1
+                self._funnel_ready_probe_n = n
+                if verdict or (n % 32 == 1):
+                    try:
+                        with open(_funnel_dbg, "a") as _fh:
+                            _fh.write(
+                                f"ready\treq={req_id}\tverdict={verdict}\t"
+                                f"reason={reason}\t"
+                                f"epoch={int(getattr(self, 'step_context_epoch', -1))}\n"
+                            )
+                    except OSError:
+                        pass
+            return verdict
+
         if _is_free_slot_id(req_id):
-            return False
+            return _funnel_note(False, "free_slot_id")
         tracking = self.request_states.get(req_id)
         if (
             tracking is not None
@@ -2865,20 +2884,27 @@ class VLLMSparseController(
             and bool(getattr(tracking, "bootstrap_bridge_active", False))
             and not bool(getattr(tracking, "bootstrap_done", False))
         ):
-            return False
+            return _funnel_note(False, "bootstrap_bridge_pending")
         if not self.layer_states:
-            return False
+            return _funnel_note(False, "no_layer_states")
         checked_layers = 0
         for state in self.layer_states.values():
             slot = int(state.request_id_to_slot.get(req_id, -1))
             if slot < 0:
-                return False
+                return _funnel_note(
+                    False, f"no_slot@L{int(getattr(state, 'layer_index', -1))}"
+                )
             if slot >= len(state.compact_kv_len):
-                return False
+                return _funnel_note(
+                    False, f"slot_oob@L{int(getattr(state, 'layer_index', -1))}"
+                )
             if int(state.compact_kv_len[slot]) <= 0:
-                return False
+                return _funnel_note(
+                    False,
+                    f"kv_len0@L{int(getattr(state, 'layer_index', -1))}:slot{slot}",
+                )
             checked_layers += 1
-        return checked_layers > 0
+        return _funnel_note(checked_layers > 0, f"ok_layers={checked_layers}")
 
     def record_prompt_tokens(self, request_ids: Iterable[str], prompt_lengths: Iterable[int]) -> None:
         for req_id, length in zip(request_ids, prompt_lengths):
@@ -4673,6 +4699,29 @@ class VLLMSparseController(
                 mode == StepRefreshMode.INFLIGHT
                 and rid in inflight_dense_consume_set
             )
+            # [PENDING-FUNNEL-DEBUG 2026-07-09 临时取证探针,破案后拆] 行判决快照。
+            _funnel_dbg = os.environ.get("VLLM_SPARSE_PENDING_FUNNEL_DEBUG_LOG", "")
+            if _funnel_dbg:
+                _fd_n = getattr(self, "_funnel_plan_probe_n", 0) + 1
+                self._funnel_plan_probe_n = _fd_n
+                if _fd_n % 16 == 1:
+                    try:
+                        _fd_tr = tracking_by_req[rid]
+                        with open(_funnel_dbg, "a") as _fd_fh:
+                            _fd_fh.write(
+                                f"plan\treq={rid}\tmode={mode}\t"
+                                f"inflight={inflight_by_req.get(rid, False)}\t"
+                                f"prinflight={pending_rebuild_inflight_by_req.get(rid, False)}\t"
+                                f"sched_ctrl={int(getattr(_fd_tr, 'scheduled_refresh_ctrl_step', -1))}\t"
+                                f"sched_dec={int(getattr(_fd_tr, 'scheduled_decode_refresh_step', -1))}\t"
+                                f"dense_consume={rid in inflight_dense_consume_set}\t"
+                                f"dg_readable={_dual_gen_inflight_compact_readable(_fd_tr)}\t"
+                                f"tk_pend={bool(tickets_plan_by_req[rid].pending_refresh)}\t"
+                                f"infl_reason={int(getattr(_fd_tr, 'inflight_reason_code', -1))}\t"
+                                f"epoch={self.step_context_epoch}\n"
+                            )
+                    except OSError:
+                        pass
 
         for idx, rid in enumerate(request_ids):
             mode = mode_by_row_list[idx]

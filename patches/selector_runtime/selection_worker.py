@@ -25,6 +25,7 @@ from patches.sparse_constants import (
     _SELECTOR_TOPK_GRAPH_CACHED,  # #13 STAGE-0 captured selector graph (default OFF)
     _WRITER_TOKEN_TILE_CACHED,
 )
+from patches.selector_runtime.selected_out_ring import SelectedOutRing
 from patches.sparse_types import SelectorBatchPayload, continuous_producer_enabled
 
 # [REBUILD-H2D-STAGING 2026-07-05] rebuild 提交路径的三个小张量原用
@@ -649,7 +650,8 @@ def rebuild_compact_slots_batched_layers_from_selection_impl(
         if _row_tensor_layer is None:
             _row_tensor_layer = torch.tensor(payload.row_list, device=device, dtype=torch.int32)
             _row_tensor_by_key[_row_key] = _row_tensor_layer
-        layer_infos.append((payload, has_rebuild, _row_tensor_layer, reset_slot_commits))
+        # info[4]=layer_cache_sig：本层签名只算一次，第二遍 per-layer 校验循环复用。
+        layer_infos.append((payload, has_rebuild, _row_tensor_layer, reset_slot_commits, layer_cache_sig))
 
     if max_len <= 0:
         return _fail_rebuild_contract("max_len_nonpositive")
@@ -757,7 +759,7 @@ def rebuild_compact_slots_batched_layers_from_selection_impl(
     for layer_idx, info in enumerate(layer_infos):
         payload = info[0]  # info[0] = payload
         state = payload.state
-        layer_cache_sig = _layer_cache_signature(payload, state, layer_idx)
+        layer_cache_sig = info[4]  # loop1 已算，复用（同 payload 同 state 同步内不变）
         selected_layer = selected_indices[layer_idx]
         if selected_layer.shape[0] != batch or selected_layer.shape[1] != num_kv_heads:
             return _fail_rebuild_contract("selected_layer_shape_mismatch")
@@ -1162,11 +1164,14 @@ def rebuild_compact_slots_batched_layers_from_selection_impl(
             ext=ext,
             launch_args=writer_launch_args,
             device=device,
+            # [PTR-REPUBLISH-REPLAY-SAFE] pure republish signal (forensics /
+            # telemetry; no longer blocks replay/capture — the graph bakes the
+            # pointer-array BUFFER addresses, contents update in place).
+            pointer_rebuild_miss=bool(pointer_rebuild_miss),
             # #9-KEY v5: unresolved layer identity (-1) would collapse both
-            # layer groups to one key - the collision regime. Treat it as a
-            # miss: eager, never capture/replay under unresolved identity.
-            pointer_rebuild_miss=bool(pointer_rebuild_miss)
-            or (
+            # layer groups to one key - the collision regime. Never
+            # capture/replay under unresolved identity (eager only).
+            key_unresolved=bool(
                 bool(_writer_group_layer_ids)
                 and min(_writer_group_layer_ids) < 0
             ),
@@ -1468,20 +1473,34 @@ def compute_alpha_selection_pipeline_unified_impl(
     slice_end = min(kv_len_total, int(topk_slice_end or kv_len_total))
     if slice_end <= 0:
         slice_end = kv_len_total
+    # [T3-LOG-R-WS-B 2026-07-08] log_r_cache default ON, borrowing ws_b.
+    # OFF meant fused_log_f_prior_kernel recomputed log_r_raw (L2 + positional
+    # prior, full-K logf/expf) THREE more times in passes 2/3/4 — the cost the
+    # cache was built to remove, left off only because its dedicated (M,K) f32
+    # buffer doubled selector scratch. ws_b is run_soft_nms's OUTPUT scratch:
+    # dead while run_log_s runs (log_r_cache's entire lifetime) and overwritten
+    # as pure output afterwards — disjoint lifetimes, zero extra VRAM, zero
+    # alloc. Bitwise-identical numerics: cached reads return the exact f32
+    # pass 1 stored; the recompute branch evaluates the same expression on the
+    # same inputs. Escape: VLLM_SPARSE_SELECTOR_LOGS_CACHE_R=0 (recompute
+    # path). The dedicated-buffer helper (_ensure_selector_log_r_cache_buffer
+    # + realloc-override machinery) is retired with this.
     log_r_cache = None
     _use_log_r_cache = (
-        os.environ.get("VLLM_SPARSE_SELECTOR_LOGS_CACHE_R", "").strip() == "1"
+        os.environ.get("VLLM_SPARSE_SELECTOR_LOGS_CACHE_R", "1").strip() != "0"
         if _DYNAMIC_ENV
         else _SELECTOR_LOGS_CACHE_R_CACHED
     )
-    if _use_log_r_cache:
-        log_r_cache = self._ensure_selector_log_r_cache_buffer(
+    if _use_log_r_cache and _SELECTOR_PIPELINE_WORKSPACE_CACHED:
+        _lrc_ws = self._ensure_selector_pipeline_workspaces(
             layers=layers,
             batch=batch_size,
             num_kv_heads=num_kv_heads,
-            kv_len=kv_len_total,
+            kv_max=kv_len_total,
             device=device,
         )
+        if _lrc_ws is not None:
+            log_r_cache = _lrc_ws[1]
 
     # 缓存 cfg 参数转换结果。cfg(AlphaFairSelectorConfig, slots=True) 构造一次、
     # 全程不原地改字段、不重绑同槽（已 rg 复核：无 .alpha_fair= / 无字段赋值 /
@@ -1649,7 +1668,18 @@ def compute_alpha_selection_pipeline_unified_impl(
                         fixed_shape_topk=_SELECTOR_FIXED_SHAPE_TOPK_CACHED,
                     )
 
-                if _SELECTOR_TOPK_GRAPH_CACHED:
+                # [SELECTED-OUT-RING v2·门控] 只有环槽 run(指针槽内稳定)才进
+                # dispatch;sync/bootstrap 路径用基础单槽 buffer,14/8 层组交替
+                # 即 realloc=key 逐 run 全新——放进 dispatch 只会以 churn 风暴
+                # 冲刷 8-graph 图库并打满 thrash 窗(rv7 keys 取证:64 捕中
+                # 40 发为 sync 路径 churn)。spill run 同理(瞬时指针)。
+                _sel_ring = getattr(self, "_selected_out_ring", None)
+                _topk_ring_run = (
+                    isinstance(_sel_ring, SelectedOutRing)
+                    and _sel_ring.run_open
+                    and not _sel_ring.current_run_spilled
+                )
+                if _SELECTOR_TOPK_GRAPH_CACHED and _topk_ring_run:
                     # Key on shapes + EVERY consumed/produced data_ptr so a moved
                     # storage or a regime change (override realloc, kbucket
                     # clamp-fallback, slice pad, env-flip changing the scan
@@ -1694,62 +1724,121 @@ def compute_alpha_selection_pipeline_unified_impl(
                     from utils.selector_pipeline_ext import pipeline_pre_denom_topk_with_bounds as _ppwb
                     self._cached_pipeline_pre_denom = _ppwb
 
-                selected_indices = _ppwb(
-                    capture_scores,
-                    log_f_denoms,
-                    row_lo,
-                    row_hi,
-                    key_norms_full,
-                    head_sink,
-                    recent_start,
-                    num_kv_heads=num_kv_heads,
-                    num_queries_per_kv=num_queries_per_kv,
-                    k_head=k_head,
-                    alpha=_alpha,
-                    eps=_eps,
-                    gamma=_gamma,
-                    prior_weight_l2=_prior_l2,
-                    prior_weight_pos=_prior_pos,
-                    prior_pos_power=_prior_pow,
-                    prior_pos_eta=_prior_eta,
-                    beta=_beta,
-                    lambda_clip_single=_lam_single,
-                    lambda_clip_multi=_lam_multi,
-                    lambda_tail_kappa=_lam_kappa,
-                    lambda_tail_pivot=_lam_pivot,
-                    lambda_soft=_lam_soft,
-                    nms_window=_nms_win,
-                    soft_alpha=_soft_alpha,
-                    alpha_cross=_alpha_cross,
-                    temperature=_temperature,
-                    cross_eps=_eps,
-                    slice_start=slice_start,
-                    slice_end=slice_end,
-                    log_r_cache=log_r_cache,
-                    pipeline_workspaces=(
-                        self._ensure_selector_pipeline_workspaces(
-                            layers=layers,
-                            batch=batch_size,
-                            num_kv_heads=num_kv_heads,
-                            kv_max=kv_len_total,
-                            device=device,
-                        )
-                        if _SELECTOR_PIPELINE_WORKSPACE_CACHED
-                        else None
-                    ),
-                    selected_indices_out=(
-                        self._ensure_selector_selected_indices_out(
-                            layers=layers,
-                            batch=batch_size,
-                            num_kv_heads=num_kv_heads,
-                            k_head=k_head,
-                            device=device,
-                        )
-                        if _SELECTOR_SELECTED_INDICES_OUT_CACHED
-                        else None
-                    ),
-                    fixed_shape_topk=_SELECTOR_FIXED_SHAPE_TOPK_CACHED,
+                # [T3-B] pre_denom arm gets the exact logits-arm treatment
+                # (#13 STAGE-0): hoist the two _ensure_* producers above the
+                # graph branch so their stable data_ptrs can fold into the
+                # captured-graph key. Identical value/ordering vs the inline
+                # form on the OFF path (byte-identical bytes into _ppwb).
+                selected_indices_out = (
+                    self._ensure_selector_selected_indices_out(
+                        layers=layers,
+                        batch=batch_size,
+                        num_kv_heads=num_kv_heads,
+                        k_head=k_head,
+                        device=device,
+                    )
+                    if _SELECTOR_SELECTED_INDICES_OUT_CACHED
+                    else None
                 )
+                pipeline_workspaces = (
+                    self._ensure_selector_pipeline_workspaces(
+                        layers=layers,
+                        batch=batch_size,
+                        num_kv_heads=num_kv_heads,
+                        kv_max=kv_len_total,
+                        device=device,
+                    )
+                    if _SELECTOR_PIPELINE_WORKSPACE_CACHED
+                    else None
+                )
+
+                def _eager_topk_pipeline_pre_denom():
+                    return _ppwb(
+                        capture_scores,
+                        log_f_denoms,
+                        row_lo,
+                        row_hi,
+                        key_norms_full,
+                        head_sink,
+                        recent_start,
+                        num_kv_heads=num_kv_heads,
+                        num_queries_per_kv=num_queries_per_kv,
+                        k_head=k_head,
+                        alpha=_alpha,
+                        eps=_eps,
+                        gamma=_gamma,
+                        prior_weight_l2=_prior_l2,
+                        prior_weight_pos=_prior_pos,
+                        prior_pos_power=_prior_pow,
+                        prior_pos_eta=_prior_eta,
+                        beta=_beta,
+                        lambda_clip_single=_lam_single,
+                        lambda_clip_multi=_lam_multi,
+                        lambda_tail_kappa=_lam_kappa,
+                        lambda_tail_pivot=_lam_pivot,
+                        lambda_soft=_lam_soft,
+                        nms_window=_nms_win,
+                        soft_alpha=_soft_alpha,
+                        alpha_cross=_alpha_cross,
+                        temperature=_temperature,
+                        cross_eps=_eps,
+                        slice_start=slice_start,
+                        slice_end=slice_end,
+                        log_r_cache=log_r_cache,
+                        pipeline_workspaces=pipeline_workspaces,
+                        selected_indices_out=selected_indices_out,
+                        fixed_shape_topk=_SELECTOR_FIXED_SHAPE_TOPK_CACHED,
+                    )
+
+                # [SELECTED-OUT-RING v2·门控] 同 logits 臂:仅环槽 run 进 dispatch。
+                _sel_ring = getattr(self, "_selected_out_ring", None)
+                _topk_ring_run = (
+                    isinstance(_sel_ring, SelectedOutRing)
+                    and _sel_ring.run_open
+                    and not _sel_ring.current_run_spilled
+                )
+                if _SELECTOR_TOPK_GRAPH_CACHED and _topk_ring_run:
+                    # Same key discipline as the logits arm: shapes + EVERY
+                    # consumed/produced data_ptr. One extra field vs the
+                    # 18-field logits key — log_f_denoms' ptr — which also
+                    # structurally separates pre_denom graphs from logits
+                    # graphs in the shared cache (different tuple arity never
+                    # compares equal).
+                    def _dp(t):
+                        try:
+                            return int(t.data_ptr()) if t is not None else 0
+                        except Exception:
+                            return 0
+
+                    _ws_a_ptr = _dp(pipeline_workspaces[0]) if pipeline_workspaces else 0
+                    _ws_b_ptr = _dp(pipeline_workspaces[1]) if pipeline_workspaces else 0
+                    _topk_graph_key = (
+                        int(layers),
+                        int(batch_size),
+                        int(num_kv_heads),
+                        int(num_queries_per_kv),
+                        int(k_head),
+                        int(kv_len_total),
+                        int(slice_start),
+                        int(slice_end),
+                        _dp(capture_scores),
+                        _dp(log_f_denoms),
+                        _dp(row_lo),
+                        _dp(row_hi),
+                        _dp(key_norms_full),
+                        _dp(head_sink),
+                        _dp(recent_start),
+                        _dp(log_r_cache),
+                        _ws_a_ptr,
+                        _ws_b_ptr,
+                        _dp(selected_indices_out),
+                    )
+                    selected_indices = self._selector_topk_graph_dispatch(
+                        eager_fn=_eager_topk_pipeline_pre_denom,
+                        key_fields=_topk_graph_key,
+                    )
+                else:
+                    selected_indices = _eager_topk_pipeline_pre_denom()
             if profile_detail:
                 pipeline_evt1 = torch.cuda.Event(enable_timing=True)
                 pipeline_evt1.record()

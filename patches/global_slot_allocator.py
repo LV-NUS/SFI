@@ -35,7 +35,14 @@ class GlobalSlotAllocator:
         if self._capacity is not None and self._next_slot >= self._capacity:
             raise RuntimeError(
                 f"global slot allocator capacity exceeded: "
-                f"next_slot={self._next_slot}, capacity={self._capacity}"
+                f"next_slot={self._next_slot}, capacity={self._capacity}. "
+                "Config root cause: the step batch carries more live sparse "
+                "requests than max_live_sparse_slots — raise it to >= the "
+                "deployment's real concurrency (serve: --max-num-seqs; the "
+                "compact lease grows by slots x blocks x 16 x KV-bytes/token "
+                "x gen_count), or cap scheduler concurrency to the slot "
+                "budget. The startup preflight logged "
+                "W_SPARSE_SLOTS_LT_MAX_NUM_SEQS when this hazard was present."
             )
         slot = int(self._next_slot)
         self._next_slot += 1

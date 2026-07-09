@@ -230,9 +230,6 @@ class _RefreshProfilePending:
     rebuild_num_kv_heads: int = 0
     rebuild_batch_slots: int = 0
     capture_kv_len_total: int = 0
-    gather_qos: int = 0
-    gather_qos_num_warps: int = 0
-    gather_qos_num_stages: int = 0
     rebuild_physical_block_sort: int = 0
     writer_pointer_rebuild_count: int = 0
     writer_pointer_lookup_count: int = 0
@@ -518,9 +515,6 @@ class _FlushProfileAccum:
     rebuild_batch_slots: int = 0
     capture_kv_len_total: int = 0
     # Gather config
-    gather_qos_flag: int = 0
-    gather_qos_num_warps: int = 0
-    gather_qos_num_stages: int = 0
     rebuild_physical_block_sort_flag: int = 0
     writer_pointer_rebuild_count: int = 0
     writer_pointer_lookup_count: int = 0
@@ -887,6 +881,16 @@ class StepCaptureLayout:
     live_lengths_key: Optional[Tuple[object, ...]] = None
     # refresh payload 对 layout 派生 view 的只读复用签名；用于同 step 同 slot 的逐层 payload build 快路径。
     refresh_payload_views_key: Optional[Tuple[object, ...]] = None
+    # [PAYLOAD-VIEWS-FAST-IDENT 2026-07-09] 同 step 逐层 payload build 的 O(1) 身份短路：
+    # (epoch, handle_id, handle_gen, bound_meta 引用, slot_row_map_key 引用,
+    #  slots_filter 引用, slots_filter_sorted, kv_needed)。引用用 `is` 比较（持强引用，
+    # 无 id() 复用风险）；epoch/handle 变化天然失效。首层全路径校验通过后置位。
+    refresh_payload_views_fast_ident: Optional[Tuple[object, ...]] = None
+    # capture_scores 逐层 5 维子视图复用：key=(slot_in_chunk, batch, kv_slice)，
+    # value=(src 引用, view)。src 以 `is` 校验防替换；ident 置位时清理跨代残留。
+    refresh_scores_subviews: Dict[Tuple[int, int, int], Tuple[torch.Tensor, torch.Tensor]] = field(
+        default_factory=dict
+    )
     # P0-2 FIX: buf_id 用于 cache key 区分不同 ring buffer 位置，防止内存复用时的缓存错误
     buf_id: int = -1
     lease_generation: int = 0
@@ -1356,6 +1360,10 @@ class PendingRefreshRebuild:
     tracking_published: bool = False
     compact_meta_defer_publish: bool = False
     compact_meta_commit_log: Optional[List[Dict[str, object]]] = None
+    # [SELECTED-OUT-RING 2026-07-09] 本 pending 的 selector run 占用的稳定环
+    # 槽(spill/环关闭=None)。终局唯一漏斗 _pending_refresh_rebuild_clear
+    # 释放(存 writer_done_event 消费序);释放前该槽绝不被后续 run 重用。
+    selected_out_ring_slot: Any = None
 
 
 def _normalize_prefill_capture_config(config: SparseControllerConfig) -> None:

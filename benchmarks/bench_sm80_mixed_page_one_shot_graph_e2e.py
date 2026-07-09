@@ -1493,7 +1493,7 @@ def _run_provenance_payload(
     git_head = _run_text_command(["git", "rev-parse", "HEAD"], timeout_s=5.0)
     git_status = _run_text_command(["git", "status", "--short"], timeout_s=5.0)
     capture_chunk = int(env.get("VLLM_SPARSE_CAPTURE_CHUNK", "14") or "14")
-    writer_token_tile = int(env.get("VLLM_SPARSE_WRITER_TOKEN_TILE", "16") or "0")
+    writer_token_tile = int(env.get("VLLM_SPARSE_WRITER_TOKEN_TILE", "128") or "0")
     refresh_stream_priority = int(
         env.get("VLLM_SPARSE_REFRESH_STREAM_PRIORITY", "0") or "0"
     )

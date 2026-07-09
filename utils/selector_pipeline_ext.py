@@ -18,6 +18,7 @@ from typing import Optional
 import torch
 from torch.utils.cpp_extension import load_inline
 from utils.torch_extension_cache import load_prebuilt_extension
+from utils.ext_toolchain import configure_jit_toolchain_or_raise
 
 _MODULE: Optional[torch.nn.Module] = None
 _LOAD_ERROR: Optional[Exception] = None
@@ -3826,6 +3827,9 @@ std::vector<torch::Tensor> selector_pipeline_pre_denom_topk_with_bounds_workspac
 
     _ensure_torch_cuda_arch_list()
     try:
+        # [EXT-NVCC-GUARD] JIT 回落前 pin nvcc+版本预检(系统 nvcc 10.1 坑根修);
+        # 失败信息进 _LOAD_ERROR,由 require/enabled 语义原样呈报。
+        configure_jit_toolchain_or_raise(ext_name="selector_pipeline_ext")
         _MODULE = load_inline(
             name="selector_pipeline_ext",
             cpp_sources=cpp_source,

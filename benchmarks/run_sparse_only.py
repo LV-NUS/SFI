@@ -781,23 +781,6 @@ def build_parser() -> argparse.ArgumentParser:
         default="/tmp/vllm_sparse_log_s_shape_trace.log",
         help="VLLM_SPARSE_TRACE_LOG_S_SHAPES_LOG path.",
     )
-    parser.add_argument(
-        "--gather-qos",
-        action="store_true",
-        help="Enable gather QoS mode (VLLM_SPARSE_GATHER_QOS=1) to reduce refresh rebuild interference with decode.",
-    )
-    parser.add_argument(
-        "--gather-qos-num-warps",
-        type=int,
-        default=None,
-        help="Override VLLM_SPARSE_GATHER_QOS_NUM_WARPS (only effective with --gather-qos).",
-    )
-    parser.add_argument(
-        "--gather-qos-num-stages",
-        type=int,
-        default=None,
-        help="Override VLLM_SPARSE_GATHER_QOS_NUM_STAGES (only effective with --gather-qos).",
-    )
     add_deferred_bridge_arguments(parser)
     return parser
 
@@ -1104,9 +1087,6 @@ def main() -> None:
         stride_tokens_vals = _collect("rebuild_stride_tokens", predicate=refresh_pred)
         selected_k_vals = _collect("rebuild_selected_k", predicate=refresh_pred)
         block_size_vals = _collect("rebuild_block_size", predicate=refresh_pred)
-        gather_qos_vals = _collect("gather_qos", predicate=refresh_pred)
-        gather_qos_warps_vals = _collect("gather_qos_num_warps", predicate=refresh_pred)
-        gather_qos_stages_vals = _collect("gather_qos_num_stages", predicate=refresh_pred)
         physical_sort_vals = _collect("rebuild_physical_block_sort", predicate=refresh_pred)
         overlap_ratio_vals = _collect("refresh_overlap_ratio", predicate=refresh_pred)
         overlap_new_k_vals = _collect("refresh_overlap_new_k", predicate=refresh_pred)
@@ -1139,12 +1119,6 @@ def main() -> None:
             parts.append(_fmt("selected_k", selected_k_vals, unit="", decimals=0))
         if block_size_vals:
             parts.append(_fmt("block_size", block_size_vals, unit="", decimals=0))
-        if gather_qos_vals:
-            parts.append(_fmt("gather_qos", gather_qos_vals, unit="", decimals=0))
-        if gather_qos_warps_vals:
-            parts.append(_fmt("gather_qos_warps", gather_qos_warps_vals, unit="", decimals=0))
-        if gather_qos_stages_vals:
-            parts.append(_fmt("gather_qos_stages", gather_qos_stages_vals, unit="", decimals=0))
         if physical_sort_vals:
             parts.append(_fmt("physical_sort", physical_sort_vals, unit="", decimals=0))
         if overlap_ratio_vals:
@@ -1275,12 +1249,6 @@ def main() -> None:
         os.environ["VLLM_SPARSE_WAIT_POLICY"] = str(args.wait_policy).strip()
     if bool(getattr(args, "rebuild_physical_block_sort", False)):
         os.environ["VLLM_SPARSE_REBUILD_PHYSICAL_BLOCK_SORT"] = "1"
-    if bool(getattr(args, "gather_qos", False)):
-        os.environ["VLLM_SPARSE_GATHER_QOS"] = "1"
-        if getattr(args, "gather_qos_num_warps", None) is not None:
-            os.environ["VLLM_SPARSE_GATHER_QOS_NUM_WARPS"] = str(max(1, int(args.gather_qos_num_warps)))
-        if getattr(args, "gather_qos_num_stages", None) is not None:
-            os.environ["VLLM_SPARSE_GATHER_QOS_NUM_STAGES"] = str(max(1, int(args.gather_qos_num_stages)))
     if args.refresh_stream_priority is not None:
         os.environ["VLLM_SPARSE_REFRESH_STREAM_PRIORITY"] = str(int(args.refresh_stream_priority))
     if bool(args.trace_async):

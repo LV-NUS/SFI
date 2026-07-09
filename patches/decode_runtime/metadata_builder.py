@@ -51,6 +51,8 @@ from patches.sparse_constants import (
     _LIFECYCLE_LIVE_STEADY_ASSERT_CACHED,
     _LIFECYCLE_ONLY_FOR_SPEC_CACHED,
     _RRP_SAME_PAGE_SKIP_REVALIDATION_CACHED,
+    _CLEAN_METADATA_CACHED,
+    _PAGE_ADD_INCREMENTAL_CACHED,
     _SAME_PAGE_MINIMAL_UPDATE_CACHED,
     _SAME_PAGE_READY_EVENT_ONLY_CACHED,
     _SAME_PAGE_MINIMAL_ASSERT_CACHED,
@@ -804,7 +806,11 @@ def _steady_fast_path_terminal_rrp_miss(
     rescue) ADMITS the step so behavior is unchanged.
     """
     if mode is DecodeRuntimeMode.PAGE_BOUNDARY_DELTA:
-        if os.environ.get("VLLM_SPARSE_CLEAN_METADATA") == "1":
+        if (
+            os.environ.get("VLLM_SPARSE_CLEAN_METADATA", "1") == "1"
+            if _DYNAMIC_ENV
+            else _CLEAN_METADATA_CACHED
+        ):
             # Leg-B live page-boundary writer may legitimately apply: admit.
             return None
         return f"mode_not_steady:{mode.value}"
@@ -838,7 +844,11 @@ def _steady_fast_path_terminal_rrp_miss(
         ),
     ):
         return None
-    if os.environ.get("VLLM_SPARSE_PAGE_ADD_INCREMENTAL") == "1":
+    if (
+        os.environ.get("VLLM_SPARSE_PAGE_ADD_INCREMENTAL", "1") == "1"
+        if _DYNAMIC_ENV
+        else _PAGE_ADD_INCREMENTAL_CACHED
+    ):
         # The page-add incremental rescue may still turn this into a hit:
         # admit and let the gate decide.
         return None
@@ -3062,20 +3072,60 @@ def _try_page_add_incremental(
             recent_count_by_row[r] = rc
             recent_first_by_row[r] = int(delta.recent_first_page_by_row[r])
             vpc.append(compact_pages + rc)
-        pages = derive_live_page_rows(
-            active_rows=range(bs),
-            block_table_cpu=block_table_cpu,
-            compact_pages_by_row=compact_pages_by_row,
-            recent_first_page_by_row=recent_first_by_row,
-            recent_page_count_by_row=recent_count_by_row,
+        # [PAGE-ADD-DIRTY-ONLY 2026-07-08] re-lay ONLY the rows whose page set
+        # actually changed instead of the whole batch every step. A row is
+        # dirty when its token-ceil page count moved vs the write-epoch shadow
+        # (same metric both sides) or its recent-first page slid. Unchanged
+        # rows keep their previously-laid pages — identical reuse semantics to
+        # a try_apply HIT; they only entered this leg because ANOTHER row in
+        # the batch missed (batch-global probe). Compact segment inputs
+        # (valid/offset) are constant inside STEADY mode: any change flips
+        # row_dynamic_signature and classifies as PAGE_BOUNDARY/REFRESH_COMMIT,
+        # which never reaches this leg. Incomplete shadow state -> conservative
+        # full re-lay.
+        _effk_now = tuple(
+            int(v) for v in tuple(delta.row_effective_k_by_row)[:bs]
         )
-        publish(pages_by_row=pages, dirty_rows=tuple(range(bs)),
-                compact_pages_by_row=compact_pages_by_row)
+        _shadow_now = manager._shadow_visible_pages(_effk_now)
+        _shadow_stored = manager._probe_visible_page_count_by_row
+        _rf_stored = manager._recent_first_page_by_row
+        if (
+            _shadow_now is not None
+            and isinstance(_shadow_stored, tuple)
+            and isinstance(_rf_stored, tuple)
+            and len(_shadow_stored) == bs
+            and len(_rf_stored) == bs
+        ):
+            dirty = tuple(
+                r
+                for r in range(bs)
+                if int(_shadow_now[r]) != int(_shadow_stored[r])
+                or int(recent_first_by_row[r]) != int(_rf_stored[r])
+            )
+        else:
+            dirty = tuple(range(bs))
+        if dirty:
+            pages = derive_live_page_rows(
+                active_rows=dirty,
+                block_table_cpu=block_table_cpu,
+                compact_pages_by_row=compact_pages_by_row,
+                recent_first_page_by_row=recent_first_by_row,
+                recent_page_count_by_row=recent_count_by_row,
+            )
+            publish(pages_by_row=pages, dirty_rows=dirty,
+                    compact_pages_by_row=compact_pages_by_row)
         manager._apply_seqused_delta(
             replay_arena,
             tuple(int(v) for v in tuple(delta.row_effective_k_by_row)[:bs]),
         )
         manager._visible_page_count_by_row = tuple(vpc)
+        # [VPC-SHADOW-METRIC] this leg's vpc uses floor compact pages
+        # (compact_tokens // ps) vs the probe's ceil — recompute the probe's
+        # own token-ceil shadow instead of copying, so a non-page-aligned
+        # compact_valid can never phase-split the comparison.
+        manager._probe_visible_page_count_by_row = manager._shadow_visible_pages(
+            tuple(int(v) for v in tuple(delta.row_effective_k_by_row)[:bs])
+        )
         manager._recent_first_page_by_row = tuple(
             recent_first_by_row[r] for r in range(bs)
         )
@@ -3103,6 +3153,10 @@ def _try_update_same_page_resolved_row_ptr_step_state(
     same_page_proven: bool = False,
 ) -> object | None:
     setattr(controller, "_decode_runtime_rrp_step_state_miss_reason", "")
+    # [Z-RRP-PROBE] diagnostic-only (env, default off) — 7.9ms plateau hunt.
+    _z_probe = os.environ.get("VLLM_SPARSE_Z_RRP_PROBE") == "1"
+    _z_t0 = _z_t1 = 0
+    _z_hit_before_page_add = False
 
     def _miss(reason: str) -> object | None:
         setattr(controller, "_decode_runtime_rrp_step_state_miss_reason", str(reason))
@@ -3111,7 +3165,11 @@ def _try_update_same_page_resolved_row_ptr_step_state(
     mode = _decode_runtime_mode_for_controller(controller)
     if mode is not DecodeRuntimeMode.STEADY_DELTA:
         if (
-            os.environ.get("VLLM_SPARSE_CLEAN_METADATA") == "1"
+            (
+                os.environ.get("VLLM_SPARSE_CLEAN_METADATA", "1") == "1"
+                if _DYNAMIC_ENV
+                else _CLEAN_METADATA_CACHED
+            )
             and mode is DecodeRuntimeMode.PAGE_BOUNDARY_DELTA
         ):
             # Leg-B: a normal recent-window slide is the live writer's JOB, not an
@@ -3287,7 +3345,11 @@ def _try_update_same_page_resolved_row_ptr_step_state(
         )
         if (
             update is None
-            and os.environ.get("VLLM_SPARSE_PAGE_ADD_INCREMENTAL") == "1"
+            and (
+                os.environ.get("VLLM_SPARSE_PAGE_ADD_INCREMENTAL", "1") == "1"
+                if _DYNAMIC_ENV
+                else _PAGE_ADD_INCREMENTAL_CACHED
+            )
             and not _sparse_native_lifecycle_enabled_for_metadata()
         ):
             update = _try_page_add_incremental(
@@ -3451,6 +3513,8 @@ def _try_update_same_page_resolved_row_ptr_step_state(
                 ],
             )
     else:
+        if _z_probe:
+            _z_t0 = time.perf_counter_ns()
         row_effective_k_by_row = tuple(
             int(v) for v in tuple(delta.row_effective_k_by_row)[:batch_size_i]
         )
@@ -3463,9 +3527,16 @@ def _try_update_same_page_resolved_row_ptr_step_state(
                 int(v) for v in tuple(delta.recent_first_page_by_row)[:batch_size_i]
             ),
         )
+        if _z_probe:
+            _z_t1 = time.perf_counter_ns()
+            _z_hit_before_page_add = update is not None
     if (
         update is None
-        and os.environ.get("VLLM_SPARSE_PAGE_ADD_INCREMENTAL") == "1"
+        and (
+            os.environ.get("VLLM_SPARSE_PAGE_ADD_INCREMENTAL", "1") == "1"
+            if _DYNAMIC_ENV
+            else _PAGE_ADD_INCREMENTAL_CACHED
+        )
         and not _sparse_native_lifecycle_enabled_for_metadata()
     ):
         update = _try_page_add_incremental(
@@ -3478,6 +3549,17 @@ def _try_update_same_page_resolved_row_ptr_step_state(
             block_size=int(block_size),
             launch_plan=launch_plan,
             device=device,
+        )
+    if _z_probe and _z_t1:
+        _z_t2 = time.perf_counter_ns()
+        _append_metadata_timing(
+            {
+                "event": "z_rrp_probe",
+                "mgr_apply_us": (_z_t1 - _z_t0) / 1000.0,
+                "page_add_us": (_z_t2 - _z_t1) / 1000.0,
+                "hit_before_page_add": _z_hit_before_page_add,
+                "hit_after_page_add": update is not None,
+            }
         )
     if update is None:
         return _miss("row_table_same_page_delta_update_miss")
@@ -8047,6 +8129,26 @@ def maybe_build_step_decode_data_from_metadata_impl(
             refresh_layer_group_active=bool(has_refresh_rows and layer_group_enabled),
         )
         _mark_xlayer_detail("pack_gate")
+        # [PENDING-FUNNEL-DEBUG 2026-07-09 临时取证探针,破案后拆] pack 段判决。
+        _funnel_dbg = os.environ.get("VLLM_SPARSE_PENDING_FUNNEL_DEBUG_LOG", "")
+        if _funnel_dbg:
+            _fd_n = getattr(self, "_funnel_pack_probe_n", 0) + 1
+            self._funnel_pack_probe_n = _fd_n
+            if _fd_n % 8 == 1 or need_fill_compact_layout:
+                try:
+                    with open(_funnel_dbg, "a") as _fd_fh:
+                        _fd_fh.write(
+                            f"pack\tneed_fill={need_fill_compact_layout}\t"
+                            f"plan_valid={bool(_xlayer_plan is not None and getattr(_xlayer_plan, 'valid', False))}\t"
+                            f"row_mode={tuple(int(v) for v in row_mode_by_row[:batch_size])}\t"
+                            f"mode={getattr(decode_runtime_mode, 'value', decode_runtime_mode)}\t"
+                            f"reason={decode_runtime_reason}\t"
+                            f"rrp_ready={rrp_replay_state_ready}\t"
+                            f"need_dyn={need_pack_dynamic_req_meta}\t"
+                            f"epoch={int(getattr(self, 'step_context_epoch', -1))}\n"
+                        )
+                except OSError:
+                    pass
 
         active_layer_count = 0
         if need_fill_compact_layout:

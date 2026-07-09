@@ -152,6 +152,22 @@ class RrpRowTableManager:
         self._row_effective_k_by_row: Tuple[int, ...] | None = None
         self._recent_first_page_by_row: Tuple[int, ...] | None = None
         self._visible_page_count_by_row: Tuple[int, ...] | None = None
+        # [VPC-SHADOW-METRIC 2026-07-08] same-page probe comparand: the
+        # arithmetic (token-ceil) page count evaluated AT WRITE TIME with the
+        # same inputs the probe recomputes later. _visible_page_count_by_row
+        # stays the writers' physical laid-page count (len semantics) for the
+        # publish dirty-diff; comparing the probe's arithmetic recompute
+        # against THAT mixes metrics whose recent-window phase differs by ±1
+        # (window-span vs token-ceil; floor-vs-ceil compact pages in the
+        # page-add leg) and mass-missed genuine same-page STEADY steps. The
+        # shadow makes the probe self-consistent: page-boundary crossings
+        # still flip token-ceil and miss (full bind re-lays the row), while a
+        # pure metric mismatch no longer forces a spurious full bind. NOTE the
+        # rejected alternative: admitting computed<=stored (PAGE_GE) changed
+        # golden output — it admitted steps whose page tables genuinely
+        # needed re-laying. The shadow admits ONLY steps where the detection
+        # inputs are bitwise-unchanged.
+        self._probe_visible_page_count_by_row: Tuple[int, ...] | None = None
         self._row_table_layout_by_row: Tuple[tuple[object, ...], ...] | None = None
         # Publish-only comparand for publish_from_descriptor_snapshot's dirty diff,
         # kept DISTINCT from _row_table_layout_by_row (which update() writes in a
@@ -328,7 +344,12 @@ class RrpRowTableManager:
         row_effective_k: Tuple[int, ...],
         recent_first_page_by_row: Iterable[int] | None,
     ) -> bool:
-        stored_visible = self._visible_page_count_by_row
+        # [VPC-SHADOW-METRIC] compare token-ceil(new effk) against
+        # token-ceil(write-epoch effk) — the shadow — instead of the writers'
+        # physical laid-page count. Same-metric comparison: a page-boundary
+        # crossing since the last write still flips token-ceil and misses; a
+        # pure metric phase difference no longer forces a spurious full bind.
+        stored_visible = self._probe_visible_page_count_by_row
         if (
             self._signature is None
             or self._row_effective_k_by_row is None
@@ -352,16 +373,15 @@ class RrpRowTableManager:
         )
         if _rrp_probe_vpc != stored_visible:
             _rrp_miss_probe_log("vpc", _rrp_probe_vpc, stored_visible, row_effective_k, self._compact_valid_tokens_by_row)
-            _rrp_page_ge_hit = (
-                _os.environ.get("VLLM_SPARSE_RRP_PAGE_GE_HIT") == "1"
-                and len(_rrp_probe_vpc) == len(stored_visible)
-                and all(
-                    int(_rrp_probe_vpc[_i]) <= int(stored_visible[_i])
-                    for _i in range(len(_rrp_probe_vpc))
-                )
-            )
-            if not _rrp_page_ge_hit:
-                return False
+            # [RRP-PAGE-GE-HIT-DELETED 2026-07-08] the "computed <= stored
+            # admits" arm (env VLLM_SPARSE_RRP_PAGE_GE_HIT) is DELETED, not
+            # just default-off: enabling it flipped golden output
+            # deterministically ({0d5f663c,636fb032} -> {894b571a,8b35f6c6}).
+            # Subset-read is OOB-safe but NOT content-fresh — a page-count
+            # change is exactly the signal that the row's table needs
+            # re-laying. Any future fast-path here must re-lay pages (see
+            # PAGE_ADD_INCREMENTAL), never skip the re-lay.
+            return False
         if recent_first_page_by_row is not None and self._recent_first_page_by_row is not None:
             recent = tuple(int(v) for v in recent_first_page_by_row)
             if (
@@ -535,12 +555,6 @@ class RrpRowTableManager:
             layout = self._descriptor_row_table_layout(descriptor)
             if layout is None:
                 return None
-            if int(graph_row) == 0 and __import__("os").environ.get("VLLM_PROBE_ROW0_PAGES") == "1":
-                try:
-                    with open(__import__("os").environ.get("VLLM_PROBE_ROW0_FILE", "/tmp/row0_pages.jsonl"), "a", encoding="utf-8") as _pf:
-                        _pf.write(__import__("json").dumps({"e": int(snapshot_epoch), "re": int(row_effective_k[graph_row]) if graph_row < len(row_effective_k) else -1, "L": repr(layout)}) + "\n")
-                except Exception:
-                    pass
             page_count = len(layout[2])
             if (
                 not published_ok
@@ -562,6 +576,12 @@ class RrpRowTableManager:
             # so update()'s own delta detection stays consistent across phases.
             self._row_effective_k_by_row = row_effective_k
             self._visible_page_count_by_row = tuple(visible_page_count)
+            # [VPC-SHADOW-METRIC] visible_page_count above is the descriptor
+            # layout's laid-page count; the probe compares token-ceil, so
+            # refresh the shadow at the same write epoch.
+            self._probe_visible_page_count_by_row = self._shadow_visible_pages(
+                row_effective_k
+            )
             self._published_descriptor_layout_by_row = tuple(published_layout)
             self._descriptor_snapshot_epoch = snapshot_epoch
             return RrpUpdateResult(
@@ -659,6 +679,12 @@ class RrpRowTableManager:
         # (mirrors publish_from_descriptor_snapshot) so a repeat with the same pages
         # diffs equal (zero dirty rows, zero writes).
         self._visible_page_count_by_row = tuple(visible_page_count)
+        # [VPC-SHADOW-METRIC] live rows carry window-span page counts; refresh
+        # the probe's token-ceil shadow at the same write epoch (row_effective
+        # is unchanged on this leg — `previous` is the stored value).
+        self._probe_visible_page_count_by_row = self._shadow_visible_pages(
+            tuple(int(v) for v in previous)
+        )
         self._published_descriptor_layout_by_row = tuple(published_layout)
 
         # leg-b surface 4 recent-first: advance the stored recent-first baseline so
@@ -787,6 +813,33 @@ class RrpRowTableManager:
             affine_key,
         )
 
+    def _shadow_visible_pages(
+        self,
+        row_effective_k: Tuple[int, ...],
+    ) -> Tuple[int, ...] | None:
+        """[VPC-SHADOW-METRIC] token-ceil page count for the given effk under
+        the CURRENT stored compact fields — the probe's own metric, evaluated
+        at write time. None when the compact baseline is incomplete (probe
+        then takes its structural miss -> full bind, the correct slow path).
+        """
+        if (
+            self._compact_ready_by_row is None
+            or self._compact_valid_tokens_by_row is None
+            or self._page_size is None
+            or self._max_pages_per_row is None
+            or len(self._compact_ready_by_row) != len(row_effective_k)
+            or len(self._compact_valid_tokens_by_row) != len(row_effective_k)
+        ):
+            return None
+        return self._visible_page_count_from_fields(
+            batch_size=len(row_effective_k),
+            row_effective_k=tuple(int(v) for v in row_effective_k),
+            compact_ready_by_row=self._compact_ready_by_row,
+            compact_valid_tokens_by_row=self._compact_valid_tokens_by_row,
+            page_size=self._page_size,
+            max_pages_per_row=self._max_pages_per_row,
+        )
+
     def _store(
         self,
         signature: tuple[object, ...],
@@ -799,6 +852,11 @@ class RrpRowTableManager:
         self._row_effective_k_by_row = row_effective_k
         self._recent_first_page_by_row = recent_first_page
         self._visible_page_count_by_row = visible_page_count
+        # [VPC-SHADOW-METRIC] recompute (not copy) so the shadow is the
+        # probe's metric regardless of which metric the caller stored.
+        self._probe_visible_page_count_by_row = self._shadow_visible_pages(
+            row_effective_k
+        )
         self._row_table_layout_by_row = row_table_layout
 
     @staticmethod

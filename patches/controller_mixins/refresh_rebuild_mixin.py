@@ -22,6 +22,7 @@ ENTRY_POINTS:
 from __future__ import annotations
 
 import logging
+import os
 import time
 from collections import deque
 from typing import (
@@ -43,12 +44,19 @@ from patches.request_intent_ticket import PendingPolicy, PendingReasonCode
 from patches.refresh_runtime.producer_workspace import (
     build_refresh_producer_work_item,
 )
+from patches.selector_runtime.selected_out_ring import (
+    SLOT_VALID_SET_ATTR,
+    SelectedOutRing,
+    SlotStableOverrides,
+)
 from patches.sparse_constants import (
     _ASYNC_REFRESH_CACHED,
     _ASYNC_PRODUCER_GPU_PROFILE_CACHED,
     _CAPTURE_CHUNK,
     _CAPTURE_IN_FLIGHT,
     _DEFERRED_SELECTOR_PROFILE_DETAIL_CACHED,
+    _selected_out_ring_enabled,
+    _selected_out_ring_slots,
     _PENDING_REBUILD_MAX_QUEUE_CACHED,
     _REFRESH_GROUPED_ASYNC_ENVELOPE_CACHED,
     _REFRESH_PRODUCER_SPLIT_SELECTOR_WRITER_RELEASE_AUTO_CACHED,
@@ -287,12 +295,14 @@ class RefreshRebuildMixin:
         self._deadline_async_producer_graph_capture_count: int = 0
         self._deadline_async_producer_graph_capture_cpu_us_total: float = 0.0
         self._deadline_async_producer_graph_capture_cpu_us_max: float = 0.0
-        # ASYNC_PRODUCER_WRITER_GRAPH (task #9): captured writer-graph holder. ``graph``/``mempool`` are
-        # owned here (dedicated side-stream pool, never the decode-graph pool);
-        # ``key`` gates replay; ``bypass`` is the fail-open / thrash latch.
+        # ASYNC_PRODUCER_WRITER_GRAPH (task #9): captured writer-graph holder.
+        # ``graphs`` maps key -> CUDAGraph (each graph owns a PRIVATE mempool,
+        # [POOL-PRIVATE] — never the decode-graph pool, never shared);
+        # ``bypass`` is the fail-open / thrash latch.
         self._writer_graph_state: Optional[Dict[str, object]] = None
         self._writer_graph_recapture_window: int = 0
         self._writer_graph_recapture_count: int = 0
+        self._writer_graph_evict_clear_count: int = 0
         self._deadline_async_producer_result_precomputed_count: int = 0
         self._deadline_async_producer_split_release_forced_count: int = 0
         self._deadline_async_producer_split_release_adaptive_count: int = 0
@@ -556,7 +566,59 @@ class RefreshRebuildMixin:
             flags[int(buf)] = int(final_flags)
             epochs[int(buf)] = int(final_epoch)
 
+    def _selected_out_ring_for_pending(self) -> Optional[SelectedOutRing]:
+        """[SELECTED-OUT-RING] 懒构造的 pending 路径稳定环(env 关=None)。"""
+        if not _selected_out_ring_enabled():
+            return None
+        ring = getattr(self, "_selected_out_ring", None)
+        if ring is None:
+            ring = SelectedOutRing(slots=_selected_out_ring_slots())
+            self._selected_out_ring = ring
+        return ring
+
+    def _selected_out_ring_release_pending_slot(
+        self, pending: PendingRefreshRebuild
+    ) -> None:
+        """[SELECTED-OUT-RING] 释放 pending 占用的环槽(幂等:属性置 None 防
+        重入双释放)。writer_done_event 作为消费序存入槽,下任 acquire 在其
+        run 流上补 wait。调用面=终局漏斗 _pending_refresh_rebuild_clear+两个
+        绕过 clear 的整批丢弃点(release_idle_buffers / reset_for_new_engine)。"""
+        _ring_slot = getattr(pending, "selected_out_ring_slot", None)
+        if _ring_slot is None:
+            return
+        pending.selected_out_ring_slot = None
+        _ring = getattr(self, "_selected_out_ring", None)
+        if _ring is not None:
+            _ring.release(
+                _ring_slot,
+                writer_done_event=getattr(pending, "writer_done_event", None),
+            )
+
     def _pending_refresh_rebuild_clear(self, pending: PendingRefreshRebuild) -> None:
+        # [PENDING-FUNNEL-DEBUG 2026-07-09 临时取证探针,破案后拆] serve 写而不读案:
+        # 谁在一步内清掉 pending(wrapper drain 计数恒 0 而队列消失)。默认关零成本。
+        _funnel_dbg = os.environ.get("VLLM_SPARSE_PENDING_FUNNEL_DEBUG_LOG", "")
+        if _funnel_dbg:
+            import sys as _fd_sys
+            try:
+                _fd_caller = _fd_sys._getframe(1).f_code.co_name
+                _fd_caller2 = _fd_sys._getframe(2).f_code.co_name
+            except Exception:
+                _fd_caller = "?"
+                _fd_caller2 = "?"
+            try:
+                with open(_funnel_dbg, "a") as _fd_fh:
+                    _fd_fh.write(
+                        f"clear\tpid={int(getattr(pending, 'pending_id', -1))}\t"
+                        f"reqs={list(getattr(pending, 'req_ids', ()) or ())}\t"
+                        f"caller={_fd_caller}<-{_fd_caller2}\t"
+                        f"writer_evt={getattr(pending, 'writer_done_event', None) is not None}\t"
+                        f"epoch={int(getattr(self, 'step_context_epoch', -1))}\n"
+                    )
+            except OSError:
+                pass
+        # [SELECTED-OUT-RING] 终局唯一漏斗释放;必须先于下方 req_ids 早退分支。
+        self._selected_out_ring_release_pending_slot(pending)
         RefreshRebuildMixin._pending_refresh_grouped_async_forget_pending(
             self, pending
         )
@@ -753,6 +815,19 @@ class RefreshRebuildMixin:
         pending_buf_ref_counts: Optional[Dict[int, int]] = None,
         wait_recorded_work: bool = True,
     ) -> Tuple[str, ...]:
+        # [PENDING-FUNNEL-DEBUG 临时取证探针,破案后拆]
+        _funnel_dbg = os.environ.get("VLLM_SPARSE_PENDING_FUNNEL_DEBUG_LOG", "")
+        if _funnel_dbg:
+            try:
+                with open(_funnel_dbg, "a") as _fd_fh:
+                    _fd_fh.write(
+                        f"drop\tpid={int(getattr(pending, 'pending_id', -1))}\t"
+                        f"reqs={list(getattr(pending, 'req_ids', ()) or ())}\t"
+                        f"status={status}\tlease={lease_reason}\t"
+                        f"epoch={int(getattr(self, 'step_context_epoch', -1))}\n"
+                    )
+            except OSError:
+                pass
         _mark_pending_selected_scope_terminal(
             pending,
             status=str(status),
@@ -1780,7 +1855,37 @@ class RefreshRebuildMixin:
             _sel_out_override_prev = getattr(
                 self, "_selector_selected_indices_out_override", None
             )
-            self._selector_selected_indices_out_override = {}
+            # [SELECTED-OUT-RING v2 2026-07-09] 槽接管=七 override 载体整套换
+            # 装为该槽的持久 SlotStableOverrides 容器(指针稳定→graph key 可
+            # 命中;valid 集已在 begin_run 清空=key_norms 每 run 强制重填);
+            # spill(容量满)/env 关=旧行为原路(仅 indices per-run 私有,
+            # off-loop 外层全量私有化+retention 原样生效)。槽随 end_run 带
+            # produce 事件返还并绑定 pending 至终局漏斗;run 失败=即时回收。
+            # 配对键=chunk_id(非 buf_id):世代 chunk 的层组(14/8 切分)决定
+            # 六容器的形状族,按 chunk 配对令每槽形状恒定(buf_id 配对时
+            # slot0 交替 chunk0/chunk2 两形状族→容器逐 run realloc→graph key
+            # 永不复现→64 窗 thrash 闩死,rv3g/rv4dbg 取证形态)。
+            _sel_out_ring = self._selected_out_ring_for_pending()
+            _ring_slot = (
+                _sel_out_ring.begin_run(
+                    preferred=int(getattr(pending, "chunk_id", -1) or -1)
+                )
+                if _sel_out_ring is not None
+                else None
+            )
+            _slot_prevs: Optional[Dict[str, object]] = None
+            if _ring_slot is not None:
+                _slot_prevs = {}
+                for _attr, _container in _ring_slot.containers.items():
+                    _slot_prevs[_attr] = getattr(self, _attr, None)
+                    setattr(self, _attr, _container)
+                _slot_prevs[SLOT_VALID_SET_ATTR] = getattr(
+                    self, SLOT_VALID_SET_ATTR, None
+                )
+                setattr(self, SLOT_VALID_SET_ATTR, _ring_slot.valid_keys)
+            else:
+                self._selector_selected_indices_out_override = {}
+            result = None
             try:
                 result = self._apply_alpha_selector_batched_fused(
                     payloads,
@@ -1788,7 +1893,19 @@ class RefreshRebuildMixin:
                     update_tracking=False,
                 )
             finally:
-                self._selector_selected_indices_out_override = _sel_out_override_prev
+                if _slot_prevs is not None:
+                    for _attr, _prev in _slot_prevs.items():
+                        setattr(self, _attr, _prev)
+                else:
+                    self._selector_selected_indices_out_override = (
+                        _sel_out_override_prev
+                    )
+                if _sel_out_ring is not None:
+                    _end_slot = _sel_out_ring.end_run()
+                    if result is None:
+                        _sel_out_ring.release(_end_slot, writer_done_event=None)
+                    elif _end_slot is not None:
+                        pending.selected_out_ring_slot = _end_slot
                 if profile_detail and not prev_profile_active:
                     self._refresh_profile_active = prev_profile_active
             if profile_t0_ns is not None and profile_deferred:
@@ -1987,6 +2104,29 @@ class RefreshRebuildMixin:
         pending: PendingRefreshRebuild,
     ) -> None:
         commit_log = getattr(pending, "compact_meta_commit_log", None)
+        # [PENDING-FUNNEL-DEBUG 临时取证探针,破案后拆]
+        _funnel_dbg = os.environ.get("VLLM_SPARSE_PENDING_FUNNEL_DEBUG_LOG", "")
+        if _funnel_dbg:
+            try:
+                _fd_detail = [
+                    (
+                        int(getattr(e.get("state"), "layer_index", -1)),
+                        len(tuple(e.get("slot_meta_commits", ()) or ())),
+                        len(tuple(e.get("dual_gen_flip_slots", ()) or ())),
+                        len(tuple(e.get("reset_slot_commits", ()) or ())),
+                    )
+                    for e in tuple(commit_log or ())
+                ]
+                with open(_funnel_dbg, "a") as _fd_fh:
+                    _fd_fh.write(
+                        f"commit\tpid={int(getattr(pending, 'pending_id', -1))}\t"
+                        f"reqs={list(getattr(pending, 'req_ids', ()) or ())}\t"
+                        f"log_entries={len(commit_log) if commit_log else 0}\t"
+                        f"entries(layer,meta,flip,reset)={_fd_detail[:4]}...\t"
+                        f"epoch={int(getattr(self, 'step_context_epoch', -1))}\n"
+                    )
+            except OSError:
+                pass
         if not commit_log:
             pending.compact_meta_commit_log = None
             return
@@ -2027,19 +2167,50 @@ class RefreshRebuildMixin:
         is a fresh dict per pending and the selected_indices buffer is freshly
         allocated each pending, so its data_ptr changes every refresh and the
         graph cannot be reused. Bypass capture/replay entirely in that mode.
+
+        [SELECTED-OUT-RING v2 engagement 2026-07-09] the production pending
+        path installs the ring slot's persistent ``SlotStableOverrides``
+        containers (a dict subclass): slot buffers are data_ptr-stable and the
+        writer's four key inputs are ADDITIONALLY copied into writer-side
+        persistent stable buffers (``_ensure_selector_writer_*_all``), so
+        capture/replay is safe there. The pre-ring bare ``isinstance(dict)``
+        test latched that path to eager forever — the "N captures / 0 replays"
+        writer-track case (captures only ever happened on the override-less
+        sync/bootstrap windows). Mirror of the selector track's
+        ``_selector_topk_graph_stable_active``. Bare per-run dicts (ring
+        spill / ring escape env / replay-refresh private helper) still bypass:
+        their buffers are per-run transient and must never be baked.
         """
         override = getattr(self, "_selector_selected_indices_out_override", None)
-        return isinstance(override, dict)
+        return isinstance(override, dict) and not isinstance(
+            override, SlotStableOverrides
+        )
 
-    def _writer_graph_record_recapture(self) -> None:
-        """Thrash detector: >THRASH_RECAPTURES in THRASH_WINDOW refreshes -> bypass."""
+    def _writer_graph_record_recapture(self) -> bool:
+        """Thrash adjudicator: latch bypass only on UNBOUNDED key churn.
+
+        [SYNC-STORM family 2026-07-09, mirrors the selector track] recapture
+        volume alone is NOT churn: a bounded key family (layer-groups x
+        writer-stable buffer generations; bootstrap and batch-composition
+        windows recapture legitimately) can exceed any count threshold and
+        must never latch bypass — that latch was exactly the selector track's
+        "capture==THRASH_WINDOW then dead" shape. Unbounded churn ALWAYS
+        overflows the 8-entry per-key graph cache (clear-before-insert), so
+        require BOTH signals inside one window: recaptures over threshold AND
+        at least one cache clear.
+        """
         self._writer_graph_recapture_window += 1
         self._writer_graph_recapture_count += 1
         if self._writer_graph_recapture_window >= int(self._WRITER_GRAPH_THRASH_WINDOW):
             recaptures = int(self._writer_graph_recapture_count)
+            clears = int(self._writer_graph_evict_clear_count)
             self._writer_graph_recapture_window = 0
             self._writer_graph_recapture_count = 0
-            return recaptures > int(self._WRITER_GRAPH_THRASH_RECAPTURES)
+            self._writer_graph_evict_clear_count = 0
+            return (
+                recaptures > int(self._WRITER_GRAPH_THRASH_RECAPTURES)
+                and clears > 0
+            )
         return False
 
     def _writer_graph_dispatch_launch(
@@ -2051,18 +2222,66 @@ class RefreshRebuildMixin:
         device: torch.device,
         pointer_rebuild_miss: bool,
         key_fields: Tuple[int, ...],
+        key_unresolved: bool = False,
     ) -> None:
         """Replay the captured writer graph on a key hit; else eager (+recapture).
 
         Fail-OPEN: any capture/replay error discards the graph, runs eager and
         latches bypass. Byte output is identical across eager/cold/replay.
+
+        [PTR-REPUBLISH-REPLAY-SAFE 2026-07-09] ``pointer_rebuild_miss`` (a
+        pointer-ARRAY republish happened while building launch_args) no longer
+        pops the key's graph nor blocks replay/capture. The graph bakes the
+        persistent GPU pointer-array BUFFER addresses, not their contents; a
+        republish rewrites contents in place (same buffer) with its H2D +
+        ready-event ordered on this stream BEFORE this dispatch, so a replayed
+        kernel reads the fresh pointers. This was the writer-track engagement
+        killer: the per-flush [DETERMINISTIC-BLOCKTABLE-SNAPSHOT] clone gives
+        block_table a fresh data_ptr EVERY generation -> block_table_ptrs
+        republishes every generation (wg2 forensics: 462/462 republishes are
+        block_table L0:ptr) -> the old pop-on-miss dropped the graph each
+        generation (pop/capture alternation, replay forever 0). The case the
+        pop actually protected — the pointer-array GPU buffer itself
+        REALLOCATING (baked address dies) — is now handled at the realloc
+        site: _get_rebuild_ptr_buffers clears the whole writer-graph state
+        (cold event, size=layers is steady-state constant).
+
+        ``key_unresolved`` (layer-group identity unresolved, -1 fields): the
+        degenerate key would collide both layer groups -> never capture or
+        replay under it (the pre-split ROW1-corruption regime); eager only.
         """
+        _wg_dbg = os.environ.get("VLLM_SPARSE_SELECTOR_TOPK_GRAPH_DEBUG_LOG", "")
+
+        def _wg_dbg_note(action: str) -> None:
+            # engagement 取证(诊断档默认关;与 capture 侧 keys 落盘同文件):
+            # 全分支 action 分布是"修后分布变化"检验的判据载体(selector 轨
+            # 三层破案同仪器)。
+            if not _wg_dbg:
+                return
+            try:
+                with open(_wg_dbg, "a") as _fh:
+                    _fh.write(
+                        f"{os.getpid()}\twriter_dispatch\t{action}\t"
+                        f"{int(bool(pointer_rebuild_miss))}\t"
+                        f"{tuple(int(v) for v in key_fields)}\n"
+                    )
+            except OSError:
+                pass
+
         state = self._writer_graph_state
         if isinstance(state, dict) and bool(state.get("bypass")):
+            _wg_dbg_note("bypass_latched")
             eager_fn()
             return
         # Defect #4: never capture/replay under the split/deferred writer path.
         if self._writer_graph_split_active():
+            _wg_dbg_note("split_bypass")
+            eager_fn()
+            return
+        if key_unresolved:
+            # Degenerate (-1) layer-group identity: both groups collapse onto
+            # one key — capturing or replaying here IS the ROW1 corruption.
+            _wg_dbg_note("eager_key_unresolved")
             eager_fn()
             return
         key = tuple(int(v) for v in key_fields)
@@ -2070,12 +2289,16 @@ class RefreshRebuildMixin:
         # (contiguous layer chunks) alternate forever; a single global slot
         # either COLLIDES (pre-v5 ROW1 corruption, when keys lacked group
         # identity) or evicts itself every call (with group-distinct keys),
-        # so each key owns its graph. The captured region allocates nothing,
-        # hence one shared mempool is safe across entries.
+        # so each key owns its graph. Each entry owns a PRIVATE mempool (the
+        # captured region allocates nothing, so the pool stays empty): a
+        # shared pool dies with its last graph (allocator use_count hits 0)
+        # and the next capture_begin on the dead pool id trips the
+        # CUDACachingAllocator "use_count > 0" INTERNAL ASSERT (wg2 forensics
+        # traceback) which then latched bypass forever.
         graphs = state.get("graphs") if isinstance(state, dict) else None
         entry = graphs.get(key) if isinstance(graphs, dict) else None
         # Hot path: key hit and a captured graph exists -> replay only.
-        if entry is not None and not pointer_rebuild_miss:
+        if entry is not None:
             try:
                 # #9-KEY v3: drain the writer-input ready latch before replay so
                 # the captured kernel sees the refreshed seq_lens/slot/selected
@@ -2086,35 +2309,47 @@ class RefreshRebuildMixin:
                     _wait_input_ready(device=device)
                 entry.replay()
                 self._record_deadline_async_producer_count("graph_replay")
+                _wg_dbg_note("replay")
                 return
             except Exception:
                 _log.warning(
                     "writer graph replay failed; bypassing capture", exc_info=True
                 )
                 self._writer_graph_state = {"bypass": True}
+                _wg_dbg_note("replay_fail")
                 eager_fn()
                 return
-        # Cold / new-key / pointer-rebuild step: run eager NOW (this is also
-        # the recapture step). Defect #3: only (re)capture when no pointer publish
-        # happened this step (pointer_rebuild_miss is False), so no H2D copy runs
-        # inside the capture region.
+        # Cold / new-key step: run eager NOW, then capture. A pointer-array
+        # republish this step is NOT an obstacle: the H2D lands on this stream
+        # before the eager launch and before the capture's pre-drain
+        # (_prepare_rebuild_ptr_ready_events_for_capture waits every ready
+        # event on the capture stream), and the capture bakes only the kernel
+        # launch — never the H2D.
         eager_fn()
-        if pointer_rebuild_miss:
-            # This key's layer-group pointer arrays were just republished (or
-            # their named buffers reallocated): its baked launch_args may be
-            # stale. Drop ONLY this key's graph; peers stay valid.
-            if isinstance(graphs, dict):
-                graphs.pop(key, None)
-            return
         try:
             self._capture_writer_graph(
                 ext=ext, launch_args=launch_args, device=device, key=key
             )
+            _wg_dbg_note("eager_capture")
         except Exception:
             _log.warning(
                 "writer graph capture failed; bypassing capture", exc_info=True
             )
             self._writer_graph_state = {"bypass": True}
+            if _wg_dbg:
+                # capture 异常全文落盘:vLLM logger 默认走 stdout 被 bench IPC
+                # 吞(§10.1 坑),此处是拿到 traceback 的唯一稳定通道。
+                try:
+                    import traceback as _tb
+
+                    with open(_wg_dbg, "a") as _fh:
+                        _fh.write(
+                            f"{os.getpid()}\twriter_capture_exc\t"
+                            f"{_tb.format_exc()!r}\n"
+                        )
+                except OSError:
+                    pass
+            _wg_dbg_note("capture_fail")
 
     def _capture_writer_graph(
         self,
@@ -2149,11 +2384,14 @@ class RefreshRebuildMixin:
             )
             return
         state = self._writer_graph_state
-        mempool = None
-        if isinstance(state, dict):
-            mempool = state.get("mempool")
-        if mempool is None:
-            mempool = torch.cuda.graph_pool_handle()
+        # [POOL-PRIVATE 2026-07-09] each graph owns a PRIVATE mempool (default
+        # capture_begin pool). The former shared handle died with its last
+        # graph (allocator pool use_count -> 0 on pop/clear/evict) and the
+        # next capture_begin on the dead id tripped the CUDACachingAllocator
+        # "use_count > 0" INTERNAL ASSERT -> permanent bypass latch (wg2
+        # forensics traceback; the §10.7 "known family noise" true face).
+        # The captured region allocates nothing, so a private pool holds no
+        # memory — sharing bought nothing and cost the lifetime coupling.
         graph = torch.cuda.CUDAGraph()
 
         # #9-KEY v4(b): the captured/replayed kernel must be STATELESS. The
@@ -2185,11 +2423,11 @@ class RefreshRebuildMixin:
             # torch.cuda.synchronize()+empty_cache()(~26ms 级全机停顿,decode
             # 主流被迫排空;empty_cache 还把 allocator 缓存段清光,后续两侧分配
             # 重新 cudaMalloc)。捕获正确性只需捕获流自身空闲——收窄为
-            # refresh_stream.synchronize();mempool 显式传入,无需 empty_cache。
-            # 捕获内容与 with 版逐字节相同。
+            # refresh_stream.synchronize();无需 empty_cache。捕获内容与 with
+            # 版逐字节相同。pool 不传=graph 私有([POOL-PRIVATE] 见上)。
             self.refresh_stream.synchronize()
             with torch.cuda.stream(self.refresh_stream):
-                graph.capture_begin(pool=mempool)
+                graph.capture_begin()
                 try:
                     _replay_body()
                 finally:
@@ -2199,9 +2437,8 @@ class RefreshRebuildMixin:
         # #9-KEY v5: per-key cache insert (state may be None / legacy shape).
         key_t = tuple(int(v) for v in key)
         if not isinstance(state, dict) or not isinstance(state.get("graphs"), dict):
-            state = {"graphs": {}, "mempool": mempool, "bypass": False}
+            state = {"graphs": {}, "bypass": False}
             self._writer_graph_state = state
-        state["mempool"] = mempool
         graphs_map = state["graphs"]
         # Defensive bound: beyond any plausible (layer-group x batch-shape)
         # population the keys are churning; drop the stale set BEFORE the
@@ -2209,8 +2446,20 @@ class RefreshRebuildMixin:
         # adjudicate a bypass.
         if len(graphs_map) >= 8 and key_t not in graphs_map:
             graphs_map.clear()
+            # Thrash joint-verdict signal: unbounded churn is the only way to
+            # overflow this cache (bounded families never reach 8 live keys).
+            self._writer_graph_evict_clear_count += 1
         graphs_map[key_t] = graph
         self._record_deadline_async_producer_count("graph_capture")
+        _wg_dbg = os.environ.get("VLLM_SPARSE_SELECTOR_TOPK_GRAPH_DEBUG_LOG", "")
+        if _wg_dbg:
+            # churn 取证:writer 轨与 selector 轨共用一个 keys 落盘(诊断档,
+            # 默认关;98 捕/0 replay 与 selector 轨同病,同仪器定名)。
+            try:
+                with open(_wg_dbg, "a") as _fh:
+                    _fh.write(f"{os.getpid()}\twriter\t{key_t}\n")
+            except OSError:
+                pass
         if self._writer_graph_record_recapture():
             self._writer_graph_state = {"bypass": True}
 
@@ -3593,11 +3842,6 @@ class RefreshRebuildMixin:
                                 "_selector_decode_bounds_buffers_override",
                                 None,
                             )
-                            log_r_prev = getattr(
-                                self,
-                                "_selector_log_r_cache_override",
-                                None,
-                            )
                             key_norms_prev = getattr(
                                 self,
                                 "_selector_key_norms_all_cache_override",
@@ -3625,7 +3869,6 @@ class RefreshRebuildMixin:
                             )
                             self._selector_selected_indices_out_override = {}
                             self._selector_decode_bounds_buffers_override = {}
-                            self._selector_log_r_cache_override = {}
                             self._selector_key_norms_all_cache_override = {}
                             self._selector_key_norms_all_valid_cache_keys_override = set()
                             self._selector_key_norms_delta_buffer_override = {}
@@ -3642,7 +3885,6 @@ class RefreshRebuildMixin:
                                 self.refresh_stream,
                                 self._selector_selected_indices_out_override,
                                 self._selector_decode_bounds_buffers_override,
-                                self._selector_log_r_cache_override,
                                 self._selector_key_norms_all_cache_override,
                                 self._selector_key_norms_delta_buffer_override,
                                 self._log_f_scratch_workspace_override,
@@ -3655,7 +3897,6 @@ class RefreshRebuildMixin:
                             self._selector_decode_bounds_buffers_override = (
                                 decode_bounds_prev
                             )
-                            self._selector_log_r_cache_override = log_r_prev
                             self._selector_key_norms_all_cache_override = (
                                 key_norms_prev
                             )

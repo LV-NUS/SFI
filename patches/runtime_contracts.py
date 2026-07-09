@@ -3,7 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Tuple
 
-_SUPPORTED_CAPTURE_IN_FLIGHT: Tuple[int, int] = (1, 2)
+# [RING-DEPTH-3 2026-07-08] depth 3 admitted for the refresh-pipeline dwell
+# cut (per-generation 3-chunk cadence no longer forces buf reuse inside one
+# generation). Consumers are fully parameterized on _CAPTURE_IN_FLIGHT (ring
+# mixin, wait ledger, meta arena); memory account: capture scratch reserve
+# projects ~1.75 GiB per buf. Default stays 2 — flip via
+# VLLM_SPARSE_CAPTURE_IN_FLIGHT=3 after the speed A/B on the target card.
+_SUPPORTED_CAPTURE_IN_FLIGHT: Tuple[int, ...] = (1, 2, 3)
 
 
 def validate_capture_inflight(value: int) -> int:

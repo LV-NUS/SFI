@@ -932,6 +932,11 @@ class ResolvedRowPtrArena:
     # a slot field because the arena is @dataclass(slots=True) with no
     # __dict__; without it B1 cannot store its baseline.
     _b1_last_pages_by_row: object = field(default=None, init=False, repr=False)
+    # [LIVE-PAGES-PINNED-ASYNC 2026-07-08] publish_live_rows pinned staging
+    # ring + persistent GPU staging (slots-declared for the same reason).
+    _live_pages_pinned_ring: object = field(default=None, init=False, repr=False)
+    _live_pages_pinned_ring_idx: int = field(default=0, init=False, repr=False)
+    _live_pages_staging_gpu: object = field(default=None, init=False, repr=False)
     # [ARENA-AFFINE-DEVICE-RETIRED 2026-07-03] The #12 v6 affine-clean
     # write-skip cache slot ``_affine_clean_last_key_by_row`` was removed with
     # the affine device tensors it gated (it only ever skipped those two
@@ -1441,44 +1446,95 @@ class ResolvedRowPtrArena:
         callers keep working.
         """
         del compact_pages_by_row  # [ARENA-AFFINE-DEVICE-RETIRED 2026-07-03]
-        for batch_row in dirty_rows:
-            batch_row = int(batch_row)
-            pages = tuple(int(v) for v in pages_by_row.get(batch_row, ()))
+        # [LIVE-PAGES-PINNED-ASYNC 2026-07-08] the old per-row
+        # ``new_tensor(list(pages))`` built a CUDA tensor from a Python list =
+        # a SYNCHRONOUS pageable H2D that stalls the host until the main
+        # stream drains — on TP2 async scheduling that is the previous step's
+        # in-flight forward (~8ms), and page_add ran it every step: the
+        # z_rrp_call 7.9ms/step plateau (96% of the TP2 steady metadata
+        # slice). Replace with a pinned staging RING (host memcpy is instant,
+        # H2D is truly async) + one persistent GPU staging tensor. Same-stream
+        # ordering makes the GPU staging reuse safe (next step's H2D is queued
+        # after this step's row_table copies); the pinned side needs the ring
+        # because host rewrites are NOT stream-ordered (SLOT-STAGING-UAF-FIX
+        # precedent). Values/write-set are byte-identical to the old path.
+        dirty = [int(r) for r in dirty_rows]
+        if not dirty:
+            return
+        max_pages = int(self.max_pages_per_row)
+        ring = getattr(self, "_live_pages_pinned_ring", None)
+        if (
+            ring is None
+            or ring[0].shape[0] < len(dirty)
+            or ring[0].shape[1] != max_pages
+        ):
+            if ring is not None:
+                # Cold-path regeneration guard (batch growth only): the old
+                # pinned buffers may still feed an in-flight H2D; dropping the
+                # refs hands them to GC mid-copy (SLOT-STAGING-UAF family).
+                torch.cuda.current_stream(self.row_table_i32.device).synchronize()
+            depth = 4
+            rows_cap = max(len(dirty), int(self.batch_size))
+            ring = [
+                torch.full(
+                    (rows_cap, max_pages), -1, dtype=torch.int32, pin_memory=True
+                )
+                for _ in range(depth)
+            ]
+            self._live_pages_pinned_ring = ring
+            self._live_pages_pinned_ring_idx = 0
+            self._live_pages_staging_gpu = torch.full(
+                (rows_cap, max_pages),
+                -1,
+                dtype=torch.int32,
+                device=self.row_table_i32.device,
+            )
+        idx = int(getattr(self, "_live_pages_pinned_ring_idx", 0))
+        pinned = ring[idx]
+        self._live_pages_pinned_ring_idx = (idx + 1) % len(ring)
+        staging = self._live_pages_staging_gpu
+        counts: list[int] = []
+        for i, batch_row in enumerate(dirty):
+            pages = pages_by_row.get(batch_row, ())
             page_count = len(pages)
-            if page_count > self.max_pages_per_row:
+            if page_count > max_pages:
                 raise ValueError(
                     f"pages length {page_count} exceeds max_pages_per_row "
-                    f"{self.max_pages_per_row} for batch_row {batch_row}"
+                    f"{max_pages} for batch_row {batch_row}"
                 )
+            row = pinned[i]
+            row[:page_count] = torch.as_tensor(
+                pages, dtype=torch.int32
+            )  # host->pinned memcpy (no device traffic)
+            if page_count < max_pages:
+                row[page_count:] = -1
+            counts.append(page_count)
+        n = len(dirty)
+        staging[:n].copy_(pinned[:n], non_blocking=True)
+        for i, batch_row in enumerate(dirty):
+            page_count = counts[i]
             row_start = batch_row * self.num_kv_heads
             row_slice = slice(row_start, row_start + self.num_kv_heads)
             # [WAR-SAFE-FILL-RETIRED 2026-07-07] 兜底下线,同上臂:恢复 fill_(-1)
             # fail-fast 语义。
             self.row_table_i32[row_slice].fill_(-1)
             if page_count:
-                page_tensor = self.row_table_i32.new_tensor(list(pages))
                 self.row_table_i32[row_slice, :page_count].copy_(
-                    page_tensor.reshape(1, page_count).expand(
-                        self.num_kv_heads,
-                        page_count,
-                    ),
+                    staging[i, :page_count]
+                    .reshape(1, page_count)
+                    .expand(self.num_kv_heads, page_count),
                     non_blocking=True,
                 )
-            # [ARENA-AFFINE-DEVICE-RETIRED 2026-07-03] The B2 affine-publish
-            # derivation and the per-row affine_i32 / affine_row_consume_mode_i32
-            # device writes (fallback sentinel or SELECTED 5-tuple) were removed.
-            # B1 stale-baseline guard: this path rewrote row_table_i32
-            # for batch_row outside B1's own writer, so the cached
-            # last-written pages are no longer valid for it. Drop the
-            # per-row baseline so the next B1 publish does a full
-            # (non-incremental) upload for this row. No-op when B1 is off.
+            # B1 stale-baseline guard: this path rewrote row_table_i32 for
+            # batch_row outside B1's own writer, so the cached last-written
+            # pages are no longer valid for it. Drop the per-row baseline so
+            # the next B1 publish does a full (non-incremental) upload for
+            # this row. No-op when B1 is off.
             _b1_last_pages_by_row = getattr(
                 self, "_b1_last_pages_by_row", None
             )
             if _b1_last_pages_by_row is not None:
                 _b1_last_pages_by_row.pop(batch_row, None)
-            # [ARENA-AFFINE-DEVICE-RETIRED 2026-07-03] v6 affine-clean cache
-            # pop removed with the cache itself.
 
 
     @staticmethod

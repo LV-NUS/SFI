@@ -23,6 +23,7 @@ ENTRY_POINTS:
 """
 from __future__ import annotations
 
+import os
 import time
 from typing import (
     Any,
@@ -45,6 +46,10 @@ from hybrid_selectors.alpha_fair_selector import (
 )
 from patches.selector_runtime.batched_selection import (
     compute_alpha_selection_batched_impl,
+)
+from patches.selector_runtime.selected_out_ring import (
+    SelectedOutRing,
+    SlotStableOverrides,
 )
 from patches.request_intent_ticket import (
     PendingPolicy,
@@ -236,16 +241,14 @@ class SelectorComputeMixin:
         self._selector_decode_bounds_buffers_override: Optional[
             Dict[Tuple[object, ...], Tuple[torch.Tensor, ...]]
         ] = None
-        self._selector_log_r_cache_key: Optional[Tuple[object, ...]] = None
-        self._selector_log_r_cache: Optional[torch.Tensor] = None
-        self._selector_log_r_cache_override: Optional[
-            Dict[Tuple[object, ...], torch.Tensor]
-        ] = None
         self._selector_selected_indices_out_key: Optional[Tuple[object, ...]] = None
         self._selector_selected_indices_out: Optional[torch.Tensor] = None
         self._selector_selected_indices_out_override: Optional[
             Dict[Tuple[object, ...], torch.Tensor]
         ] = None
+        # [SELECTED-OUT-RING 2026-07-09] pending 路径稳定环(懒构造,见
+        # refresh_rebuild_mixin._selected_out_ring_for_pending;env 关=None)。
+        self._selected_out_ring: Optional[SelectedOutRing] = None
         # ASYNC_PRODUCER_WRITER_GRAPH: persistent (layers, max_batch) int32 row-tensor buffer so the
         # captured writer reads a STABLE data_ptr on replay (defect #6).
         self._selector_writer_row_tensor_all_key: Optional[Tuple[object, ...]] = None
@@ -568,16 +571,21 @@ class SelectorComputeMixin:
         self._selector_key_norms_all_active_cache_key = cache_key
         override = getattr(self, "_selector_key_norms_all_cache_override", None)
         if isinstance(override, dict):
-            override_key = (
-                cache_key
-                if cache_key is not None
-                else (
-                    "__default__",
+            # [SELECTED-OUT-RING v2] 槽稳定容器按**容量**键控:语义 cache_key
+            # (含层组标识/slot_list)每世代漂移,per-run 私有 dict 下无所谓
+            # (dict 一次性),槽持久 dict 下=每代插新 buffer=graph key 的
+            # key_norms 指针永新(rv8 keys 取证:其余 9 指针全 3 槽周期,唯
+            # key_norms 24 唯一≈每世代一个)。环模式 valid 集每 run 清空=
+            # 必重填,语义键的跨 run 复用本已不存在,按容量复用值语义相同。
+            if isinstance(override, SlotStableOverrides) or cache_key is None:
+                override_key = (
+                    "__slot_capacity__" if isinstance(override, SlotStableOverrides) else "__default__",
                     str(device),
                     str(dtype),
                     tuple(int(v) for v in alloc_shape),
                 )
-            )
+            else:
+                override_key = cache_key
             buf = override.get(override_key)
             self._selector_key_norms_all_reallocated = False
             if (
@@ -589,6 +597,9 @@ class SelectorComputeMixin:
                 or buf.shape[2] < shape[2]
                 or buf.shape[3] < shape[3]
             ):
+                if buf is not None and buf.is_cuda:
+                    # [SELECTED-OUT-RING v2] 槽稳定容器换代弃旧走守卫。
+                    self._uaf_guard_record_streams_before_discard(buf)
                 buf = torch.empty(alloc_shape, device=device, dtype=dtype)
                 override[override_key] = buf
                 valid_keys = getattr(
@@ -789,6 +800,11 @@ class SelectorComputeMixin:
                 and gpu_end_o.shape[0] >= shape[0]
                 and gpu_end_o.shape[1] >= shape[1]
             ):
+                # [SELECTED-OUT-RING v2] 槽稳定容器换代弃旧走守卫(GPU 对);
+                # pinned CPU 对由 CachingHostAllocator 自动挂事件免守卫。
+                for _old in (gpu_start_o, gpu_end_o):
+                    if isinstance(_old, torch.Tensor) and _old.is_cuda:
+                        self._uaf_guard_record_streams_before_discard(_old)
                 cpu_start_o = torch.empty(
                     shape,
                     device="cpu",
@@ -974,6 +990,12 @@ class SelectorComputeMixin:
                 or any(tuple(t.shape) != shape_3d for t in buffers[:4])
                 or any(tuple(t.shape) != shape_2d for t in buffers[4:])
             ):
+                if isinstance(buffers, tuple):
+                    # [SELECTED-OUT-RING v2] 槽稳定容器跨 run 持久,换代弃旧
+                    # 走守卫(bounds 有 deferred writer 晚读=R5 消费链最长站)。
+                    for _old in buffers:
+                        if isinstance(_old, torch.Tensor) and _old.is_cuda:
+                            self._uaf_guard_record_streams_before_discard(_old)
                 buffers = (
                     torch.empty(shape_3d, device=device, dtype=torch.int32),
                     torch.empty(shape_3d, device=device, dtype=torch.int32),
@@ -1018,58 +1040,6 @@ class SelectorComputeMixin:
             self._selector_decode_bounds_buffers = buffers
         return buffers
 
-    def _ensure_selector_log_r_cache_buffer(
-        self,
-        *,
-        layers: int,
-        batch: int,
-        num_kv_heads: int,
-        kv_len: int,
-        device: torch.device,
-    ) -> torch.Tensor:
-        """Reuse the optional log-r scratch for selector pipeline experiments."""
-        device = torch.device(device)
-        if device.type == "cuda" and device.index is None:
-            device = torch.device("cuda", torch.cuda.current_device())
-        if layers <= 0 or batch <= 0 or num_kv_heads <= 0 or kv_len <= 0:
-            return torch.empty((0, 0), device=device, dtype=torch.float32)
-
-        shape = (int(layers) * int(batch) * int(num_kv_heads), int(kv_len))
-        key = (
-            str(device.type),
-            int(device.index) if device.index is not None else -1,
-            shape,
-        )
-        override = getattr(self, "_selector_log_r_cache_override", None)
-        if isinstance(override, dict):
-            buf = override.get(key)
-            if (
-                buf is None
-                or buf.device != device
-                or buf.dtype != torch.float32
-                or not buf.is_contiguous()
-                or tuple(buf.shape) != shape
-            ):
-                buf = torch.empty(shape, device=device, dtype=torch.float32)
-                override[key] = buf
-            return buf
-        buf = self._selector_log_r_cache
-        if (
-            self._selector_log_r_cache_key != key
-            or buf is None
-            or buf.device != device
-            or buf.dtype != torch.float32
-            or not buf.is_contiguous()
-            or tuple(buf.shape) != shape
-        ):
-            if buf is not None and buf.is_cuda:
-                # [SELECTOR-SHARED-SCRATCH-REALLOC-UAF-FIX] R5:同族换代守卫。
-                self._uaf_guard_record_streams_before_discard(buf)
-            buf = torch.empty(shape, device=device, dtype=torch.float32)
-            self._selector_log_r_cache_key = key
-            self._selector_log_r_cache = buf
-        return buf
-
     def _ensure_selector_selected_indices_out(
         self,
         *,
@@ -1107,6 +1077,11 @@ class SelectorComputeMixin:
                 or not out.is_contiguous()
                 or tuple(out.shape) != shape
             ):
+                if out is not None and out.is_cuda:
+                    # [SELECTED-OUT-RING v2] 槽稳定容器(SlotStableOverrides)
+                    # 跨 run 持久,换代弃旧走守卫(评审清单·换代臂);per-run
+                    # 私有 dict 内几乎不换代,守卫为零成本防御。
+                    self._uaf_guard_record_streams_before_discard(out)
                 out = torch.empty(shape, device=device, dtype=torch.int32)
                 override[key] = out
             return out
@@ -1625,6 +1600,9 @@ class SelectorComputeMixin:
                 or int(scratch.shape[3]) < int(kv_needed)
             )
             if need_alloc:
+                if scratch is not None and scratch.is_cuda:
+                    # [SELECTED-OUT-RING v2] 槽稳定容器换代弃旧走守卫。
+                    self._uaf_guard_record_streams_before_discard(scratch)
                 prev_kv = (
                     int(scratch.shape[3])
                     if scratch is not None and scratch.dim() == 4
@@ -1729,6 +1707,11 @@ class SelectorComputeMixin:
         if isinstance(override, dict):
             pair = override.get(key)
             if pair is None or not _is_valid(pair[0]) or not _is_valid(pair[1]):
+                if pair is not None:
+                    # [SELECTED-OUT-RING v2] 槽稳定容器换代弃旧走守卫。
+                    for _old in pair:
+                        if isinstance(_old, torch.Tensor) and _old.is_cuda:
+                            self._uaf_guard_record_streams_before_discard(_old)
                 pair = _alloc()
                 override[key] = pair
             return pair
@@ -1775,28 +1758,50 @@ class SelectorComputeMixin:
         _writer_graph_split_active, defect #4). On the synchronous flush path the
         override attrs are None and the buffers are shape-keyed stable, so the
         graph is safe.
+
+        [SELECTED-OUT-RING v2 2026-07-09] the production pending path installs
+        the ring slot's persistent SlotStableOverrides containers: buffers are
+        data_ptr-stable per slot, per-slot release events restore the
+        cross-stream ordering, and the slot is never reused before its pending
+        is terminal — so the graph is safe there (out/bounds/ws ptrs are part
+        of the graph key -> per-slot graphs). Bare per-run dicts (ring spill /
+        escape env / replay-refresh private helper) still bypass. Ring spill
+        runs are additionally excluded at the dispatch site via
+        ptr_rebuild_miss (transient ptrs must never be captured).
         """
         for attr in (
             "_selector_selected_indices_out_override",
             "_selector_decode_bounds_buffers_override",
-            "_selector_log_r_cache_override",
             "_selector_pipeline_workspace_override",
         ):
-            if isinstance(getattr(self, attr, None), dict):
+            _ov = getattr(self, attr, None)
+            if isinstance(_ov, dict) and not isinstance(_ov, SlotStableOverrides):
                 return False
         return True
 
     def _selector_topk_graph_record_recapture(self) -> bool:
-        """Thrash detector: >THRASH_RECAPTURES recaptures in a window -> bypass."""
+        """Thrash detector: recapture 超阈 **且窗口内发生过防御性清库** -> bypass。
+
+        [SELECTED-OUT-RING v2] 旧判据只数 capture 次数——环门控后合法稳态
+        key 族(3 槽×两臂+ramp 形状)首窗即可超过 4,误闩死永久 bypass。
+        真 churn 的签名是 8-graph 上限清库风暴(population 溢出),故加
+        clear 计数联判:无清库=population 有界=不闩(rv7 取证:sync 路径
+        churn 正是靠清库风暴打满 64 窗)。
+        """
         self._selector_topk_graph_recapture_window += 1
         self._selector_topk_graph_recapture_count += 1
         if self._selector_topk_graph_recapture_window >= int(
             self._SELECTOR_TOPK_GRAPH_THRASH_WINDOW
         ):
             recaptures = int(self._selector_topk_graph_recapture_count)
+            clears = int(getattr(self, "_selector_topk_graph_window_clear_count", 0))
             self._selector_topk_graph_recapture_window = 0
             self._selector_topk_graph_recapture_count = 0
-            return recaptures > int(self._SELECTOR_TOPK_GRAPH_THRASH_RECAPTURES)
+            self._selector_topk_graph_window_clear_count = 0
+            return (
+                recaptures > int(self._SELECTOR_TOPK_GRAPH_THRASH_RECAPTURES)
+                and clears > 0
+            )
         return False
 
     def _selector_topk_graph_dispatch(
@@ -1931,6 +1936,11 @@ class SelectorComputeMixin:
         # churning; drop the stale set (keep the just-captured graph) and let the
         # thrash detector adjudicate a bypass.
         if len(graphs_map) >= 8 and key_t not in graphs_map:
+            # [SELECTED-OUT-RING v2] 清库=population 溢出的 churn 实证,计数
+            # 供 thrash 联判(合法稳态 key 族有界,永不触发此臂)。
+            self._selector_topk_graph_window_clear_count = (
+                int(getattr(self, "_selector_topk_graph_window_clear_count", 0)) + 1
+            )
             if _selector_graph_lru_enabled():
                 # Single-entry LRU: evict only the least-recently-used key
                 # (the oldest in the map's insertion ordering, kept fresh by
@@ -1947,6 +1957,20 @@ class SelectorComputeMixin:
             "graph": graph,
             "result": captured_result,
         }
+        # [SELECTED-OUT-RING v2] 判据仪器:capture 累计(flush 遥测导出)。
+        self._selector_topk_graph_capture_count = (
+            int(getattr(self, "_selector_topk_graph_capture_count", 0)) + 1
+        )
+        _tkg_dbg = os.environ.get("VLLM_SPARSE_SELECTOR_TOPK_GRAPH_DEBUG_LOG", "")
+        if _tkg_dbg:
+            # churn 取证:逐字段落盘 key(诊断档,默认关;bench 吞 stdout 故写文件)。
+            try:
+                with open(_tkg_dbg, "a") as _fh:
+                    _fh.write(
+                        f"{os.getpid()}\tcapture#{int(self._selector_topk_graph_capture_count)}\t{key_t}\n"
+                    )
+            except OSError:
+                pass
         if self._selector_topk_graph_record_recapture():
             self._selector_topk_graph_state = {"bypass": True}
 
@@ -3544,11 +3568,6 @@ class SelectorComputeMixin:
                 "_selector_decode_bounds_buffers_override",
                 None,
             )
-            log_r_prev = getattr(
-                self,
-                "_selector_log_r_cache_override",
-                None,
-            )
             key_norms_prev = getattr(
                 self,
                 "_selector_key_norms_all_cache_override",
@@ -3576,7 +3595,6 @@ class SelectorComputeMixin:
             )
             self._selector_selected_indices_out_override = {}
             self._selector_decode_bounds_buffers_override = {}
-            self._selector_log_r_cache_override = {}
             self._selector_key_norms_all_cache_override = {}
             self._selector_key_norms_all_valid_cache_keys_override = set()
             self._selector_key_norms_delta_buffer_override = {}
@@ -3593,7 +3611,6 @@ class SelectorComputeMixin:
                     selected_indices_out_prev
                 )
                 self._selector_decode_bounds_buffers_override = decode_bounds_prev
-                self._selector_log_r_cache_override = log_r_prev
                 self._selector_key_norms_all_cache_override = key_norms_prev
                 self._selector_key_norms_all_valid_cache_keys_override = (
                     key_norms_valid_prev

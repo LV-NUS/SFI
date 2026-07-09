@@ -8,6 +8,7 @@ freely by both the main patch and all runtime worker modules.
 from __future__ import annotations
 
 import os
+import sys
 from typing import Optional
 
 from patches.runtime_contracts import validate_capture_inflight
@@ -19,9 +20,6 @@ __all__ = [
     "_RELEASE_ON_IDLE_CACHED",
     "_REBUILD_PTRS_PINNED_CACHED",
     "_WRITER_TOKEN_TILE_CACHED",
-    "_GATHER_QOS_CACHED",
-    "_GATHER_QOS_NUM_WARPS_CACHED",
-    "_GATHER_QOS_NUM_STAGES_CACHED",
     "_REBUILD_PHYSICAL_BLOCK_SORT_CACHED",
     "_SELECTOR_TRUSTED_SHAPES_CACHED",
     "_SELECTOR_FAST_SIG_CACHED",
@@ -35,6 +33,8 @@ __all__ = [
     "_LIFECYCLE_LIVE_STEADY_ASSERT_CACHED",
     "_LIFECYCLE_ONLY_FOR_SPEC_CACHED",
     "_RRP_SAME_PAGE_SKIP_REVALIDATION_CACHED",
+    "_CLEAN_METADATA_CACHED",
+    "_PAGE_ADD_INCREMENTAL_CACHED",
     "_SAME_PAGE_MINIMAL_UPDATE_CACHED",
     "_SAME_PAGE_READY_EVENT_ONLY_CACHED",
     "_PROBE_CACHEKEY_CACHED",
@@ -75,6 +75,10 @@ __all__ = [
     "_SELECTOR_TOPK_GRAPH_CACHED",
     "_SELECTOR_GRAPH_LRU_CACHED",
     "_selector_graph_lru_enabled",
+    "_SELECTED_OUT_RING_CACHED",
+    "_SELECTED_OUT_RING_SLOTS_CACHED",
+    "_selected_out_ring_enabled",
+    "_selected_out_ring_slots",
     "_REFRESH_PROFILE_CACHED",
     "_REFRESH_PROFILE_CALL_MIN_CACHED",
     "_REFRESH_PROFILE_EVERY_CACHED",
@@ -102,8 +106,17 @@ __all__ = [
 # ---------------------------------------------------------------------------
 # Dynamic environment detection
 # ---------------------------------------------------------------------------
-_DYNAMIC_ENV = (os.environ.get("PYTEST_CURRENT_TEST") is not None) or (
-    os.environ.get("VLLM_SPARSE_DYNAMIC_ENV", "0") == "1"
+# [DYNAMIC-ENV-COLLECT-FIX 2026-07-08] PYTEST_CURRENT_TEST is only set while a
+# test RUNS; test modules that import this package at module level do so during
+# pytest COLLECTION, where it is absent — _DYNAMIC_ENV froze False and every
+# `if _DYNAMIC_ENV else _CACHED` consumer silently ignored monkeypatch.setenv
+# (root cause of the standing lifecycle-admission contract red). "pytest" in
+# sys.modules is already true at collection import time and never true in
+# production, so it is the correct import-time signal.
+_DYNAMIC_ENV = (
+    (os.environ.get("PYTEST_CURRENT_TEST") is not None)
+    or ("pytest" in sys.modules)
+    or (os.environ.get("VLLM_SPARSE_DYNAMIC_ENV", "0") == "1")
 )
 
 # ---------------------------------------------------------------------------
@@ -122,10 +135,11 @@ _ONE_SHOT_BLOCKED_DENSE_FALLBACK_CACHED = (
 # Rebuild / gather hot-path knobs
 # ---------------------------------------------------------------------------
 _REBUILD_PTRS_PINNED_CACHED = os.environ.get("VLLM_SPARSE_REBUILD_PTRS_PINNED", "1") == "1"
-_WRITER_TOKEN_TILE_CACHED: int = int(os.environ.get("VLLM_SPARSE_WRITER_TOKEN_TILE", "16") or "0")
-_GATHER_QOS_CACHED = os.environ.get("VLLM_SPARSE_GATHER_QOS", "1") == "1"
-_GATHER_QOS_NUM_WARPS_CACHED: int = int(os.environ.get("VLLM_SPARSE_GATHER_QOS_NUM_WARPS", "0") or "0")
-_GATHER_QOS_NUM_STAGES_CACHED: int = int(os.environ.get("VLLM_SPARSE_GATHER_QOS_NUM_STAGES", "0") or "0")
+# [WRITER-TILE-128 2026-07-08] gather 相1 每 token 单线程译码:tile=16 时 128
+# 线程仅 16 活跃(12.5%)且 block 数 ×8,microbench(12k 档 L36 B8 H8 k1536)
+# steady 全 skip 0.80→0.24ms、cold 全拷贝 5.97→2.15ms;128=kMaxSharedTileTokens
+# 上限,相1 满活跃。tile 只改并行拆分不改写集合(每 (t,vi) 单写手)=逐位等价。
+_WRITER_TOKEN_TILE_CACHED: int = int(os.environ.get("VLLM_SPARSE_WRITER_TOKEN_TILE", "128") or "0")
 
 # ---------------------------------------------------------------------------
 # Selector / rebuild experiment switches
@@ -149,8 +163,11 @@ _SELECTOR_PIPELINE_UNIFIED_CACHED = (
     os.environ.get("VLLM_SPARSE_SELECTOR_PIPELINE_UNIFIED", "1") == "1"
 )
 _DECODE_BOUNDS_KERNEL_CACHED = os.environ.get("VLLM_SPARSE_DECODE_BOUNDS_KERNEL", "1") == "1"
+# [T3-LOG-R-WS-B 2026-07-08] default ON: the cache now borrows the selector
+# pipeline's ws_b (zero extra VRAM), removing the 3x full-K log_r recompute in
+# the fused kernel's passes 2/3/4. Bitwise-identical numerics. Escape =0.
 _SELECTOR_LOGS_CACHE_R_CACHED = (
-    os.environ.get("VLLM_SPARSE_SELECTOR_LOGS_CACHE_R", "").strip() == "1"
+    os.environ.get("VLLM_SPARSE_SELECTOR_LOGS_CACHE_R", "1").strip() != "0"
 )
 # --- one-shot async bootstrap gate deployment flags (phase_h FIND #5) ---
 _ONE_SHOT_ASYNC_BOOTSTRAP_CACHED = (
@@ -173,6 +190,21 @@ _LIFECYCLE_ONLY_FOR_SPEC_CACHED = (
 )
 _RRP_SAME_PAGE_SKIP_REVALIDATION_CACHED = (
     os.environ.get("VLLM_SPARSE_RRP_SAME_PAGE_SKIP_REVALIDATION", "1") == "1"
+)
+# [LEG-B-PROMOTED 2026-07-08] live page-boundary writer default ON (user call:
+# "能加速没有bug都可以考虑转正"). Evidence: golden anchors MATCH, 4B 12k TP1
+# 8-hash bitwise IDENTICAL vs OFF, counts identical, TP2 same-card pair +1.5%.
+# Escape hatch: VLLM_SPARSE_CLEAN_METADATA=0.
+_CLEAN_METADATA_CACHED = os.environ.get("VLLM_SPARSE_CLEAN_METADATA", "1") == "1"
+# [PAGE-ADD-PROMOTED 2026-07-08] growth page-boundary live re-lay default ON:
+# a genuine recent-page growth re-lays the row's pages in place instead of the
+# heavy full bind. Evidence: golden x2 MATCH, 4B 8-hash bitwise IDENTICAL,
+# full_bind steps 804->288 (-64%) with remaining-bind p50 8.2ms->1.8ms; wall
+# clock flat at TP1/TP2 (host-structural win: the metadata host slice shrinks,
+# freeing headroom under TP>1 refresh contention). Miss still falls through to
+# the full bind (fail-safe direction). Escape: VLLM_SPARSE_PAGE_ADD_INCREMENTAL=0.
+_PAGE_ADD_INCREMENTAL_CACHED = (
+    os.environ.get("VLLM_SPARSE_PAGE_ADD_INCREMENTAL", "1") == "1"
 )
 _SAME_PAGE_MINIMAL_UPDATE_CACHED = (
     os.environ.get("VLLM_SPARSE_SAME_PAGE_MINIMAL_UPDATE", "1") == "1"
@@ -420,6 +452,41 @@ _SELECTOR_TOPK_GRAPH_CACHED = (
 _SELECTOR_GRAPH_LRU_CACHED = (
     os.environ.get("VLLM_SPARSE_SELECTOR_GRAPH_LRU", "0") == "1"
 )
+# [SELECTED-OUT-RING 2026-07-09] pending-path selected_indices_out stable ring
+# (default ON). Replaces [SELECTED-PRIVATE-OUT 2026-07-07]'s per-run fresh
+# allocation with a bounded ring of data_ptr-stable buffers guarded by per-slot
+# release events (produce/consume ordering) and released at the pending
+# terminal funnel (_pending_refresh_rebuild_clear). Liveness semantics are
+# unchanged (a slot is never reused before its pending is terminal); what
+# changes is pointer stability, which is what lets the #13 STAGE-0
+# selector-topk captured graph hit on the production pending path (fresh
+# per-run pointers miss the ptr-encoding key forever). Escape:
+# VLLM_SPARSE_SELECTED_OUT_RING=0 restores the per-run private dict verbatim.
+_SELECTED_OUT_RING_CACHED = (
+    os.environ.get("VLLM_SPARSE_SELECTED_OUT_RING", "1") == "1"
+)
+# 槽数默认 3=世代 chunk 数对齐(begin_run preferred=chunk_id 稳定配对):
+# 每槽只服务一个 chunk 的层组形状族(形状恒定→容器零 realloc→指针稳定),
+# 3 chunk 在飞也不 spill;graph key 组合数≈chunk 数×capture 环深=6<8 上限。
+# (rv2g/rv3g 取证:自由/buf 配对下形状族交替致容器逐 run realloc,key 永
+# 不复现→64 窗 thrash 闩死 bypass。)容量超额走 spill(计数可见)。
+_SELECTED_OUT_RING_SLOTS_CACHED = int(
+    os.environ.get("VLLM_SPARSE_SELECTED_OUT_RING_SLOTS", "3") or "3"
+)
+
+
+def _selected_out_ring_enabled() -> bool:
+    """Pending-path selected-out ring gate. Dynamic/cached convention: live
+    env read under ``_DYNAMIC_ENV`` (e.g. pytest), else the import-time bool."""
+    if _DYNAMIC_ENV:
+        return os.environ.get("VLLM_SPARSE_SELECTED_OUT_RING", "1") == "1"
+    return _SELECTED_OUT_RING_CACHED
+
+
+def _selected_out_ring_slots() -> int:
+    if _DYNAMIC_ENV:
+        return int(os.environ.get("VLLM_SPARSE_SELECTED_OUT_RING_SLOTS", "4") or "4")
+    return _SELECTED_OUT_RING_SLOTS_CACHED
 
 
 def _selector_graph_lru_enabled() -> bool:

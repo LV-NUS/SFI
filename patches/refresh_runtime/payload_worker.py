@@ -275,6 +275,88 @@ def prepare_refresh_capture_payload_impl(
         step_context=step_context,
         stage="refresh payload",
     )
+    # [PAYLOAD-VIEWS-FAST-IDENT 2026-07-09] 同 step 同 layout 的逐层重建短路
+    # （取证 payload_build 537µs/世代主项=每层重建 views_key 三 tuple+ready 双
+    # tuple+preamble max()）。首层全路径校验通过后置 ident（引用 `is` 比较，
+    # 无 id 复用风险；epoch/handle 换步天然失效，slot_row_map_key/bound_meta/
+    # slots_filter 对象替换即失效）。命中=直接产出与全路径 ready-hit 分支逐位
+    # 相同的返回元组，值语义零变化。
+    if layout is not None:
+        _fast_pack = layout.refresh_payload_views_fast_ident
+        if (
+            _fast_pack is not None
+            and _fast_pack[0] == int(step_context.epoch)
+            and _fast_pack[1] == int(step_context.step_handle_id)
+            and _fast_pack[2] == int(step_context.step_handle_generation)
+            and _fast_pack[3] is bound_meta
+            and _fast_pack[4] is layout.slot_row_map_key
+            and _fast_pack[5] is slots_filter
+            and _fast_pack[6] == bool(slots_filter_sorted)
+        ):
+            slot_list_fast = layout.slot_list
+            kv_needed_fast = int(_fast_pack[7])
+            if (
+                int(getattr(state, "layer_index_epoch", -2))
+                == int(getattr(controller, "_layer_index_cache_epoch", -1))
+                and int(getattr(state, "capture_slot_in_chunk", -1)) >= 0
+            ):
+                slot_in_chunk = int(state.capture_slot_in_chunk)
+            else:
+                global_layer_index = controller.layer_index_by_cache_key.get(cache_key, -1)
+                if global_layer_index < 0:
+                    raise RuntimeError(
+                        "refresh payload missing global layer index; "
+                        f"cache_key={int(cache_key)} epoch={int(getattr(step_context, 'epoch', -1))}"
+                    )
+                _, _, slot_in_chunk = controller._map_global_layer_to_capture_slot(
+                    global_layer_index
+                )
+            kv_slice_fast = (
+                int(layout.kv_max) if _selector_fixed_k_enabled() else int(kv_needed_fast)
+            )
+            _scores_src = layout.capture_scores
+            _sv_key = (int(slot_in_chunk), int(len(slot_list_fast)), int(kv_slice_fast))
+            _sv = layout.refresh_scores_subviews.get(_sv_key)
+            if _sv is not None and _sv[0] is _scores_src:
+                capture_scores = _sv[1]
+            else:
+                capture_scores = _scores_src[
+                    slot_in_chunk, : len(slot_list_fast), :, :, :kv_slice_fast
+                ]
+                layout.refresh_scores_subviews[_sv_key] = (_scores_src, capture_scores)
+            (
+                kv_lengths_tensor,
+                seq_lens_batch,
+                kv_len_per_row_i32,
+                row_list_cpu,
+                seq_lens_cpu,
+                slot_tensor_i32,
+                self_slot_tensor_cpu,
+                self_seq_lens_tensor_cpu,
+            ) = _refresh_payload_views_from_layout(layout)
+            row_tensor_i32 = layout.row_tensor_i32
+            if row_tensor_i32 is None:
+                raise RuntimeError(
+                    "refresh capture layout missing normalized row_tensor_i32"
+                )
+            return (
+                capture_scores,
+                None,
+                kv_lengths_tensor,
+                seq_lens_batch,
+                getattr(layout, "seq_lens_batch_i32", None),
+                layout.slot_list,
+                layout.slot_tensor,
+                slot_tensor_i32,
+                self_slot_tensor_cpu,
+                row_list_cpu if row_list_cpu is not None else [],
+                layout.row_tensor,
+                row_tensor_i32,
+                kv_len_per_row_i32,
+                seq_lens_cpu,
+                self_seq_lens_tensor_cpu,
+                int(slot_in_chunk),
+            )
     plan_last_n_by_row = bound_meta.logits_last_n_by_row
     plan_caps_by_row = bound_meta.logits_capacity_by_row
     plan_max_last_n = max((int(v) for v in plan_last_n_by_row), default=0)
@@ -377,7 +459,17 @@ def prepare_refresh_capture_payload_impl(
     kv_needed = int(plan_max_kv)
     use_fixed_k = _selector_fixed_k_enabled()
     kv_slice = int(layout.kv_max) if use_fixed_k else int(kv_needed)
-    capture_scores = layout.capture_scores[slot_in_chunk, : len(slot_list), :, :, :kv_slice]
+    # [PAYLOAD-VIEWS-FAST-IDENT] 全路径切片同走子视图复用（src `is` 校验防替换）。
+    _scores_src_full = layout.capture_scores
+    _sv_key_full = (int(slot_in_chunk), int(len(slot_list)), int(kv_slice))
+    _sv_full = layout.refresh_scores_subviews.get(_sv_key_full)
+    if _sv_full is not None and _sv_full[0] is _scores_src_full:
+        capture_scores = _sv_full[1]
+    else:
+        capture_scores = _scores_src_full[
+            slot_in_chunk, : len(slot_list), :, :, :kv_slice
+        ]
+        layout.refresh_scores_subviews[_sv_key_full] = (_scores_src_full, capture_scores)
 
     # refresh(decode) 默认 last_n==1（见 prepare_step_logits_buffers）。
     # B1：kernel 仅写 logits（fp16/fp32），selector 内部完成 log_softmax；
@@ -402,12 +494,14 @@ def prepare_refresh_capture_payload_impl(
         layout=layout,
         slot_list=slot_list,
     )
+    _views_ready_for_fast = False
     if _refresh_payload_views_ready(
         layout=layout,
         slot_list=slot_list,
         views_key=refresh_views_key,
     ):
         layout.refresh_payload_views_key = refresh_views_key
+        _views_ready_for_fast = True
         (
             kv_lengths_tensor,
             seq_lens_batch,
@@ -444,6 +538,27 @@ def prepare_refresh_capture_payload_impl(
                 layout=layout,
                 slot_list=slot_list,
             )
+            _views_ready_for_fast = True
+    if _views_ready_for_fast:
+        # [PAYLOAD-VIEWS-FAST-IDENT] 首层全路径校验通过：置同 step 逐层短路
+        # 身份，并清跨代 src 已替换的残留子视图（防旧 capture_scores 被条目
+        # 强引用滞留）。
+        _sv_map = layout.refresh_scores_subviews
+        if _sv_map:
+            for _sv_entry in _sv_map.values():
+                if _sv_entry[0] is not _scores_src_full:
+                    _sv_map.clear()
+                    break
+        layout.refresh_payload_views_fast_ident = (
+            int(step_context.epoch),
+            int(step_context.step_handle_id),
+            int(step_context.step_handle_generation),
+            bound_meta,
+            layout.slot_row_map_key,
+            slots_filter,
+            bool(slots_filter_sorted),
+            int(kv_needed),
+        )
     seq_lens_batch_i32 = getattr(layout, "seq_lens_batch_i32", None)
     row_tensor_i32 = layout.row_tensor_i32
     if row_tensor_i32 is None:

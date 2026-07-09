@@ -897,9 +897,6 @@ class ProfileMixin:
             "rebuild_num_kv_heads": int(pending.rebuild_num_kv_heads or 0),
             "rebuild_batch_slots": int(pending.rebuild_batch_slots or 0),
             "capture_kv_len_total": int(pending.capture_kv_len_total or 0),
-            "gather_qos": int(pending.gather_qos or 0),
-            "gather_qos_num_warps": int(pending.gather_qos_num_warps or 0),
-            "gather_qos_num_stages": int(pending.gather_qos_num_stages or 0),
             "rebuild_physical_block_sort": int(pending.rebuild_physical_block_sort or 0),
             "writer_pointer_rebuild_count": int(
                 pending.writer_pointer_rebuild_count or 0
@@ -1269,6 +1266,22 @@ class ProfileMixin:
             record[f"deadline_async_producer_{stage}_gpu_ms_max"] = float(
                 getattr(self, f"_deadline_async_producer_{stage}_gpu_ms_max", 0.0)
             )
+        # [SELECTED-OUT-RING v2] graph 接管判据仪器:selector topk graph 的
+        # replay/capture 累计与环的 acquire/spill 计数(附加字段,消费端按
+        # 键读不受影响)。
+        record["selector_topk_graph_replay_count"] = int(
+            getattr(self, "_selector_topk_graph_replay_count", 0)
+        )
+        record["selector_topk_graph_capture_count"] = int(
+            getattr(self, "_selector_topk_graph_capture_count", 0)
+        )
+        _sor = getattr(self, "_selected_out_ring", None)
+        record["selected_out_ring_acquire_count"] = (
+            int(_sor.acquire_count) if _sor is not None else 0
+        )
+        record["selected_out_ring_spill_count"] = (
+            int(_sor.spill_run_count) if _sor is not None else 0
+        )
         try:
             payload = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
         except Exception:

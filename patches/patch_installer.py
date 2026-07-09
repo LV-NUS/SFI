@@ -292,17 +292,6 @@ _ORIGINAL_KV_CACHE_MANAGER_INIT = None
 _ORIGINAL_BLOCK_POOL_METHODS = None
 _COMPACT_PAGE_BLOCK_POOL_CLS = None
 _COMPACT_PAGE_KV_CACHE_MANAGER_CLS = None
-_ENGINE_CORE_STEP_TIMING_PATCHED: bool = False
-_ORIGINAL_ENGINE_CORE_STEP = None
-_ORIGINAL_ENGINE_CORE_STEP_WITH_BATCH_QUEUE = None
-_ORIGINAL_ENGINE_CORE_POST_STEP = None
-_ENGINE_CORE_STEP_TIMING_LOG_CACHED = os.environ.get(
-    "VLLM_DECODE_ENGINE_CORE_STEP_LOG",
-    "",
-)
-_ENGINE_CORE_STEP_TIMING_ROWS: List[dict[str, object]] = []
-_ENGINE_CORE_STEP_TIMING_PATH = ""
-_ENGINE_CORE_STEP_TIMING_REGISTERED = False
 _FA3_LIVE_ROUTE_REQUIRED_AUTHORITY_FIELDS = (
     "is_prefill_by_row",
     "use_compact_by_row",
@@ -3393,8 +3382,18 @@ def _deserialize_config(payload: str) -> Optional[SparseControllerConfig]:
         trigger_raw["start_exclude_tokens"] = set(trigger_raw["start_exclude_tokens"])
     trigger_cfg = RefreshTriggerConfig(**trigger_raw)
     raw["trigger"] = trigger_cfg
-    # 过滤掉 SparseControllerConfig 不接受的未知字段
+    # 过滤掉 SparseControllerConfig 不接受的未知字段——但必须响亮:字段名打错
+    # (如 residency 三字段拼写错)静默丢弃=配置静默不生效(sparse 活性陷阱),
+    # 对齐 alpha_fair 侧 unknown-field warning 的既有做法。
     known_fields = {f.name for f in fields(SparseControllerConfig)}
+    unknown_top = set(raw) - known_fields
+    if unknown_top:
+        _log.warning(
+            "%s: dropping unknown/retired top-level config fields "
+            "(typo'd fields silently do nothing — check spelling): %s",
+            _SERIALIZED_CONFIG_ENV,
+            sorted(unknown_top),
+        )
     raw = {k: v for k, v in raw.items() if k in known_fields}
     try:
         return SparseControllerConfig(**raw)
@@ -4135,6 +4134,69 @@ def _exp4_capture_alloc_preflight(runner: object) -> None:
     )
 
 
+_SLOTS_CONCURRENCY_PREFLIGHT_LATCHED = False
+
+
+def _sparse_slots_concurrency_preflight(runner: object, controller: object) -> None:
+    """[SERVE-LIVENESS-PREFLIGHT 2026-07-09] slots vs scheduler concurrency.
+
+    With page residency ON the global slot allocator hard-raises the moment a
+    step batch carries more live requests than max_live_sparse_slots
+    (global_slot_allocator "capacity exceeded") — an engine-killing death mid
+    workload, far from its config root cause, killing every in-flight request
+    (the serve/LongBench trap: --max-num-seqs defaults to 128+ while the
+    sparse JSON pins slots to a small bench batch). vLLM v1 schedules at most
+    scheduler_config.max_num_seqs requests into one forward
+    (max_num_running_reqs = max_num_seqs, sched/scheduler.py:105 — same
+    invariant the capture prebuild sizing relies on), so
+    slots >= max_num_seqs proves the allocator can never overflow. Enforce
+    that at the profile dummy_run (startup, runner config resolved), where a
+    raise aborts serve before it takes traffic.
+    """
+    global _SLOTS_CONCURRENCY_PREFLIGHT_LATCHED
+    if _SLOTS_CONCURRENCY_PREFLIGHT_LATCHED:
+        return
+    _SLOTS_CONCURRENCY_PREFLIGHT_LATCHED = True
+    cfg = getattr(controller, "config", None)
+    if cfg is None or not bool(getattr(cfg, "compact_page_residency_enabled", False)):
+        return
+    slots = int(getattr(cfg, "max_live_sparse_slots", 0) or 0)
+    sched = getattr(runner, "scheduler_config", None)
+    if sched is None:
+        vllm_config = getattr(runner, "vllm_config", None)
+        sched = getattr(vllm_config, "scheduler_config", None)
+    max_num_seqs = int(getattr(sched, "max_num_seqs", 0) or 0)
+    if max_num_seqs <= 0:
+        # Config shape unknown (exotic runner) — cannot prove either way;
+        # the allocator's own capacity raise remains the backstop.
+        _log.warning(
+            "slots-concurrency preflight: scheduler max_num_seqs unresolved; "
+            "skipping the startup capacity proof"
+        )
+        return
+    if slots < max_num_seqs:
+        # LOUD warning, not a raise: slots < max_num_seqs only dies when the
+        # SUBMITTED concurrency actually exceeds slots (the bench harness
+        # legitimately runs batch_size==slots requests under vLLM's default
+        # max_num_seqs=256 — a raise here killed that healthy shape, wg3
+        # forensics). The true capacity contract stays at the allocator
+        # ("capacity exceeded" raise, whose message names this config root
+        # cause); this preflight makes the hazard visible BEFORE traffic.
+        _log.warning(
+            "W_SPARSE_SLOTS_LT_MAX_NUM_SEQS: max_live_sparse_slots=%d < "
+            "scheduler max_num_seqs=%d. If more than %d requests are ever "
+            "co-batched (serve/LongBench concurrency!), the sparse global "
+            "slot allocator hard-raises and kills the engine mid-workload. "
+            "For serve deployments set max_live_sparse_slots >= expected "
+            "concurrency (lease grows by slots x blocks x 16 x "
+            "KV-bytes/token x gen_count) or pass --max-num-seqs %d.",
+            slots,
+            max_num_seqs,
+            slots,
+            slots,
+        )
+
+
 def _patch_dummy_run() -> None:
     global _DUMMY_RUN_PATCHED, _ORIGINAL_DUMMY_RUN
     if _DUMMY_RUN_PATCHED:
@@ -4175,6 +4237,11 @@ def _patch_dummy_run() -> None:
         # 开始前拦下 expandable×custom-AR 致命组合(见 helper docstring)。
         if bool(_dummy_ctx.get("is_graph_capturing")):
             _exp4_capture_alloc_preflight(self)
+        # [SERVE-LIVENESS-PREFLIGHT] profile 型 dummy_run=启动必经且 runner
+        # 配置已解析:residency 槽容量 < 调度并发上限=运行中必炸(allocator
+        # capacity raise),启动期 fail-fast(见 helper docstring)。
+        if bool(_dummy_ctx.get("is_profile")):
+            _sparse_slots_concurrency_preflight(self, controller)
         # PHASE-2B de-legacy: latch the real cudagraph mode so steady-state gates
         # engage compact without VLLM_SPARSE_ATTENTION_IN_CUDAGRAPH. Run-level sticky
         # (only ever set True, never cleared) so a later PIECEWISE prefill dummy-run
@@ -9315,6 +9382,21 @@ def _enqueue_full_cudagraph_refresh_payloads_after_replay(
     # 收集的 KV 本就是提交时刻的,映射同时刻语义更正确。每世代每源表 clone
     # 一次(~32KB D2D,全层共享,µs 级);is_latest 的行号对账退化为纯防线。
     _btable_snapshot_by_ptr: Dict[int, torch.Tensor] = {}
+    # [HOOK-PERLAYER-DIET 2026-07-09] 世代内层不变量上提（取证 residual 662µs/世代主项）：
+    # layout ring 同步校验/step 级标量/authority 字段在同一世代内逐层重算为纯冗余。
+    # layout 判定按 buf_id 记忆（同 buf 同世代同判定）；capture slot 映射走
+    # _register_layer 已维护的 state 缓存（layer_index_epoch 门失效即回退全量调用）。
+    _step_epoch_hoisted = int(getattr(step_ctx, "epoch", -1))
+    _refresh_slot_tuple_hoisted = tuple(int(v) for v in refresh_slot_list)
+    _target_scope_key_hoisted = getattr(step_authority, "target_selected_scope_key", None)
+    _scope_wait_handle_hoisted = getattr(step_authority, "selected_scope_wait_handle", None)
+    _layer_index_cache_epoch = int(getattr(controller, "_layer_index_cache_epoch", -1))
+    _layout_verdict_by_buf: Dict[int, object] = {}
+    refresh_ring = getattr(controller, "step_refresh_capture_layout_ring", None)
+    if not isinstance(refresh_ring, list):
+        raise RuntimeError(
+            "full cudagraph replay refresh payload enqueue missing refresh layout ring"
+        )
     for ordinal, cache_key_raw in enumerate(layer_keys):
         _stage_inc("layer_count")
         cache_key = int(cache_key_raw)
@@ -9330,23 +9412,37 @@ def _enqueue_full_cudagraph_refresh_payloads_after_replay(
             raise RuntimeError(
                 "full cudagraph replay refresh payload enqueue missing layer index"
             )
-        chunk_id, buf_id, slot_in_chunk = controller._map_global_layer_to_capture_slot(layer_index)
-        refresh_ring = getattr(controller, "step_refresh_capture_layout_ring", None)
-        if not isinstance(refresh_ring, list) or int(buf_id) >= len(refresh_ring):
+        if (
+            int(getattr(state, "layer_index_epoch", -2)) == _layer_index_cache_epoch
+            and int(getattr(state, "capture_chunk_id", -1)) >= 0
+            and int(getattr(state, "layer_index", -1)) == layer_index
+        ):
+            chunk_id = int(state.capture_chunk_id)
+            buf_id = int(state.capture_buf_id)
+            slot_in_chunk = int(state.capture_slot_in_chunk)
+        else:
+            chunk_id, buf_id, slot_in_chunk = controller._map_global_layer_to_capture_slot(layer_index)
+        if int(buf_id) >= len(refresh_ring):
             raise RuntimeError(
                 "full cudagraph replay refresh payload enqueue missing refresh layout ring"
             )
-        layout = refresh_ring[int(buf_id)]
-        if layout is not None:
-            same_step_layout = (
-                int(getattr(layout, "epoch", -1)) == int(getattr(step_ctx, "epoch", -2))
-                and int(getattr(layout, "step_handle_id", -1)) == handle_id
-                and int(getattr(layout, "step_handle_generation", -1)) == handle_generation
-                and tuple(int(v) for v in getattr(layout, "slot_list", tuple()))
-                == tuple(int(v) for v in refresh_slot_list)
-            )
-            if not same_step_layout:
-                layout = None
+        # None 判定不记忆：builder 会在 layout=None 时经 _get_step_capture_layout
+        # 就地重建 ring 槽，同 chunk 次层必须能看到新建 layout（原行为）。
+        layout = _layout_verdict_by_buf.get(int(buf_id))
+        if layout is None:
+            layout = refresh_ring[int(buf_id)]
+            if layout is not None:
+                same_step_layout = (
+                    int(getattr(layout, "epoch", -1)) == _step_epoch_hoisted
+                    and int(getattr(layout, "step_handle_id", -1)) == handle_id
+                    and int(getattr(layout, "step_handle_generation", -1)) == handle_generation
+                    and tuple(int(v) for v in getattr(layout, "slot_list", tuple()))
+                    == _refresh_slot_tuple_hoisted
+                )
+                if not same_step_layout:
+                    layout = None
+                else:
+                    _layout_verdict_by_buf[int(buf_id)] = layout
 
         key_cache = getattr(state, "_sfi_replay_key_cache", None)
         value_cache = getattr(state, "_sfi_replay_value_cache", None)
@@ -9506,15 +9602,15 @@ def _enqueue_full_cudagraph_refresh_payloads_after_replay(
             layer_index=int(layer_index_in_chunk),
             seq_lens_cpu=seq_lens_cpu if seq_lens_cpu is not None else tuple(),
             seq_lens_tensor_cpu=seq_lens_tensor_cpu,
-            target_selected_scope_key=getattr(step_authority, "target_selected_scope_key", None),
-            selected_scope_wait_handle=getattr(step_authority, "selected_scope_wait_handle", None),
+            target_selected_scope_key=_target_scope_key_hoisted,
+            selected_scope_wait_handle=_scope_wait_handle_hoisted,
             # Replay refresh runs with trusted-shape validation by default.
             # Avoid per-layer signature tuple/string construction on the
             # trigger hot path; strict fallback validation remains available.
             fast_signature=None,
             capture_handle_id=handle_id,
             capture_handle_generation=handle_generation,
-            capture_epoch=int(getattr(step_ctx, "epoch", -1)),
+            capture_epoch=_step_epoch_hoisted,
             refresh_reason=refresh_reason,
             refresh_intent_req_ids=refresh_intent_req_ids,
             stagger_layer_index=int(layer_index),
@@ -11715,8 +11811,6 @@ def _patch_compact_page_residency_core() -> None:
     global _COMPACT_PAGE_RESIDENCY_PATCHED, _ORIGINAL_KV_CACHE_MANAGER_INIT
     global _ORIGINAL_BLOCK_POOL_METHODS, _COMPACT_PAGE_BLOCK_POOL_CLS
     global _COMPACT_PAGE_KV_CACHE_MANAGER_CLS
-    global _ENGINE_CORE_STEP_TIMING_PATCHED, _ORIGINAL_ENGINE_CORE_STEP
-    global _ORIGINAL_ENGINE_CORE_STEP_WITH_BATCH_QUEUE, _ORIGINAL_ENGINE_CORE_POST_STEP
     controller = _GLOBAL_CONTROLLER
     config = getattr(controller, "config", None) if controller is not None else None
     compact_page_enabled = bool(
@@ -14151,6 +14245,68 @@ def _restore_sparse_patch_entry_env(
     _restore_env_var("PYTHONPATH", pythonpath)
 
 
+def _preflight_controller_config_contract(config: SparseControllerConfig) -> None:
+    """Install-time fail-fast for config combinations that die later and darker.
+
+    [SERVE-LIVENESS-PREFLIGHT 2026-07-09] this transaction is the single
+    convergence point of BOTH install paths (bench ``apply_vllm_sparse_patch``
+    and serve ``ensure_vllm_sparse_patch_from_env``), so contracts here cover
+    the serve path that previously ran bare:
+
+    1. dual-gen (default ON since 758185e) requires page residency — without
+       it the first long-request rebuild raises deep inside
+       selection_worker ("compact dual-gen requires page residency"), an
+       engine-killing error far from its config root cause. Promote that
+       death to install time with an actionable message.
+    2. FORCE_DENSE / FORCE_COMPACT_OFF conflict with compact_recent: the env
+       silently routes every row dense (row_policy) with zero counters — a
+       sparse-liveness trap on serve/LongBench. Previously only the bench
+       path checked FORCE_DENSE.
+    """
+    from patches.sparse_constants import (
+        _DYNAMIC_ENV,
+        _FORCE_COMPACT_OFF_CACHED,
+        _FORCE_DENSE_CACHED,
+        compact_gen_count,
+    )
+
+    if compact_gen_count() > 1 and not bool(
+        getattr(config, "compact_page_residency_enabled", False)
+    ):
+        raise RuntimeError(
+            "sparse config contract: dual-generation compact read is ON "
+            "(VLLM_SPARSE_COMPACT_DUAL_GEN default) but the controller config "
+            "has compact_page_residency_enabled=false (legacy arena is "
+            "unsupported for dual-gen). Fix the serve/bench config JSON: set "
+            "compact_page_residency_enabled=true with positive "
+            "max_live_sparse_slots and compact_blocks_per_slot, or explicitly "
+            "run single-generation via VLLM_SPARSE_COMPACT_DUAL_GEN=0."
+        )
+    if config.attn_mode == "compact_recent":
+        force_dense = (
+            (os.environ.get("VLLM_SPARSE_FORCE_DENSE") == "1")
+            if _DYNAMIC_ENV
+            else _FORCE_DENSE_CACHED
+        )
+        force_compact_off = (
+            (os.environ.get("VLLM_SPARSE_FORCE_COMPACT_OFF") == "1")
+            if _DYNAMIC_ENV
+            else _FORCE_COMPACT_OFF_CACHED
+        )
+        if force_dense or force_compact_off:
+            offender = (
+                "VLLM_SPARSE_FORCE_DENSE"
+                if force_dense
+                else "VLLM_SPARSE_FORCE_COMPACT_OFF"
+            )
+            raise RuntimeError(
+                f"attn_mode=compact_recent conflicts with {offender}=1: every "
+                "decode row would silently route dense (zero sparse activity, "
+                "zero counters). Unset it, or run a dense baseline without "
+                "installing the sparse controller."
+            )
+
+
 def _install_controller_patch_transaction(
     config: SparseControllerConfig,
     *,
@@ -14159,6 +14315,7 @@ def _install_controller_patch_transaction(
     ] = None,
 ) -> "VLLMSparseController":
     try:
+        _preflight_controller_config_contract(config)
         controller = _set_controller(config)
         _install_patch()
         _patch_flash_metadata_builder()
@@ -14178,14 +14335,9 @@ def _install_controller_patch_transaction(
 
 def apply_vllm_sparse_patch(config: SparseControllerConfig) -> "VLLMSparseController":
     """Install the sparse wrapper and expose config to child processes."""
-    # Fail-fast: compact_recent + FORCE_DENSE=1 is an ambiguous configuration.
-    from patches.sparse_constants import _DYNAMIC_ENV, _FORCE_DENSE_CACHED
-    force_dense = (os.environ.get("VLLM_SPARSE_FORCE_DENSE") == "1") if _DYNAMIC_ENV else _FORCE_DENSE_CACHED
-    if config.attn_mode == "compact_recent" and force_dense:
-        raise RuntimeError(
-            "attn_mode=compact_recent conflicts with VLLM_SPARSE_FORCE_DENSE=1; "
-            "unset VLLM_SPARSE_FORCE_DENSE for compact_recent mode"
-        )
+    # Config-contract fail-fast (FORCE_DENSE conflict, dual-gen x residency)
+    # lives in _install_controller_patch_transaction: the single convergence
+    # point shared with the serve path (ensure_vllm_sparse_patch_from_env).
     env_snapshot = (
         _snapshot_env_var(_SERIALIZED_CONFIG_ENV),
         _snapshot_env_var("PYTHONPATH"),
@@ -14354,13 +14506,9 @@ def disable_vllm_sparse_patch() -> None:
             raise
     _KV_INIT_PATCHED = False
     _ORIGINAL_INIT_KV_CACHE = None
-    if _COMPILATION_PATCHED and _ORIGINAL_SET_SPLITTING_OPS_FOR_V1 is not None:
-        try:
-            from vllm.config import CompilationConfig  # type: ignore[import]
-            CompilationConfig.set_splitting_ops_for_v1 = _ORIGINAL_SET_SPLITTING_OPS_FOR_V1  # type: ignore[assignment]
-        except Exception:
-            _log.error("Failed to restore set_splitting_ops_for_v1 during patch uninstall")
-            raise
+    # compilation-config patch retired (PHASE-2B de-legacy): the installer stub
+    # never patches, so there is nothing to restore here. _COMPILATION_PATCHED
+    # can only be False (no True assignment exists in the tree).
     _COMPILATION_PATCHED = False
     _ORIGINAL_SET_SPLITTING_OPS_FOR_V1 = None
     _restore_compact_page_residency_core_patch()

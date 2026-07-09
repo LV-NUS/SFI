@@ -1136,7 +1136,12 @@ def compute_alpha_selection_batched_impl(
         if any_delta:
             raise RuntimeError(
                 "selector key_norms delta requires CUDA layers delta path; "
-                "legacy Triton key_norms fallback is retired"
+                "legacy Triton key_norms fallback is retired. The direct CUDA "
+                "path gates on config.one_shot_bootstrap_only — serve/bench "
+                "sparse form must set \"one_shot_bootstrap_only\": true plus "
+                "\"continuous_producer_enabled\": true in "
+                "VLLM_SPARSE_CONTROLLER_JSON (production full-open form; "
+                "2026-07-09 serve smoke hit this with the fields missing)"
             )
         self._record_event_safe(profile_key_norms_delta_evt0, device)
         _publish_key_norms_lens_from_stacked_end()

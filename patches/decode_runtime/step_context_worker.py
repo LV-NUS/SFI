@@ -1049,6 +1049,26 @@ def prepare_step_context_impl(
         else:
             row_mode_by_row = tuple(row_mode_by_row_list)
         row_mode_signature = row_mode_by_row
+        # [PENDING-FUNNEL-DEBUG 2026-07-09 临时取证探针,破案后拆] authority 终值。
+        _funnel_dbg = os.environ.get("VLLM_SPARSE_PENDING_FUNNEL_DEBUG_LOG", "")
+        if _funnel_dbg:
+            _fd_n = getattr(self, "_funnel_auth_probe_n", 0) + 1
+            self._funnel_auth_probe_n = _fd_n
+            if _fd_n % 16 == 1:
+                try:
+                    with open(_funnel_dbg, "a") as _fd_fh:
+                        _fd_fh.write(
+                            f"auth\trow_mode={tuple(row_mode_by_row_list)}\t"
+                            f"is_prefill={tuple(bool(v) for v in is_prefill_by_row_list)}\t"
+                            f"boot={tuple(bool(v) for v in bootstrap_done_list)}\t"
+                            f"refresh_mask={tuple(bool(v) for v in refresh_row_mask)}\t"
+                            f"force_dense={tuple(bool(v) for v in force_dense_while_inflight_by_row)}\t"
+                            f"short_dense={tuple(bool(getattr(self.request_states.get(_r), '_was_short_dense', False)) for _r in req_ids_tuple)}\t"
+                            f"q_lens={tuple(int(v) for v in q_lens)}\t"
+                            f"epoch={self.step_context_epoch}\n"
+                        )
+                except OSError:
+                    pass
         logf_producer_by_row = tuple(logf_producer_by_row_list)
         needs_logits_by_row = tuple(needs_logits_by_row_list)
         logits_last_n_by_row = tuple(logits_last_n_by_row_list)

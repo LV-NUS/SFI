@@ -21,6 +21,7 @@ ENTRY_POINTS:
 from __future__ import annotations
 
 import logging
+import os
 import time
 from collections import deque
 from typing import TYPE_CHECKING, Deque, Dict, List, Optional, Set, Tuple
@@ -142,6 +143,13 @@ class CaptureRingMixin:
                 # writer gather(deferred replay 另一流)可持旧数组在飞。
                 # size=layers 稳态恒定=近死臂,族纯度收口。冷事件。
                 self._uaf_guard_record_streams_before_discard(gpu)
+                # [PTR-REPUBLISH-REPLAY-SAFE 2026-07-09] captured writer graphs
+                # bake THIS buffer's address into their launch_args; a realloc
+                # kills every baked address. Invalidate the whole writer-graph
+                # cache here (the ONLY event that stales baked args — content
+                # republish keeps the buffer and stays replay-safe). Cold
+                # event: size=layers is steady-state constant.
+                self._writer_graph_state = None
             gpu = torch.empty((size,), device=device, dtype=torch.int64)
             self._rebuild_ptrs_gpu[name] = gpu
         return cpu, gpu
@@ -214,6 +222,56 @@ class CaptureRingMixin:
     def _clear_rebuild_ptr_capture_wait_satisfied(self) -> None:
         self._rebuild_ptrs_capture_wait_satisfied_names = set()
 
+    @staticmethod
+    def _rebuild_ptr_sig_diff_reason(old: object, new: tuple) -> str:
+        """Name the FIRST differing component between two publish signatures.
+
+        Forensics-only (writer-graph miss attribution): the dispatcher's
+        pointer_rebuild_miss is the OR of six per-name publishes; naming which
+        layer/field flipped is the difference between "every generation
+        republishes by design" and "a semantic key leaked into the signature"
+        (the selector-track key_norms verdict shape).
+        """
+        try:
+            if old is None:
+                return "cold"
+            if not isinstance(old, tuple) or len(old) != len(new):
+                return "sig_shape"
+            if old[1] != new[1]:
+                return "gpu_realloc"
+            if old[2:] != new[2:]:
+                return "numel_or_device"
+            o_layers, n_layers = old[0], new[0]
+            if len(o_layers) != len(n_layers):
+                return f"layer_count:{len(o_layers)}->{len(n_layers)}"
+            for i, (o, n) in enumerate(zip(o_layers, n_layers)):
+                if o == n:
+                    continue
+                if o[0] != n[0]:
+                    return f"L{i}:ptr"
+                o_sig, n_sig = o[1], n[1]
+                field_names = (
+                    "cache_key",
+                    "payload_layer_idx",
+                    "state_layer_idx",
+                    "compact_gen",
+                    "residency_gen",
+                    "residency_sig",
+                )
+                for j, fname in enumerate(field_names):
+                    if (
+                        j < len(o_sig)
+                        and j < len(n_sig)
+                        and o_sig[j] != n_sig[j]
+                    ):
+                        return (
+                            f"L{i}:{fname}:{o_sig[j]!r}->{n_sig[j]!r}"[:200]
+                        )
+                return f"L{i}:layer_sig_len"
+            return "eq_but_missed"
+        except Exception:
+            return "diff_error"
+
     def _publish_rebuild_ptr_buffer_if_needed(
         self,
         *,
@@ -234,6 +292,17 @@ class CaptureRingMixin:
             torch.cuda.current_stream(device=gpu.device).wait_event(ready_event)
             self._release_rebuild_ptr_cpu_buffer(name=name, cpu=cpu)
             return False
+        _wg_dbg = os.environ.get("VLLM_SPARSE_SELECTOR_TOPK_GRAPH_DEBUG_LOG", "")
+        if _wg_dbg:
+            # miss 归因取证(诊断档默认关;与 writer dispatch 落盘同文件)。
+            try:
+                with open(_wg_dbg, "a") as _fh:
+                    _fh.write(
+                        f"{os.getpid()}\trepublish\t{name}\t"
+                        f"{self._rebuild_ptr_sig_diff_reason(self._rebuild_ptrs_signature.get(name), sig)}\n"
+                    )
+            except OSError:
+                pass
         stream = torch.cuda.current_stream(device=gpu.device)
         # [REBUILD-PTRS-OVERWRITE-WAR-FIX] P1:签名变化原位覆写持久 GPU 指针
         # 数组前,query-first 等 writer dispatch-done(R3 反向序同型)——

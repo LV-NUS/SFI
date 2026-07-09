@@ -148,9 +148,6 @@ def flush_prefill_batches_impl(
     flush_micro_profile_summary_fn: Callable[[], None],
     refresh_profile_pending_cls: type,
     make_selector_fast_signature_fn: Callable[..., object],
-    gather_qos_cached: bool,
-    gather_qos_num_warps_cached: int,
-    gather_qos_num_stages_cached: int,
     rebuild_physical_block_sort_cached: bool,
 ) -> None:
     _CAPTURE_IN_FLIGHT = capture_in_flight
@@ -172,9 +169,6 @@ def flush_prefill_batches_impl(
             _REFRESH_MICRO_PROFILE_EVERY = 64
     _RefreshProfilePending = refresh_profile_pending_cls
     _make_selector_fast_signature = make_selector_fast_signature_fn
-    _GATHER_QOS_CACHED = gather_qos_cached
-    _GATHER_QOS_NUM_WARPS_CACHED = gather_qos_num_warps_cached
-    _GATHER_QOS_NUM_STAGES_CACHED = gather_qos_num_stages_cached
     _REBUILD_PHYSICAL_BLOCK_SORT_CACHED = rebuild_physical_block_sort_cached
     """Chunk-batched flush.
 
@@ -200,7 +194,7 @@ def flush_prefill_batches_impl(
             producer_workspace.drain_payload_bucket(
                 kind="prefill",
                 bucket=prefill_bucket,
-                mask=int(self.step_prefill_chunk_mask[buf]),
+                mask=self.step_prefill_chunk_mask[buf],
                 size=size,
             )
         )
@@ -208,7 +202,7 @@ def flush_prefill_batches_impl(
         prefill_payloads = producer_workspace.drain_payload_bucket(
             kind="prefill",
             bucket=prefill_bucket,
-            mask=int(self.step_prefill_chunk_mask[buf]),
+            mask=self.step_prefill_chunk_mask[buf],
             size=0,
         )[0]
 
@@ -220,7 +214,7 @@ def flush_prefill_batches_impl(
             producer_workspace.drain_payload_bucket(
                 kind="refresh",
                 bucket=refresh_bucket,
-                mask=int(self.step_refresh_chunk_mask[buf]),
+                mask=self.step_refresh_chunk_mask[buf],
                 size=size,
             )
         )
@@ -228,7 +222,7 @@ def flush_prefill_batches_impl(
         refresh_payloads = producer_workspace.drain_payload_bucket(
             kind="refresh",
             bucket=refresh_bucket,
-            mask=int(self.step_refresh_chunk_mask[buf]),
+            mask=self.step_refresh_chunk_mask[buf],
             size=0,
         )[0]
     refresh_carrier = producer_workspace.prepare_refresh_carrier(refresh_payloads)
@@ -904,17 +898,6 @@ def flush_prefill_batches_impl(
                 except Exception:
                     _log.warning("refresh profiling: rebuild_selected_k extraction failed", exc_info=True)
                     prof.rebuild_selected_k = 0
-                # 记录 rebuild/gather 相关开关（用于定位固定开销/长尾抖动）；不引入任何同步点。
-                try:
-                    prof.gather_qos_flag = 1 if bool(_GATHER_QOS_CACHED) else 0
-                    if prof.gather_qos_flag:
-                        prof.gather_qos_num_warps = int(_GATHER_QOS_NUM_WARPS_CACHED)
-                        prof.gather_qos_num_stages = int(_GATHER_QOS_NUM_STAGES_CACHED)
-                except Exception:
-                    _log.warning("refresh profiling: gather_qos_flag extraction failed", exc_info=True)
-                    prof.gather_qos_flag = 0
-                    prof.gather_qos_num_warps = 0
-                    prof.gather_qos_num_stages = 0
                 try:
                     prof.rebuild_physical_block_sort_flag = 1 if bool(_REBUILD_PHYSICAL_BLOCK_SORT_CACHED) else 0
                 except Exception:
@@ -2867,9 +2850,6 @@ def flush_prefill_batches_impl(
                     rebuild_num_kv_heads=int(prof.rebuild_num_kv_heads),
                     rebuild_batch_slots=int(prof.rebuild_batch_slots),
                     capture_kv_len_total=int(prof.capture_kv_len_total),
-                    gather_qos=int(prof.gather_qos_flag),
-                    gather_qos_num_warps=int(prof.gather_qos_num_warps),
-                    gather_qos_num_stages=int(prof.gather_qos_num_stages),
                     rebuild_physical_block_sort=int(prof.rebuild_physical_block_sort_flag),
                     writer_pointer_rebuild_count=int(prof.writer_pointer_rebuild_count),
                     writer_pointer_lookup_count=int(prof.writer_pointer_lookup_count),
@@ -3796,9 +3776,6 @@ def flush_prefill_batches_impl(
                     "rebuild_num_kv_heads": int(prof.rebuild_num_kv_heads),
                     "rebuild_batch_slots": int(prof.rebuild_batch_slots),
                     "capture_kv_len_total": int(prof.capture_kv_len_total),
-                    "gather_qos": int(prof.gather_qos_flag),
-                    "gather_qos_num_warps": int(prof.gather_qos_num_warps),
-                    "gather_qos_num_stages": int(prof.gather_qos_num_stages),
                     "rebuild_physical_block_sort": int(prof.rebuild_physical_block_sort_flag),
                     "writer_pointer_rebuild_count": int(prof.writer_pointer_rebuild_count),
                     "writer_pointer_lookup_count": int(prof.writer_pointer_lookup_count),

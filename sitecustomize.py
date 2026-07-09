@@ -355,27 +355,10 @@ except Exception as exc:
             f"sitecustomize vendored flash-attn probe patch failed: {exc}"
         ) from exc
 
-if os.environ.get("VLLM_DECODE_ENGINE_CORE_STEP_LOG"):
-    try:
-        from patches.patch_installer import install_engine_core_step_timing_diagnostic
-
-        install_engine_core_step_timing_diagnostic()
-        if site_log_enabled:
-            with open("/tmp/vllm_sparse_site.log", "a", encoding="utf-8") as _log:
-                _log.write(
-                    "sitecustomize installed EngineCore step timing diagnostic, "
-                    f"PID={os.getpid()}\n"
-                )
-    except Exception as exc:
-        if site_log_enabled:
-            with open("/tmp/vllm_sparse_site.log", "a", encoding="utf-8") as _log:
-                _log.write(
-                    "sitecustomize EngineCore step timing diagnostic failed, "
-                    f"PID={os.getpid()}, error={exc}\n"
-                )
-        raise SystemExit(
-            f"sitecustomize EngineCore step timing diagnostic failed: {exc}"
-        ) from exc
+# (EngineCore step-timing diagnostic hook retired: its installer
+# install_engine_core_step_timing_diagnostic was deleted from patch_installer
+# in an earlier sweep, leaving this entry a hard SystemExit for anyone setting
+# VLLM_DECODE_ENGINE_CORE_STEP_LOG. Orphan state cluster removed with it.)
 
 
 # Native CUDAGraphWrapper replay CUDA-event diagnostic.
