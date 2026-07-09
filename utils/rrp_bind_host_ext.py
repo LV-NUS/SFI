@@ -82,7 +82,10 @@ except Exception:  # pragma: no cover - isolated/local
         return None
 
 
-_EXT_NAME = "rrp_bind_host_cpp_ext"
+# [DUAL-GEN-L2a-CPP-SYNC 2026-07-09] 名带 dg2：C++ 校验窗补双代 gen-half 项
+# （ABI 追加 compact_gen_count）。prebuilt 缓存按名取件不看源 hash（已知坑），
+# 改源必须 bump 名字，否则吃旧 .so。
+_EXT_NAME = "rrp_bind_host_cpp_ext_dg2"
 _ENABLE_ENV = "VLLM_SPARSE_BIND_HOST_CPP"
 
 _MODULE: Optional[torch.nn.Module] = None
@@ -236,7 +239,8 @@ py::object bind_host_derive_cpp_v2(
     bool has_canonical_cpu,
     int64_t canonical_cpu_ptr,
     int64_t canonical_cpu_rows,
-    int64_t canonical_cpu_row_stride) {
+    int64_t canonical_cpu_row_stride,
+    int64_t compact_gen_count) {
   (void)reserved_is_tensor;  // accepted for ABI parity; not used by derivation
 
   const int32_t* row_effk = reinterpret_cast<const int32_t*>(row_effk_ptr);
@@ -402,7 +406,21 @@ py::object bind_host_derive_cpp_v2(
             "visible compact/recent pages exceed row width");
       }
       int64_t slot = static_cast<int64_t>(slot_v[batch]);
-      int64_t expected_slot_start = slot * compact_capacity_i;
+      // [DUAL-GEN-L2a-CPP-SYNC 2026-07-09] mirror of the Python loop's
+      // gen-half window selection (resolved_row_ptr_arena [DUAL-GEN-L2a]):
+      // the offset picks the generation half, then the slot window is
+      // validated inside that half. gen_count==1 reduces to the historical
+      // single-gen expression bit-identically. This term was missing after
+      // dual-gen landed (Python loop updated, embedded C++ not re-synced) ->
+      // gen-B rows were wrongly rejected as "exceeds slot compact span".
+      int64_t gen_stride_pages =
+          compact_gen_count > 0 ? reserved_len / compact_gen_count : 0;
+      int64_t gen_of_offset =
+          (compact_gen_count > 1 && compact_offset_pages >= gen_stride_pages)
+              ? 1
+              : 0;
+      int64_t expected_slot_start =
+          gen_of_offset * gen_stride_pages + slot * compact_capacity_i;
       int64_t expected_slot_end = expected_slot_start + compact_capacity_i;
       if (slot < 0 || expected_slot_start < 0 || expected_slot_end > reserved_len) {
         throw std::invalid_argument("slot exceeds reserved_manager_block_ids");
@@ -924,6 +942,7 @@ def _build_buffers(kwargs: dict):
         canonical_cpu_ptr,
         canonical_cpu_rows,
         canonical_cpu_row_stride,
+        int(kwargs["compact_gen_count"]),
     )
     return args, bufs
 
@@ -965,15 +984,24 @@ def bind_host_derive_cpp(**kwargs) -> dict:
     Marshals all batch-length sequences + reserved_cpu + the canonical CPU block
     table into contiguous int32 buffers ONCE, then passes raw data_ptrs. Raises
     ``RRPBindHostExtUnavailable`` if the ext cannot be loaded, or ``ValueError``
-    if an input cannot be safely marshalled; the caller is expected to catch ANY
-    exception and fall back to the inline Python loop in bind_production_row_table.
+    if an input cannot be safely marshalled. [BIND-CPP-FAILFAST 2026-07-09]
+    调用方（bind_production_row_table 快路径）对任何异常 fail-fast——不再静默
+    落穿 Python loop；显式逃生=VLLM_SPARSE_BIND_HOST_CPP=0。
     """
     ext = _require_ext()
     args, _keepalive = _build_buffers(kwargs)
     # _keepalive must outlive the call: the C++ reads the data_ptrs synchronously
     # within this call, then returns a fully materialized Python dict (no tensor
     # aliasing into the output), so it is safe to drop _keepalive on return.
-    _rrp_cpp_result = ext.bind_host_derive_cpp_v2(*args)
+    # [BIND-CPP-VALUEERROR-CONTRACT 2026-07-09] 嵌入 C++ 的全部 16 个 throw 均为
+    # std::invalid_argument（输入合同校验，与 Python loop 的 ValueError 同一合同），
+    # 但 torch cpp_extension 的异常翻译把它们统一成 RuntimeError——在此译回
+    # ValueError，保证两臂对同一坏输入抛同型异常（几何拒绝合同测试跨臂同判）。
+    # 翻译是完备的：C++ 源无其它 throw 种类（re-sync 时须保持该不变量）。
+    try:
+        _rrp_cpp_result = ext.bind_host_derive_cpp_v2(*args)
+    except RuntimeError as _cpp_contract_exc:
+        raise ValueError(str(_cpp_contract_exc)) from _cpp_contract_exc
     # Optional firing trace (default OFF, byte-neutral): when RRP_BIND_CPP_TRACE
     # is set, append one line per SUCCESSFUL C++ derive so a gate can prove the
     # fast path actually fired in the real CUDA-graph e2e (the ext loads

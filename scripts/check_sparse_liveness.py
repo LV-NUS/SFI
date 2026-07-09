@@ -63,17 +63,29 @@ def _iter_profile_records(path: str):
 
 
 def _read_route_counter_mmap(path: str):
-    """8×int64: total / kind4 / has_resolved_row_ptr / kind0..kind4."""
+    """10×int64: total / kind4 / has_resolved_row_ptr / kind0..kind4 /
+    compact_row_steps / compact_rows。
+
+    [JUDGE-REPLAY-AWARE 2026-07-09] 后两字段由 step build 侧每步 bump(graph
+    replay 无关),是 FULL-graph serve 下唯一覆盖 replay 步的读侧活性信号;
+    旧 64B 文件(8q 时代)按缺省 -1 兼容读出。
+    """
     with open(path, "rb") as fh:
-        raw = fh.read(64)
+        raw = fh.read(80)
     if len(raw) < 64:
         return None
-    values = struct.unpack("8q", raw)
+    values = struct.unpack("8q", raw[:64])
+    compact_row_steps = -1
+    compact_rows = -1
+    if len(raw) >= 80:
+        compact_row_steps, compact_rows = struct.unpack("2q", raw[64:80])
     return {
         "total": values[0],
         "kind4": values[1],
         "has_resolved_row_ptr": values[2],
         "by_kind": dict(enumerate(values[3:8])),
+        "compact_row_steps": compact_row_steps,
+        "compact_rows": compact_rows,
     }
 
 
@@ -149,6 +161,7 @@ def main() -> int:
             print(f"R2 触发活性: sentence_intents={reasons.get('sentence', 0)}")
 
     # ---- R3a 路由活性(mmap 结构化计数,主判据) ----
+    compact_row_steps = -1
     if mmap_ok:
         counters = _read_route_counter_mmap(args.route_counter_mmap)
         if counters is None:
@@ -156,6 +169,7 @@ def main() -> int:
         else:
             total = counters["total"]
             kind4 = counters["kind4"]
+            compact_row_steps = int(counters.get("compact_row_steps", -1))
             ratio = (kind4 / total) if total else 0.0
             print(
                 f"R3a 路由活性(mmap): total={total} kind4={kind4} "
@@ -166,6 +180,23 @@ def main() -> int:
                 fails.append(
                     "R3a: mmap 计数 kind4=0 —— 前向从未走 sparse resolver"
                 )
+            # ---- R3c 读侧活性(step build 侧计数,replay-aware 主判据) ----
+            # [JUDGE-REPLAY-AWARE 2026-07-09] FULL-graph serve 下 python 侧
+            # 路由计数/trace 只在 capture/eager/prefill 步发射,replay 步不可
+            # 见——旧 R3b 在健康引擎上恒 FAIL(eager 定谳:18576/18684 步
+            # compact 健康,dense 事件全是 bootstrap/prefill 窗)。本判据由
+            # step_context_worker 每步 bump,graph 无关,是 replay 覆盖的读侧
+            # 真值。字段为 -1=旧版运行时(8q)产物,不判。
+            if compact_row_steps >= 0:
+                print(
+                    f"R3c 读侧活性(step 计数): compact_row_steps="
+                    f"{compact_row_steps} compact_rows={counters['compact_rows']}"
+                )
+                if compact_row_steps == 0 and world_publishes > 0:
+                    fails.append(
+                        "R3c: 世代已发布但没有任何 step 存在 compact 读行 "
+                        "——写而不读(读侧装配断点)"
+                    )
 
     # ---- R3b 路由活性(trace 结构化解析;字符串 grep 已废:旧匹配串
     #      '"dense_native"' 全仓无源=恒 0 假安静) ----
@@ -200,11 +231,23 @@ def main() -> int:
             fails.append(
                 "R3b: route trace 无 resolved_row_ptr 事件=前向从未走 sparse"
             )
+        # [JUDGE-REPLAY-AWARE 2026-07-09] trace 的 row_is_compact 只覆盖
+        # python 可见步(capture/eager/prefill)——FULL-graph 下 replay 步不发
+        # 事件,"全 False"在健康引擎上是常态(那些步 dense 本合法)。降档:
+        # 仅当 R3c(step 计数)不可用(旧运行时)时才以此判死;R3c 可用时给
+        # 信息行,以 R3c 为准。
         if total_rows > 0 and compact_rows == 0:
-            fails.append(
-                "R3b: row_is_compact 全 False —— 所有行 dense(请求全短于"
-                "阈值?FORCE_* env?bootstrap 未完成即结束?)"
-            )
+            if compact_row_steps >= 0:
+                print(
+                    "[INFO] R3b: trace 可见步(capture/eager/prefill 窗)全 "
+                    "dense=FULL-graph 常态,读侧真值以 R3c 为准"
+                )
+            else:
+                fails.append(
+                    "R3b: row_is_compact 全 False 且无 R3c 计数(旧运行时)"
+                    "——所有可见行 dense(请求全短于阈值?FORCE_* env?"
+                    "bootstrap 未完成即结束?)"
+                )
     if not (mmap_ok or trace_ok):
         warns.append("R3 未判(--route-trace / --route-counter-mmap 均不可用)")
 

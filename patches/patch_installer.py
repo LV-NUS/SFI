@@ -940,12 +940,24 @@ def _get_block_table_device_tensor(table: object, num_reqs: int) -> torch.Tensor
 
 
 def _get_block_table_cpu_source(table: object, num_reqs: int) -> object | None:
+    # [BIND-CPP-CANONICAL-TENSOR 2026-07-09] canonical_cpu 全链合同=torch CPU
+    # tensor（rrp bind C++ host 推导快路径的 BUFFER ABI 只收 tensor）。此前
+    # 优先 get_numpy_array() 喂出 numpy → 稳态 full-bind 步 canonical 在 GPU
+    # 时 100% ValueError 静默落穿、Python 慢 loop 双跑（短轮取证 fired=146 /
+    # fallthrough=122，全部同型别雷）。numpy 与 cpu tensor 在 vLLM BlockTable
+    # 里共享同一存储，from_numpy 为零拷贝视图，内容语义不变。
     cpu_source = None
-    if hasattr(table, "get_numpy_array"):
-        cpu_source = table.get_numpy_array()
-    elif hasattr(table, "get_cpu_tensor"):
+    if hasattr(table, "get_cpu_tensor"):
         cpu_source = table.get_cpu_tensor()
-    elif isinstance(table, torch.Tensor) and table.device.type == "cpu":
+    if cpu_source is None and hasattr(table, "get_numpy_array"):
+        numpy_source = table.get_numpy_array()
+        if numpy_source is not None:
+            cpu_source = torch.from_numpy(numpy_source)
+    if (
+        cpu_source is None
+        and isinstance(table, torch.Tensor)
+        and table.device.type == "cpu"
+    ):
         cpu_source = table
     if cpu_source is None:
         return None

@@ -2175,6 +2175,7 @@ class ResolvedRowPtrArena:
                     reserved_len=reserved_len,
                     reserved_cpu_values=reserved_cpu_values,
                     canonical_cpu=canonical_cpu_source,
+                    compact_gen_count=compact_gen_count(),
                 )
                 apply_arena_writes_from_descriptors(
                     self,
@@ -2190,9 +2191,20 @@ class ResolvedRowPtrArena:
                 _mark_row_table_phase("rrp_row_table_affine_refresh")
                 _mark_row_table_phase("rrp_row_table_state_publish")
                 return
-            except Exception as _cpp_exc:
-                # Fall through to the unchanged original Python loop below.
-                rrp_bind_host_ext.trace_cpp_fallthrough(_cpp_exc)
+            except Exception:
+                # [BIND-CPP-FAILFAST 2026-07-09] 原 catch-ANY 静默落穿（§10.17
+                # 点名的兜底形态）：稳态 full-bind 步 C++ 白抛 + Python 全量
+                # 重跑=贵步双倍 host（取证 fired=146/fallthrough=122，全部
+                # canonical_cpu numpy 型别雷，源头已根修为 CPU tensor）。改
+                # fail-fast 裸 raise：原异常类型/文案原样上抛（C++ 合同校验
+                # 用 std::invalid_argument→ValueError，与 Python loop 同一
+                # 输入合同，几何拒绝测试跨臂同判）；显式逃生=
+                # VLLM_SPARSE_BIND_HOST_CPP=0（enabled() 为假走下方 Python
+                # loop，唯一合法慢路径分支）。
+                import sys as _sys
+
+                rrp_bind_host_ext.trace_cpp_fallthrough(_sys.exc_info()[1])
+                raise
         # ---- end fast path -----------------------------------------------
 
         coverage: list[int] = []

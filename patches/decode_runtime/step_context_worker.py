@@ -71,6 +71,12 @@ _DEFER_BOOTSTRAP_PRODUCER_CACHED = (
 _SKIP_DECODE_PREFILL_RESERVE_CACHED = (
     os.environ.get("VLLM_SPARSE_SKIP_DECODE_PREFILL_RESERVE", "1") != "0"
 )
+# [JUDGE-REPLAY-AWARE 2026-07-09] Env-gated compact-residency poison probe. Read
+# once here; when unset every step pays exactly one cached-bool check and never
+# imports the probe module. See patches/debug/compact_poison_probe.py.
+_COMPACT_POISON_PROBE_ARMED = bool(
+    os.environ.get("VLLM_SPARSE_DEBUG_COMPACT_POISON")
+)
 
 
 def _psc_bskip_restamp_authority(auth, *, epoch, handle_id, handle_generation,
@@ -1489,6 +1495,22 @@ def prepare_step_context_impl(
         refresh_non_last_n1_count = _c['refresh_non_last_n1_count']
         refresh_prefill_count = _c['refresh_prefill_count']
 
+    # [JUDGE-REPLAY-AWARE 2026-07-09] 每步 compact 读行活性计数(全量/复用两臂
+    # 汇合处恰一次;host 侧,graph replay 无关)。FULL-graph serve 下 python 路由
+    # 计数只见 capture/eager 步,本计数是判官对 replay 步的唯一活性判据(R3c)。
+    # mmap env 未配置时 bump 内部零副作用。
+    if _has_compact_row:
+        from patches.fa3_native.install import bump_step_compact_row_liveness
+
+        bump_step_compact_row_liveness(sum(1 for _uc in _use_compact if _uc))
+        if _COMPACT_POISON_PROBE_ARMED:
+            from patches.debug.compact_poison_probe import (
+                maybe_fire_compact_poison_probe,
+            )
+
+            maybe_fire_compact_poison_probe(
+                self, _use_compact, slot_by_row, seq_lens_tuple
+            )
     has_request_phase_mix_i32 = 1 if has_request_phase_mix else 0
     previous_step_authority = getattr(self, "step_authority", None)
     consume_selected_scope_key, consume_selected_scope_wait_handle = (

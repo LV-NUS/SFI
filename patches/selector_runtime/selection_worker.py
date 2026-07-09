@@ -45,6 +45,12 @@ _REBUILD_ROW_TENSOR_CACHE_ATTR = "_rebuild_row_tensor_value_cache"
 _REBUILD_ROW_TENSOR_CACHE_MAX = int(
     os.environ.get("VLLM_SPARSE_REBUILD_ROW_CACHE_MAX", "32")
 )
+# [JUDGE-REPLAY-AWARE 2026-07-09] Env-gated compact-residency poison probe. Read
+# once; when unset the rebuild loop pays one cached-bool check per layer and
+# never imports the probe. See patches/debug/compact_poison_probe.py.
+_COMPACT_POISON_PROBE_ARMED = bool(
+    os.environ.get("VLLM_SPARSE_DEBUG_COMPACT_POISON")
+)
 
 
 
@@ -545,6 +551,18 @@ def rebuild_compact_slots_batched_layers_from_selection_impl(
         block_size = block_size_ref
         head_dim = head_dim_ref
         state = payload.state
+
+        if _COMPACT_POISON_PROBE_ARMED:
+            # Register this layer's pool KV tensors (the compact arena is a view
+            # of exactly these at the reserved blocks). First-seen is enough;
+            # pool tensors are process-stable. Env-gated: unset -> not reached.
+            from patches.debug.compact_poison_probe import maybe_register_layer_kv
+
+            maybe_register_layer_kv(
+                int(getattr(payload, "layer_index", layer_idx)),
+                payload.key_cache,
+                payload.value_cache,
+            )
 
         if layer_idx == 0:
             # 首层：完整检查

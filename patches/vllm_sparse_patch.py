@@ -4418,9 +4418,19 @@ class VLLMSparseController(
                     interval_reason_code = PendingReasonCode.INTERVAL
 
         interval_merge_policy = getattr(self, "_interval_merge_policy", "delta1")
-        # interval coalescing（delta1）：chunked prefill / scheduler 可能导致不同 request
-        # 进入 decode 的时间相差 1 步。允许将“仅差 1 步”的请求提前并入 refresh，
-        # 以 1 token 的轻微提前换取大 batch 吞吐。
+        # [INTERVAL-RIDE-ALONG 2026-07-09] interval 拍点世代拉齐（整块替换原
+        # delta1"全有或全无"合并）。原语义要求批内全部未触发请求恰好
+        # delta==interval-1 才整批并入——chunked prefill/serve 错峰批下几乎
+        # 永不成立 → 每请求各开独立世代，世代固定成本（selector/writer 链墙
+        # +bind）×BS 放大（TP8×64k bs32 取证 interval 事件=朴素预期 4.3×，
+        # 0.77× 倒挂的结构根源）。
+        # 新语义：interval 拍点开世代时，决定论 gap 挡板放行、无既有 pending
+        # 票、且已进入稳态 decode 的请求，就地以**当前 decode_step 为票面**
+        # 正常触发搭同一班车（新鲜信号，无旧票堆积/延迟攒批）；提交即终局
+        # 推进时钟 → 搭车批自锁进同一节拍，稳态恢复每请求 1/interval，世代数
+        # 坍缩到节拍数。sentence/lease 语义不动（有票不抢占）；min_refresh_gap
+        # 全局合同不变（挡板原样）；输入全为 host 决定论量（[TP-DET-TRIGGER]
+        # 合同保持）。escape=interval_merge_policy="off"（既有旋钮，零新增）。
         if (
             interval_merge_policy == "delta1"
             and (not workload_plan_replay_active)
@@ -4429,9 +4439,13 @@ class VLLMSparseController(
             and refresh_set
             and len(refresh_set) < len(request_ids)
         ):
-            coalesce_ok = True
+            ride_along_joined = 0
             for rid in request_ids:
                 if rid in refresh_set:
+                    continue
+                ticket = tickets_plan_by_req.get(rid)
+                if ticket is not None and bool(ticket.pending_refresh):
+                    # 已有票（sentence/lease/interval pending）：不抢占不改票。
                     continue
                 tracking = tracking_by_req[rid]
                 # [TP-DET-TRIGGER] inflight 过滤 → 决定论 gap 过滤。
@@ -4442,25 +4456,30 @@ class VLLMSparseController(
                 decode_step = int(tracking.decode_step) if tracking.decode_step is not None else -1
                 last_decode_refresh = int(tracking.last_decode_refresh_step) if tracking.last_decode_refresh_step is not None else -1
                 if decode_step < 0 or last_decode_refresh < 0:
-                    coalesce_ok = False
-                    break
-                delta = decode_step - last_decode_refresh
-                if delta != (interval - 1):
-                    coalesce_ok = False
-                    break
-            if coalesce_ok:
-                refresh_set.update(
-                    rid
-                    for rid in request_ids
-                    if (
-                        not _refresh_gap_blocked(
-                            tracking_by_req[rid],
-                            decode_step_by_req.get(rid, -1),
-                        )
-                    )
-                    and (not _is_short_dense_blocked(rid))
+                    # bootstrap/prefill 窗（decode 时钟未立）：不拉。
+                    continue
+                refresh_set.add(rid)
+                _queue_set_pending_refresh(
+                    request_id=rid,
+                    reason_code=PendingReasonCode.INTERVAL,
+                    decode_step=decode_step,
+                    pending_policy=PendingPolicy.COALESCEABLE,
+                    pending_ctrl_step=self.step_context_epoch,
                 )
+                ride_along_joined += 1
+            if ride_along_joined:
                 coalesced = True
+                if update_state:
+                    self._interval_ride_along_joined_total = (
+                        int(
+                            getattr(
+                                self,
+                                "_interval_ride_along_joined_total",
+                                0,
+                            )
+                        )
+                        + ride_along_joined
+                    )
 
         self._current_decode_step_by_req_epoch = int(self.step_context_epoch)
         self._current_decode_step_by_req = dict(decode_step_by_req)
