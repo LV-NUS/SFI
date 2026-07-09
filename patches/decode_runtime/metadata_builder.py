@@ -8382,21 +8382,24 @@ def maybe_build_step_decode_data_from_metadata_impl(
                     if layer_group_epoch == step_authority.epoch
                     else (layer_group_event_idx & 1)
                 )
+                # [OUT-PTR-H2D-DIET 2026-07-09] 原 torch.as_tensor(list)→copy_
+                # =每触发步一次 pageable 同步 H2D(等 GPU 队列排空,z_rrp 同族,
+                # decode_out_ptr_prep 2-8ms 族根源之一)。enable 向量只有两种
+                # 内容(active_group 奇偶),预建 GPU 常驻 even/odd 对,触发步按
+                # parity 切换引用=零 H2D 零同步。消费点(pack_req_meta_decode_
+                # fast_layers)每步重读本属性且为 eager 发射不烘地址,交替引用
+                # 安全;numel 精确等于 num_layers(模型常量),消费合同不变。
+                _logf_pair = getattr(self, "_decode_layer_logf_enable_pair", None)
                 if (
-                    self._decode_layer_logf_enable_i32 is None
-                    or self._decode_layer_logf_enable_i32.device != device
-                    or self._decode_layer_logf_enable_i32.numel() < num_layers
+                    _logf_pair is None
+                    or _logf_pair[0].device != device
+                    or _logf_pair[0].numel() != num_layers
                 ):
-                    self._decode_layer_logf_enable_i32 = torch.empty(
-                        (num_layers,), device=device, dtype=torch.int32
-                    )
-                _enable_cpu = [
-                    1 if (li & 1) == active_group else 0
-                    for li in range(num_layers)
-                ]
-                self._decode_layer_logf_enable_i32[:num_layers].copy_(
-                    torch.as_tensor(_enable_cpu, dtype=torch.int32)
-                )
+                    _li = torch.arange(num_layers, device=device, dtype=torch.int32)
+                    _even = ((_li & 1) == 0).to(torch.int32).contiguous()
+                    _logf_pair = (_even, (1 - _even).contiguous())
+                    self._decode_layer_logf_enable_pair = _logf_pair
+                self._decode_layer_logf_enable_i32 = _logf_pair[int(active_group) & 1]
             else:
                 # 无 refresh 或无 layer-group gating：所有层统一启用（全 1）。
                 # pack kernel 对 log_f_mask==0 的行直接跳过，故全 1 无副作用。
@@ -8435,24 +8438,10 @@ def maybe_build_step_decode_data_from_metadata_impl(
                     "decode out_ptr slot->row refresh failed; refuse silent fallback"
                 ) from exc
 
-            # 生成 cu_seqlens_q（GPU）：numpy cumsum + 预分配 GPU buffer（避免 torch.tensor(list, device=cuda)）
-            q_lens_auth = step_authority.q_lens_by_row
-            if len(q_lens_auth) < batch_size:
-                raise RuntimeError(
-                    "decode out_ptr requires full q_lens_by_row coverage from step_authority; "
-                    f"rows={len(q_lens_auth)} batch={int(batch_size)} epoch={int(step_authority.epoch)}"
-                )
-            q_lens = q_lens_auth[:batch_size]
-            _q_np = np.array(q_lens, dtype=np.int32)
-            np.maximum(_q_np, 0, out=_q_np)
-            _cu_np = np.empty(batch_size + 1, dtype=np.int32)
-            _cu_np[0] = 0
-            np.cumsum(_q_np, out=_cu_np[1:])
-            _cu_cap = max_batch_size + 1
-            if self._decode_cu_seqlens_q_i32 is None or self._decode_cu_seqlens_q_i32.device != device or self._decode_cu_seqlens_q_i32.numel() < _cu_cap:
-                self._decode_cu_seqlens_q_i32 = torch.empty((_cu_cap,), device=device, dtype=torch.int32)
-            self._decode_cu_seqlens_q_i32[:batch_size + 1].copy_(torch.as_tensor(_cu_np))
-            cu_seqlens_q_gpu = self._decode_cu_seqlens_q_i32[:batch_size + 1]
+            # [CU-SEQLENS-DEAD-PARAM-RETIRE 2026-07-09] 原地死段下线:此处曾
+            # 每触发步做 numpy cumsum+pageable 同步 H2D 生成 cu_seqlens_q_gpu,
+            # 唯一去处是 layout impl 的死形参(全程不读)——纯为喂死参付
+            # 2-8ms 族同步代价(z_rrp 同族)。参数链已连根拔除。
 
             # buf0：global_layer_index=0 必定映射到 buf0（chunk_id=0）
             layout0 = self._get_step_capture_layout(
@@ -8461,7 +8450,6 @@ def maybe_build_step_decode_data_from_metadata_impl(
                 step_context=step_ctx,  # type: ignore[arg-type]
                 global_layer_index=0,
                 slot_list=slot_list,
-                cu_seqlens_q=cu_seqlens_q_gpu,
                 seqused_k=step_meta.seqused_k_gpu,
                 num_heads=int(first_state.num_heads),
                 device=device,
@@ -8484,7 +8472,6 @@ def maybe_build_step_decode_data_from_metadata_impl(
                     step_context=step_ctx,  # type: ignore[arg-type]
                     global_layer_index=int(_CAPTURE_CHUNK),
                     slot_list=slot_list,
-                    cu_seqlens_q=cu_seqlens_q_gpu,
                     seqused_k=step_meta.seqused_k_gpu,
                     num_heads=int(first_state.num_heads),
                     device=device,
@@ -9662,7 +9649,6 @@ def maybe_build_step_prefill_global_meta_from_metadata_impl(
             step_context=step_ctx,
             global_layer_index=0,
             slot_list=prefill_slots,
-            cu_seqlens_q=cu_seqlens_q[: batch_size + 1],
             seqused_k=seqused_k[:batch_size],
             num_heads=int(first_state.num_heads),
             device=device,
@@ -9700,7 +9686,6 @@ def maybe_build_step_prefill_global_meta_from_metadata_impl(
                 step_context=step_ctx,
                 global_layer_index=int(_CAPTURE_CHUNK),
                 slot_list=prefill_slots,
-                cu_seqlens_q=cu_seqlens_q[: batch_size + 1],
                 seqused_k=seqused_k[:batch_size],
                 num_heads=int(first_state.num_heads),
                 device=device,

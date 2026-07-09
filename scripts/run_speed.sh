@@ -108,7 +108,13 @@ fi
 
 SFI_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FA_ROOT="${VLLM_SPARSE_FA3_UPSTREAM_ROOT:-${SFI_ROOT}/third_party_upstreams/vllm-project-flash-attention}"
-PY="${PYTHON:-python}"
+# PYTHON is REQUIRED (fail-fast, no bare-`python` fallback): the shared
+# tmp/torch_extensions/sm80_gt1 cache keys prebuilt .so by NAME only. A wrong
+# interpreter (e.g. conda base py3.12) silently rebuilds the whole ext family
+# with an incompatible ABI, and the next correct run then imports those
+# poisoned artifacts ("Python version mismatch" / symbol errors). Root fix is
+# refusing to launch rather than producing the bad cache.
+PY="${PYTHON:?PYTHON env required: absolute path of the benchmark interpreter (e.g. /ssd/.../envs/vllm019-cu126/bin/python); bare 'python' poisons the shared ext cache with a wrong-ABI build}"
 OUT="${SFI_ROOT}/out"
 mkdir -p "${OUT}"
 

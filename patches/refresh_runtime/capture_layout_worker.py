@@ -99,7 +99,6 @@ def get_step_capture_layout_impl(
     step_context: StepContext,
     global_layer_index: int,
     slot_list: List[int],
-    cu_seqlens_q: torch.Tensor,
     seqused_k: torch.Tensor,
     num_heads: int,
     device: torch.device,

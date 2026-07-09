@@ -4516,7 +4516,23 @@ class RefreshRebuildMixin:
             tracking.inflight_reason_code = pending_reason_commit
             tracking.inflight_policy = pending_policy_commit
             tracking.last_refresh_step = self.step_context_epoch
-            tracking.last_decode_refresh_step = int(pending_step)
+            # [TICKET-AGING-CLOCK 2026-07-09] 放大 B 根修:时钟推进语义 票面步→
+            # 提交点实际计划步。票面被 sentence/lease 并票 min() 拉早、或立票后
+            # 等 gap/slots 才物化(票面老化)时,last 欠推进 → interval 提前到点
+            # (decode_step-last>=interval)+min_gap 挡板提前失效=过密触发残余
+            # 通道。刷新新鲜度由提交点决定(selector 读到的 KV 截至提交步),故
+            # 时钟推进到提交点 decode_step——host 计划量,[TP-DET-TRIGGER] 合同
+            # 保持(与上方 pending_step<0 fallback 同源,非 GPU 完成时刻)。
+            # max()=decode 时钟未立(bootstrap,-1)回退票面;post_bridge lookahead
+            # 票(票面=step+1)不倒退。scheduled_* 保留票面(意图/观测语义不变)。
+            _commit_decode_step = (
+                int(tracking.decode_step)
+                if tracking.decode_step is not None
+                else -1
+            )
+            tracking.last_decode_refresh_step = max(
+                int(pending_step), _commit_decode_step
+            )
             trigger = getattr(tracking, "trigger", None)
             if trigger is not None:
                 trigger.state.steps_since_refresh = 0

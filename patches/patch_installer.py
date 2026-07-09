@@ -165,8 +165,6 @@ _FLASH_ATTN_FORWARD_PATCHED: bool = False
 _V1_FLASH_ATTN_MODULES = None
 _GLOBAL_CONTROLLER: Optional[VLLMSparseController] = None
 _PATCH_INSTALLED: bool = False
-_COMPILATION_PATCHED: bool = False
-_ORIGINAL_SET_SPLITTING_OPS_FOR_V1 = None
 _UBATCH_WRAPPER_PATCHED: bool = False
 _ORIGINAL_UBATCH_WRAPPER_CALL = None
 _CUDAGRAPH_WRAPPER_PATCHED: bool = False
@@ -798,9 +796,6 @@ def _full_cudagraph_replay_wrapper_steady_fast_path_ready(
         return False
     pending = getattr(controller, "_pending_refresh_rebuilds", None)
     if pending:
-        return False
-    deferred = getattr(controller, "_deferred_replay_refresh_payload_groups", None)
-    if deferred:
         return False
     flags_obj = getattr(controller, "_buf_pending_work_flags", ())
     if isinstance(flags_obj, (list, tuple)):
@@ -4368,22 +4363,6 @@ def _patch_flash_metadata_builder() -> None:
     FlashAttentionMetadataBuilder.build = _patched_build  # type: ignore[assignment]
     _ORIGINAL_FLASH_METADATA_BUILD = original_build
     _FLASH_METADATA_PATCHED = True
-
-def _patch_compilation_config_for_sparse() -> None:
-    """Keep sparse graph-on configuration aligned with native vLLM.
-
-    This patch intentionally does not rewrite ``splitting_ops`` or enable
-    ``cudagraph_copy_inputs`` during configuration/profile setup. The mixed-page
-    graph path must be selected by capture metadata and refreshed at the native
-    FULL replay boundary, not by changing ordinary memory-profile compilation.
-    """
-    # PHASE-2B de-legacy: RETIRED. This patch's only runtime effect was the
-    # VLLM_SPARSE_ATTENTION_IN_CUDAGRAPH x VLLM_SPARSE_ASYNC_REFRESH mutex (now
-    # removed); per the docstring it never rewrote splitting_ops, so it is a pure
-    # no-op. The install call is commented out so it is never applied, and
-    # _COMPILATION_PATCHED stays False so the uninstall restore path stays inert.
-    return
-
 
 def _refresh_mixed_page_full_cudagraph_replay_for_forward_context(
     *,
@@ -8505,81 +8484,6 @@ def _flush_full_cudagraph_refresh_payloads_batched_after_replay(
     return int(len(payloads))
 
 
-def _ensure_deferred_replay_refresh_queue(controller: object) -> deque:
-    """Lazily attach + return controller's deferred replay-refresh FIFO.
-
-    Used by P3 stagger (spec 2026-05-10). Each entry is a payload_group
-    list waiting to be enqueued in a later wrapper post-call. The drain
-    hook (`_drain_deferred_replay_refresh_payload_groups`) consumes one
-    per call.
-    """
-    deferred = getattr(controller, "_deferred_replay_refresh_payload_groups", None)
-    if not isinstance(deferred, deque):
-        deferred = deque()
-        setattr(controller, "_deferred_replay_refresh_payload_groups", deferred)
-    return deferred
-
-
-def _append_deferred_replay_refresh_payload_groups(
-    *,
-    controller: object,
-    groups: Sequence[list],
-    current_handle: int,
-    delay_steps: int,
-) -> int:
-    if not groups:
-        return 0
-    deferred = _ensure_deferred_replay_refresh_queue(controller)
-    current_handle = int(current_handle)
-    delay_steps = max(1, int(delay_steps))
-    # Step handles can jump when the scheduler emits fewer wrapper calls than
-    # logical decode steps near the tail. Keep the queue deadline one handle
-    # wider than the producer-work deadline while preserving the carrier's
-    # actual freshness slack.
-    queue_deadline_guard_steps = 1
-    new_deadline = (
-        int(current_handle + delay_steps + queue_deadline_guard_steps)
-        if current_handle >= 0
-        else -1
-    )
-    existing_deadline = int(
-        getattr(controller, "_deferred_replay_refresh_deadline_handle_id", -1)
-        or -1
-    )
-    if existing_deadline >= 0 and new_deadline >= 0:
-        deadline_handle = min(existing_deadline, new_deadline)
-    else:
-        deadline_handle = max(existing_deadline, new_deadline)
-    existing_slack = int(
-        getattr(controller, "_deferred_replay_refresh_deadline_slack_steps", -1)
-        or -1
-    )
-    slack_steps = (
-        min(existing_slack, delay_steps)
-        if existing_slack > 0
-        else delay_steps
-    )
-    queued = 0
-    for group in groups:
-        if not group:
-            continue
-        deferred.append(group)
-        queued += 1
-    if queued <= 0:
-        return 0
-    setattr(
-        controller,
-        "_deferred_replay_refresh_deadline_handle_id",
-        int(deadline_handle),
-    )
-    setattr(
-        controller,
-        "_deferred_replay_refresh_deadline_slack_steps",
-        int(slack_steps),
-    )
-    return queued
-
-
 def _enqueue_one_replay_refresh_payload_group(
     *,
     controller: object,
@@ -8922,202 +8826,6 @@ def _adaptive_replay_refresh_deferred_deadline_steps(
     if bool(ready_chunk_subgroups):
         return 1
     return max(1, int(target_group_count))
-
-
-def _deferred_replay_refresh_drain_budget(
-    *,
-    queued: int,
-    current_handle: int,
-    deadline: int,
-) -> int:
-    queued = max(0, int(queued))
-    if queued <= 0:
-        return 0
-    current_handle = int(current_handle)
-    deadline = int(deadline)
-    if deadline < 0 or current_handle <= 0:
-        return 1
-    # Keep one wrapper-call of slack for the pending writer itself. The
-    # deferred queue feeds _enqueue_pending_refresh_rebuild; the resulting
-    # pending item still needs time on the refresh stream before consumer
-    # drain waits its writer_done_event.
-    remaining_steps = max(1, deadline - current_handle)
-    return min(queued, (queued + remaining_steps - 1) // remaining_steps)
-
-
-def _deferred_replay_refresh_payload_group_finished_req_ids(
-    *,
-    controller: object,
-    group: Sequence[object],
-) -> tuple[str, ...]:
-    if not group:
-        return tuple()
-    finished = set(getattr(controller, "_finished_req_ids_step", set()) or set())
-    snapshot_finished = set(
-        getattr(controller, "_snapshot_finished_req_ids", set()) or set()
-    )
-    finished.update(snapshot_finished)
-    if not finished:
-        return tuple()
-    normalize = getattr(controller, "_normalize_refresh_req_ids", None)
-    if not callable(normalize):
-        return tuple()
-    req_ids: tuple[str, ...] = tuple()
-    for payload in group:
-        raw = getattr(payload, "slot_req_ids", None)
-        if raw is None:
-            raw = getattr(payload, "refresh_intent_req_ids", None)
-        cur = tuple(str(v) for v in normalize(raw))
-        if not cur:
-            return tuple()
-        if not req_ids:
-            req_ids = cur
-        elif cur != req_ids:
-            return tuple()
-    if all(str(req_id) in finished for req_id in req_ids):
-        return req_ids
-    return tuple()
-
-
-def _drain_deferred_replay_refresh_payload_groups(
-    *,
-    controller: object,
-) -> int:
-    """Drain at most one deferred replay-refresh payload_group, or all if
-    deadline is imminent.
-
-    Spec: docs/superpowers/specs/2026-05-10-sm80-refresh-enqueue-stagger-design.md
-
-    Called from the wrapper post-call envelope on **every** wrapper call
-    where ``profile_reason == "prebound_rrp_graph_state"`` — independent
-    of trigger fire. Without this independent drain, queue accumulates
-    until a trigger arrives and we miss the deadline.
-
-    Deadline overflow raises (per ``eliminate_not_mask_hotpath``); no
-    silent flush.
-
-    Returns the number of payload_groups actually drained this call.
-    """
-    profile_enabled = bool(_full_cudagraph_hook_profile_log(True))
-    drain_profile: Optional[dict[str, object]] = None
-    drain_total_start_ns = time.perf_counter_ns() if profile_enabled else 0
-    if profile_enabled:
-        drain_profile = {
-            "schema": "deferred_replay_refresh_drain_profile_v1",
-            "drained": 0,
-            "pending_group_count": 0,
-            "pending_group_payload_count": 0,
-            "pending_group_clear_us": 0.0,
-            "pending_group_carrier_prepare_us": 0.0,
-            "pending_group_bootstrap_slots_list_us": 0.0,
-            "pending_group_enqueue_pending_us": 0.0,
-            "pending_group_total_us": 0.0,
-            "dropped_finished": 0,
-            "dropped_finished_payload_count": 0,
-            "total_us": 0.0,
-        }
-        setattr(
-            controller,
-            "_mixed_page_deferred_replay_refresh_last_drain_profile",
-            None,
-        )
-    if not _REFRESH_ENQUEUE_STAGGER_CACHED:
-        return 0
-    deferred = getattr(controller, "_deferred_replay_refresh_payload_groups", None)
-    if not isinstance(deferred, deque) or not deferred:
-        return 0
-    enqueue_pending = getattr(controller, "_enqueue_pending_refresh_rebuild", None)
-    map_layer = getattr(controller, "_map_global_layer_to_capture_slot", None)
-    if not callable(enqueue_pending) or not callable(map_layer):
-        raise RuntimeError(
-            "deferred replay-refresh drain requires pending rebuild enqueue hooks"
-        )
-    from patches.refresh_runtime.producer_workspace import (
-        get_refresh_producer_workspace,
-    )
-    workspace = get_refresh_producer_workspace(controller)
-
-    step_authority = getattr(controller, "step_authority", None)
-    current_handle = int(getattr(step_authority, "step_handle_id", -1) or -1)
-    deadline = int(
-        getattr(controller, "_deferred_replay_refresh_deadline_handle_id", -1)
-        or -1
-    )
-    deadline_slack_steps = int(
-        getattr(controller, "_deferred_replay_refresh_deadline_slack_steps", -1)
-        or -1
-    )
-
-    if deadline >= 0 and current_handle > deadline:
-        raise RuntimeError(
-            "deferred replay-refresh queue missed deadline: "
-            f"current={current_handle} deadline={deadline} "
-            f"queued={len(deferred)}"
-        )
-    drained = 0
-    budget = _deferred_replay_refresh_drain_budget(
-        queued=len(deferred),
-        current_handle=current_handle,
-        deadline=deadline,
-    )
-    while deferred and drained < budget:
-        group = deferred.popleft()
-        finished_req_ids = _deferred_replay_refresh_payload_group_finished_req_ids(
-            controller=controller,
-            group=group,
-        )
-        if finished_req_ids:
-            resolve_lease = getattr(controller, "_resolve_refresh_lease", None)
-            if callable(resolve_lease):
-                resolve_lease(
-                    req_ids=finished_req_ids,
-                    reason="deferred_replay_refresh_drop_finished",
-                )
-            if drain_profile is not None:
-                drain_profile["dropped_finished"] = int(
-                    drain_profile.get("dropped_finished", 0) or 0
-                ) + 1
-                drain_profile["dropped_finished_payload_count"] = int(
-                    drain_profile.get("dropped_finished_payload_count", 0) or 0
-                ) + int(len(group))
-            continue
-        carrier_deadline_slack_steps = int(deadline_slack_steps)
-        if deadline >= 0 and current_handle > 0:
-            carrier_deadline_slack_steps = max(1, int(deadline - current_handle))
-            if deadline_slack_steps > 0:
-                carrier_deadline_slack_steps = min(
-                    int(deadline_slack_steps),
-                    int(carrier_deadline_slack_steps),
-                )
-        if _enqueue_one_replay_refresh_payload_group(
-            controller=controller,
-            group=group,
-            result=None,
-            workspace=workspace,
-            enqueue_pending=enqueue_pending,
-            map_layer=map_layer,
-            deadline_slack_steps=carrier_deadline_slack_steps,
-            stage_profile=drain_profile,
-            profile_detail=_REPLAY_REFRESH_ENQUEUE_PROFILE_DETAIL_CACHED,
-        ):
-            drained += 1
-
-    if not deferred:
-        # Queue empty: reset deadline to sentinel so a future enqueue can
-        # set a fresh deadline starting from its own handle.
-        setattr(controller, "_deferred_replay_refresh_deadline_handle_id", -1)
-        setattr(controller, "_deferred_replay_refresh_deadline_slack_steps", -1)
-    if drain_profile is not None:
-        drain_profile["drained"] = int(drained)
-        drain_profile["total_us"] = (
-            time.perf_counter_ns() - drain_total_start_ns
-        ) / 1000.0
-        setattr(
-            controller,
-            "_mixed_page_deferred_replay_refresh_last_drain_profile",
-            dict(drain_profile),
-        )
-    return drained
 
 
 def _enqueue_full_cudagraph_refresh_payloads_after_replay(
@@ -10068,7 +9776,6 @@ def _patch_cuda_graph_wrapper_for_sparse_cudagraph() -> None:
         profile_refresh_called = False
         profile_payload_enqueue_count = 0
         profile_refresh_stage_profile = None
-        profile_deferred_replay_refresh_drain_profile = None
         profile_pre_consume_drain_us = 0.0
         profile_pre_consume_drain_stats = None
         profile_pre_timing = _new_full_cudagraph_pre_timing(profile_enabled)
@@ -10675,21 +10382,9 @@ def _patch_cuda_graph_wrapper_for_sparse_cudagraph() -> None:
             and profile_reason == "prebound_rrp_graph_state"
         ):
             profile_refresh_start_ns = time.perf_counter_ns() if profile_enabled else 0
-            deferred_replay_groups = getattr(
-                controller,
-                "_deferred_replay_refresh_payload_groups",
-                None,
-            )
-            if deferred_replay_groups:
-                # P3 stagger drain: run independently of trigger fire so the
-                # deferred queue doesn't accumulate across 100+ wrapper calls
-                # between triggers (which would miss the deadline).
-                _drain_deferred_replay_refresh_payload_groups(controller=controller)
-                profile_deferred_replay_refresh_drain_profile = getattr(
-                    controller,
-                    "_mixed_page_deferred_replay_refresh_last_drain_profile",
-                    None,
-                )
+            # [B-GRADE-1 2026-07-09] deferred replay-refresh FIFO 死码下线:
+            # 生产者(_append_...)全树零调用 → 队列属性恒 None → 本处 drain 门
+            # 恒假。5 函数+守卫+profile 管道随删(§10.20 拍板材料项 1)。
             if (
                 not _REPLAY_REFRESH_NOOP_FAST_SKIP_CACHED
                 or _full_cudagraph_replay_step_has_refresh_row(controller)
@@ -10804,14 +10499,6 @@ def _patch_cuda_graph_wrapper_for_sparse_cudagraph() -> None:
                     "refresh_stage_profile": (
                         dict(profile_refresh_stage_profile)
                         if isinstance(profile_refresh_stage_profile, dict)
-                        else None
-                    ),
-                    "deferred_replay_refresh_drain_profile": (
-                        dict(profile_deferred_replay_refresh_drain_profile)
-                        if isinstance(
-                            profile_deferred_replay_refresh_drain_profile,
-                            dict,
-                        )
                         else None
                     ),
                     "pre_consume_pending_rebuild_drain_us": float(
@@ -12030,8 +11717,6 @@ def _install_patch() -> None:
     if _PATCH_INSTALLED:
         _patch_compact_page_residency_core()
         return
-    # PHASE-2B de-legacy: compilation patch retired (no-op after mutex removal); not installed.
-    # _patch_compilation_config_for_sparse()
     _patch_cuda_graph_wrapper_for_sparse_cudagraph()
     _patch_gpu_ubatch_wrapper_for_sparse_cudagraph()
     _patch_compact_page_residency_core()
@@ -12827,7 +12512,6 @@ def _run_capture_only_mixed_forward(
             step_context=step_ctx,
             global_layer_index=global_layer_index,
             slot_list=prefill_slot_list,
-            cu_seqlens_q=cu_seqlens_q,
             seqused_k=seqused_k,
             num_heads=query.shape[1],
             device=query.device,
@@ -12866,7 +12550,6 @@ def _run_capture_only_mixed_forward(
             step_context=step_ctx,
             global_layer_index=global_layer_index,
             slot_list=active_refresh_slot_list,
-            cu_seqlens_q=cu_seqlens_q,
             seqused_k=seqused_k,
             num_heads=query.shape[1],
             device=query.device,
@@ -14386,7 +14069,6 @@ def disable_vllm_sparse_patch() -> None:
     global _FLASH_METADATA_PATCHED, _ORIGINAL_FLASH_METADATA_BUILD
     global _REQUEST_PATCHED, _ORIGINAL_APPEND_OUTPUT_TOKEN_IDS
     global _KV_INIT_PATCHED, _ORIGINAL_INIT_KV_CACHE
-    global _COMPILATION_PATCHED, _ORIGINAL_SET_SPLITTING_OPS_FOR_V1
     global _UBATCH_WRAPPER_PATCHED, _ORIGINAL_UBATCH_WRAPPER_CALL
     global _CUDAGRAPH_WRAPPER_PATCHED, _ORIGINAL_CUDAGRAPH_WRAPPER_CALL
     global _UPDATE_STATES_PATCHED, _ORIGINAL_UPDATE_STATES
@@ -14518,9 +14200,4 @@ def disable_vllm_sparse_patch() -> None:
             raise
     _KV_INIT_PATCHED = False
     _ORIGINAL_INIT_KV_CACHE = None
-    # compilation-config patch retired (PHASE-2B de-legacy): the installer stub
-    # never patches, so there is nothing to restore here. _COMPILATION_PATCHED
-    # can only be False (no True assignment exists in the tree).
-    _COMPILATION_PATCHED = False
-    _ORIGINAL_SET_SPLITTING_OPS_FOR_V1 = None
     _restore_compact_page_residency_core_patch()

@@ -379,26 +379,31 @@ def build_compact_recent_launch_plan(
     descriptor_cpu = descriptor_cpu_storage[:, :batch_size]
     host_plan_i32 = host_cpu_storage[:batch_size, :]
     compact_offset_cpu = offset_cpu_storage[:batch_size]
-    for row in range(batch_size):
-        compact_base = int(compact_base_block_list[row])
-        compact_tokens = max(0, int(compact_valid_tokens_list[row]))
-        recent_first = max(0, int(recent_first_list[row]))
-        recent_count = max(0, int(recent_count_list[row]))
-        request_recent_len = max(0, int(request_recent_len_list[row]))
-        launch_effective_k = max(0, int(launch_effective_k_len_list[row]))
-        host_effective_k = max(0, int(host_static_k_bound_list[row]))
-        descriptor_cpu[0, row] = compact_base
-        descriptor_cpu[1, row] = compact_tokens
-        descriptor_cpu[2, row] = recent_first
-        descriptor_cpu[3, row] = recent_count
-        descriptor_cpu[4, row] = request_recent_len
-        descriptor_cpu[_LAUNCH_EFFECTIVE_K_LEN_DESCRIPTOR_ROW, row] = launch_effective_k
-        host_plan_i32[row, 0] = compact_base
-        host_plan_i32[row, 1] = compact_tokens
-        host_plan_i32[row, 2] = recent_first
-        host_plan_i32[row, 3] = recent_count
-        host_plan_i32[row, 4] = host_effective_k
-        compact_offset_cpu[row] = max(0, int(compact_offset_tokens_gathered[row]))
+    # [LAUNCH-PLAN-BATCH-WRITE 2026-07-09] 原逐行×逐字段 tensor __setitem__
+    # (11 标量写/行,bs8 实测 416µs=launch_plan_build 0.67ms 的主项)改为
+    # list→tensor 批量物化+copy_(实测 23µs)。上方第一趟循环出口已保证全部
+    # 值非负(compact 臂 max(0,·)/对齐截断,full 臂由 real/count 推导),原
+    # 第二趟的 max(0,·) 为冗余防御,批量化语义逐位等价;int32 溢出时
+    # torch.tensor 与原标量写同样抛错,无静默截断通道。
+    descriptor_src = torch.tensor(
+        [
+            compact_base_block_list,
+            compact_valid_tokens_list,
+            recent_first_list,
+            recent_count_list,
+            request_recent_len_list,
+            launch_effective_k_len_list,
+        ],
+        dtype=torch.int32,
+    )
+    descriptor_cpu.copy_(descriptor_src)
+    host_plan_i32[:, 0:4].copy_(descriptor_src[0:4].t())
+    host_plan_i32[:, 4].copy_(
+        torch.tensor(host_static_k_bound_list, dtype=torch.int32)
+    )
+    compact_offset_cpu.copy_(
+        torch.tensor(compact_offset_tokens_gathered, dtype=torch.int64)
+    )
 
     non_blocking = str(device.type) == "cuda"
     descriptor_i32 = descriptor_gpu_storage[:, :batch_size]

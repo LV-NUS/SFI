@@ -2045,7 +2045,6 @@ class VLLMSparseController(
         step_context: StepContext,
         global_layer_index: int,
         slot_list: List[int],
-        cu_seqlens_q: torch.Tensor,
         seqused_k: torch.Tensor,
         num_heads: int,
         device: torch.device,
@@ -2053,6 +2052,11 @@ class VLLMSparseController(
         prepared_only: bool = False,
         skip_live_lengths: bool = False,
     ) -> Optional[StepCaptureLayout]:
+        # [CU-SEQLENS-DEAD-PARAM-RETIRE 2026-07-09] cu_seqlens_q 形参下线:
+        # layout impl 全程不读(死形参),而 metadata_builder 触发步为喂它
+        # 每次做 numpy cumsum+pageable 同步 H2D(decode_out_ptr_prep 2-8ms
+        # 族根源之一)。参数链连根拔除;payload_worker 入参链的残余死参随
+        # installer B 级清理场收尾。
         impl = _load_capture_layout_impl()
         return impl(
             self,
@@ -2061,7 +2065,6 @@ class VLLMSparseController(
             step_context=step_context,
             global_layer_index=global_layer_index,
             slot_list=slot_list,
-            cu_seqlens_q=cu_seqlens_q,
             seqused_k=seqused_k,
             num_heads=num_heads,
             device=device,
@@ -2636,11 +2639,6 @@ class VLLMSparseController(
         self._should_refresh_cache_step = -1
         self._should_refresh_cache_nonce = -1
         self._should_refresh_cache.clear()
-        deferred = getattr(self, "_deferred_replay_refresh_payload_groups", None)
-        if isinstance(deferred, deque):
-            deferred.clear()
-        setattr(self, "_deferred_replay_refresh_deadline_handle_id", -1)
-        setattr(self, "_deferred_replay_refresh_deadline_slack_steps", -1)
 
     def reset_for_new_engine(self) -> None:
         """重置与 engine/kv-cache 绑定的状态，避免跨 engine 污染。"""
