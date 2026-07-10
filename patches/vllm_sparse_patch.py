@@ -4384,6 +4384,16 @@ class VLLMSparseController(
                 and interval > 0
                 and decode_step >= 0
                 and (decode_step - last_decode_refresh) >= interval
+                # [INTERVAL-BOOTSTRAP-GATE 2026-07-10] bootstrap producer 在飞
+                # (one-shot bridge 窗)的请求不触发 interval:compact 首刷由
+                # bootstrap 兑现,此处开 refresh 世代=与 producer 竞争同一
+                # dual-gen 写半区;且该世代按 _CAPTURE_CHUNK 分轮 commit,与
+                # bootstrap ready 的全层 commit 交错=层间 read_gen 错开,精确
+                # 命中 [DUAL-GEN-LAYER-PARITY](远端 TP8×64k bs32 崩案:
+                # offending layer_index=14=chunk 界;bs16 全程无交错故不炸)。
+                # ready 后节拍由既有 post_bridge 追赶票接管,无饿死;sentence
+                # 同窗本有追赶机制,interval 缺此门即本案设计缺口。
+                and not bool(getattr(tracking, "bootstrap_pending", False))
             ):
                 # [CREDIT-RETIRE 2026-07-07] 原 post_bridge credit 在此吞掉
                 # interval 到点(推 last+continue),已随状态机退休——interval
@@ -4446,6 +4456,12 @@ class VLLMSparseController(
                     # 已有票（sentence/lease/interval pending）：不抢占不改票。
                     continue
                 tracking = tracking_by_req[rid]
+                # [INTERVAL-BOOTSTRAP-GATE 2026-07-10] 半途(bootstrap producer
+                # 在飞)请求不拉入搭车——拉入即重演 interval 触发同型的
+                # dual-gen parity 竞争(bridge 下 decode 时钟已立,仅靠下方
+                # last<0 检查挡不住)。
+                if bool(getattr(tracking, "bootstrap_pending", False)):
+                    continue
                 # [TP-DET-TRIGGER] inflight 过滤 → 决定论 gap 过滤。
                 if _refresh_gap_blocked(tracking, decode_step_by_req.get(rid, -1)):
                     continue

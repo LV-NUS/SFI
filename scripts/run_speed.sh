@@ -178,6 +178,14 @@ for key in sorted(s):
     if "refresh" in key and "count" in key and isinstance(s[key], (int, float)) and s[key]:
         print(f"  {key}={s[key]}")
 fallbacks = s.get("dense_native_fallback_count", 0) or 0
+# [SPARSE-ROUTE-PROOF-GATE 2026-07-10] sparse child crashing at boot (e.g.
+# sitecustomize patch failure) leaves fallback_count=0 and only noise-class
+# gate reasons while dense keeps decoding -> the old checks alone printed
+# "SPEED RUN OK" on a run where sparse never engaged (remote TP8 silent-
+# fallback case). Route proof is populated on every healthy sparse run
+# (empty reasons list), so any entry here means sparse never ran: fail.
+route_proof_reasons = list((s.get("route_proof") or {}).get("reasons") or [])
+route_proof_reasons += list(s.get("speed_child_route_proof_reasons") or [])
 expected_noise = {
     "unknown_without_reference",           # no dense reference in this mode
     "missing_text",                        # outputs captured without text
@@ -185,11 +193,13 @@ expected_noise = {
 }
 reasons = [r for r in (s.get("semantic_gate_reasons") or []) + (s.get("producer_gate_reasons") or [])
            if not any(n in str(r) for n in expected_noise)]
-ok = tps is not None and not fallbacks and not reasons
+ok = tps is not None and not fallbacks and not reasons and not route_proof_reasons
 if fallbacks:
     print(f"  dense_native_fallback_count={fallbacks} (must be 0)")
 if reasons:
     print(f"  unexpected gate reasons: {reasons}")
+if route_proof_reasons:
+    print(f"  sparse route proof missing (sparse never engaged): {route_proof_reasons[:6]}")
 print("SPEED RUN OK" if ok else "SPEED RUN CHECK FAILED")
 sys.exit(0 if ok else 1)
 EOF

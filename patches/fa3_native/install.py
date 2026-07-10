@@ -578,6 +578,52 @@ def _flash_backend_probe_requested() -> bool:
     )
 
 
+def _guard_transformers_flash_attn_probes() -> list[str]:
+    # [TRANSFORMERS-FLASH-PROBE-GUARD 2026-07-10] vendored flash_attn 在
+    # sys.path 而无 pip 安装分发时,transformers 5.x 的
+    # is_flash_attn_{2,3}_available() 走 importlib.metadata 抛
+    # PackageNotFoundError(KeyError 子类),沿 vllm BlockPool import 链传染
+    # → sitecustomize sparse patch SystemExit(远端 TP8×64k A800 静默回退案
+    # 根因,transformers 5.6.2 实测;远端 boot-only 同修法验证有效)。
+    # vendored 形态下该探测的正确语义=不可用:包一层 except KeyError→False。
+    # 幂等(_sfi_keyerror_guard 标记);同步 transformers.utils 顶层
+    # re-export;transformers 缺席=零行为。
+    wrapped: list[str] = []
+    try:
+        from transformers.utils import import_utils as tf_import_utils
+    except Exception:
+        return wrapped
+    try:
+        import transformers.utils as tf_utils
+    except Exception:
+        tf_utils = None
+    for probe_name in (
+        "is_flash_attn_2_available",
+        "is_flash_attn_3_available",
+    ):
+        fn = getattr(tf_import_utils, probe_name, None)
+        if fn is None or bool(getattr(fn, "_sfi_keyerror_guard", False)):
+            continue
+
+        def _make_guarded(inner):
+            def _guarded(*args, **kwargs):
+                try:
+                    return inner(*args, **kwargs)
+                except KeyError:
+                    return False
+
+            _guarded._sfi_keyerror_guard = True
+            _guarded.__name__ = getattr(inner, "__name__", "flash_attn_probe")
+            return _guarded
+
+        guarded = _make_guarded(fn)
+        setattr(tf_import_utils, probe_name, guarded)
+        if tf_utils is not None and getattr(tf_utils, probe_name, None) is fn:
+            setattr(tf_utils, probe_name, guarded)
+        wrapped.append(probe_name)
+    return wrapped
+
+
 def install_vendored_flash_attn_probe_patch(
     *,
     repo_root: str | Path | None = None,
@@ -588,6 +634,7 @@ def install_vendored_flash_attn_probe_patch(
         "requested_flash_attn_version": os.environ.get("VLLM_FLASH_ATTN_VERSION"),
         "sparse_fa3_requested": _sparse_vendored_fa3_probe_requested(),
         "patched_modules": [],
+        "transformers_probe_guards": [],
     }
     flash_probe_requested = _flash_backend_probe_requested()
     sparse_probe_requested = bool(summary["sparse_fa3_requested"])
@@ -598,6 +645,8 @@ def install_vendored_flash_attn_probe_patch(
         if summary["requested_flash_attn_version"] not in ("3", "4"):
             summary["reason"] = "unsupported_flash_attn_request"
             return summary
+    # 先于任何下游 import(vllm BlockPool 链会触发 transformers 探测)。
+    summary["transformers_probe_guards"] = _guard_transformers_flash_attn_probes()
     bridge = load_vendored_flash_attn_bridge(repo_root=repo_root)
     native_get_flash_attn_version = build_vendored_get_flash_attn_version(bridge)
     resolved_flash_attn_version = native_get_flash_attn_version()
