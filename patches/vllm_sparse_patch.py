@@ -107,7 +107,6 @@ from patches.refresh_runtime.workload_plan import (
     workload_plan_pending_policy,
 )
 from patches.prefill_capture_meta_arena import (
-    ARENA_PHASE1_QWEN06_BS2_BUDGET_BYTES,
     ARENA_PHASE1_QWEN06_BS2_CAP262K_BUDGET_BYTES,
     ArenaReservationStatus,
     CaptureArenaIntent,
@@ -134,8 +133,6 @@ from patches.sparse_types import (
     _RefreshProfilePending,
     continuous_producer_enabled,
 )
-if TYPE_CHECKING:
-    from patches.sparse_types import BoundLayerMeta
 from patches.step_authority import StepAuthority
 from patches.fa_sparse_runtime.compact_recent_alignment import (
     compact_slot_offset_tokens,
@@ -155,7 +152,6 @@ from patches.sparse_constants import (
     _is_free_slot_id,
 )
 from patches.sparse_utils import (
-    _align_up_int,
     _is_stream_capturing_or_raise,
     _make_selector_fast_signature,
     assert_cleanup_ledgers_drained_for_step_build,
@@ -1080,8 +1076,6 @@ class VLLMSparseController(
         self._step_bound_meta_probe_checked_handle_id: int = -1
         self._step_bound_meta_probe_checked_handle_generation: int = -1
         self._step_bound_meta_probe_warned_missing_authority: bool = False
-        # RefreshStepBundle 验证缓存（每 step 仅校验一次）。
-        self._refresh_bundle_validated_token: int = -1
         # decode log_f / logits stage cache: 必须绑定 step identity，避免同 epoch 重入误复用。
         self._step_logits_ready_token: int = -1
         self._step_logits_ready_input_signature: Optional[Tuple[object, ...]] = None
@@ -1443,7 +1437,6 @@ class VLLMSparseController(
         self._step_local_pack_compact_kv_len_by_row = tuple()
         self._step_local_pack_compact_offsets_by_row = tuple()
         self._step_local_pack_compact_kv_len_max = 0
-        self._refresh_bundle_validated_token = -1
         self._step_refresh_slot_req_ids_epoch = -1
         self._step_refresh_slot_req_ids_handle_id = -1
         self._step_refresh_slot_req_ids_handle_generation = -1
@@ -2856,28 +2849,8 @@ class VLLMSparseController(
 
     def _request_compact_ready_all_layers(self, req_id: str) -> bool:
         """Whether request may consume compact buffers on every registered layer."""
-        # [PENDING-FUNNEL-DEBUG 2026-07-09 临时取证探针,破案后拆] 读门 verdict:
-        # False 采样 1/32 记首个失败层(reason),True 必记(稀有转折事件)。
-        _funnel_dbg = os.environ.get("VLLM_SPARSE_PENDING_FUNNEL_DEBUG_LOG", "")
-
-        def _funnel_note(verdict: bool, reason: str) -> bool:
-            if _funnel_dbg:
-                n = getattr(self, "_funnel_ready_probe_n", 0) + 1
-                self._funnel_ready_probe_n = n
-                if verdict or (n % 32 == 1):
-                    try:
-                        with open(_funnel_dbg, "a") as _fh:
-                            _fh.write(
-                                f"ready\treq={req_id}\tverdict={verdict}\t"
-                                f"reason={reason}\t"
-                                f"epoch={int(getattr(self, 'step_context_epoch', -1))}\n"
-                            )
-                    except OSError:
-                        pass
-            return verdict
-
         if _is_free_slot_id(req_id):
-            return _funnel_note(False, "free_slot_id")
+            return False
         tracking = self.request_states.get(req_id)
         if (
             tracking is not None
@@ -2885,27 +2858,20 @@ class VLLMSparseController(
             and bool(getattr(tracking, "bootstrap_bridge_active", False))
             and not bool(getattr(tracking, "bootstrap_done", False))
         ):
-            return _funnel_note(False, "bootstrap_bridge_pending")
+            return False
         if not self.layer_states:
-            return _funnel_note(False, "no_layer_states")
+            return False
         checked_layers = 0
         for state in self.layer_states.values():
             slot = int(state.request_id_to_slot.get(req_id, -1))
             if slot < 0:
-                return _funnel_note(
-                    False, f"no_slot@L{int(getattr(state, 'layer_index', -1))}"
-                )
+                return False
             if slot >= len(state.compact_kv_len):
-                return _funnel_note(
-                    False, f"slot_oob@L{int(getattr(state, 'layer_index', -1))}"
-                )
+                return False
             if int(state.compact_kv_len[slot]) <= 0:
-                return _funnel_note(
-                    False,
-                    f"kv_len0@L{int(getattr(state, 'layer_index', -1))}:slot{slot}",
-                )
+                return False
             checked_layers += 1
-        return _funnel_note(checked_layers > 0, f"ok_layers={checked_layers}")
+        return checked_layers > 0
 
     def record_prompt_tokens(self, request_ids: Iterable[str], prompt_lengths: Iterable[int]) -> None:
         for req_id, length in zip(request_ids, prompt_lengths):
@@ -3655,6 +3621,43 @@ class VLLMSparseController(
         inflight_dense_consume_set: Set[str] = set()
         workload_plan_replay_active = self._workload_plan_replay is not None
 
+        def _bootstrap_hold(rid_local: str) -> bool:
+            # [BOOTSTRAP-MATERIALIZE-GATE 2026-07-10] TP8 同型病理统一门谓词:
+            # bootstrap producer 在飞(one-shot bridge 窗)的请求,任何 reason 的
+            # 票一律不得 materialize 进 refresh 世代——世代按 _CAPTURE_CHUNK 分轮
+            # commit,与 bootstrap ready 的全层 commit 交错=层间 read_gen 错开=
+            # [DUAL-GEN-LAYER-PARITY] 崩(远端 TP8×64k bs32 案,offending layer=
+            # chunk 界),且两者竞争同一 dual-gen 写半区。散点门([INTERVAL-
+            # BOOTSTRAP-GATE] interval 触发/ride-along 两处)只防落票面;其余
+            # 落票 reason(sentence/lease_rearm/post_bridge/coalesce/残留票)
+            # 同窗等价可崩——统一挡在票→refresh_set 的公共咽喉。保票不清:
+            # ready 后由 post_bridge 追赶票或保留票自然到点接管(bootstrap 从未
+            # refresh ⇒ last<0 ⇒ gap 挡板放行),无饿死。输入=决定论量
+            # (bootstrap_pending 由 controller 单写者推进,TP-rank 一致)。
+            return bool(
+                getattr(tracking_by_req[rid_local], "bootstrap_pending", False)
+            )
+
+        def _admit_refresh(rid_local: str) -> bool:
+            # [BOOTSTRAP-MATERIALIZE-GATE] 票 materialize 唯一咽喉:除 workload
+            # replay(benchmark 控制流,planned events must fire)外,refresh_set
+            # 只能经此进入(合同测试断言站点数)。
+            if _bootstrap_hold(rid_local):
+                if update_state:
+                    self._bootstrap_materialize_gate_held_total = (
+                        int(
+                            getattr(
+                                self,
+                                "_bootstrap_materialize_gate_held_total",
+                                0,
+                            )
+                        )
+                        + 1
+                    )
+                return False
+            refresh_set.add(rid_local)
+            return True
+
         def _is_threshold_crossing_force_pending(ticket_local: RequestIntentTicket) -> bool:
             return bool(
                 ticket_local.pending_refresh
@@ -3814,21 +3817,18 @@ class VLLMSparseController(
                 != "1"
             ):
                 return False
-            try:
-                from patches.refresh_runtime.producer_ready import (
-                    resolve_one_shot_ready_chunk,
-                    validate_one_shot_ready_chunk_alignment,
-                )
+            from patches.refresh_runtime.producer_ready import (
+                resolve_one_shot_ready_chunk,
+                validate_one_shot_ready_chunk_alignment,
+            )
 
-                ready_chunk = resolve_one_shot_ready_chunk(
-                    capture_chunk=int(_CAPTURE_CHUNK),
-                )
-                validate_one_shot_ready_chunk_alignment(
-                    capture_chunk=int(_CAPTURE_CHUNK),
-                    ready_chunk=int(ready_chunk),
-                )
-            except Exception:
-                raise
+            ready_chunk = resolve_one_shot_ready_chunk(
+                capture_chunk=int(_CAPTURE_CHUNK),
+            )
+            validate_one_shot_ready_chunk_alignment(
+                capture_chunk=int(_CAPTURE_CHUNK),
+                ready_chunk=int(ready_chunk),
+            )
             return int(ready_chunk) < int(_CAPTURE_CHUNK)
 
         # [CREDIT-RETIRE 2026-07-07] _post_bridge_refresh_credit_active/_due
@@ -3880,37 +3880,6 @@ class VLLMSparseController(
             if scheduled_decode < 0 and pending_rebuild_inflight_local:
                 return True
             return scheduled_decode >= intent_step
-
-        def _pending_dense_consume_guard_active() -> bool:
-            layer_count = len(getattr(self, "layer_cache_keys", ()) or ())
-            if layer_count <= 0:
-                return False
-            try:
-                from patches.refresh_runtime.producer_ready import (
-                    resolve_one_shot_ready_chunk,
-                    validate_one_shot_ready_chunk_alignment,
-                )
-
-                ready_chunk = resolve_one_shot_ready_chunk(
-                    capture_chunk=int(_CAPTURE_CHUNK),
-                )
-                validate_one_shot_ready_chunk_alignment(
-                    capture_chunk=int(_CAPTURE_CHUNK),
-                    ready_chunk=int(ready_chunk),
-                )
-                if int(ready_chunk) < int(_CAPTURE_CHUNK):
-                    return False
-            except Exception:
-                raise
-            if (
-                os.environ.get(
-                    "VLLM_SPARSE_REPLAY_REFRESH_PROGRESSIVE_CONSUME",
-                    "0",
-                )
-                == "1"
-            ):
-                return False
-            return int(_CAPTURE_CHUNK) >= int(layer_count)
 
         def _dual_gen_inflight_compact_readable(
             tracking_local: RequestTracking,
@@ -4094,6 +4063,10 @@ class VLLMSparseController(
                         pending_ctrl_step=self.step_context_epoch,
                     )
                     ticket = tickets_plan_by_req[rid]
+                    # [BOOTSTRAP-MATERIALIZE-GATE 豁免] replay=benchmark 控制
+                    # 数据,planned events must fire(上方注释);录制来自带门
+                    # 真跑,不含 bootstrap 窗内事件。唯一绕过 _admit_refresh
+                    # 咽喉的站点(合同测试锚)。
                     refresh_set.add(rid)
                     replay_forced_refresh_set.add(rid)
                     self._workload_plan_replay_injected_count += 1
@@ -4371,13 +4344,18 @@ class VLLMSparseController(
                             ),
                         )
                         ticket = tickets_plan_by_req[rid]
-                    if earliest_pending_decode is None or (
-                        req_pending_step >= 0 and req_pending_step < earliest_pending_decode
-                    ):
-                        earliest_pending_decode = req_pending_step
-                    refresh_set.add(rid)
-                    if pending_reason_code is None:
-                        pending_reason_code = ticket.pending_reason_code
+                    # [BOOTSTRAP-MATERIALIZE-GATE] sentence/lease_rearm/
+                    # post_bridge/defer 残留票的统一 materialize 点:被门保票
+                    # 的请求不进 refresh_set,也不以其票面步污染 coalesce
+                    # target(earliest_pending_decode)/reason 编队。
+                    if _admit_refresh(rid):
+                        if earliest_pending_decode is None or (
+                            req_pending_step >= 0
+                            and req_pending_step < earliest_pending_decode
+                        ):
+                            earliest_pending_decode = req_pending_step
+                        if pending_reason_code is None:
+                            pending_reason_code = ticket.pending_reason_code
 
             # interval 基于 request 自身的 decode 步数，避免跨 request 污染。
             # [TP-DET-TRIGGER] inflight 门删除:判定自身(decode_step-last≥
@@ -4395,7 +4373,9 @@ class VLLMSparseController(
                 # 命中 [DUAL-GEN-LAYER-PARITY](远端 TP8×64k bs32 崩案:
                 # offending layer_index=14=chunk 界;bs16 全程无交错故不炸)。
                 # ready 后节拍由既有 post_bridge 追赶票接管,无饿死;sentence
-                # 同窗本有追赶机制,interval 缺此门即本案设计缺口。
+                # 同窗本有追赶机制,interval 缺此门即本案设计缺口。此门防触发
+                # 面(不落票不重立);materialize 面由 [BOOTSTRAP-MATERIALIZE-
+                # GATE] 咽喉统一兜底(全 reason)。
                 and not bool(getattr(tracking, "bootstrap_pending", False))
             ):
                 # [CREDIT-RETIRE 2026-07-07] 原 post_bridge credit 在此吞掉
@@ -4407,23 +4387,30 @@ class VLLMSparseController(
                 # interval 不抢占更强 pending（如 sentence/lease_rearm）。
                 if has_pending and (not pending_is_interval_cur):
                     continue
+                if has_pending:
+                    # [INTERVAL-TICKET-NO-RESTAMP 2026-07-10] 已有 INTERVAL 票
+                    # (defer 残留):到点 ⇒ decode-last≥interval≥gap ⇒ 上方残留
+                    # 票段 gap 必放行、已 materialize;此处原每步幂等重立票+
+                    # 无条件重写 pending_updates(→_set_request_pending_refresh)
+                    # =纯 host 记账浪费(触发→提交排队窗每步重记账,远端 intents
+                    # 膨胀头号嫌疑)。票面逐位等价论证:重立参数(reason=INTERVAL/
+                    # step=票面/policy=COALESCEABLE 为 INTERVAL 票不变式/ctrl=
+                    # 票面,残留段已补 ctrl<0)与票面全同。保留 interval 拍点
+                    # 信号(ride-along 班车依赖)后跳过。
+                    if interval_reason_code is None:
+                        interval_reason_code = PendingReasonCode.INTERVAL
+                    continue
 
-                pending_step_cur = (
-                    ticket.pending_decode_step
-                    if has_pending and ticket.pending_decode_step >= 0
-                    else decode_step
-                )
-                refresh_set.add(rid)
+                if not _admit_refresh(rid):
+                    # [INTERVAL-BOOTSTRAP-GATE] 触发条件门已挡 bootstrap_pending,
+                    # 此臂=咽喉纵深(理论不可达),不落票防每步重立。
+                    continue
                 _queue_set_pending_refresh(
                     request_id=rid,
                     reason_code=PendingReasonCode.INTERVAL,
-                    decode_step=pending_step_cur,
+                    decode_step=decode_step,
                     pending_policy=PendingPolicy.COALESCEABLE,
-                    pending_ctrl_step=(
-                        ticket.pending_ctrl_step
-                        if has_pending and ticket.pending_ctrl_step >= 0
-                        else self.step_context_epoch
-                    ),
+                    pending_ctrl_step=self.step_context_epoch,
                 )
                 if interval_reason_code is None:
                     interval_reason_code = PendingReasonCode.INTERVAL
@@ -4462,20 +4449,27 @@ class VLLMSparseController(
                 # [INTERVAL-BOOTSTRAP-GATE 2026-07-10] 半途(bootstrap producer
                 # 在飞)请求不拉入搭车——拉入即重演 interval 触发同型的
                 # dual-gen parity 竞争(bridge 下 decode 时钟已立,仅靠下方
-                # last<0 检查挡不住)。
+                # last<0 检查挡不住)。此门防拉入面(不落票);materialize 面由
+                # [BOOTSTRAP-MATERIALIZE-GATE] 咽喉统一兜底(全 reason)。
                 if bool(getattr(tracking, "bootstrap_pending", False)):
                     continue
                 # [TP-DET-TRIGGER] inflight 过滤 → 决定论 gap 过滤。
-                if _refresh_gap_blocked(tracking, decode_step_by_req.get(rid, -1)):
+                # [JOIN-CLOCK-UNIFY 2026-07-10] gap 挡板与票面统一走
+                # decode_step_by_req 快照口径(主循环对全部 rid 无条件建档,
+                # 与 tracking.decode_step 同源等值;决定论合同单一口径)。
+                decode_step = decode_step_by_req.get(rid, -1)
+                if _refresh_gap_blocked(tracking, decode_step):
                     continue
                 if _is_short_dense_blocked(rid):
                     continue
-                decode_step = int(tracking.decode_step) if tracking.decode_step is not None else -1
                 last_decode_refresh = int(tracking.last_decode_refresh_step) if tracking.last_decode_refresh_step is not None else -1
                 if decode_step < 0 or last_decode_refresh < 0:
                     # bootstrap/prefill 窗（decode 时钟未立）：不拉。
                     continue
-                refresh_set.add(rid)
+                if not _admit_refresh(rid):
+                    # [INTERVAL-BOOTSTRAP-GATE] join 门已挡 bootstrap_pending,
+                    # 此臂=咽喉纵深(理论不可达),不落票。
+                    continue
                 _queue_set_pending_refresh(
                     request_id=rid,
                     reason_code=PendingReasonCode.INTERVAL,
@@ -4543,6 +4537,11 @@ class VLLMSparseController(
                 decode_step = decode_step_by_req.get(rid, -1)
                 if decode_step < 0:
                     continue
+                if _bootstrap_hold(rid):
+                    # [BOOTSTRAP-MATERIALIZE-GATE] 半途请求不拉入 coalesce
+                    # 编队(拉入即重演同型交错);挡在块头=不动票/不清
+                    # post_bridge due/不计 skip 计数。
+                    continue
                 if abs(decode_step - target) <= sentence_effective_coalesce_window:
                     if _has_interval_pending_not_ready(
                         rid,
@@ -4585,8 +4584,8 @@ class VLLMSparseController(
                             tracking_by_req[
                                 rid
                             ].post_bridge_refresh_due_decode_step = -1
-                    refresh_set.add(rid)
-                    coalesced = True
+                    if _admit_refresh(rid):
+                        coalesced = True
 
         for rid in tuple(refresh_set):
             ticket = tickets_plan_by_req[rid]
@@ -4735,29 +4734,6 @@ class VLLMSparseController(
                 mode == StepRefreshMode.INFLIGHT
                 and rid in inflight_dense_consume_set
             )
-            # [PENDING-FUNNEL-DEBUG 2026-07-09 临时取证探针,破案后拆] 行判决快照。
-            _funnel_dbg = os.environ.get("VLLM_SPARSE_PENDING_FUNNEL_DEBUG_LOG", "")
-            if _funnel_dbg:
-                _fd_n = getattr(self, "_funnel_plan_probe_n", 0) + 1
-                self._funnel_plan_probe_n = _fd_n
-                if _fd_n % 16 == 1:
-                    try:
-                        _fd_tr = tracking_by_req[rid]
-                        with open(_funnel_dbg, "a") as _fd_fh:
-                            _fd_fh.write(
-                                f"plan\treq={rid}\tmode={mode}\t"
-                                f"inflight={inflight_by_req.get(rid, False)}\t"
-                                f"prinflight={pending_rebuild_inflight_by_req.get(rid, False)}\t"
-                                f"sched_ctrl={int(getattr(_fd_tr, 'scheduled_refresh_ctrl_step', -1))}\t"
-                                f"sched_dec={int(getattr(_fd_tr, 'scheduled_decode_refresh_step', -1))}\t"
-                                f"dense_consume={rid in inflight_dense_consume_set}\t"
-                                f"dg_readable={_dual_gen_inflight_compact_readable(_fd_tr)}\t"
-                                f"tk_pend={bool(tickets_plan_by_req[rid].pending_refresh)}\t"
-                                f"infl_reason={int(getattr(_fd_tr, 'inflight_reason_code', -1))}\t"
-                                f"epoch={self.step_context_epoch}\n"
-                            )
-                    except OSError:
-                        pass
 
         for idx, rid in enumerate(request_ids):
             mode = mode_by_row_list[idx]
@@ -4778,6 +4754,10 @@ class VLLMSparseController(
                 and ticket.pending_policy == PendingPolicy.FORCE_NOW
                 and rid not in refresh_reqs_set
                 and allow_materialize
+                # [BOOTSTRAP-MATERIALIZE-GATE] 咽喉门保票(bridge 窗内落的
+                # FORCE_NOW sentence 票等)=设计内 DEFER 形态,非不变量违反;
+                # ready 后追赶/到点接管。
+                and not _bootstrap_hold(rid)
             ):
                 raise RuntimeError(
                     "FORCE_NOW pending request missing from refresh_reqs: "

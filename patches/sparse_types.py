@@ -717,23 +717,6 @@ class StepEnvelopeV2:
 
 
 @dataclass(frozen=True, slots=True)
-class RefreshStepBundle:
-    """refresh 步级参数胶囊（StepBoundMeta 单源字段）。"""
-
-    enabled_i32: int
-    refresh_decode_count: int
-    refresh_prefill_count: int
-    refresh_non_last_n1_count: int
-    refresh_rows: Tuple[int, ...]
-    refresh_slots: Tuple[int, ...]
-    logf_attn_rows: Tuple[int, ...]
-    logf_mask_by_row: Tuple[int, ...]
-    logits_last_n_by_row: Tuple[int, ...]
-    req_meta_ready_i32: int
-    signature: Tuple[int, int, int, int, int]
-
-
-@dataclass(frozen=True, slots=True)
 class StepPlan:
     """step 级不可变执行计划（单真源）。"""
 
@@ -1101,9 +1084,7 @@ class StepBoundMeta:
     logf_mask_by_row: Tuple[int, ...]
     logf_attn_rows: Tuple[int, ...]
     prefill_rows: Tuple[int, ...]
-    decode_rows: Tuple[int, ...]
     layer_bound: Tuple[Optional[BoundLayerMeta], ...]
-    refresh_bundle: Optional[RefreshStepBundle] = None
     # FA3 selected/no-capture compact_recent host-plan carriers.
     recent_cap: int = 0
     sink_tokens: int = 0
@@ -1175,8 +1156,6 @@ class StepBoundMeta:
             self.logf_attn_rows = tuple(int(v) for v in self.logf_attn_rows)
         if not isinstance(self.prefill_rows, tuple):
             self.prefill_rows = tuple(int(v) for v in self.prefill_rows)
-        if not isinstance(self.decode_rows, tuple):
-            self.decode_rows = tuple(int(v) for v in self.decode_rows)
         if not isinstance(self.canonical_real_kv_len_cpu, tuple):
             self.canonical_real_kv_len_cpu = tuple(
                 int(v) for v in self.canonical_real_kv_len_cpu
@@ -1197,12 +1176,6 @@ class StepBoundMeta:
             self.bound_meta_signature = tuple(self.bound_meta_signature)
         if not isinstance(self.layer_bound, tuple):
             self.layer_bound = tuple(self.layer_bound)
-        if self.refresh_bundle is not None and not isinstance(
-            self.refresh_bundle, RefreshStepBundle
-        ):
-            raise TypeError(
-                "StepBoundMeta.refresh_bundle must be RefreshStepBundle or None"
-            )
         if self.step_identity_token == 0:
             self.step_identity_token = (
                 int(self.epoch) * 1_000_000_000

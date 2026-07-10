@@ -65,7 +65,7 @@ from patches.sparse_constants import (
     _VALIDATE_META_CONTRACT_CACHED,
     should_skip_page_sparse_state,
 )
-from patches.sparse_types import BoundLayerMeta, RefreshStepBundle, StepBoundMeta
+from patches.sparse_types import BoundLayerMeta, StepBoundMeta
 from patches.sparse_utils import (
     _align_up_int,
     _make_step_decode_cache_key,
@@ -1241,29 +1241,6 @@ def _reset_decode_runtime_full_recompile(controller: object, reason: str) -> Non
         state.last_reason = str(reason)
         state.last_applied_step_id = None
 
-import atexit as _atexit_reseed_probe
-_RESEED_PROBE_ACC: dict = {}
-
-
-def _reseed_probe_note(reason: object) -> None:
-    if os.getenv("VLLM_SPARSE_REFRESH_RESEED_PROBE", "0") != "1":
-        return
-    k = str(reason)[:90]
-    _RESEED_PROBE_ACC[k] = _RESEED_PROBE_ACC.get(k, 0) + 1
-
-
-def _reseed_probe_flush() -> None:
-    if os.getenv("VLLM_SPARSE_REFRESH_RESEED_PROBE", "0") != "1":
-        return
-    if not _RESEED_PROBE_ACC:
-        print("[RESEED_PROBE] (empty -- reseed fn never reached)", flush=True)
-        return
-    items = sorted(_RESEED_PROBE_ACC.items(), key=lambda kv: -kv[1])
-    print("[RESEED_PROBE] " + " | ".join("%s=%d" % (k, v) for k, v in items), flush=True)
-
-
-_atexit_reseed_probe.register(_reseed_probe_flush)
-
 
 def _seed_decode_runtime_state_after_full_recompile(
     controller: object,
@@ -1291,18 +1268,18 @@ def _seed_decode_runtime_state_after_full_recompile(
             block_size=int(block_size),
             num_kv_heads=int(num_kv_heads),
         )
-        # RESEED_TO_DELTA (PART 1, env-OFF default): stamp CURRENT recent descriptors
-        # (request_recent_epoch / recent first+count) before collecting the delta, as the
-        # template-delta branch does, so the epoch/block-size guards in
-        # _collect_decode_delta_packet do not raise -> the seed LANDS -> the next step
-        # reclassifies STEADY/PAGE_BOUNDARY (no empty-reason FULL_RECOMPILE cascade).
-        # Inside the try: any failure falls back to the existing FAILED-seed path.
-        if os.getenv("VLLM_SPARSE_REFRESH_RESEED_TO_DELTA", "1") == "1":
-            _ensure_current_recent_descriptors_for_launch_template(
-                step_bound_meta=getattr(controller, "step_bound_meta", None),
-                step_authority=step_authority,
-                page_size=int(getattr(plan, "page_size", 0) or int(block_size)),
-            )
+        # [RESEED-TO-DELTA 转正 2026-07-10] 原 VLLM_SPARSE_REFRESH_RESEED_TO_DELTA
+        # 旋钮(默认开)已跑全判据,循无旋钮纪律删除转无条件:先盖 CURRENT recent
+        # 描述符(request_recent_epoch / recent first+count,与 template-delta 分支
+        # 同手法),使 _collect_decode_delta_packet 的 epoch/block-size 守卫不抛 →
+        # seed 落地 → 下一步重分类 STEADY/PAGE_BOUNDARY(无空 reason 的
+        # FULL_RECOMPILE 级联)。下方共享 except=真实采集失败的 FAILED-seed 慢路
+        # (维持 FULL_RECOMPILE 级联,功能正确),非旋钮臂,保留。
+        _ensure_current_recent_descriptors_for_launch_template(
+            step_bound_meta=getattr(controller, "step_bound_meta", None),
+            step_authority=step_authority,
+            page_size=int(getattr(plan, "page_size", 0) or int(block_size)),
+        )
         delta = _collect_decode_delta_packet(
             step_authority=step_authority,
             step_bound_meta=getattr(controller, "step_bound_meta", None),
@@ -1312,7 +1289,6 @@ def _seed_decode_runtime_state_after_full_recompile(
         controller._decode_runtime_full_recompile_seed_reason = (
             f"failed:{type(exc).__name__}:{exc}"
         )
-        _reseed_probe_note(controller._decode_runtime_full_recompile_seed_reason)
         return False
 
     state.active_guard = guard
@@ -1327,7 +1303,6 @@ def _seed_decode_runtime_state_after_full_recompile(
     controller._decode_runtime_full_recompile_seed_count = (
         int(getattr(controller, "_decode_runtime_full_recompile_seed_count", 0)) + 1
     )
-    _reseed_probe_note("seeded:" + str(state.last_mode))
     return True
 
 
@@ -1709,7 +1684,6 @@ def _refresh_step_bound_meta_for_steady_delta(
     launch_plan: object,
     q_start_loc: Tuple[int, ...],
     prefill_rows: Tuple[int, ...],
-    decode_rows: Tuple[int, ...],
 ) -> None:
     batch_size = int(step_authority.batch_size)
     step_bound_meta.step_handle_id = int(step_authority.step_handle_id)
@@ -1743,8 +1717,6 @@ def _refresh_step_bound_meta_for_steady_delta(
         if 0 <= int(row) < batch_size
     )
     step_bound_meta.prefill_rows = tuple(prefill_rows)
-    step_bound_meta.decode_rows = tuple(decode_rows)
-    step_bound_meta.refresh_bundle = None
     step_bound_meta.recent_cap = int(step_authority.recent_cap)
     step_bound_meta.sink_tokens = int(step_authority.sink_tokens)
     step_bound_meta.canonical_real_kv_len_cpu = step_bound_meta.context_kv_len_by_row
@@ -3721,7 +3693,6 @@ def _try_apply_same_page_minimal_metadata_update(
         launch_plan=launch_plan,
         q_start_loc=q_start_loc,
         prefill_rows=prefill_rows,
-        decode_rows=tuple(range(batch_size)),
     )
     controller.step_bound_meta = previous_step_bound_meta
     # [T4-FORENSIC 2026-07-10] 拆开旧 ready_event 相位:SBM 刷新与 event 机器分账。
@@ -3973,7 +3944,6 @@ def _try_run_steady_decode_metadata_fast_path_inner(
         )
         if os.environ.get("VLLM_ABLATE_FORCE_FASTPATH") != "1":
             return _miss("delta_rrp_step_state_update_miss")
-    decode_rows = _identity_rows(batch_size)
     _refresh_step_bound_meta_for_steady_delta(
         step_bound_meta=previous_step_bound_meta,
         step_meta=step_meta,
@@ -3982,7 +3952,6 @@ def _try_run_steady_decode_metadata_fast_path_inner(
         launch_plan=launch_plan,
         q_start_loc=q_start_loc,
         prefill_rows=prefill_rows,
-        decode_rows=decode_rows,
     )
     controller.step_bound_meta = previous_step_bound_meta
 
@@ -5690,63 +5659,6 @@ def _maybe_bind_resolved_row_ptr_replay_metadata(
         )
 
 
-def _build_refresh_bundle(
-    *,
-    step_authority: object,
-    batch_size: int,
-    req_meta_ready_i32: int,
-) -> Optional[RefreshStepBundle]:
-    refresh_decode_count = int(step_authority.refresh_decode_count)
-    refresh_prefill_count = int(step_authority.refresh_prefill_count)
-    refresh_non_last_n1_count = int(step_authority.refresh_non_last_n1_count)
-    refresh_total = refresh_decode_count + refresh_prefill_count
-    if refresh_total <= 0:
-        return None
-
-    layer_effective_refresh_by_row = step_authority.layer_effective_refresh_by_row[:batch_size]
-    refresh_rows = tuple(
-        row for row, enabled in enumerate(layer_effective_refresh_by_row) if enabled
-    )
-    refresh_slots = tuple(int(v) for v in step_authority.refresh_capture_slot_list)
-    if not refresh_slots:
-        raise RuntimeError(
-            "refresh bundle build requires non-empty refresh_capture_slot_list; "
-            f"epoch={int(step_authority.epoch)} batch={batch_size}"
-        )
-
-    logf_attn_rows = tuple(
-        int(row) for row in step_authority.logf_attn_rows if 0 <= int(row) < batch_size
-    )
-    logf_mask_by_row = step_authority.logf_mask_by_row[:batch_size]
-    logits_last_n_by_row = step_authority.logits_last_n_by_row[:batch_size]
-    signature = (
-        int(step_authority.epoch),
-        int(step_authority.step_handle_id),
-        int(step_authority.step_handle_generation),
-        int(step_authority.req_set_hash),
-        int(step_authority.row_phase_hash),
-    )
-    if signature[0] < 0 or signature[1] <= 0 or signature[2] <= 0:
-        raise RuntimeError(
-            "refresh bundle build missing valid step signature; "
-            f"signature={signature}"
-        )
-
-    return RefreshStepBundle(
-        enabled_i32=1,
-        refresh_decode_count=refresh_decode_count,
-        refresh_prefill_count=refresh_prefill_count,
-        refresh_non_last_n1_count=refresh_non_last_n1_count,
-        refresh_rows=refresh_rows,
-        refresh_slots=refresh_slots,
-        logf_attn_rows=logf_attn_rows,
-        logf_mask_by_row=logf_mask_by_row,
-        logits_last_n_by_row=logits_last_n_by_row,
-        req_meta_ready_i32=int(req_meta_ready_i32),
-        signature=signature,
-    )
-
-
 def maybe_build_step_decode_data_from_metadata_impl(
     self,
     *,
@@ -6199,8 +6111,6 @@ def maybe_build_step_decode_data_from_metadata_impl(
         prefill_rows = tuple(
             int(row) for row in step_authority.prefill_rows if 0 <= int(row) < batch_size
         )
-        prefill_set = set(prefill_rows)
-        decode_rows = tuple(row for row in range(batch_size) if row not in prefill_set)
         # 先发布 row-only bound meta，供 prefill-global-meta 阶段的 capture_layout 单源消费；
         # layer_bound 会在后续 decode/prefill req_meta 打包完成后补齐。
         self.step_bound_meta = StepBoundMeta(
@@ -6224,9 +6134,7 @@ def maybe_build_step_decode_data_from_metadata_impl(
                 int(row) for row in step_authority.logf_attn_rows if 0 <= int(row) < batch_size
             ),
             prefill_rows=prefill_rows,
-            decode_rows=decode_rows,
             layer_bound=tuple(),
-            refresh_bundle=None,
             recent_cap=int(step_authority.recent_cap),
             sink_tokens=int(step_authority.sink_tokens),
             canonical_real_kv_len_cpu=tuple(
@@ -6794,6 +6702,8 @@ def maybe_build_step_decode_data_from_metadata_impl(
         # (每步 env 读+每层 5 站点残税)已删——LSR 取证使命被
         # VLLM_SPARSE_MB_CPROFILE_DIR(函数级 ncalls+分相,严格更强)接替,
         # 破案后拆;ablation 属实验废墟,无旋钮原则。
+        # VLLM_SPARSE_ABLATE_FORCE_REUSE(强制 reuse_decode_data 命中的 ablation
+        # 旋钮,每步活 env 读)同批删除 2026-07-10,同属实验废墟。
         layer_states_for_refresh = (
             tuple()
             if skip_layer_state_refresh or pure_prefill_step
@@ -7005,8 +6915,6 @@ def maybe_build_step_decode_data_from_metadata_impl(
             and self.step_decode_data.cache_key == step_decode_cache_key
             and self._step_decode_spec_key == spec_key
         )
-        if os.environ.get("VLLM_SPARSE_ABLATE_FORCE_REUSE") == "1" and self.step_decode_data is not None:
-            reuse_decode_data = True
         if (
             not reuse_decode_data
             and os.environ.get("VLLM_SPARSE_REFRESH_REUSE_DECODE_DATA") == "1"
@@ -7161,27 +7069,6 @@ def maybe_build_step_decode_data_from_metadata_impl(
             refresh_layer_group_active=bool(has_refresh_rows and layer_group_enabled),
         )
         _mark_xlayer_detail("pack_gate")
-        # [PENDING-FUNNEL-DEBUG 2026-07-09 临时取证探针,破案后拆] pack 段判决。
-        _funnel_dbg = os.environ.get("VLLM_SPARSE_PENDING_FUNNEL_DEBUG_LOG", "")
-        if _funnel_dbg:
-            _fd_n = getattr(self, "_funnel_pack_probe_n", 0) + 1
-            self._funnel_pack_probe_n = _fd_n
-            if _fd_n % 8 == 1 or need_fill_compact_layout:
-                try:
-                    with open(_funnel_dbg, "a") as _fd_fh:
-                        _fd_fh.write(
-                            f"pack\tneed_fill={need_fill_compact_layout}\t"
-                            f"plan_valid={bool(_xlayer_plan is not None and getattr(_xlayer_plan, 'valid', False))}\t"
-                            f"row_mode={tuple(int(v) for v in row_mode_by_row[:batch_size])}\t"
-                            f"mode={getattr(decode_runtime_mode, 'value', decode_runtime_mode)}\t"
-                            f"reason={decode_runtime_reason}\t"
-                            f"rrp_ready={rrp_replay_state_ready}\t"
-                            f"need_dyn={need_pack_dynamic_req_meta}\t"
-                            f"epoch={int(getattr(self, 'step_context_epoch', -1))}\n"
-                        )
-                except OSError:
-                    pass
-
         active_layer_count = 0
         if need_fill_compact_layout:
             def _ensure_buffer(
@@ -8028,8 +7915,6 @@ def build_step_bound_meta_from_metadata_impl(
     prefill_rows = tuple(
         int(row) for row in step_authority.prefill_rows if 0 <= row < batch_size
     )
-    prefill_set = set(prefill_rows)
-    decode_rows = tuple(row for row in range(batch_size) if row not in prefill_set)
     bound_meta_signature = (
         int(step_authority.epoch),
         int(step_handle_id),
@@ -8067,101 +7952,104 @@ def build_step_bound_meta_from_metadata_impl(
         row_mode_by_row,
         logf_mask_by_row,
     )
-    layer_bound_cache_key = (
-        id(step_decode_data),
-        step_decode_data.cache_key,
-        id(req_meta_i32_all),
-        id(req_meta_i64_all),
-        int(batch_size),
-        bool(step_authority.hint_all_compact),
-        bool(step_authority.hint_has_log_f),
-        bool(step_authority.hint_log_f_eq1),
-        bool(step_authority.hint_log_f_gt1),
-    )
-    cached_layer_bound = getattr(self, "_step_bound_layer_bound_cache", None)
-    if (
-        isinstance(cached_layer_bound, tuple)
-        and len(cached_layer_bound) == 2
-        and cached_layer_bound[0] == layer_bound_cache_key
-        and isinstance(cached_layer_bound[1], tuple)
-    ):
-        layer_bound_tuple = cached_layer_bound[1]
-    else:
-        layer_count = len(step_decode_data.layer_data)
-        layer_bound_list: List[Optional[BoundLayerMeta]] = [None] * layer_count
-        # [T2-HOST-DIET 2026-07-10] 36 层循环的步级不变量提环外
-        # (int()/bool()/shape 逐层重转 ×36 → 一次)。
-        _lb_block_size = int(step_decode_data.block_size)
-        _lb_num_kv_heads = int(step_decode_data.num_kv_heads)
-        _lb_head_dim = int(step_decode_data.head_dim)
-        _lb_i32_layers = int(req_meta_i32_all.shape[0])
-        _lb_i64_layers = int(req_meta_i64_all.shape[0])
-        _hint_all_compact = bool(step_authority.hint_all_compact)
-        _hint_has_log_f = bool(step_authority.hint_has_log_f)
-        _hint_log_f_eq1 = bool(step_authority.hint_log_f_eq1)
-        _hint_log_f_gt1 = bool(step_authority.hint_log_f_gt1)
-        for layer_index, layer_data in enumerate(step_decode_data.layer_data):
-            if layer_data is None:
-                continue
-            if layer_index >= _lb_i32_layers or layer_index >= _lb_i64_layers:
-                raise RuntimeError(
-                    "bound-meta layer index out of req_meta range: "
-                    f"layer_index={layer_index} "
-                    f"i32_layers={_lb_i32_layers} "
-                    f"i64_layers={_lb_i64_layers}"
-                )
-            k_compact = layer_data.k_compact
-            v_compact = layer_data.v_compact
-            token_positions = layer_data.token_positions
-            compact_kv_len_max = int(layer_data.compact_kv_len_max)
-            all_compact = bool(layer_data.has_compact)
-            state_ref = layer_data.state_ref
-            has_compact_layout = False
-            if state_ref is not None:
-                has_compact_layout = bool(
-                    getattr(state_ref, "step_cache_has_compact", False)
-                    and int(getattr(state_ref, "compact_stride_blocks", 0)) > 0
-                )
-                if has_compact_layout:
-                    k_compact, v_compact = state_ref.get_compact_kv_views(
-                        block_size=_lb_block_size,
-                        num_kv_heads=_lb_num_kv_heads,
-                        head_dim=_lb_head_dim,
-                    )
-                    token_positions = state_ref.get_compact_token_positions_view(
-                        block_size=_lb_block_size,
-                        num_kv_heads=_lb_num_kv_heads,
-                        device=state_ref.device,
-                        rows=batch_size,
-                    )
-                all_compact = bool(getattr(state_ref, "step_cache_all_compact", all_compact))
-                if has_compact_layout:
-                    persist_cap = max(0, compact_kv_len_max)
-                    compact_kv_len_max = persist_cap
-                else:
-                    compact_kv_len_max = 0
-            layer_bound_list[layer_index] = BoundLayerMeta(
-                req_meta_i32=req_meta_i32_all[layer_index],
-                req_meta_i64=req_meta_i64_all[layer_index],
-                k_compact=k_compact,
-                v_compact=v_compact,
-                token_positions=token_positions,
-                compact_kv_len_max=compact_kv_len_max,
-                all_compact=bool(_hint_all_compact and all_compact),
-                hint_has_log_f=_hint_has_log_f,
-                hint_log_f_eq1=_hint_log_f_eq1,
-                hint_log_f_gt1=_hint_log_f_gt1,
-            )
-        layer_bound_tuple = tuple(layer_bound_list)
-        self._step_bound_layer_bound_cache = (
-            layer_bound_cache_key,
-            layer_bound_tuple,
+    # [FINAL-LAYER-BOUND-LAZY 2026-07-10] layer_bound 全树唯一读者是
+    # _validate_bound_meta_compact_contract(门控验证器,默认关);默认档
+    # 36 层 BoundLayerMeta 构造(含 72 次 view getter + 72 次 req_meta 切片)
+    # 是纯税,只在验证门开时构造。req_meta 存在性 raise 留在门外,保住
+    # "pack 相位已跑"的活体合同。
+    validate_bound_meta_contract = _validate_bound_meta_contract_enabled()
+    layer_bound_tuple: Tuple[Optional[BoundLayerMeta], ...] = tuple()
+    if validate_bound_meta_contract:
+        layer_bound_cache_key = (
+            id(step_decode_data),
+            step_decode_data.cache_key,
+            id(req_meta_i32_all),
+            id(req_meta_i64_all),
+            int(batch_size),
+            bool(step_authority.hint_all_compact),
+            bool(step_authority.hint_has_log_f),
+            bool(step_authority.hint_log_f_eq1),
+            bool(step_authority.hint_log_f_gt1),
         )
-    refresh_bundle = _build_refresh_bundle(
-        step_authority=step_authority,
-        batch_size=batch_size,
-        req_meta_ready_i32=1,
-    )
+        cached_layer_bound = getattr(self, "_step_bound_layer_bound_cache", None)
+        if (
+            isinstance(cached_layer_bound, tuple)
+            and len(cached_layer_bound) == 2
+            and cached_layer_bound[0] == layer_bound_cache_key
+            and isinstance(cached_layer_bound[1], tuple)
+        ):
+            layer_bound_tuple = cached_layer_bound[1]
+        else:
+            layer_count = len(step_decode_data.layer_data)
+            layer_bound_list: List[Optional[BoundLayerMeta]] = [None] * layer_count
+            # [T2-HOST-DIET 2026-07-10] 36 层循环的步级不变量提环外
+            # (int()/bool()/shape 逐层重转 ×36 → 一次)。
+            _lb_block_size = int(step_decode_data.block_size)
+            _lb_num_kv_heads = int(step_decode_data.num_kv_heads)
+            _lb_head_dim = int(step_decode_data.head_dim)
+            _lb_i32_layers = int(req_meta_i32_all.shape[0])
+            _lb_i64_layers = int(req_meta_i64_all.shape[0])
+            _hint_all_compact = bool(step_authority.hint_all_compact)
+            _hint_has_log_f = bool(step_authority.hint_has_log_f)
+            _hint_log_f_eq1 = bool(step_authority.hint_log_f_eq1)
+            _hint_log_f_gt1 = bool(step_authority.hint_log_f_gt1)
+            for layer_index, layer_data in enumerate(step_decode_data.layer_data):
+                if layer_data is None:
+                    continue
+                if layer_index >= _lb_i32_layers or layer_index >= _lb_i64_layers:
+                    raise RuntimeError(
+                        "bound-meta layer index out of req_meta range: "
+                        f"layer_index={layer_index} "
+                        f"i32_layers={_lb_i32_layers} "
+                        f"i64_layers={_lb_i64_layers}"
+                    )
+                k_compact = layer_data.k_compact
+                v_compact = layer_data.v_compact
+                token_positions = layer_data.token_positions
+                compact_kv_len_max = int(layer_data.compact_kv_len_max)
+                all_compact = bool(layer_data.has_compact)
+                state_ref = layer_data.state_ref
+                has_compact_layout = False
+                if state_ref is not None:
+                    has_compact_layout = bool(
+                        getattr(state_ref, "step_cache_has_compact", False)
+                        and int(getattr(state_ref, "compact_stride_blocks", 0)) > 0
+                    )
+                    if has_compact_layout:
+                        k_compact, v_compact = state_ref.get_compact_kv_views(
+                            block_size=_lb_block_size,
+                            num_kv_heads=_lb_num_kv_heads,
+                            head_dim=_lb_head_dim,
+                        )
+                        token_positions = state_ref.get_compact_token_positions_view(
+                            block_size=_lb_block_size,
+                            num_kv_heads=_lb_num_kv_heads,
+                            device=state_ref.device,
+                            rows=batch_size,
+                        )
+                    all_compact = bool(getattr(state_ref, "step_cache_all_compact", all_compact))
+                    if has_compact_layout:
+                        persist_cap = max(0, compact_kv_len_max)
+                        compact_kv_len_max = persist_cap
+                    else:
+                        compact_kv_len_max = 0
+                layer_bound_list[layer_index] = BoundLayerMeta(
+                    req_meta_i32=req_meta_i32_all[layer_index],
+                    req_meta_i64=req_meta_i64_all[layer_index],
+                    k_compact=k_compact,
+                    v_compact=v_compact,
+                    token_positions=token_positions,
+                    compact_kv_len_max=compact_kv_len_max,
+                    all_compact=bool(_hint_all_compact and all_compact),
+                    hint_has_log_f=_hint_has_log_f,
+                    hint_log_f_eq1=_hint_log_f_eq1,
+                    hint_log_f_gt1=_hint_log_f_gt1,
+                )
+            layer_bound_tuple = tuple(layer_bound_list)
+            self._step_bound_layer_bound_cache = (
+                layer_bound_cache_key,
+                layer_bound_tuple,
+            )
     step_bound_meta = StepBoundMeta(
         step_handle_id=step_handle_id,
         step_handle_generation=step_handle_generation,
@@ -8175,8 +8063,6 @@ def build_step_bound_meta_from_metadata_impl(
         logf_mask_by_row=logf_mask_by_row,
         logf_attn_rows=logf_attn_rows,
         prefill_rows=prefill_rows,
-        decode_rows=decode_rows,
-        refresh_bundle=refresh_bundle,
         recent_cap=int(step_authority.recent_cap),
         sink_tokens=int(step_authority.sink_tokens),
         canonical_real_kv_len_cpu=context_kv_len_by_row,
@@ -8187,7 +8073,7 @@ def build_step_bound_meta_from_metadata_impl(
         layer_bound=layer_bound_tuple,
         compact_recent_launch_plan=existing_launch_plan,
     )
-    if _validate_bound_meta_contract_enabled():
+    if validate_bound_meta_contract:
         step_envelope = step_ctx.step_envelope_v2
         if step_envelope is None:
             raise RuntimeError("bound-meta compact contract requires step_envelope_v2")

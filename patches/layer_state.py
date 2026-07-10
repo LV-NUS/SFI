@@ -602,15 +602,9 @@ class LayerState:
         # 关键约束：扩容时不能通过全局同步硬挡。改为 record_stream + generation lease：
         # 旧 arena 的 storage 生命周期绑定到当前流与 refresh_stream，避免跨流 UAF。
         if old.numel() > 0 and old.device.type == "cuda":
-            try:
-                old.record_stream(torch.cuda.current_stream(device=self.device))
-            except Exception:
-                raise
+            old.record_stream(torch.cuda.current_stream(device=self.device))
             if refresh_stream is not None:
-                try:
-                    old.record_stream(refresh_stream)
-                except Exception:
-                    raise
+                old.record_stream(refresh_stream)
 
         new_slots = max(slots, old_slots)
         new_stride = max(stride, old_stride)
@@ -629,10 +623,7 @@ class LayerState:
         old_lease = self._key_norms_active_lease
         if old_lease is not None:
             retire_id = f"key_norms-retire-{old_lease.generation}-{time.time_ns()}"
-            try:
-                self._key_norms_lease_registry.retire(lease=old_lease, event_id=retire_id)
-            except Exception:
-                raise
+            self._key_norms_lease_registry.retire(lease=old_lease, event_id=retire_id)
         new_lease = self._key_norms_lease_registry.acquire(
             kind=LeaseKind.KEY_NORMS,
             slot=0,

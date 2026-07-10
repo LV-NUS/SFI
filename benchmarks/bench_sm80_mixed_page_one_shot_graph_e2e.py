@@ -1341,6 +1341,10 @@ def _copy_sparse_metadata_profile_env_for_diagnostic(env: dict[str, str]) -> Non
         # [T2-FORENSIC 2026-07-10] 世代 commit 步 metadata builder host 分相
         # cProfile 采样目录(同上须回填)。
         "VLLM_SPARSE_MB_CPROFILE_DIR",
+        # [S7-FORENSIC 2026-07-10] 兑现窗 off-loop enqueue/body 细分计时
+        # (pending_group_enqueue_* 键随 stage_profile 进 hook_profile;名字含
+        # PROFILE 命中 gate-D 通配清洗,须显式回填诊断 child)。
+        "VLLM_SPARSE_REPLAY_REFRESH_ENQUEUE_PROFILE_DETAIL",
     ):
         value = os.environ.get(key, "").strip()
         if value:
@@ -2381,6 +2385,10 @@ def _gate_d_payload(
         refresh_profile,
         producer_route_summary,
     )
+    # [INTENTS-SEMANTICS 口径 2026-07-10] 名为 intents 实为 interval-reason 的
+    # 世代 enqueue 计数(refresh_reason_counts["interval"],按 payload enqueue
+    # 事件×req_count 累加),非 token-time 意图数——判读膨胀比值时以"世代数"
+    # 口径解读(远端 5.66× 案即此语义,勿再误读)。改名会破坏远端对照口径,保名注释。
     interval_trigger_intents = int(refresh_reason_counts.get("interval", 0))
     expected_interval_trigger_intents = _expected_interval_trigger_intents(
         args,
@@ -7480,6 +7488,10 @@ def _record_from_result(
         refresh_profile,
         producer_route_summary,
     )
+    # [INTENTS-SEMANTICS 口径 2026-07-10] 名为 intents 实为 interval-reason 的
+    # 世代 enqueue 计数(refresh_reason_counts["interval"],按 payload enqueue
+    # 事件×req_count 累加),非 token-time 意图数——判读膨胀比值时以"世代数"
+    # 口径解读(远端 5.66× 案即此语义,勿再误读)。改名会破坏远端对照口径,保名注释。
     interval_trigger_intents = int(refresh_reason_counts.get("interval", 0))
     expected_interval_trigger_intents = _expected_interval_trigger_intents(
         args,

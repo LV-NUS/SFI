@@ -582,7 +582,18 @@ class RefreshRebuildMixin:
         """[SELECTED-OUT-RING] 释放 pending 占用的环槽(幂等:属性置 None 防
         重入双释放)。writer_done_event 作为消费序存入槽,下任 acquire 在其
         run 流上补 wait。调用面=终局漏斗 _pending_refresh_rebuild_clear+两个
-        绕过 clear 的整批丢弃点(release_idle_buffers / reset_for_new_engine)。"""
+        绕过 clear 的整批丢弃点(release_idle_buffers / reset_for_new_engine)
+        +[RING-RELEASE-ON-WRITER-SUBMIT 2026-07-10] 三个 writer_done_event
+        record 点的前移释放(默认档/grouped envelope/split writer):writer 已
+        提交且事件已 record ⇒ 槽 buffer 的全部 GPU 消费序已凝固为事件(下任
+        begin_run 在发射流 wait release_events∋writer_done_event=WAR 完备,
+        produce 事件由 end_run 记=WAW;publish/drain 只 wait 事件+host 记账,
+        不读槽 GPU 数值,核实 2026-07-10)。原"槽绑定 pending 至终局"使占用
+        跨步(finished-cleanup 边界),3 槽被跨代 pending 占满 → 稳态 2/3
+        flush spill(裸 dict realloc ~250µs/chunk+current_run_spilled→
+        selector-topk graph 恒拒捕;dw_cprof 取证指纹 bounds empty 4/fl=
+        6×2/3)。前移后槽占用=run 内,3 槽 3 chunk 稳态恒命中;终局漏斗幂等
+        兜底 drop/失败/inline 臂。"""
         _ring_slot = getattr(pending, "selected_out_ring_slot", None)
         if _ring_slot is None:
             return
@@ -595,28 +606,6 @@ class RefreshRebuildMixin:
             )
 
     def _pending_refresh_rebuild_clear(self, pending: PendingRefreshRebuild) -> None:
-        # [PENDING-FUNNEL-DEBUG 2026-07-09 临时取证探针,破案后拆] serve 写而不读案:
-        # 谁在一步内清掉 pending(wrapper drain 计数恒 0 而队列消失)。默认关零成本。
-        _funnel_dbg = os.environ.get("VLLM_SPARSE_PENDING_FUNNEL_DEBUG_LOG", "")
-        if _funnel_dbg:
-            import sys as _fd_sys
-            try:
-                _fd_caller = _fd_sys._getframe(1).f_code.co_name
-                _fd_caller2 = _fd_sys._getframe(2).f_code.co_name
-            except Exception:
-                _fd_caller = "?"
-                _fd_caller2 = "?"
-            try:
-                with open(_funnel_dbg, "a") as _fd_fh:
-                    _fd_fh.write(
-                        f"clear\tpid={int(getattr(pending, 'pending_id', -1))}\t"
-                        f"reqs={list(getattr(pending, 'req_ids', ()) or ())}\t"
-                        f"caller={_fd_caller}<-{_fd_caller2}\t"
-                        f"writer_evt={getattr(pending, 'writer_done_event', None) is not None}\t"
-                        f"epoch={int(getattr(self, 'step_context_epoch', -1))}\n"
-                    )
-            except OSError:
-                pass
         # [SELECTED-OUT-RING] 终局唯一漏斗释放;必须先于下方 req_ids 早退分支。
         self._selected_out_ring_release_pending_slot(pending)
         RefreshRebuildMixin._pending_refresh_grouped_async_forget_pending(
@@ -815,19 +804,6 @@ class RefreshRebuildMixin:
         pending_buf_ref_counts: Optional[Dict[int, int]] = None,
         wait_recorded_work: bool = True,
     ) -> Tuple[str, ...]:
-        # [PENDING-FUNNEL-DEBUG 临时取证探针,破案后拆]
-        _funnel_dbg = os.environ.get("VLLM_SPARSE_PENDING_FUNNEL_DEBUG_LOG", "")
-        if _funnel_dbg:
-            try:
-                with open(_funnel_dbg, "a") as _fd_fh:
-                    _fd_fh.write(
-                        f"drop\tpid={int(getattr(pending, 'pending_id', -1))}\t"
-                        f"reqs={list(getattr(pending, 'req_ids', ()) or ())}\t"
-                        f"status={status}\tlease={lease_reason}\t"
-                        f"epoch={int(getattr(self, 'step_context_epoch', -1))}\n"
-                    )
-            except OSError:
-                pass
         _mark_pending_selected_scope_terminal(
             pending,
             status=str(status),
@@ -2104,29 +2080,6 @@ class RefreshRebuildMixin:
         pending: PendingRefreshRebuild,
     ) -> None:
         commit_log = getattr(pending, "compact_meta_commit_log", None)
-        # [PENDING-FUNNEL-DEBUG 临时取证探针,破案后拆]
-        _funnel_dbg = os.environ.get("VLLM_SPARSE_PENDING_FUNNEL_DEBUG_LOG", "")
-        if _funnel_dbg:
-            try:
-                _fd_detail = [
-                    (
-                        int(getattr(e.get("state"), "layer_index", -1)),
-                        len(tuple(e.get("slot_meta_commits", ()) or ())),
-                        len(tuple(e.get("dual_gen_flip_slots", ()) or ())),
-                        len(tuple(e.get("reset_slot_commits", ()) or ())),
-                    )
-                    for e in tuple(commit_log or ())
-                ]
-                with open(_funnel_dbg, "a") as _fd_fh:
-                    _fd_fh.write(
-                        f"commit\tpid={int(getattr(pending, 'pending_id', -1))}\t"
-                        f"reqs={list(getattr(pending, 'req_ids', ()) or ())}\t"
-                        f"log_entries={len(commit_log) if commit_log else 0}\t"
-                        f"entries(layer,meta,flip,reset)={_fd_detail[:4]}...\t"
-                        f"epoch={int(getattr(self, 'step_context_epoch', -1))}\n"
-                    )
-            except OSError:
-                pass
         if not commit_log:
             pending.compact_meta_commit_log = None
             return
@@ -2710,6 +2663,9 @@ class RefreshRebuildMixin:
                                 done_event = torch.cuda.Event(enable_timing=False)
                                 done_event.record(cur_stream)
                             pending.writer_done_event = done_event
+                            # [RING-RELEASE-ON-WRITER-SUBMIT] 事件已 record,
+                            # 槽消费序凝固,前移释放(见 helper docstring)。
+                            self._selected_out_ring_release_pending_slot(pending)
                             submitted_ids.add(id(record))
                             submitted += 1
             except Exception:
@@ -3030,6 +2986,8 @@ class RefreshRebuildMixin:
                 )
                 continue
             pending.writer_done_event = writer_event
+            # [RING-RELEASE-ON-WRITER-SUBMIT] split 臂事件已 record,前移释放。
+            self._selected_out_ring_release_pending_slot(pending)
             self._pending_refresh_rebuild_forget_writer_release(pending)
             _append_submit_debug(debug_record, "launch_writer", is_latest=True)
             submitted += 1
@@ -4127,6 +4085,10 @@ class RefreshRebuildMixin:
                                 req_mapping_snapshot=req_mapping_snapshot,
                             )
                             return
+                        # [RING-RELEASE-ON-WRITER-SUBMIT] 默认档(off-loop
+                        # pre-publish)writer 事件已 record,前移释放槽——
+                        # 稳态主路径,spill 2/3→0 的主战场。
+                        self._selected_out_ring_release_pending_slot(pending)
                 _detail_add_elapsed(
                     "pending_group_enqueue_record_async_work_us",
                     record_async_start_ns,

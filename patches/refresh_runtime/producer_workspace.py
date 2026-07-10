@@ -53,29 +53,6 @@ class RefreshProducerWorkItem:
         profile.producer_work_admission_reason = str(self.admission_reason or "")
 
 
-@dataclass(frozen=True, slots=True)
-class ReplayRefreshMultiSourceSelectorPlan:
-    """No-copy selector plan spanning multiple replay-refresh source groups.
-
-    The plan carries payload references and layer spans only. It does not
-    stack or concatenate capture tensors; a future selector implementation can
-    lower ``groups`` into a fixed descriptor table for graph replay.
-    """
-
-    payloads: Tuple[Any, ...]
-    groups: Tuple[Tuple[Any, ...], ...]
-    group_spans: Tuple[Tuple[int, int], ...]
-    source_keys: Tuple[tuple[Any, ...] | None, ...]
-
-    @property
-    def group_count(self) -> int:
-        return len(self.groups)
-
-    @property
-    def source_count(self) -> int:
-        return len(self.source_keys)
-
-
 class RefreshProducerWorkspace:
     """Reusable per-controller scratch for refresh producer orchestration."""
 
@@ -262,38 +239,6 @@ class RefreshProducerWorkspace:
         return carrier
 
 
-def build_replay_refresh_multi_source_selector_plan(
-    payload_groups: Sequence[Sequence[Any]],
-) -> ReplayRefreshMultiSourceSelectorPlan:
-    """Build a no-copy descriptor plan for a logical replay-refresh selector.
-
-    ``payload_groups`` remains the writer boundary. The returned ``payloads``
-    tuple is a flattened list of the same payload objects, and ``group_spans``
-    maps each writer group into that flattened logical selector output.
-    """
-    groups: list[Tuple[Any, ...]] = []
-    payloads: list[Any] = []
-    spans: list[Tuple[int, int]] = []
-    source_keys: list[tuple[Any, ...] | None] = []
-    start = 0
-    for group in payload_groups:
-        group_tuple = tuple(group)
-        if not group_tuple:
-            continue
-        groups.append(group_tuple)
-        spans.append((int(start), int(len(group_tuple))))
-        first_capture = getattr(group_tuple[0], "capture_scores", None)
-        source_keys.append(_tensor_storage_key_for_replay_group(first_capture))
-        payloads.extend(group_tuple)
-        start += len(group_tuple)
-    return ReplayRefreshMultiSourceSelectorPlan(
-        payloads=tuple(payloads),
-        groups=tuple(groups),
-        group_spans=tuple(spans),
-        source_keys=tuple(source_keys),
-    )
-
-
 def replay_refresh_payload_groups_have_adjacent_selector_fusion(
     payload_groups: Sequence[Sequence[Any]],
 ) -> bool:
@@ -356,59 +301,6 @@ def fuse_replay_refresh_payload_groups_for_adjacent_selector_source(
     if current:
         fused.append(current)
     return fused
-
-
-def _slice_selector_tensor_for_replay_group(
-    tensor: Any,
-    *,
-    layer_start: int,
-    layer_count: int,
-) -> Any:
-    import torch
-
-    if tensor is None or not isinstance(tensor, torch.Tensor):
-        return tensor
-    if tensor.dim() <= 0:
-        return tensor
-    if int(tensor.shape[0]) < int(layer_start) + int(layer_count):
-        raise RuntimeError(
-            "replay refresh selector result cannot slice group: "
-            f"shape0={int(tensor.shape[0])} start={int(layer_start)} "
-            f"count={int(layer_count)}"
-        )
-    return tensor.narrow(0, int(layer_start), int(layer_count))
-
-
-def slice_selector_result_for_replay_group(
-    result: Any,
-    *,
-    layer_start: int,
-    layer_count: int,
-    slot_list: Sequence[int],
-) -> Any:
-    """Return a per-writer-group ``SelectorResult`` backed by tensor views."""
-    from patches.sparse_types import SelectorResult
-
-    if not isinstance(result, SelectorResult):
-        raise TypeError("result must be a SelectorResult")
-    values = {field.name: getattr(result, field.name) for field in dataclass_fields(result)}
-    for field_name in (
-        "selected_indices",
-        "head_sink",
-        "recent_start",
-        "kv_len_head",
-        "allowed_lengths",
-        "selected_middle_pages",
-        "selected_middle_counts",
-        "selected_token_scores",
-    ):
-        values[field_name] = _slice_selector_tensor_for_replay_group(
-            values.get(field_name),
-            layer_start=int(layer_start),
-            layer_count=int(layer_count),
-        )
-    values["slot_list"] = [int(slot) for slot in slot_list]
-    return SelectorResult(**values)
 
 
 def get_refresh_producer_workspace(owner: Any) -> RefreshProducerWorkspace:

@@ -7673,40 +7673,6 @@ def _enqueue_one_replay_refresh_payload_group(
     return True
 
 
-def _full_cudagraph_replay_refresh_multi_source_selector_pair_size() -> int:
-    raw = os.environ.get(
-        "VLLM_SPARSE_REFRESH_MULTI_SOURCE_SELECTOR_PAIR_SIZE",
-        "0",
-    )
-    try:
-        value = int(raw or "0")
-    except ValueError:
-        value = 0
-    return max(0, value)
-
-
-def _full_cudagraph_replay_refresh_selector_precompute_requested() -> bool:
-    return (
-        os.environ.get("VLLM_SPARSE_REFRESH_MULTI_SOURCE_SELECTOR", "0") == "1"
-        or os.environ.get("VLLM_SPARSE_REFRESH_BOUNDED_SELECTOR_PRECOMPUTE", "0")
-        == "1"
-        or _full_cudagraph_replay_refresh_multi_source_selector_pair_size() > 0
-    )
-
-
-def _full_cudagraph_replay_refresh_multi_source_selector_group_limit(
-    group_count: int,
-    *,
-    stagger_enabled: bool,
-) -> int:
-    if _full_cudagraph_replay_refresh_selector_precompute_requested():
-        raise RuntimeError(
-            "env-driven replay-refresh selector precompute is retired; "
-            "bounded same-storage selector fusion is automatic"
-        )
-    return 0
-
-
 def _full_cudagraph_replay_refresh_progressive_consume_enabled() -> bool:
     return os.environ.get("VLLM_SPARSE_REPLAY_REFRESH_PROGRESSIVE_CONSUME", "0") == "1"
 
@@ -8556,10 +8522,6 @@ def _enqueue_full_cudagraph_refresh_payloads_after_replay(
             )
             if delay_steps <= 0:
                 delay_steps = max(1, target_group_count)
-            _full_cudagraph_replay_refresh_multi_source_selector_group_limit(
-                len(new_groups),
-                stagger_enabled=stagger_enabled,
-            )
             submit_group_count_for_profile = len(new_groups)
             pending_count = 0
             queued_count = 0
@@ -8786,6 +8748,7 @@ def _enqueue_full_cudagraph_refresh_payloads_after_replay(
         try:
             from patches.fa3_native.install import append_fa3_route_trace
 
+            _sor = getattr(controller, "_selected_out_ring", None)
             append_fa3_route_trace(
                 {
                     "event": "mixed_page_full_cudagraph_replay_refresh_payload_enqueue",
@@ -8797,6 +8760,16 @@ def _enqueue_full_cudagraph_refresh_payloads_after_replay(
                     "refresh_intent_req_count": int(len(refresh_intent_req_ids)),
                     "refresh_intent_req_ids": list(refresh_intent_req_ids),
                     "refresh_intent_debug": _route_refresh_intent_debug(),
+                    # [RING-RELEASE-ON-WRITER-SUBMIT 遥测] speed child 视角的
+                    # 环健康累计(REFRESH_CPROFILE 只覆盖 diagnostic child 的
+                    # eager flush,pending 路径无 pstats 出口——ring 真实
+                    # spill 率以本字段为准;稳态合同=spill 恒 0)。
+                    "selected_out_ring_acquire_count": (
+                        int(getattr(_sor, "acquire_count", -1)) if _sor is not None else -1
+                    ),
+                    "selected_out_ring_spill_count": (
+                        int(getattr(_sor, "spill_run_count", -1)) if _sor is not None else -1
+                    ),
                 }
             )
         except Exception:
