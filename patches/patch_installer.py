@@ -34,10 +34,6 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, TYPE_CHECKING
 import torch
 
 from hybrid_selectors.alpha_fair_selector import AlphaFairSelectorConfig
-from patches.decode_runtime.native_batch_state import SparseDecodeBatchState
-from patches.decode_runtime.native_visible_values import (
-    sparse_native_visible_values_from_step,
-)
 from patches.sparse_constants import (
     _DYNAMIC_ENV,
     _REFRESH_ENQUEUE_STAGGER_CACHED,
@@ -265,10 +261,6 @@ _FULL_CUDAGRAPH_REPLAY_WRAPPER_ABLATE_HIT_LOG_CACHED = os.environ.get(
     "VLLM_SPARSE_FULL_CUDAGRAPH_REPLAY_WRAPPER_ABLATE_HIT_LOG",
     "",
 )
-_FULL_CUDAGRAPH_REPLAY_WRAPPER_STEADY_FAST_PATH_CACHED = os.environ.get(
-    "VLLM_SPARSE_FULL_CUDAGRAPH_REPLAY_WRAPPER_STEADY_FAST_PATH",
-    "1",
-)
 _FULL_CUDAGRAPH_REPLAY_WRAPPER_ABLATE_HIT_LOG_REGISTERED = False
 _FULL_CUDAGRAPH_REPLAY_CUDA_EVENT_ROWS: List[dict] = []
 _FULL_CUDAGRAPH_REPLAY_CUDA_EVENT_PATH = ""
@@ -302,351 +294,6 @@ def _cached_or_dynamic_env(name: str, cached: str, default: str = "") -> str:
     if _DYNAMIC_ENV:
         return os.environ.get(name, default)
     return cached
-
-
-def _sparse_native_lifecycle_enabled() -> bool:
-    if str(os.environ.get("VLLM_SPARSE_NATIVE_LIFECYCLE", "0")).strip() != "1":
-        return False
-    if os.environ.get("VLLM_SPARSE_LIFECYCLE_ONLY_FOR_SPEC") == "1":
-        # Full lifecycle is load-bearing ONLY for async-spec-decode sessions;
-        # every non-spec session is byte-identical on the cheaper arena path.
-        # The session spec flag is latched once from the runner in
-        # _update_sparse_native_identity_from_prepare_inputs; unresolved (None)
-        # defaults ON (safe), resolved "0" (confirmed non-spec) disables.
-        if os.environ.get("_VLLM_SPARSE_SESSION_SPEC") == "0":
-            return False
-    return True
-
-
-def _sparse_native_batch_state_for_controller(
-    controller: object,
-    *,
-    device: torch.device,
-) -> SparseDecodeBatchState:
-    state = getattr(controller, "_sparse_native_batch_state", None)
-    if not isinstance(state, SparseDecodeBatchState):
-        state = SparseDecodeBatchState(device=torch.device(device))
-        setattr(controller, "_sparse_native_batch_state", state)
-    return state
-
-
-def _sparse_native_lifecycle_async_flags(runner: object) -> tuple[bool, bool]:
-    async_spec_active = bool(getattr(runner, "use_async_spec_decode", False))
-    use_spec_decode = bool(getattr(runner, "use_spec_decode", False))
-    input_batch = getattr(runner, "input_batch", None)
-    has_num_tokens_no_spec = bool(
-        input_batch is not None
-        and getattr(input_batch, "num_tokens_no_spec", None) is not None
-    )
-    native_gpu_lengths_authoritative = bool(
-        async_spec_active or (use_spec_decode and has_num_tokens_no_spec)
-    )
-    return bool(async_spec_active or use_spec_decode), bool(native_gpu_lengths_authoritative)
-
-
-def _sparse_native_dense_row_modes(row_mode_source: object, *, live_count: int) -> bool:
-    if row_mode_source is None or isinstance(row_mode_source, torch.Tensor):
-        return False
-    try:
-        values = tuple(row_mode_source)[: int(live_count)]
-    except Exception:
-        return False
-    if len(values) != int(live_count):
-        return False
-    for value in values:
-        try:
-            if int(value) != int(_ROW_MODE_DENSE):
-                return False
-            continue
-        except Exception:
-            pass
-        if str(value).strip().lower() not in ("0", "dense", "native"):
-            return False
-    return True
-
-
-def _sparse_native_positive_int(value: object) -> int | None:
-    if value is None or isinstance(value, torch.Tensor):
-        return None
-    value_i = int(value)
-    return value_i if value_i > 0 else None
-
-
-def _sparse_native_rrp_capacity_key(
-    *,
-    batch_capacity: int,
-    block_size: int,
-    num_kv_heads: int,
-    max_pages_per_row: int,
-) -> tuple[object, ...]:
-    return (
-        "full",
-        int(batch_capacity),
-        int(block_size),
-        int(num_kv_heads),
-        int(max_pages_per_row),
-    )
-
-
-def _sparse_native_prepare_capacity(
-    *,
-    controller: object,
-    runner: object,
-) -> tuple[torch.device, object, int, int, int, int] | None:
-    block_table = getattr(controller, "_worker_block_table", None)
-    if not isinstance(block_table, torch.Tensor) or block_table.dim() < 2:
-        return None
-    block_size = _sparse_native_positive_int(getattr(controller, "kv_cache_block_size", None))
-    if block_size is None:
-        block_size = _sparse_native_positive_int(getattr(runner, "kv_cache_block_size", None))
-    num_kv_heads = _sparse_native_positive_int(
-        getattr(controller, "kv_cache_num_kv_heads", None)
-    )
-    if num_kv_heads is None:
-        num_kv_heads = _sparse_native_positive_int(getattr(runner, "num_kv_heads", None))
-    if block_size is None or num_kv_heads is None:
-        return None
-    batch_capacity = int(block_table.shape[0])
-    max_pages_per_row = int(block_table.shape[1])
-    capacity_key = _sparse_native_rrp_capacity_key(
-        batch_capacity=batch_capacity,
-        block_size=block_size,
-        num_kv_heads=num_kv_heads,
-        max_pages_per_row=max_pages_per_row,
-    )
-    return (
-        block_table.device,
-        capacity_key,
-        int(batch_capacity),
-        int(max_pages_per_row),
-        int(block_size),
-        int(num_kv_heads),
-    )
-
-
-def _update_sparse_native_identity_from_prepare_inputs(
-    *,
-    controller: object,
-    runner: object,
-    step_ticket: object,
-    req_ids: Sequence[str],
-    active_row_indices: Sequence[int],
-    q_start_loc: Sequence[int],
-    slot_mapping_signature: Sequence[int] | None = None,
-) -> None:
-    if not _sparse_native_lifecycle_enabled():
-        return
-
-    step_id = int(getattr(step_ticket, "target_epoch", -1))
-    state = getattr(controller, "_sparse_native_batch_state", None)
-
-    def _invalidate(reason: str) -> None:
-        setattr(controller, "_sparse_native_active_row_indices", tuple())
-        setattr(controller, "_sparse_native_slot_mapping_signature", tuple())
-        setattr(controller, "_sparse_native_capacity_key", None)
-        if isinstance(state, SparseDecodeBatchState):
-            state.invalidate_for_step_failure(step_id=step_id, reason=reason)
-
-    if not req_ids:
-        _invalidate("native_lifecycle_empty_prepare")
-        return
-
-    previous_capacity_key = getattr(controller, "_sparse_native_capacity_key", None)
-    capacity = _sparse_native_prepare_capacity(controller=controller, runner=runner)
-    if capacity is None:
-        if not isinstance(state, SparseDecodeBatchState) or previous_capacity_key is None:
-            _invalidate("native_lifecycle_capacity_unavailable")
-            return
-        capacity_key = previous_capacity_key
-    else:
-        (
-            capacity_device,
-            capacity_key,
-            batch_capacity,
-            max_pages_per_row,
-            block_size,
-            num_kv_heads,
-        ) = capacity
-        state = _sparse_native_batch_state_for_controller(
-            controller, device=capacity_device
-        )
-        state.reset_for_graph_capacity(
-            graph_key=capacity_key,
-            batch_capacity=batch_capacity,
-            max_pages_per_row=max_pages_per_row,
-            block_size=block_size,
-            page_size=block_size,
-            num_kv_heads=num_kv_heads,
-            device=capacity_device,
-        )
-
-    q_lens = tuple(
-        int(q_start_loc[i + 1]) - int(q_start_loc[i])
-        for i in range(max(0, len(q_start_loc) - 1))
-    )
-    req_tuple = tuple(str(v) for v in req_ids)
-    if len(q_lens) != len(req_tuple):
-        _invalidate("q_lens_by_row_len_mismatch")
-        return
-    active_rows = tuple(int(v) for v in active_row_indices)
-    if len(active_rows) != len(req_tuple):
-        _invalidate("active_row_indices_len_mismatch")
-        return
-    slot_signature = (
-        tuple(int(v) for v in slot_mapping_signature)
-        if slot_mapping_signature is not None
-        else tuple(int(i) for i in range(len(req_tuple)))
-    )
-    if len(slot_signature) != len(req_tuple):
-        _invalidate("slot_mapping_signature_len_mismatch")
-        return
-    step_authority = getattr(controller, "step_authority", None)
-    row_mode_source = getattr(step_authority, "row_mode_by_row", None)
-    if row_mode_source is None or isinstance(row_mode_source, torch.Tensor):
-        _invalidate("native_lifecycle_row_mode_unavailable")
-        return
-    row_mode_class = tuple(str(v) for v in tuple(row_mode_source)[: len(req_tuple)])
-    if len(row_mode_class) != len(req_tuple):
-        _invalidate("row_mode_class_len_mismatch")
-        return
-
-    async_spec_active, native_gpu_lengths_authoritative = _sparse_native_lifecycle_async_flags(runner)
-    if os.environ.get("VLLM_SPARSE_LIFECYCLE_ONLY_FOR_SPEC") == "1":
-        # Latch session-level spec flag (sticky: never downgrade once "1" seen).
-        if bool(async_spec_active) or bool(native_gpu_lengths_authoritative):
-            os.environ["_VLLM_SPARSE_SESSION_SPEC"] = "1"
-        elif os.environ.get("_VLLM_SPARSE_SESSION_SPEC") != "1":
-            os.environ["_VLLM_SPARSE_SESSION_SPEC"] = "0"
-    state.update_runner_identity_from_prepare_inputs(
-        step_id=step_id,
-        req_ids=req_tuple,
-        active_row_indices=active_rows,
-        slot_mapping_signature=slot_signature,
-        q_lens_by_row=q_lens,
-        row_mode_class=row_mode_class,
-        capacity_key=capacity_key,
-        async_spec_active=async_spec_active,
-        native_gpu_lengths_authoritative=native_gpu_lengths_authoritative,
-    )
-    if (
-        not bool(native_gpu_lengths_authoritative)
-        and _sparse_native_dense_row_modes(row_mode_source, live_count=len(req_tuple))
-    ):
-        context_kv_len = _sparse_native_int_tuple_metadata(
-            getattr(step_authority, "context_kv_len_by_row", None)
-        )
-        if context_kv_len is not None and len(context_kv_len) >= len(req_tuple):
-            native_lengths = tuple(int(v) for v in context_kv_len[: len(req_tuple)])
-            try:
-                state.update_visible_k_from_values(
-                    step_id=step_id,
-                    visible_k_tensor=None,
-                    row_effective_k_by_row=native_lengths,
-                    launch_effective_k_by_row=native_lengths,
-                    update_source="prepare_inputs_native_seq_lens",
-                )
-            except RuntimeError:
-                pass
-
-    setattr(controller, "_sparse_native_active_row_indices", active_rows)
-    setattr(controller, "_sparse_native_slot_mapping_signature", slot_signature)
-    setattr(controller, "_sparse_native_capacity_key", capacity_key)
-
-
-def _sparse_native_int_tuple_metadata(value: object) -> tuple[int, ...] | None:
-    if value is None or isinstance(value, torch.Tensor):
-        return None
-    try:
-        return tuple(int(v) for v in tuple(value))
-    except Exception:
-        return None
-
-
-def _update_sparse_native_visible_k_from_step_bound_meta(
-    *,
-    controller: object,
-    step_authority: object,
-    step_bound_meta: object,
-    row_effective_k_by_row: Sequence[int],
-    launch_effective_k_by_row: Sequence[int],
-) -> bool:
-    if not _sparse_native_lifecycle_enabled():
-        return False
-    state = getattr(controller, "_sparse_native_batch_state", None)
-    if not isinstance(state, SparseDecodeBatchState):
-        return False
-
-    step_id = int(getattr(step_authority, "epoch", -1))
-    batch_size = int(getattr(step_authority, "batch_size", 0) or 0)
-    row_values = tuple(int(v) for v in row_effective_k_by_row)
-    launch_values = tuple(int(v) for v in launch_effective_k_by_row)
-    if batch_size <= 0 or len(row_values) != batch_size or len(launch_values) != batch_size:
-        state.invalidate_for_step_failure(
-            step_id=step_id,
-            reason="native_lifecycle_visible_k_row_coverage_mismatch",
-        )
-        return False
-
-    launch_plan = getattr(step_bound_meta, "compact_recent_launch_plan", None)
-    if launch_plan is None or not bool(getattr(launch_plan, "valid", False)):
-        state.invalidate_for_step_failure(
-            step_id=step_id,
-            reason="native_lifecycle_missing_current_launch_plan",
-        )
-        return False
-
-    launch_cpu = _sparse_native_int_tuple_metadata(
-        getattr(launch_plan, "launch_effective_k_len_cpu", None)
-    )
-    if launch_cpu is not None and len(launch_cpu) >= len(launch_values):
-        if launch_cpu[: len(launch_values)] != launch_values:
-            state.invalidate_for_step_failure(
-                step_id=step_id,
-                reason="native_lifecycle_launch_cpu_mismatch",
-            )
-            return False
-
-    try:
-        state.update_visible_k_from_step_bound_meta(
-            step_id=step_id,
-            step_bound_meta=step_bound_meta,
-            launch_plan=launch_plan,
-            row_effective_k_by_row=row_values,
-            launch_effective_k_by_row=launch_values,
-        )
-    except RuntimeError:
-        return False
-    return True
-
-
-def _update_sparse_native_visible_k_from_current_delta(
-    *,
-    controller: object,
-    step_authority: object | None,
-    step_bound_meta: object | None,
-) -> bool:
-    if not _sparse_native_lifecycle_enabled():
-        return False
-    if step_authority is None or step_bound_meta is None:
-        return False
-    delta = getattr(controller, "_decode_runtime_delta", None)
-    if delta is None or int(getattr(delta, "step_id", -2)) != int(getattr(step_authority, "epoch", -1)):
-        return False
-    visible_values = sparse_native_visible_values_from_step(
-        controller=controller,
-        step_authority=step_authority,
-        step_bound_meta=step_bound_meta,
-    )
-    if visible_values is None:
-        return False
-    row_values, launch_values = visible_values
-    return _update_sparse_native_visible_k_from_step_bound_meta(
-        controller=controller,
-        step_authority=step_authority,
-        step_bound_meta=step_bound_meta,
-        row_effective_k_by_row=row_values,
-        launch_effective_k_by_row=launch_values,
-    )
 
 
 def _full_cudagraph_hook_profile_log(refresh_enabled: bool) -> str:
@@ -768,21 +415,6 @@ def _full_cudagraph_replay_wrapper_ablate_extra_enabled(refresh_enabled: bool) -
         )
         == "1"
     )
-
-
-def _full_cudagraph_replay_wrapper_steady_fast_path_enabled(
-    refresh_enabled: bool,
-) -> bool:
-    if not refresh_enabled:
-        return False
-    if not _sparse_native_lifecycle_enabled():
-        return False
-    value = _cached_or_dynamic_env(
-        "VLLM_SPARSE_FULL_CUDAGRAPH_REPLAY_WRAPPER_STEADY_FAST_PATH",
-        _FULL_CUDAGRAPH_REPLAY_WRAPPER_STEADY_FAST_PATH_CACHED,
-        "1",
-    )
-    return str(value).strip().lower() not in {"", "0", "false", "off", "no"}
 
 
 def _full_cudagraph_replay_wrapper_steady_fast_path_ready(
@@ -1112,35 +744,6 @@ def _bind_profile_resolved_row_ptr_visible_source(
     profile_capture_max_seqlen_k: int,
 ) -> torch.Tensor:
     profile_k = int(profile_capture_max_seqlen_k)
-    if _sparse_native_lifecycle_enabled():
-        state = _sparse_native_batch_state_for_controller(controller, device=device)
-        capacity_key = _sparse_native_rrp_capacity_key(
-            batch_capacity=int(batch_size),
-            block_size=int(block_size),
-            num_kv_heads=int(num_kv_heads),
-            max_pages_per_row=int(max_pages_per_row),
-        )
-        state.reset_for_graph_capacity(
-            graph_key=capacity_key,
-            batch_capacity=int(batch_size),
-            max_pages_per_row=int(max_pages_per_row),
-            block_size=int(block_size),
-            page_size=int(block_size),
-            num_kv_heads=int(num_kv_heads),
-            device=torch.device(device),
-        )
-        state.initialize_visible_k_for_graph_capture(
-            visible_k=profile_k,
-            update_source="profile_capture",
-        )
-        visible = state.visible_effective_k_tensor()
-        arena.bind_resolved_seqused_source(
-            visible,
-            source_kind="sparse_dynamic_state",
-        )
-        setattr(controller, "_sparse_native_capacity_key", capacity_key)
-        return visible
-
     del controller, batch_size, device, block_size, num_kv_heads, max_pages_per_row
     batch_seqused = getattr(arena, "batch_seqused_k_i32", None)
     if not isinstance(batch_seqused, torch.Tensor):
@@ -3543,7 +3146,6 @@ def _patch_prepare_inputs() -> None:
                 block_tables = compacted_tables
                 block_tables_cpu = compacted_tables_cpu
             num_reqs = len(req_ids)
-            mapped_indices_for_native: Tuple[int, ...] = tuple()
 
             if num_reqs > 0:
                 computed_tokens: List[int]
@@ -3590,9 +3192,6 @@ def _patch_prepare_inputs() -> None:
                     token_ids_rows=token_ids_cpu_rows,
                     tp_size=tp_size,
                 )
-                # validate_tp_input_contract 已保证 tuple[int, ...]（tp_contract 单测锁定）。
-                mapped_indices_for_native = mapped_indices
-
                 prompt_lengths: List[int] = [0] * len(req_ids)
                 num_tokens_no_spec_cpu = getattr(self.input_batch, "num_tokens_no_spec", None)
                 if num_tokens_no_spec_cpu is not None:
@@ -3821,15 +3420,6 @@ def _patch_prepare_inputs() -> None:
                 finished_req_ids=set(),
                 block_tables_cpu=block_tables_cpu,
             )
-            _update_sparse_native_identity_from_prepare_inputs(
-                controller=controller,
-                runner=self,
-                step_ticket=step_ticket,
-                req_ids=req_ids,
-                active_row_indices=active_row_indices,
-                q_start_loc=q_start_loc,
-                slot_mapping_signature=mapped_indices_for_native,
-            )
             if num_reqs:
                 attn_metadata_obj = None
                 try:
@@ -3851,11 +3441,6 @@ def _patch_prepare_inputs() -> None:
                         metadata_builder=builder0,
                     )
 
-                    _update_sparse_native_visible_k_from_current_delta(
-                        controller=controller,
-                        step_authority=getattr(controller, "step_authority", None),
-                        step_bound_meta=getattr(controller, "step_bound_meta", None),
-                    )
                     if not _mixed_page_full_cudagraph_replay_refresh_enabled(
                         controller
                     ):
@@ -4219,20 +3804,6 @@ def _patch_dummy_run() -> None:
         return
 
     def _sparse_dummy_run(self, *args, **kwargs):  # type: ignore[override]
-        if os.environ.get("VLLM_SPARSE_LIFECYCLE_ONLY_FOR_SPEC") == "1":
-            # Resolve the session spec flag BEFORE capture builds the graph.
-            # _dummy_run IS the capture path (capture_model); _prepare_inputs is
-            # bypassed during capture, so without this the gate stays unresolved
-            # (default ON) at capture -> graph binds lifecycle/sparse_dynamic_state
-            # while replay uses arena -> descriptor mismatch -> garbage tokens.
-            try:
-                _async_spec, _gpu_auth = _sparse_native_lifecycle_async_flags(self)
-                if _async_spec or _gpu_auth:
-                    os.environ["_VLLM_SPARSE_SESSION_SPEC"] = "1"
-                elif os.environ.get("_VLLM_SPARSE_SESSION_SPEC") != "1":
-                    os.environ["_VLLM_SPARSE_SESSION_SPEC"] = "0"
-            except Exception:
-                pass
         controller = _GLOBAL_CONTROLLER or _ensure_controller()
         if controller is None:
             return original_dummy_run(self, *args, **kwargs)
@@ -4845,68 +4416,6 @@ def _prebound_rrp_current_row_modes(
     return modes
 
 
-def _prebound_rrp_native_page_carriers_current_for_owner(
-    *,
-    controller: object,
-    snapshot: object,
-    live_batch_size: int,
-) -> bool:
-    from patches.decode_runtime.rrp_row_table_manager import RrpRowTableManager
-    from patches.decode_runtime.thin_builder_state import DecodeDeltaPacket
-
-    manager = getattr(controller, "_rrp_row_table_manager", None)
-    if not isinstance(manager, RrpRowTableManager):
-        return False
-    row_effective_k = manager.row_effective_from_descriptor_snapshot(snapshot)
-    if row_effective_k is None:
-        return False
-    try:
-        row_effective_k = tuple(int(v) for v in row_effective_k)
-    except Exception:
-        return False
-    try:
-        snapshot_epoch = int(getattr(snapshot, "epoch"))
-    except Exception:
-        snapshot_epoch = -1
-    recent_first_page_by_row = None
-    compact_rows_require_recent = any(
-        bool(v) for v in tuple(getattr(manager, "_compact_ready_by_row", tuple()))
-    )
-    delta = getattr(controller, "_decode_runtime_delta", None)
-    if compact_rows_require_recent:
-        if not isinstance(delta, DecodeDeltaPacket):
-            raise RuntimeError(
-                "prebound RRP compact page-current proof requires current DecodeDeltaPacket"
-            )
-        try:
-            if int(delta.step_id) != int(snapshot_epoch):
-                raise RuntimeError(
-                    "prebound RRP compact page-current proof saw stale DecodeDeltaPacket"
-                )
-            recent_first_page_by_row = tuple(delta.recent_first_page_by_row)[
-                : int(live_batch_size)
-            ]
-        except RuntimeError:
-            raise
-        except Exception as exc:
-            raise RuntimeError(
-                "prebound RRP compact page-current proof has invalid recent-first payload"
-            ) from exc
-        if len(tuple(recent_first_page_by_row)) < int(live_batch_size):
-            raise RuntimeError(
-                "prebound RRP compact page-current proof recent-first payload "
-                "does not cover live rows"
-            )
-    recent_first = manager._recent_first_from_descriptor_snapshot(
-        snapshot,
-        tuple(recent_first_page_by_row)[: int(live_batch_size)]
-        if recent_first_page_by_row is not None
-        else None,
-        batch_size=len(row_effective_k),
-    )
-    return bool(manager._is_pure_seqused_delta(row_effective_k, recent_first))
-
-
 def _prebound_rrp_static_stats_values_with_carrier_publish(
     static_values: tuple[object, ...],
     carrier_publish: object | None,
@@ -4934,313 +4443,6 @@ def _prebound_rrp_static_stats_values_with_carrier_publish(
     return tuple(values)
 
 
-def _publish_prebound_rrp_native_dirty_page_rows_for_current_step(
-    *,
-    controller: object,
-    step_id: int,
-) -> object | None:
-    """Phase 2 closure: in-place republish ONLY the dirty descriptor page rows
-    into the existing replay arena before a static prebound RRP full-graph replay
-    is accepted, so a recent-window page slide cannot leave the captured graph
-    reading stale page carriers.
-
-    Single-source / address-stable / no rebind / no full rebuild / no row
-    contamination: the dirty set is the live descriptor snapshot's per-row page
-    LAYOUT diffed against the manager's last actually-published layout (its
-    publish-only carrier-content generation); each dirty row is written with
-    in-place .copy_/.fill_ on the same carrier tensors. Same-page steps diff to
-    zero dirty rows -> zero GPU work (the sparse_dynamic_state seqused owner is
-    advanced by the native lifecycle; the manager same-page seqused write is a
-    no-op for that external source). The proven descriptor snapshot built by the
-    currentness proof for this step is reused when available (no duplicate build).
-    Compact rows require a current DecodeDeltaPacket; a missing/stale/uncovered
-    proof RAISES -- there is no dense/native fallback. Returns the RrpUpdateResult
-    (carries ``delta_rows`` for route-trace stats) when a sparse-native compact
-    publish applies, else None.
-    """
-    if not _sparse_native_lifecycle_enabled():
-        return None
-    from patches.decode_runtime.rrp_row_table_manager import RrpRowTableManager
-    from patches.decode_runtime.metadata_builder import (
-        _sparse_native_current_descriptor_snapshot,
-    )
-
-    manager = getattr(controller, "_rrp_row_table_manager", None)
-    if not isinstance(manager, RrpRowTableManager):
-        return None
-    replay_arena = getattr(controller, "_resolved_row_ptr_replay_arena", None)
-    if replay_arena is None:
-        return None
-    sparse_state = getattr(controller, "_sparse_native_batch_state", None)
-    if not isinstance(sparse_state, SparseDecodeBatchState):
-        return None
-    compact_ready = tuple(
-        getattr(manager, "_compact_ready_by_row", tuple()) or tuple()
-    )
-    if not any(bool(v) for v in compact_ready):
-        # No compact page-table rows -> nothing slides under the recent window.
-        return None
-
-    step_authority = getattr(controller, "step_authority", None)
-    try:
-        live_batch_size = int(getattr(step_authority, "batch_size", 0) or 0)
-    except (TypeError, ValueError):
-        live_batch_size = 0
-    if live_batch_size <= 0:
-        return None
-
-    snapshot = None
-    stashed = getattr(controller, "_prebound_rrp_proven_page_snapshot", None)
-    if (
-        isinstance(stashed, tuple)
-        and len(stashed) == 2
-        and int(step_id) >= 0
-        and int(stashed[0]) == int(step_id)
-    ):
-        snapshot = stashed[1]
-    if snapshot is None:
-        snapshot = _sparse_native_current_descriptor_snapshot(
-            controller, require_page_payload=True
-        )
-    if snapshot is None:
-        raise RuntimeError(
-            "prebound RRP compact page-carrier republish requires a current "
-            "descriptor snapshot covering active rows"
-        )
-
-    # Enforce the current-delta invariant (raises on a missing/stale compact
-    # DecodeDeltaPacket); the logical same-page verdict is intentionally unused --
-    # the authoritative dirty set is the layout diff in
-    # publish_from_descriptor_snapshot below.
-    _prebound_rrp_native_page_carriers_current_for_owner(
-        controller=controller,
-        snapshot=snapshot,
-        live_batch_size=int(live_batch_size),
-    )
-
-    update = manager.publish_from_descriptor_snapshot(replay_arena, snapshot)
-    if update is None:
-        raise RuntimeError(
-            "prebound RRP compact page-carrier republish could not apply the "
-            "current descriptor rows"
-        )
-    return update
-
-
-def _rrp_owner_match_memo_key(controller, state, private_fast_identity, live_batch_size, expected_batch_size):
-    try:
-        if _resolved_row_ptr_graph_binding_state_for_replay(controller) is not state:
-            return None
-        arena = getattr(controller, "_resolved_row_ptr_replay_arena", None)
-        carriers = getattr(arena, "carriers", None)
-        bound = getattr(carriers, "resolver_visible_seqused_k_by_head_i32", None)
-        if not isinstance(bound, torch.Tensor):
-            return None
-        sparse_state = getattr(controller, "_sparse_native_batch_state", None)
-        if not isinstance(sparse_state, SparseDecodeBatchState):
-            return None
-        sv = sparse_state.visible_effective_k_tensor()
-        sv_ptr = int(sv.data_ptr()) if isinstance(sv, torch.Tensor) else -1
-        pages = getattr(sparse_state, "_row_table_pages_by_graph_row", None)
-        return (
-            tuple(int(x) for x in private_fast_identity[:8]),
-            int(live_batch_size), int(expected_batch_size), id(state),
-            getattr(controller, "_resolved_row_ptr_arena_key", None),
-            int(bound.data_ptr()), sv_ptr,
-            str(getattr(arena, "_resolved_seqused_source_kind", "") or ""),
-            getattr(controller, "_sparse_native_capacity_key", None),
-            pages,
-        )
-    except Exception:
-        return None
-
-
-def _prebound_rrp_native_visible_source_matches_owner(
-    *,
-    controller: object,
-    state: dict[str, object],
-    live_batch_size: int,
-    graph_batch_size: int,
-) -> bool:
-    if _resolved_row_ptr_graph_binding_state_for_replay(controller) is not state:
-        return False
-    expected_batch_size = max(int(live_batch_size), int(graph_batch_size))
-    replay_arena = getattr(controller, "_resolved_row_ptr_replay_arena", None)
-    carriers = getattr(replay_arena, "carriers", None)
-    bound_visible = getattr(carriers, "resolver_visible_seqused_k_by_head_i32", None)
-    if not isinstance(bound_visible, torch.Tensor):
-        return False
-    binding = getattr(controller, "_resolved_row_ptr_replay_metadata_binding", None)
-    captured_visible = getattr(
-        getattr(binding, "replay_carriers", None),
-        "resolver_visible_seqused_k_by_head_i32",
-        None,
-    )
-    if not (
-        isinstance(captured_visible, torch.Tensor)
-        and captured_visible.device == bound_visible.device
-        and int(captured_visible.data_ptr()) == int(bound_visible.data_ptr())
-    ):
-        return False
-    source_kind = str(getattr(replay_arena, "_resolved_seqused_source_kind", "") or "")
-
-    def _same_visible_owner(owner: object) -> bool:
-        return bool(
-            isinstance(owner, torch.Tensor)
-            and bound_visible.device == owner.device
-            and int(bound_visible.data_ptr()) == int(owner.data_ptr())
-            and int(bound_visible.numel()) >= expected_batch_size
-        )
-
-    step_authority = getattr(controller, "step_authority", None)
-
-    if source_kind != "sparse_dynamic_state":
-        return False
-    sparse_state = getattr(controller, "_sparse_native_batch_state", None)
-    if not isinstance(sparse_state, SparseDecodeBatchState):
-        return False
-    sparse_visible = sparse_state.visible_effective_k_tensor()
-    if not _same_visible_owner(sparse_visible):
-        return False
-
-    live_count = int(live_batch_size)
-    capacity_key = getattr(controller, "_sparse_native_capacity_key", None)
-    if step_authority is None or capacity_key is None:
-        return False
-    if (
-        os.environ.get("VLLM_SPARSE_LIFECYCLE_MINIMAL") == "1"
-        and os.environ.get("VLLM_SPARSE_LIFECYCLE_MINIMAL_ASSERT") != "1"
-        and not bool(getattr(sparse_state, "native_gpu_lengths_authoritative", False))
-    ):
-        # cheap pointer/owner/source checks above already prove the graph-bound
-        # visible tensor IS the lifecycle owner's current tensor; not-spec-decode
-        # => CPU lengths authoritative; the heavy per-row covers/snapshot re-derive
-        # is redundant (lifecycle=0 proves byte-identical). Recent-page slide bumps
-        # epoch -> caller fast-identity miss -> full rebind, never here.
-        try:
-            controller._lifecycle_minimal_hits = int(
-                getattr(controller, "_lifecycle_minimal_hits", 0)
-            ) + 1
-        except Exception:
-            pass
-        return True
-
-    def _tuple_from(value: object, *, cast: object) -> tuple[object, ...] | None:
-        if value is None or isinstance(value, torch.Tensor):
-            return None
-        try:
-            raw = tuple(value)
-        except Exception:
-            return None
-        if len(raw) < live_count:
-            return None
-        try:
-            return tuple(cast(v) for v in raw[:live_count])  # type: ignore[misc]
-        except Exception:
-            return None
-
-    try:
-        step_id = int(getattr(step_authority, "epoch", -1))
-    except Exception:
-        return False
-
-    req_ids = _tuple_from(getattr(step_authority, "req_ids", None), cast=str)
-    active_rows = _tuple_from(
-        getattr(controller, "_sparse_native_active_row_indices", None),
-        cast=int,
-    )
-    slot_signature = _tuple_from(
-        getattr(controller, "_sparse_native_slot_mapping_signature", None),
-        cast=int,
-    )
-    q_lens = _tuple_from(getattr(step_authority, "q_lens_by_row", None), cast=int)
-    row_modes = _tuple_from(getattr(step_authority, "row_mode_by_row", None), cast=str)
-    if not all(
-        values is not None
-        for values in (
-            req_ids,
-            active_rows,
-            slot_signature,
-            q_lens,
-            row_modes,
-        )
-    ):
-        return False
-    try:
-        snapshot = sparse_state.current_step_row_descriptors()
-    except RuntimeError:
-        return False
-    if not bool(getattr(snapshot, "valid", False)):
-        return False
-    descriptor_covers = getattr(
-        sparse_state,
-        "descriptor_payload_covers_active_rows",
-        None,
-    )
-    if not callable(descriptor_covers):
-        return False
-    try:
-        if not bool(descriptor_covers(require_pages=True)):
-            return False
-    except RuntimeError:
-        return False
-    try:
-        if int(getattr(snapshot, "epoch")) != step_id:
-            return False
-        rows_by_graph_row = tuple(getattr(snapshot, "rows_by_graph_row"))
-    except (AttributeError, TypeError, ValueError):
-        return False
-    row_value_list: list[int] = []
-    launch_value_list: list[int] = []
-    for live_row, graph_row in enumerate(active_rows):
-        try:
-            row = rows_by_graph_row[int(graph_row)]
-        except (IndexError, TypeError, ValueError):
-            return False
-        if row is None:
-            return False
-        try:
-            if (
-                int(getattr(row, "epoch")) != step_id
-                or int(getattr(row, "visible_epoch")) != step_id
-                or int(getattr(row, "row_mode_epoch")) != step_id
-                or int(getattr(row, "live_row_index")) != int(live_row)
-                or int(getattr(row, "graph_row_index")) != int(graph_row)
-            ):
-                return False
-            row_value_list.append(int(getattr(row, "row_effective")))
-            launch_value_list.append(int(getattr(row, "launch_effective")))
-        except (AttributeError, TypeError, ValueError):
-            return False
-    row_values = tuple(row_value_list)
-    launch_values = tuple(launch_value_list)
-
-    # Stash the proven descriptor snapshot so the static-accept replay marker can
-    # republish dirty page rows from it without rebuilding the snapshot.
-    setattr(controller, "_prebound_rrp_proven_page_snapshot", (int(step_id), snapshot))
-    if not _prebound_rrp_native_page_carriers_current_for_owner(
-        controller=controller,
-        snapshot=snapshot,
-        live_batch_size=live_count,
-    ):
-        return False
-
-    return sparse_state.covers_step(
-        step_id=step_id,
-        req_ids=req_ids,
-        active_row_indices=active_rows,
-        slot_mapping_signature=slot_signature,
-        q_lens_by_row=q_lens,
-        row_mode_class=row_modes,
-        capacity_key=capacity_key,
-        row_effective_k_by_row=row_values,
-        launch_effective_k_by_row=launch_values,
-        native_gpu_lengths_authoritative=bool(
-            getattr(sparse_state, "native_gpu_lengths_authoritative", False)
-        ),
-    )
-
-
 def _prebound_rrp_row_modes_require_rebind(
     *,
     controller: object,
@@ -5265,13 +4467,6 @@ def _prebound_rrp_row_modes_require_rebind(
         if len(state_tuple) >= len(current_modes):
             if state_tuple[: len(current_modes)] != current_modes:
                 return True
-            if _sparse_native_lifecycle_enabled() and _prebound_rrp_native_visible_source_matches_owner(
-                controller=controller,
-                state=state,
-                live_batch_size=int(live_batch_size),
-                graph_batch_size=int(graph_batch_size),
-            ):
-                return False
 
     state_distribution = state.get("row_mode_distribution")
     if not isinstance(state_distribution, dict):
@@ -5382,25 +4577,6 @@ def _prebound_rrp_graph_binding_is_current_for_step(
                     and int(private_fast_identity[6]) == int(live_batch_size)
                     and int(private_fast_identity[7]) == int(expected_batch_size)
                 ):
-                    if _sparse_native_lifecycle_enabled():
-                        if __import__("os").environ.get("VLLM_SPARSE_RRP_OWNER_MATCH_MEMO") == "1":
-                            _omm_key = _rrp_owner_match_memo_key(controller, state, private_fast_identity, int(live_batch_size), int(expected_batch_size))
-                            if _omm_key is not None and getattr(controller, "_rrp_owner_match_memo_key", None) == _omm_key:
-                                return True
-                            _omm_res = _prebound_rrp_native_visible_source_matches_owner(
-                                controller=controller,
-                                state=state,
-                                live_batch_size=int(live_batch_size),
-                                graph_batch_size=int(expected_batch_size),
-                            )
-                            setattr(controller, "_rrp_owner_match_memo_key", _omm_key if _omm_res is True else None)
-                            return _omm_res
-                        return _prebound_rrp_native_visible_source_matches_owner(
-                            controller=controller,
-                            state=state,
-                            live_batch_size=int(live_batch_size),
-                            graph_batch_size=int(expected_batch_size),
-                        )
                     return True
             except Exception:
                 return False
@@ -5424,13 +4600,6 @@ def _prebound_rrp_graph_binding_is_current_for_step(
                 )
                 if not bool(identity_matches):
                     return False
-                if _sparse_native_lifecycle_enabled():
-                    return _prebound_rrp_native_visible_source_matches_owner(
-                        controller=controller,
-                        state=state,
-                        live_batch_size=int(live_batch_size),
-                        graph_batch_size=int(expected_batch_size),
-                    )
                 return True
             except Exception:
                 return False
@@ -5504,13 +4673,6 @@ def _prebound_rrp_graph_binding_is_current_for_step(
     )
     if not bool(identity_matches):
         return False
-    if _sparse_native_lifecycle_enabled():
-        return _prebound_rrp_native_visible_source_matches_owner(
-            controller=controller,
-            state=state,
-            live_batch_size=int(live_batch_size),
-            graph_batch_size=int(expected_batch_size),
-        )
     return True
 
 
@@ -5672,65 +4834,20 @@ def _try_prepare_prebound_rrp_external_visible_minimal(
     ):
         return False
     source_kind = str(getattr(replay_arena, "_resolved_seqused_source_kind", "") or "")
-    sparse_state = None
-    if _sparse_native_lifecycle_enabled():
-        if source_kind == "sparse_dynamic_state":
-            sparse_state = getattr(controller, "_sparse_native_batch_state", None)
-            sparse_visible = (
-                sparse_state.visible_effective_k_tensor()
-                if isinstance(sparse_state, SparseDecodeBatchState)
-                else None
-            )
-            visible_is_current_source = (
-                isinstance(sparse_visible, torch.Tensor)
-                and source_kind == "sparse_dynamic_state"
-                and visible.device == sparse_visible.device
-                and int(visible.data_ptr()) == int(sparse_visible.data_ptr())
-                and int(visible.numel()) >= int(expected_batch_size)
-                and _prebound_rrp_native_visible_source_matches_owner(
-                    controller=controller,
-                    state=_resolved_row_ptr_graph_binding_state_for_replay(controller) or {},
-                    live_batch_size=int(live_batch_size),
-                    graph_batch_size=int(expected_batch_size),
-                )
-            )
-        else:
-            visible_is_current_source = False
-    else:
-        visible_is_current_source = source_kind in {
-            "arena_batch_seqused",
-            "dense_seqused",
-            "launch_effective",
-        }
+    visible_is_current_source = source_kind in {
+        "arena_batch_seqused",
+        "dense_seqused",
+        "launch_effective",
+    }
     if not visible_is_current_source:
         return False
 
-    if _sparse_native_lifecycle_enabled() and source_kind == "sparse_dynamic_state":
-        if not isinstance(sparse_state, SparseDecodeBatchState):
-            return False
-        try:
-            descriptor_snapshot = sparse_state.current_step_row_descriptors()
-        except RuntimeError:
-            return False
-        row_effective_k_by_row = manager.row_effective_from_descriptor_snapshot(
-            descriptor_snapshot
-        )
-        if row_effective_k_by_row is None:
-            return False
-        update = manager.update_from_descriptor_snapshot(
-            replay_arena,
-            descriptor_snapshot,
-            recent_first_page_by_row=tuple(delta.recent_first_page_by_row)[
-                : int(live_batch_size)
-            ],
-        )
-    else:
-        row_effective_k_by_row = delta.row_effective_k_by_row
-        update = manager.try_apply_same_page_delta(
-            replay_arena,
-            row_effective_k_by_row,
-            recent_first_page_by_row=delta.recent_first_page_by_row,
-        )
+    row_effective_k_by_row = delta.row_effective_k_by_row
+    update = manager.try_apply_same_page_delta(
+        replay_arena,
+        row_effective_k_by_row,
+        recent_first_page_by_row=delta.recent_first_page_by_row,
+    )
     if update is None or int(getattr(update, "update_kernel_count", 0)) != 0:
         return False
     _attach_resolved_row_ptr_replay_metadata_if_needed(
@@ -5813,8 +4930,8 @@ def _maybe_rebind_rrp_for_full_graph_replay(
         try:
             from patches.fa3_native.install import append_fa3_route_trace
 
-            sparse_state = getattr(controller, "_sparse_native_batch_state", None)
-            capacity_key = getattr(controller, "_sparse_native_capacity_key", None)
+            sparse_state = None
+            capacity_key = None
             delta = getattr(controller, "_decode_runtime_delta", None)
             step_authority_for_probe = getattr(controller, "step_authority", None)
 
@@ -5974,14 +5091,6 @@ def _maybe_rebind_rrp_for_full_graph_replay(
         step_authority=step_authority,
     )
     graph_binding_state = _resolved_row_ptr_graph_binding_state_for_replay(controller)
-    if _sparse_native_lifecycle_enabled() and graph_binding_state is not None:
-        source_kind = str(getattr(replay_arena, "_resolved_seqused_source_kind", "") or "")
-        if source_kind != "sparse_dynamic_state":
-            _append_rebind_probe(
-                "native_lifecycle_stale_visible_owner",
-                source_kind=source_kind,
-            )
-            return False
     binding_current_for_step = _prebound_rrp_graph_binding_is_current_for_step(
         controller=controller,
         step_authority=step_authority,
@@ -6147,10 +5256,7 @@ def _maybe_rebind_rrp_for_full_graph_replay(
             step_markers_match=step_markers_match,
             graph_capacity_or_mode_rebind=graph_capacity_or_mode_rebind,
             has_existing_binding=existing_binding is not None,
-            sparse_native_capacity_key_present=(
-                getattr(first_metadata, "_sparse_native_capacity_key", None)
-                is not None
-            ),
+            sparse_native_capacity_key_present=False,
             **_metadata_rrp_visible_source_fields(first_metadata),
             route_family_after_bind=_mixed_page_metadata_route_family(first_metadata),
         )
@@ -7549,11 +6655,6 @@ def _mark_prebound_rrp_full_cudagraph_replay(
     )
     step_id = -1 if step_id_value is None else int(step_id_value)
     carrier_publish = None
-    if owner_state_current:
-        carrier_publish = _publish_prebound_rrp_native_dirty_page_rows_for_current_step(
-            controller=controller,
-            step_id=int(step_id),
-        )
     # [RAW-FENCE 2026-07-02] Symmetric counterpart of the GRAPH-WAR fence below: the
     # WAR fence orders "descriptor republish AFTER the prior replay's reads", but
     # nothing ordered "this replay's reads AFTER the refresh-stream compact writes"
@@ -9758,7 +8859,6 @@ def _patch_cuda_graph_wrapper_for_sparse_cudagraph() -> None:
         diagnostic_enabled = bool(profile_enabled or cuda_event_path or route_trace_enabled)
         if (
             _full_cudagraph_replay_wrapper_ablate_extra_enabled(refresh_enabled)
-            or _full_cudagraph_replay_wrapper_steady_fast_path_enabled(refresh_enabled)
         ):
             _ensure_full_cudagraph_replay_wrapper_ablate_hit_log_registered(
                 refresh_enabled
@@ -10110,16 +9210,7 @@ def _patch_cuda_graph_wrapper_for_sparse_cudagraph() -> None:
                                 route_family_mismatch=route_family_mismatch,
                                 bridge_graph_policy=bridge_graph_policy,
                             )
-                        steady_fast_path_ready = (
-                            not diagnostic_enabled
-                            and _full_cudagraph_replay_wrapper_steady_fast_path_enabled(
-                                refresh_enabled
-                            )
-                            and _full_cudagraph_replay_wrapper_steady_fast_path_ready(
-                                controller=controller,
-                                state=prebound_rrp_graph_state,
-                            )
-                        )
+                        steady_fast_path_ready = False
                         ablation_fast_path_ready = (
                             not diagnostic_enabled
                             and _full_cudagraph_replay_wrapper_ablate_extra_enabled(

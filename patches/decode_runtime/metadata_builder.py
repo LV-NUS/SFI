@@ -28,6 +28,10 @@ _FA3_ROUTE_TRACE_LOG_CACHED = os.environ.get("VLLM_SPARSE_FA3_ROUTE_TRACE_LOG", 
 # live, so tests observe updated values.
 _MB_PROFILE_LOG_CACHED = os.environ.get(_MB_PROFILE_LOG_ENV, "")
 _METADATA_TIMING_LOG_CACHED = os.environ.get(_METADATA_TIMING_LOG_ENV, "")
+# [T2-FORENSIC 2026-07-10] 世代 commit 步 host 分相取证目录(默认空=零税;
+# cProfile 扭曲相位时长,取证发与判速发分离,同 flush_worker REFRESH_CPROFILE_DIR)。
+_MB_CPROFILE_DIR_ENV = "VLLM_SPARSE_MB_CPROFILE_DIR"
+_MB_CPROFILE_DIR_CACHED = os.environ.get(_MB_CPROFILE_DIR_ENV, "").strip()
 _METADATA_TIMING_FLUSH_EVERY_ENV = "VLLM_SPARSE_METADATA_TIMING_FLUSH_EVERY"
 _RRP_PREP_PROFILE_LOG_ENV = "VLLM_SPARSE_RRP_PREP_PROFILE_LOG"
 _RRP_READY_EVENT_ATTR = "mixed_page_resolver_replay_ready_event"
@@ -37,6 +41,7 @@ _RRP_READY_EVENT_STREAM_ATTR = "mixed_page_resolver_replay_ready_event_stream"
 from patches.runtime_deps import require_runtime_dep
 from patches.layer_state import _stable_slot_signature64
 from patches.refresh_runtime.post_kernel_worker import (
+    build_step_cache_invariants,
     publish_selected_scope_launch_ready_if_needed,
     refresh_selected_launch_view_for_current_step,
 )
@@ -46,10 +51,6 @@ from patches.sparse_constants import (
     _CAPTURE_IN_FLIGHT,
     _CAPTURE_KV_BUCKET_CACHED,
     _DYNAMIC_ENV,
-    _NATIVE_LIFECYCLE_CACHED,
-    _LIFECYCLE_LIVE_STEADY_CACHED,
-    _LIFECYCLE_LIVE_STEADY_ASSERT_CACHED,
-    _LIFECYCLE_ONLY_FOR_SPEC_CACHED,
     _RRP_SAME_PAGE_SKIP_REVALIDATION_CACHED,
     _CLEAN_METADATA_CACHED,
     _PAGE_ADD_INCREMENTAL_CACHED,
@@ -88,9 +89,6 @@ from patches.decode_runtime.rrp_row_table_manager import (
     RrpUpdateKind,
     RrpUpdateResult,
     should_record_rrp_ready_event,
-)
-from patches.decode_runtime.native_visible_values import (
-    sparse_native_visible_values_from_step,
 )
 from patches.decode_runtime.launch_template import (
     LaunchTemplate,
@@ -162,6 +160,44 @@ def _append_mb_profile(event: dict[str, object]) -> None:
         fh.write(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n")
 
 
+def _mb_cprofile_dir() -> str:
+    return (
+        os.environ.get(_MB_CPROFILE_DIR_ENV, "").strip()
+        if _DYNAMIC_ENV
+        else _MB_CPROFILE_DIR_CACHED
+    )
+
+
+# [T2-FORENSIC 2026-07-10] 单 profiler 跨 commit 步累积;每次窗口关闭后 dump
+# 覆盖同一文件(child 被 kill 也保留已积累样本)。目录空=永不构造。
+_MB_COMMIT_CPROFILE_STATE: dict = {}
+
+
+def _mb_commit_cprofile() -> object | None:
+    cprofile_dir = _mb_cprofile_dir()
+    if not cprofile_dir:
+        return None
+    prof = _MB_COMMIT_CPROFILE_STATE.get("prof")
+    if prof is None:
+        import cProfile
+
+        prof = cProfile.Profile()
+        _MB_COMMIT_CPROFILE_STATE["prof"] = prof
+        _MB_COMMIT_CPROFILE_STATE["path"] = os.path.join(
+            cprofile_dir,
+            f"mb_commit_{os.getpid()}_{time.time_ns()}.pstats",
+        )
+    return prof
+
+
+def _mb_commit_cprofile_dump() -> None:
+    prof = _MB_COMMIT_CPROFILE_STATE.get("prof")
+    path = _MB_COMMIT_CPROFILE_STATE.get("path")
+    if prof is None or not path:
+        return
+    prof.dump_stats(str(path))
+
+
 _metadata_timing_rows: List[dict[str, object]] = []
 _metadata_timing_atexit_registered = False
 
@@ -214,6 +250,29 @@ def _append_rrp_prep_profile(event: dict[str, object]) -> None:
         fh.write(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n")
 
 
+
+
+# [T4-STREAM-WRAPPER-MEMO 2026-07-10] torch.cuda.current_stream 每调都新构
+# Stream wrapper(re_record 相位实测 19.9µs/步);wrapper 只是 (device,
+# cuda_stream) 句柄的不可变包装,同句柄复用同对象语义等价。键=raw 句柄
+# (torch._C._cuda_getCurrentRawStream,纯 C 调用):capture/replay 切流时
+# 句柄变则自动 miss 走全构造;memo 持有 wrapper 引用,其句柄不会被 torch
+# 流池回收复用,无同址重生歧义。decode 主线程单写者,无锁。
+_CURRENT_STREAM_WRAPPER_MEMO: dict[tuple[int, int], object] = {}
+
+
+def _current_stream_cached(device: torch.device) -> object:
+    idx = device.index
+    if idx is None:
+        idx = torch.cuda.current_device()
+    idx = int(idx)
+    raw = int(torch._C._cuda_getCurrentRawStream(idx))
+    key = (idx, raw)
+    stream = _CURRENT_STREAM_WRAPPER_MEMO.get(key)
+    if stream is None:
+        stream = torch.cuda.current_stream(device)
+        _CURRENT_STREAM_WRAPPER_MEMO[key] = stream
+    return stream
 
 
 def _cuda_stream_identity(stream: object | None) -> int:
@@ -292,9 +351,21 @@ def _record_resolved_row_ptr_replay_ready_event(
     *,
     device: torch.device,
     holders: tuple[object, ...] | None = None,
+    profile_phase_us: dict[str, float] | None = None,
 ) -> bool:
     if torch.device(device).type != "cuda":
         return False
+    # [T4-FORENSIC 2026-07-10] re_record 44.6µs 内层拆分(调用方传 dict 才计时)。
+    _rec_t0 = time.perf_counter_ns() if profile_phase_us is not None else 0
+
+    def _mark_rec_phase(name: str) -> None:
+        nonlocal _rec_t0
+        if profile_phase_us is None:
+            return
+        now_ns = time.perf_counter_ns()
+        profile_phase_us[name] = float(now_ns - _rec_t0) / 1000.0
+        _rec_t0 = now_ns
+
     try:
         if holders is None:
             holders = _resolved_row_ptr_ready_event_holders(attn_metadata)
@@ -304,8 +375,11 @@ def _record_resolved_row_ptr_replay_ready_event(
         if event is None:
             event = torch.cuda.Event(blocking=False, enable_timing=False)
             setattr(attn_metadata, _RRP_READY_EVENT_ATTR, event)
-        stream = torch.cuda.current_stream(device)
+        _mark_rec_phase("rec_state_scan")
+        stream = _current_stream_cached(device)
+        _mark_rec_phase("rec_current_stream")
         event.record(stream)
+        _mark_rec_phase("rec_event_record")
         stream_identity = _cuda_stream_identity(stream)
         generation = (
             max(
@@ -327,6 +401,7 @@ def _record_resolved_row_ptr_replay_ready_event(
             setattr(holder, _RRP_READY_EVENT_ATTR, event)
             setattr(holder, _RRP_READY_EVENT_GENERATION_ATTR, generation)
             setattr(holder, _RRP_READY_EVENT_STREAM_ATTR, stream_identity)
+        _mark_rec_phase("rec_identity_publish")
         return True
     except Exception as exc:
         raise RuntimeError(
@@ -340,11 +415,26 @@ def _record_resolved_row_ptr_owner_update_ready_event(
     attn_metadata: object,
     device: torch.device,
     update_kernel_count: int,
+    profile_phase_us: dict[str, float] | None = None,
 ) -> bool:
     if int(update_kernel_count) <= 0:
         return False
     if torch.device(device).type != "cuda":
         return False
+    # [T4-FORENSIC 2026-07-10] 仿 _mark_rrp_attach_phase:调用方传 dict 才计时,
+    # 默认 None 零税。
+    _re_phase_start_ns = (
+        time.perf_counter_ns() if profile_phase_us is not None else 0
+    )
+
+    def _mark_re_phase(name: str) -> None:
+        nonlocal _re_phase_start_ns
+        if profile_phase_us is None:
+            return
+        now_ns = time.perf_counter_ns()
+        profile_phase_us[name] = float(now_ns - _re_phase_start_ns) / 1000.0
+        _re_phase_start_ns = now_ns
+
     binding = getattr(controller, "_resolved_row_ptr_replay_metadata_binding", None)
     if not isinstance(binding, ResolvedRowPtrReplayMetadataBinding):
         raise RuntimeError(
@@ -356,11 +446,14 @@ def _record_resolved_row_ptr_owner_update_ready_event(
             "resolved-row-ptr owner update requires an active arena key"
         )
     _ready_event_holders = _resolved_row_ptr_ready_event_holders(attn_metadata)
+    _mark_re_phase("re_guards")
     ready_event_recorded = _record_resolved_row_ptr_replay_ready_event(
         attn_metadata,
         device=device,
         holders=_ready_event_holders,
+        profile_phase_us=profile_phase_us,
     )
+    _mark_re_phase("re_record")
     (
         ready_event_generation,
         ready_event,
@@ -373,6 +466,7 @@ def _record_resolved_row_ptr_owner_update_ready_event(
         "_resolved_row_ptr_ready_event_recorded",
         bool(ready_event_recorded),
     )
+    _mark_re_phase("re_state")
     if _same_page_ready_event_only_publish_enabled() and (
         _update_resolved_row_ptr_graph_binding_ready_event_only(
             controller,
@@ -382,6 +476,7 @@ def _record_resolved_row_ptr_owner_update_ready_event(
             ready_event_stream=int(ready_event_stream),
         )
     ):
+        _mark_re_phase("re_publish_fast")
         return bool(ready_event_recorded)
     if not _refresh_resolved_row_ptr_graph_binding_ready_state(
         controller,
@@ -399,6 +494,7 @@ def _record_resolved_row_ptr_owner_update_ready_event(
             ready_event=ready_event,
             ready_event_stream=int(ready_event_stream),
         )
+    _mark_re_phase("re_publish_slow")
     return bool(ready_event_recorded)
 
 
@@ -754,11 +850,7 @@ def _should_bind_resolved_row_ptr_replay_metadata_for_update(
 def _should_update_launch_template_gpu_for_decode_delta(
     mode: DecodeRuntimeMode,
 ) -> bool:
-    if (
-        mode is DecodeRuntimeMode.STEADY_DELTA
-        and _sparse_native_lifecycle_enabled_for_metadata()
-    ):
-        return False
+    del mode  # [LIFECYCLE-OFF-ONLY] 原 ON 下 STEADY_DELTA 不更 GPU 的分支已删。
     return True
 
 
@@ -793,7 +885,10 @@ def _steady_fast_path_terminal_rrp_miss(
     record:
 
       * ``mode_not_steady:page_boundary_delta`` -- PAGE_BOUNDARY_DELTA
-        without the VLLM_SPARSE_CLEAN_METADATA Leg-B live writer (the gate's
+        without a live boundary writer to admit into: CLEAN_METADATA off, or
+        (lifecycle-OFF) PAGE_ADD_INCREMENTAL off. With CLEAN_METADATA on the
+        gate routes the step to the lifecycle-ON Leg-B writer or the
+        lifecycle-OFF steady-arm page-add (the gate's
         ``f"mode_not_steady:{mode.value}"`` exit).
       * ``row_table_same_page_delta_update_miss`` -- STEADY_DELTA whose
         same-page predicate provably fails with no rescue available
@@ -817,10 +912,6 @@ def _steady_fast_path_terminal_rrp_miss(
     if mode is not DecodeRuntimeMode.STEADY_DELTA:
         # Defensive admit: other modes are filtered out before the steady
         # fast path runs; let the gate own their miss reasons.
-        return None
-    if _sparse_native_lifecycle_enabled_for_metadata():
-        # Lifecycle steady path updates from descriptor snapshots / live
-        # writers, not the same-page predicate: admit.
         return None
     manager = getattr(controller, "_rrp_row_table_manager", None)
     if not isinstance(manager, RrpRowTableManager):
@@ -1037,8 +1128,6 @@ def _refresh_reuse_decode_data_eligible(controller: object) -> bool:
     # (=sink_cap+persist_cap, config constant) is invariant and all kernel compact
     # fields are re-derived from the live state_ref downstream, so reusing
     # StepDecodeData here is byte-identical. lifecycle-OFF only.
-    if _sparse_native_lifecycle_enabled_for_metadata():
-        return False
     state = getattr(controller, "_decode_runtime_state", None)
     if state is None:
         return False
@@ -1208,10 +1297,7 @@ def _seed_decode_runtime_state_after_full_recompile(
         # _collect_decode_delta_packet do not raise -> the seed LANDS -> the next step
         # reclassifies STEADY/PAGE_BOUNDARY (no empty-reason FULL_RECOMPILE cascade).
         # Inside the try: any failure falls back to the existing FAILED-seed path.
-        if (
-            os.getenv("VLLM_SPARSE_REFRESH_RESEED_TO_DELTA", "1") == "1"
-            and not _sparse_native_lifecycle_enabled_for_metadata()
-        ):
+        if os.getenv("VLLM_SPARSE_REFRESH_RESEED_TO_DELTA", "1") == "1":
             _ensure_current_recent_descriptors_for_launch_template(
                 step_bound_meta=getattr(controller, "step_bound_meta", None),
                 step_authority=step_authority,
@@ -1790,18 +1876,8 @@ def _infer_rrp_graph_batch_size(
         getattr(attn_metadata, "num_reqs", None),
         getattr(getattr(attn_metadata, "common_attn_metadata", None), "num_reqs", None),
     ]
-    if controller is not None and _sparse_native_lifecycle_enabled_for_metadata():
-        capacity_key = getattr(controller, "_sparse_native_capacity_key", None)
-        if isinstance(capacity_key, tuple) and len(capacity_key) > 1:
-            candidates.append(capacity_key[1])
-        sparse_dynamic_state = getattr(controller, "_sparse_native_batch_state", None)
-        structural_key = getattr(sparse_dynamic_state, "structural_key", None)
-        if callable(structural_key):
-            try:
-                candidates.append(getattr(structural_key(), "batch_capacity", None))
-            except RuntimeError:
-                pass
-
+    # [LIFECYCLE-OFF-ONLY 2026-07-10] 原 ON 专属 native capacity/structural
+    # 候选块已删。
     try:
         from vllm.forward_context import (  # type: ignore[import]
             get_forward_context,
@@ -1875,194 +1951,6 @@ def _project_rrp_q_layout(
     return q_lens, tuple(q_start_list)
 
 
-def _sparse_native_lifecycle_enabled_for_metadata() -> bool:
-    _native_lifecycle_on = (
-        os.environ.get("VLLM_SPARSE_NATIVE_LIFECYCLE", "0").strip() == "1"
-        if _DYNAMIC_ENV
-        else _NATIVE_LIFECYCLE_CACHED
-    )
-    if not _native_lifecycle_on:
-        return False
-    _lifecycle_only_for_spec = (
-        os.environ.get("VLLM_SPARSE_LIFECYCLE_ONLY_FOR_SPEC") == "1"
-        if _DYNAMIC_ENV
-        else _LIFECYCLE_ONLY_FOR_SPEC_CACHED
-    )
-    if _lifecycle_only_for_spec:
-        # Mirror of _sparse_native_lifecycle_enabled: disable the lifecycle
-        # metadata path for confirmed non-spec sessions (flag latched in
-        # patch_installer's prepare-inputs hook).
-        if os.environ.get("_VLLM_SPARSE_SESSION_SPEC") == "0":
-            return False
-    return True
-
-
-def _sparse_native_cpu_sequence_values(
-    value: object,
-    *,
-    batch_size: int,
-    default: object = tuple(),
-) -> tuple[object, ...] | None:
-    if value is None:
-        value = default
-    if isinstance(value, torch.Tensor):
-        return None
-    try:
-        values = tuple(value)  # type: ignore[arg-type]
-    except TypeError:
-        return None
-    if any(isinstance(item, torch.Tensor) for item in values):
-        return None
-    return values[: int(batch_size)]
-
-
-def _sparse_native_int_tuple(
-    value: object,
-    *,
-    batch_size: int,
-    default: object = tuple(),
-) -> tuple[int, ...] | None:
-    values = _sparse_native_cpu_sequence_values(
-        value,
-        batch_size=int(batch_size),
-        default=default,
-    )
-    if values is None:
-        return None
-    try:
-        return tuple(int(v) for v in values)
-    except (TypeError, ValueError):
-        return None
-
-
-def _sparse_native_str_tuple(
-    value: object,
-    *,
-    batch_size: int,
-    default: object = tuple(),
-) -> tuple[str, ...] | None:
-    values = _sparse_native_cpu_sequence_values(
-        value,
-        batch_size=int(batch_size),
-        default=default,
-    )
-    if values is None:
-        return None
-    try:
-        return tuple(str(v) for v in values)
-    except (TypeError, ValueError):
-        return None
-
-
-def _sparse_native_int_value(value: object) -> int | None:
-    if isinstance(value, torch.Tensor):
-        return None
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _sparse_native_visible_tensor(sparse_dynamic_state: object | None) -> torch.Tensor | None:
-    visible_getter = getattr(sparse_dynamic_state, "visible_effective_k_tensor", None)
-    if not callable(visible_getter):
-        return None
-    try:
-        candidate = visible_getter()
-    except RuntimeError:
-        return None
-    return candidate if isinstance(candidate, torch.Tensor) else None
-
-
-def _sparse_native_current_descriptor_snapshot(
-    controller: object,
-    *,
-    require_page_payload: bool = False,
-) -> object | None:
-    sparse_dynamic_state = getattr(controller, "_sparse_native_batch_state", None)
-    if bool(require_page_payload):
-        covers_payload = getattr(
-            sparse_dynamic_state,
-            "descriptor_payload_covers_active_rows",
-            None,
-        )
-        if not callable(covers_payload):
-            return None
-        try:
-            if not bool(covers_payload(require_pages=True)):
-                return None
-        except RuntimeError:
-            return None
-    snapshot_getter = getattr(sparse_dynamic_state, "current_step_row_descriptors", None)
-    if not callable(snapshot_getter):
-        return None
-    try:
-        snapshot = snapshot_getter()
-    except RuntimeError:
-        return None
-    if not bool(getattr(snapshot, "valid", False)):
-        return None
-    return snapshot
-
-
-def _sparse_native_update_visible_state(
-    *,
-    controller: object,
-    step_authority: object,
-    row_effective_k_by_row: object,
-    launch_effective_k_by_row: object,
-    update_source: str,
-    descriptor_payload: ResolvedRowPtrDescriptorPayload | None = None,
-) -> bool:
-    if not _sparse_native_lifecycle_enabled_for_metadata():
-        return False
-    sparse_dynamic_state = getattr(controller, "_sparse_native_batch_state", None)
-    update_visible_k = getattr(sparse_dynamic_state, "update_visible_k_from_values", None)
-    if not callable(update_visible_k):
-        return False
-    batch_size = int(getattr(step_authority, "batch_size", 0) or 0)
-    step_id = _sparse_native_int_value(getattr(step_authority, "epoch", -1))
-    row_values = _sparse_native_int_tuple(row_effective_k_by_row, batch_size=batch_size)
-    launch_values = _sparse_native_int_tuple(launch_effective_k_by_row, batch_size=batch_size)
-    if batch_size <= 0 or step_id is None or row_values is None or launch_values is None:
-        invalidator = getattr(sparse_dynamic_state, "invalidate_for_step_failure", None)
-        if callable(invalidator) and step_id is not None:
-            invalidator(step_id=step_id, reason="sparse_visible_state_update_inputs_missing")
-        return False
-    if len(row_values) != batch_size or len(launch_values) != batch_size:
-        invalidator = getattr(sparse_dynamic_state, "invalidate_for_step_failure", None)
-        if callable(invalidator):
-            invalidator(step_id=step_id, reason="sparse_visible_state_update_coverage")
-        return False
-    try:
-        update_visible_k(
-            step_id=step_id,
-            visible_k_tensor=None,
-            row_effective_k_by_row=row_values,
-            launch_effective_k_by_row=launch_values,
-            affine_descriptor_by_row=(
-                descriptor_payload.affine_descriptor_by_row
-                if descriptor_payload is not None
-                else None
-            ),
-            row_table_pages_by_row=(
-                descriptor_payload.row_table_pages_by_row
-                if descriptor_payload is not None
-                else None
-            ),
-            segment_pages_by_row=(
-                descriptor_payload.segment_pages_by_row
-                if descriptor_payload is not None
-                else None
-            ),
-            descriptor_epoch=step_id if descriptor_payload is not None else None,
-            update_source=update_source,
-        )
-    except RuntimeError:
-        return False
-    return True
-
-
 def _rrp_descriptor_payload_from_step_bound_meta(
     step_bound_meta: object | None,
     *,
@@ -2070,13 +1958,34 @@ def _rrp_descriptor_payload_from_step_bound_meta(
 ) -> ResolvedRowPtrDescriptorPayload | None:
     if step_bound_meta is None:
         return None
-    try:
-        affine_values = tuple(getattr(step_bound_meta, "affine_descriptor_by_row"))
-        row_table_values = tuple(getattr(step_bound_meta, "row_table_pages_by_row"))
-        segment_values = tuple(int(v) for v in getattr(step_bound_meta, "segment_pages_by_row"))
-    except (AttributeError, TypeError, ValueError):
+    affine_raw = getattr(step_bound_meta, "affine_descriptor_by_row", None)
+    row_table_raw = getattr(step_bound_meta, "row_table_pages_by_row", None)
+    segment_raw = getattr(step_bound_meta, "segment_pages_by_row", None)
+    if affine_raw is None or row_table_raw is None or segment_raw is None:
         return None
     batch_size_i = int(batch_size)
+    # [T4-SBM-PAYLOAD-IDCACHE 2026-07-10] 单槽身份 memo(接替 07-02 实验遗留
+    # 的 VLLM_SPARSE_CACHE_DESC_PAYLOAD 值比较旋钮:值比较逐 int 遍历与全量
+    # 构造同量级=伪省,旋钮从未启用,循无旋钮纪律删除转正)。payload 是三
+    # 源字段的纯函数;键存 payload 自身字段对象(1769 调用点会把 payload
+    # 字段原样写回 sbm,下步 getattr 即同对象,is 比较 O(1) 首个 same-page
+    # 步即命中);memo 持有引用无同址重生歧义;任何身份变化(commit 步重建
+    # 描述符)=miss 走全量重建,fail-close 不做部分复用。
+    cache = getattr(step_bound_meta, "_rrp_payload_cache", None)
+    if (
+        cache is not None
+        and cache[0] is affine_raw
+        and cache[1] is row_table_raw
+        and cache[2] is segment_raw
+        and cache[3] == batch_size_i
+    ):
+        return cache[4]
+    try:
+        affine_values = tuple(affine_raw)
+        row_table_values = tuple(row_table_raw)
+        segment_values = tuple(int(v) for v in segment_raw)
+    except (TypeError, ValueError):
+        return None
     if (
         batch_size_i <= 0
         or len(affine_values) < batch_size_i
@@ -2084,12 +1993,6 @@ def _rrp_descriptor_payload_from_step_bound_meta(
         or len(segment_values) < batch_size_i
     ):
         return None
-    _cache_payload = os.environ.get("VLLM_SPARSE_CACHE_DESC_PAYLOAD") == "1"
-    if _cache_payload:
-        _dpc_key = (affine_values, row_table_values, segment_values, batch_size_i)
-        _dpc = getattr(step_bound_meta, "_rrp_payload_cache", None)
-        if _dpc is not None and _dpc[0] == _dpc_key:
-            return _dpc[1]
     _payload = ResolvedRowPtrDescriptorPayload(
         affine_descriptor_by_row=tuple(affine_values[:batch_size_i]),
         row_table_pages_by_row=tuple(
@@ -2098,158 +2001,17 @@ def _rrp_descriptor_payload_from_step_bound_meta(
         ),
         segment_pages_by_row=tuple(int(v) for v in segment_values[:batch_size_i]),
     )
-    if _cache_payload:
-        try:
-            step_bound_meta._rrp_payload_cache = (_dpc_key, _payload)
-        except Exception:
-            pass
+    try:
+        step_bound_meta._rrp_payload_cache = (
+            _payload.affine_descriptor_by_row,
+            _payload.row_table_pages_by_row,
+            _payload.segment_pages_by_row,
+            batch_size_i,
+            _payload,
+        )
+    except Exception:
+        pass
     return _payload
-
-
-def _sparse_native_update_visible_state_from_delta(
-    *,
-    controller: object,
-    step_authority: object,
-    delta: object,
-    step_bound_meta: object | None = None,
-    page_size: int | None = None,
-    update_source: str,
-) -> bool:
-    if not isinstance(delta, DecodeDeltaPacket):
-        return False
-    if int(delta.step_id) != int(getattr(step_authority, "epoch", -1)):
-        return False
-    visible_values = sparse_native_visible_values_from_step(
-        controller=controller,
-        step_authority=step_authority,
-        step_bound_meta=(
-            step_bound_meta
-            if step_bound_meta is not None
-            else getattr(controller, "step_bound_meta", None)
-        ),
-        page_size=page_size,
-    )
-    if visible_values is None:
-        return False
-    row_values, launch_values = visible_values
-    descriptor_payload = None
-    if _decode_runtime_mode_for_controller(controller) is DecodeRuntimeMode.STEADY_DELTA:
-        descriptor_payload = _rrp_descriptor_payload_from_step_bound_meta(
-            step_bound_meta,
-            batch_size=int(delta.batch_size),
-        )
-    return _sparse_native_update_visible_state(
-        controller=controller,
-        step_authority=step_authority,
-        row_effective_k_by_row=row_values,
-        launch_effective_k_by_row=launch_values,
-        descriptor_payload=descriptor_payload,
-        update_source=update_source,
-    )
-
-
-def _sparse_native_rrp_state_covers_step(
-    *,
-    controller: object,
-    step_authority: object,
-    delta: DecodeDeltaPacket,
-    batch_size: int,
-    block_size: int,
-    num_kv_heads: int,
-    max_pages_per_row: int,
-    require_visible_lengths: bool = True,
-) -> bool:
-    sparse_dynamic_state = getattr(controller, "_sparse_native_batch_state", None)
-    covers_step = getattr(
-        sparse_dynamic_state,
-        "covers_step" if bool(require_visible_lengths) else "covers_step_identity",
-        None,
-    )
-    if not callable(covers_step):
-        return False
-    batch_size_i = int(batch_size)
-    step_id = _sparse_native_int_value(getattr(step_authority, "epoch", -1))
-    req_ids = _sparse_native_str_tuple(
-        getattr(step_authority, "req_ids", tuple()),
-        batch_size=batch_size_i,
-    )
-    active_rows = _sparse_native_int_tuple(
-        getattr(controller, "_sparse_native_active_row_indices", None),
-        batch_size=batch_size_i,
-    )
-    slot_signature = _sparse_native_int_tuple(
-        getattr(controller, "_sparse_native_slot_mapping_signature", None),
-        batch_size=batch_size_i,
-    )
-    q_lens = _sparse_native_int_tuple(
-        getattr(step_authority, "q_lens_by_row", tuple()),
-        batch_size=batch_size_i,
-    )
-    row_mode_class = _sparse_native_str_tuple(
-        getattr(step_authority, "row_mode_by_row", tuple()),
-        batch_size=batch_size_i,
-    )
-    values_to_check = [
-        step_id,
-        req_ids,
-        active_rows,
-        slot_signature,
-        q_lens,
-        row_mode_class,
-    ]
-    row_values = tuple()
-    launch_values = tuple()
-    if bool(require_visible_lengths):
-        native_values = (
-            sparse_native_visible_values_from_step(
-                controller=controller,
-                step_authority=step_authority,
-                step_bound_meta=getattr(controller, "step_bound_meta", None),
-                page_size=int(block_size),
-            )
-            if _sparse_native_lifecycle_enabled_for_metadata()
-            else None
-        )
-        if native_values is not None:
-            row_values, launch_values = native_values
-        else:
-            row_values = _sparse_native_int_tuple(
-                getattr(delta, "row_effective_k_by_row", tuple()),
-                batch_size=batch_size_i,
-            )
-            launch_values = _sparse_native_int_tuple(
-                getattr(delta, "launch_effective_k_by_row", tuple()),
-                batch_size=batch_size_i,
-            )
-        values_to_check.append(row_values)
-    if not all(
-        values is not None
-        for values in values_to_check
-    ):
-        return False
-    capacity_key = getattr(controller, "_sparse_native_capacity_key", None)
-    if capacity_key is None:
-        return False
-    kwargs = dict(
-        step_id=step_id,
-        req_ids=req_ids,
-        active_row_indices=active_rows,
-        slot_mapping_signature=slot_signature,
-        q_lens_by_row=q_lens,
-        row_mode_class=row_mode_class,
-        capacity_key=capacity_key,
-        native_gpu_lengths_authoritative=bool(
-            getattr(sparse_dynamic_state, "native_gpu_lengths_authoritative", False)
-        ),
-    )
-    if bool(require_visible_lengths):
-        kwargs.update(
-            row_effective_k_by_row=row_values,
-            launch_effective_k_by_row=(
-                launch_values if launch_values is not None else row_values
-            ),
-        )
-    return bool(covers_step(**kwargs))
 
 
 def _try_attach_same_page_resolved_row_ptr_replay_metadata(
@@ -2389,58 +2151,28 @@ def _try_attach_same_page_resolved_row_ptr_replay_metadata(
     if _mark_rrp_attach_phase is not None:
         _mark_rrp_attach_phase("rrp_attach_binding_checks")
     if mode is DecodeRuntimeMode.STEADY_DELTA:
-        if _sparse_native_lifecycle_enabled_for_metadata():
-            if not _sparse_native_rrp_state_covers_step(
-                controller=controller,
-                step_authority=step_authority,
-                delta=delta,
-                batch_size=live_batch_size_i,
-                block_size=int(block_size),
-                num_kv_heads=int(num_kv_heads),
-                max_pages_per_row=int(replay_arena.max_pages_per_row),
+        row_effective_k_by_row = tuple(
+            int(v) for v in tuple(delta.row_effective_k_by_row)[:live_batch_size_i]
+        )
+        if len(row_effective_k_by_row) != live_batch_size_i:
+            return None
+        if projected_graph_capacity:
+            previous_row_effective = getattr(manager, "_row_effective_k_by_row", None)
+            if (
+                not isinstance(previous_row_effective, tuple)
+                or len(previous_row_effective) != batch_size_i
             ):
                 return None
-            descriptor_snapshot = _sparse_native_current_descriptor_snapshot(
-                controller,
-                require_page_payload=True,
-            )
-            if descriptor_snapshot is None:
-                return None
-            row_effective_k_by_row = manager.row_effective_from_descriptor_snapshot(
-                descriptor_snapshot
-            )
-            if row_effective_k_by_row is None:
-                return None
-            update = manager.update_from_descriptor_snapshot(
-                replay_arena,
-                descriptor_snapshot,
-                recent_first_page_by_row=tuple(delta.recent_first_page_by_row)[
-                    :live_batch_size_i
-                ],
-            )
-        else:
-            row_effective_k_by_row = tuple(
-                int(v) for v in tuple(delta.row_effective_k_by_row)[:live_batch_size_i]
-            )
-            if len(row_effective_k_by_row) != live_batch_size_i:
-                return None
-            if projected_graph_capacity:
-                previous_row_effective = getattr(manager, "_row_effective_k_by_row", None)
-                if (
-                    not isinstance(previous_row_effective, tuple)
-                    or len(previous_row_effective) != batch_size_i
-                ):
-                    return None
-                row_effective_list = [
-                    int(v) for v in previous_row_effective[:batch_size_i]
-                ]
-                for live_row, arena_row in enumerate(active_arena_row_indices):
-                    row_effective_list[int(arena_row)] = int(row_effective_k_by_row[live_row])
-                row_effective_k_by_row = tuple(row_effective_list)
-            update = manager.try_apply_same_page_delta(
-                replay_arena,
-                row_effective_k_by_row,
-            )
+            row_effective_list = [
+                int(v) for v in previous_row_effective[:batch_size_i]
+            ]
+            for live_row, arena_row in enumerate(active_arena_row_indices):
+                row_effective_list[int(arena_row)] = int(row_effective_k_by_row[live_row])
+            row_effective_k_by_row = tuple(row_effective_list)
+        update = manager.try_apply_same_page_delta(
+            replay_arena,
+            row_effective_k_by_row,
+        )
         if update is None:
             return None
     else:
@@ -2535,50 +2267,26 @@ def _try_attach_same_page_resolved_row_ptr_replay_metadata(
             int(v) for v in compact_offset_projected[:batch_size_i]
         )
         descriptor_snapshot = None
-        if _sparse_native_lifecycle_enabled_for_metadata():
-            if not _sparse_native_rrp_state_covers_step(
-                controller=controller,
-                step_authority=step_authority,
-                delta=delta,
-                batch_size=live_batch_size_i,
-                block_size=int(block_size),
-                num_kv_heads=int(num_kv_heads),
-                max_pages_per_row=int(replay_arena.max_pages_per_row),
-            ):
-                return None
-            descriptor_snapshot = _sparse_native_current_descriptor_snapshot(
-                controller,
-                require_page_payload=True,
-            )
-            if descriptor_snapshot is None:
-                return None
-            row_effective_k_by_row = manager.row_effective_from_descriptor_snapshot(
-                descriptor_snapshot
-            )
-            if row_effective_k_by_row is None:
-                return None
-            recent_first_page_by_row = tuple(0 for _ in range(batch_size_i))
-        else:
-            if len(delta.row_effective_k_by_row) < live_batch_size_i or len(
-                delta.recent_first_page_by_row
-            ) < live_batch_size_i:
-                return None
-            row_effective_projected = _project_live_values(
-                delta.row_effective_k_by_row,
-                default=inactive_dummy_k,
-            )
-            recent_first_projected = _project_live_values(
-                delta.recent_first_page_by_row,
-                default=0,
-            )
-            if row_effective_projected is None or recent_first_projected is None:
-                return None
-            row_effective_k_by_row = tuple(
-                int(v) for v in row_effective_projected[:batch_size_i]
-            )
-            recent_first_page_by_row = tuple(
-                int(v) for v in recent_first_projected[:batch_size_i]
-            )
+        if len(delta.row_effective_k_by_row) < live_batch_size_i or len(
+            delta.recent_first_page_by_row
+        ) < live_batch_size_i:
+            return None
+        row_effective_projected = _project_live_values(
+            delta.row_effective_k_by_row,
+            default=inactive_dummy_k,
+        )
+        recent_first_projected = _project_live_values(
+            delta.recent_first_page_by_row,
+            default=0,
+        )
+        if row_effective_projected is None or recent_first_projected is None:
+            return None
+        row_effective_k_by_row = tuple(
+            int(v) for v in row_effective_projected[:batch_size_i]
+        )
+        recent_first_page_by_row = tuple(
+            int(v) for v in recent_first_projected[:batch_size_i]
+        )
         lease = _compact_page_lease_from_controller(controller)
         (
             reserved_manager_block_ids,
@@ -2772,242 +2480,6 @@ def _try_attach_same_page_resolved_row_ptr_replay_metadata(
     return update
 
 
-def _sparse_native_lifecycle_live_steady_enabled() -> bool:
-    # [sync_lifecycle_live_steady_20260605]
-    return (
-        os.environ.get("VLLM_SPARSE_LIFECYCLE_LIVE_STEADY", "0").strip() == "1"
-        if _DYNAMIC_ENV
-        else _LIFECYCLE_LIVE_STEADY_CACHED
-    )
-
-
-def _sparse_native_lifecycle_live_steady_assert_enabled() -> bool:
-    # [sync_lifecycle_live_steady_20260605]
-    return (
-        os.environ.get("VLLM_SPARSE_LIFECYCLE_LIVE_STEADY_ASSERT", "0").strip()
-        == "1"
-        if _DYNAMIC_ENV
-        else _LIFECYCLE_LIVE_STEADY_ASSERT_CACHED
-    )
-
-
-def _try_live_steady_lifecycle_update(
-    # [sync_lifecycle_live_steady_20260605]
-    controller: object,
-    *,
-    step_authority: object,
-    delta: object,
-    replay_arena: object,
-    manager: object,
-    batch_size: int,
-    block_size: int,
-) -> object | None:
-    """Cheap Leg-B in-place writer for the NATIVE-LIFECYCLE steady branch.
-
-    Mirrors the VLLM_SPARSE_CLEAN_METADATA PAGE_BOUNDARY template (the existing
-    caller @ ~2740-2852): derive the live page rows (stable compact prefix from
-    the manager baseline + freshly-sliced recent pages from the live block
-    table), route them through manager.try_apply_live_page_boundary (recent-
-    first-aware page-tuple diff, dirty-row-only in-place publish), and publish
-    the per-row PAGE descriptor from the SAME pages so the binding-currency
-    descriptor_payload_covers_active_rows(require_pages=True) gate passes
-    legitimately. Returns the RrpUpdateResult on a hit, or None so the caller
-    FALLS BACK to the verbatim heavy snapshot path (true layout change / no
-    baseline). NEVER raises into the hot path.
-    """
-    from patches.fa_sparse_runtime.live_page_table import derive_live_page_rows
-    from patches.decode_runtime.native_batch_state import ROW_TABLE_FALLBACK
-    from patches.decode_runtime.native_visible_values import (
-        sparse_native_visible_values_from_step,
-    )
-
-    block_table_cpu = getattr(controller, "_worker_block_table_cpu", None)
-    if block_table_cpu is None:
-        return None
-    batch_size_i = int(batch_size)
-    active = list(range(batch_size_i))
-    # Compact pages are STABLE across a recent slide (compact is copy-out). Read
-    # them from the manager's published baseline (5-tuple layout, pages @ idx 2)
-    # sliced to the compact prefix length ceil(compact_valid_tokens/page_size).
-    published = getattr(manager, "_published_descriptor_layout_by_row", None)
-    compact_valid_tokens = getattr(manager, "_compact_valid_tokens_by_row", None)
-    page_size_m = getattr(manager, "_page_size", None)
-    if (
-        not isinstance(published, tuple)
-        or compact_valid_tokens is None
-        or page_size_m is None
-        or len(published) < batch_size_i
-        or len(compact_valid_tokens) < batch_size_i
-    ):
-        return None
-    page_size_m = max(1, int(page_size_m))
-    compact_pages_by_row: dict[int, tuple[int, ...]] = {}
-    for r in active:
-        row_layout = published[r]
-        if not (isinstance(row_layout, tuple) and len(row_layout) == 5):
-            return None
-        base_pages = row_layout[2]
-        compact_tokens = max(0, int(compact_valid_tokens[r]))
-        compact_count = (compact_tokens + page_size_m - 1) // page_size_m
-        compact_count = min(compact_count, len(base_pages))
-        compact_pages_by_row[r] = tuple(int(p) for p in base_pages[:compact_count])
-    try:
-        pages = derive_live_page_rows(
-            active_rows=active,
-            block_table_cpu=block_table_cpu,
-            compact_pages_by_row=compact_pages_by_row,
-            recent_first_page_by_row={
-                r: int(delta.recent_first_page_by_row[r]) for r in active
-            },
-            recent_page_count_by_row={
-                r: int(delta.recent_page_count_by_row[r]) for r in active
-            },
-        )
-    except (ValueError, IndexError, TypeError, KeyError):
-        return None
-
-    # SHADOW ASSERT pre-image: capture arena descriptor tensors BEFORE the cheap
-    # writer so we can prove the heavy snapshot path would write nothing extra.
-    _assert_on = _sparse_native_lifecycle_live_steady_assert_enabled()
-    _pre_row_table = None
-    _pre_affine = None
-    if _assert_on:
-        _pre_row_table = _live_steady_clone_tensor(
-            getattr(replay_arena, "row_table_i32", None)
-        )
-        _pre_affine = _live_steady_clone_tensor(
-            getattr(replay_arena, "affine_i32", None)
-        )
-
-    rrp_update = manager.try_apply_live_page_boundary(
-        replay_arena,
-        pages_by_row=pages,
-        recent_first_page_by_row=tuple(
-            int(delta.recent_first_page_by_row[r]) for r in active
-        ),
-    )
-    if rrp_update is None:
-        return None
-
-    # Leg-B surface-3 descriptor publish: publish the per-row PAGE descriptor for
-    # this step FROM THE SAME pages just written into row_table_i32 (single source
-    # of truth) so the binding-currency gate descriptor_payload_covers_active_rows
-    # (require_pages=True) passes legitimately. Lengths come from the SAME source
-    # the earlier visible-state update used -> length-idempotent, descriptors-only.
-    _legb_visible = sparse_native_visible_values_from_step(
-        controller=controller,
-        step_authority=step_authority,
-        step_bound_meta=getattr(controller, "step_bound_meta", None),
-        page_size=int(block_size),
-    )
-    if _legb_visible is None:
-        return None
-    _legb_row_values, _legb_launch_values = _legb_visible
-    _legb_descriptor_payload = ResolvedRowPtrDescriptorPayload(
-        affine_descriptor_by_row=tuple(ROW_TABLE_FALLBACK for _ in active),
-        row_table_pages_by_row=tuple(
-            tuple(int(p) for p in pages[r]) for r in active
-        ),
-        segment_pages_by_row=tuple(-1 for _ in active),
-    )
-    if not _sparse_native_update_visible_state(
-        controller=controller,
-        step_authority=step_authority,
-        row_effective_k_by_row=_legb_row_values,
-        launch_effective_k_by_row=_legb_launch_values,
-        descriptor_payload=_legb_descriptor_payload,
-        update_source="lifecycle_live_steady_page_writer",
-    ):
-        return None
-
-    setattr(
-        controller,
-        "_live_steady_hits",
-        int(getattr(controller, "_live_steady_hits", 0)) + 1,
-    )
-    if _assert_on:
-        _live_steady_shadow_assert(
-            controller=controller,
-            manager=manager,
-            replay_arena=replay_arena,
-            delta=delta,
-            batch_size=batch_size_i,
-            cheap_update=rrp_update,
-            cheap_pages=pages,
-            pre_row_table=_pre_row_table,
-            pre_affine=_pre_affine,
-        )
-    return rrp_update
-
-
-def _live_steady_clone_tensor(tensor: object) -> object | None:
-    # [sync_lifecycle_live_steady_20260605]
-    if isinstance(tensor, torch.Tensor):
-        return tensor.detach().clone()
-    return None
-
-
-def _live_steady_shadow_assert(
-    # [sync_lifecycle_live_steady_20260605]
-    *,
-    controller: object,
-    manager: object,
-    replay_arena: object,
-    delta: object,
-    batch_size: int,
-    cheap_update: object,
-    cheap_pages: dict,
-    pre_row_table: object,
-    pre_affine: object,
-) -> None:
-    """Prove the cheap Leg-B writer's arena writes equal what the heavy snapshot
-    path would write. Randomness-immune: validates ARENA TENSORS, not G6 tokens.
-
-    - STEADY (no slide -> zero dirty rows): the heavy snapshot path's
-      update_from_descriptor_snapshot is length-only; row_table_i32 / affine_i32
-      must be element-equal to the captured pre-image (cheap writer touched no
-      pages either).
-    - SLIDE (dirty rows): the heavy update_from_descriptor_snapshot MISSES (its
-      same-page predicate returns None), so it cannot produce a one-call ground
-      truth; instead assert the cheap writer's self-consistency: the live
-      row_table_i32 dirty rows reflect exactly derive_live_page_rows(cheap_pages).
-    """
-    dirty = tuple(int(r) for r in getattr(cheap_update, "delta_rows", ()) or ())
-    row_table = getattr(replay_arena, "row_table_i32", None)
-    affine = getattr(replay_arena, "affine_i32", None)
-    if not dirty:
-        # Steady: nothing should have moved in the page/affine tensors.
-        if isinstance(row_table, torch.Tensor) and isinstance(
-            pre_row_table, torch.Tensor
-        ):
-            assert torch.equal(row_table, pre_row_table), (
-                "live_steady shadow: steady step mutated row_table_i32"
-            )
-        if isinstance(affine, torch.Tensor) and isinstance(
-            pre_affine, torch.Tensor
-        ):
-            assert torch.equal(affine, pre_affine), (
-                "live_steady shadow: steady step mutated affine_i32"
-            )
-        return
-    # Slide: each dirty batch row's row_table_i32 prefix must equal cheap_pages.
-    if not isinstance(row_table, torch.Tensor):
-        return
-    num_kv_heads = int(getattr(replay_arena, "num_kv_heads", 1) or 1)
-    for batch_row in dirty:
-        expected = tuple(int(p) for p in cheap_pages.get(batch_row, ()))
-        flat_row = batch_row * num_kv_heads
-        written = row_table[flat_row, : len(expected)].tolist()
-        assert tuple(int(p) for p in written) == expected, (
-            "live_steady shadow: slide row "
-            + str(batch_row)
-            + " row_table_i32 prefix "
-            + str(written)
-            + " != derived pages "
-            + str(expected)
-        )
-
-
 def _try_page_add_incremental(
     controller,
     *,
@@ -3054,24 +2526,52 @@ def _try_page_add_incremental(
             device=device,
         )[0]
         from patches.fa_sparse_runtime.live_page_table import derive_live_page_rows
-        compact_pages_by_row = {}
+        # [T5-PAGE-ADD-COMPACT-MEMO 2026-07-10] compact 段输入(valid/offset)
+        # 在 STEADY 模式内恒定(变则重分类,到不了本臂;见下 DIRTY-ONLY 注),
+        # 而 compact_pages_by_row 曾每页界步全量重物化 8×~百元素 tuple(int)。
+        # memo 键=旧档 §10.23 设计:(reserved 元组身份+长度, valid, offset,
+        # page_size, bs)——reserved 经 lease snapshot memo 命中时跨步同对象,
+        # id 锚成立;任一键分量变(含 lease 重建)整表重建,越界防卫随建随验,
+        # miss=全量重建非跳过。消费方(derive 只读 .get/publish del 形参)均只读。
+        _cpm_valid_t = tuple(int(compact_valid_cpu[r]) for r in range(bs))
+        _cpm_off_t = tuple(int(compact_offset_cpu[r]) for r in range(bs))
+        _cpm_key = (id(reserved), len(reserved), _cpm_valid_t, _cpm_off_t, ps, bs)
+        _cpm_cached = getattr(controller, "_page_add_compact_pages_memo", None)
+        if (
+            isinstance(_cpm_cached, tuple)
+            and len(_cpm_cached) == 3
+            and _cpm_cached[0] == _cpm_key
+        ):
+            compact_pages_by_row = _cpm_cached[1]
+            compact_pages_count_by_row = _cpm_cached[2]
+        else:
+            compact_pages_by_row = {}
+            compact_pages_count_by_row = {}
+            for r in range(bs):
+                compact_tokens = max(0, _cpm_valid_t[r])
+                compact_pages = compact_tokens // ps
+                compact_off_pages = _cpm_off_t[r] // ps
+                if compact_off_pages < 0 or compact_off_pages + compact_pages > len(reserved):
+                    return None
+                compact_pages_by_row[r] = tuple(
+                    int(v) for v in reserved[compact_off_pages:compact_off_pages + compact_pages]
+                )
+                compact_pages_count_by_row[r] = compact_pages
+            controller._page_add_compact_pages_memo = (
+                _cpm_key,
+                compact_pages_by_row,
+                compact_pages_count_by_row,
+            )
         recent_first_by_row = {}
         recent_count_by_row = {}
         vpc = []
         for r in range(bs):
-            compact_tokens = max(0, int(compact_valid_cpu[r]))
-            compact_pages = compact_tokens // ps
-            compact_off_pages = int(compact_offset_cpu[r]) // ps
-            if compact_off_pages < 0 or compact_off_pages + compact_pages > len(reserved):
-                return None
-            compact_pages_by_row[r] = tuple(
-                int(v) for v in reserved[compact_off_pages:compact_off_pages + compact_pages]
-            )
+            compact_tokens = max(0, _cpm_valid_t[r])
             row_effk = max(0, int(delta.row_effective_k_by_row[r]))
             rc = (max(0, row_effk - compact_tokens) + ps - 1) // ps
             recent_count_by_row[r] = rc
             recent_first_by_row[r] = int(delta.recent_first_page_by_row[r])
-            vpc.append(compact_pages + rc)
+            vpc.append(compact_pages_count_by_row[r] + rc)
         # [PAGE-ADD-DIRTY-ONLY 2026-07-08] re-lay ONLY the rows whose page set
         # actually changed instead of the whole batch every step. A row is
         # dirty when its token-ceil page count moved vs the write-epoch shadow
@@ -3164,133 +2664,29 @@ def _try_update_same_page_resolved_row_ptr_step_state(
 
     mode = _decode_runtime_mode_for_controller(controller)
     if mode is not DecodeRuntimeMode.STEADY_DELTA:
-        if (
-            (
-                os.environ.get("VLLM_SPARSE_CLEAN_METADATA", "1") == "1"
+        _page_boundary_live_route = (
+            os.environ.get("VLLM_SPARSE_CLEAN_METADATA", "1") == "1"
+            if _DYNAMIC_ENV
+            else _CLEAN_METADATA_CACHED
+        ) and mode is DecodeRuntimeMode.PAGE_BOUNDARY_DELTA
+        if not (
+            _page_boundary_live_route
+            and (
+                os.environ.get("VLLM_SPARSE_PAGE_ADD_INCREMENTAL", "1") == "1"
                 if _DYNAMIC_ENV
-                else _CLEAN_METADATA_CACHED
+                else _PAGE_ADD_INCREMENTAL_CACHED
             )
-            and mode is DecodeRuntimeMode.PAGE_BOUNDARY_DELTA
         ):
-            # Leg-B: a normal recent-window slide is the live writer's JOB, not an
-            # escape to the heavy bind. Derive the live page rows (stable compact
-            # prefix + freshly-sliced recent pages) and route to the in-place
-            # boundary writer. Any non-apply records the manager's specific
-            # last_failure_reason so Phase-4 can root-cause the distribution.
-            from patches.fa_sparse_runtime.live_page_table import derive_live_page_rows
-
-            delta = getattr(controller, "_decode_runtime_delta", None)
-            manager = getattr(controller, "_rrp_row_table_manager", None)
-            replay_arena = getattr(controller, "_resolved_row_ptr_replay_arena", None)
-            if delta is None or manager is None or replay_arena is None:
-                return _miss("live_page_boundary:inputs_missing")
-            block_table_cpu = getattr(controller, "_worker_block_table_cpu", None)
-            if block_table_cpu is None:
-                return _miss("live_page_boundary:no_block_table")
-            batch_size_i = int(batch_size)
-            active = list(range(batch_size_i))
-            # Compact pages are STABLE across a recent slide (compact is copy-out).
-            # Read them from the manager's published baseline: the row's full page
-            # tuple (5-tuple layout, pages at index 2) sliced to its compact prefix
-            # length = ceil(compact_valid_tokens / page_size).
-            published = getattr(manager, "_published_descriptor_layout_by_row", None)
-            compact_valid_tokens = getattr(
-                manager, "_compact_valid_tokens_by_row", None
-            )
-            page_size_m = getattr(manager, "_page_size", None)
-            if (
-                not isinstance(published, tuple)
-                or compact_valid_tokens is None
-                or page_size_m is None
-                or len(published) < batch_size_i
-                or len(compact_valid_tokens) < batch_size_i
-            ):
-                return _miss("live_page_boundary:compact_baseline_missing")
-            page_size_m = max(1, int(page_size_m))
-            compact_pages_by_row: dict[int, tuple[int, ...]] = {}
-            for r in active:
-                row_layout = published[r]
-                if not (isinstance(row_layout, tuple) and len(row_layout) == 5):
-                    return _miss("live_page_boundary:compact_baseline_row")
-                base_pages = row_layout[2]
-                compact_tokens = max(0, int(compact_valid_tokens[r]))
-                compact_count = (compact_tokens + page_size_m - 1) // page_size_m
-                compact_count = min(compact_count, len(base_pages))
-                compact_pages_by_row[r] = tuple(
-                    int(p) for p in base_pages[:compact_count]
-                )
-            try:
-                pages = derive_live_page_rows(
-                    active_rows=active,
-                    block_table_cpu=block_table_cpu,
-                    compact_pages_by_row=compact_pages_by_row,
-                    recent_first_page_by_row={
-                        r: int(delta.recent_first_page_by_row[r]) for r in active
-                    },
-                    recent_page_count_by_row={
-                        r: int(delta.recent_page_count_by_row[r]) for r in active
-                    },
-                )
-            except (ValueError, IndexError, TypeError) as exc:
-                return _miss(f"live_page_boundary:derive_live_rows:{type(exc).__name__}")
-            rrp_update = manager.try_apply_live_page_boundary(
-                replay_arena,
-                pages_by_row=pages,
-                recent_first_page_by_row=tuple(
-                    int(delta.recent_first_page_by_row[r]) for r in active
-                ),
-            )
-            if rrp_update is None:
-                return _miss(
-                    f"live_page_boundary:{getattr(manager, 'last_failure_reason', 'unknown')}"
-                )
-            # leg-b surface 3 descriptor publish: publish the per-row PAGE descriptor
-            # for this step FROM THE SAME pages just written into row_table_i32 (single
-            # source of truth), so binding-currency gate descriptor_payload_covers_
-            # active_rows(require_pages=True) passes legitimately (NOT a stamp). Lengths
-            # come from the SAME source the earlier _sparse_native_update_visible_state_
-            # from_delta call used -> this second update is length-idempotent and only
-            # adds the descriptors. Fallback rows -> ROW_TABLE_FALLBACK / segment -1.
-            from patches.decode_runtime.native_batch_state import ROW_TABLE_FALLBACK
-            from patches.decode_runtime.native_visible_values import (
-                sparse_native_visible_values_from_step,
-            )
-
-            _legb_visible = sparse_native_visible_values_from_step(
-                controller=controller,
-                step_authority=step_authority,
-                step_bound_meta=getattr(controller, "step_bound_meta", None),
-                page_size=int(block_size),
-            )
-            if _legb_visible is None:
-                return _miss("live_page_boundary:visible_values_unavailable")
-            _legb_row_values, _legb_launch_values = _legb_visible
-            _legb_descriptor_payload = ResolvedRowPtrDescriptorPayload(
-                affine_descriptor_by_row=tuple(ROW_TABLE_FALLBACK for _ in active),
-                row_table_pages_by_row=tuple(
-                    tuple(int(p) for p in pages[r]) for r in active
-                ),
-                segment_pages_by_row=tuple(-1 for _ in active),
-            )
-            if not _sparse_native_update_visible_state(
-                controller=controller,
-                step_authority=step_authority,
-                row_effective_k_by_row=_legb_row_values,
-                launch_effective_k_by_row=_legb_launch_values,
-                descriptor_payload=_legb_descriptor_payload,
-                update_source="leg_b_page_boundary_live_writer",
-            ):
-                return _miss("live_page_boundary:visible_descriptor_publish_miss")
-            # leg-b stamp for replay
-            _stamp_resolved_row_ptr_step_state(
-                controller=controller,
-                step_authority=step_authority,
-                live_batch_size=batch_size_i,
-                effective_batch_size=batch_size_i,
-            )
-            setattr(controller, "_decode_runtime_rrp_step_state_miss_reason", "hit")
-            return rrp_update
-        return _miss(f"mode_not_steady:{mode.value}")
+            return _miss(f"mode_not_steady:{mode.value}")
+        # [PAGE-BOUNDARY-FIRST-PASS 2026-07-09] lifecycle-OFF production route:
+        # fall through into the steady verification arm below. A boundary step
+        # runs the SAME sequence the slow path's rescue ran on its second
+        # attempt (full replay-safety preconditions -> try_apply_same_page_delta
+        # says None on a true boundary -> _try_page_add_incremental lays the
+        # slid/grown rows from the lease + launch_plan, byte-identical to the
+        # heavy bind) — so the FIRST attempt now succeeds where it previously
+        # burned ~400us on the dead Leg-B arm and forced a full second
+        # metadata pass (592/1068 steps double-ran per 12k run).
     if not _decode_runtime_classification_is_current(controller, step_authority):
         return _miss("classification_not_current")
     if not bool(getattr(controller, "_resolved_row_ptr_metadata_ready", False)):
@@ -3306,7 +2702,6 @@ def _try_update_same_page_resolved_row_ptr_step_state(
             if _DYNAMIC_ENV
             else _RRP_SAME_PAGE_SKIP_REVALIDATION_CACHED
         )
-        and not _sparse_native_lifecycle_enabled_for_metadata()
     ):
         # Cut #3 structured gated skip: the minimal super-fast-path already proved
         # THIS step is a pure same-page STEADY_DELTA step (recent_first/recent_count/
@@ -3350,7 +2745,6 @@ def _try_update_same_page_resolved_row_ptr_step_state(
                 if _DYNAMIC_ENV
                 else _PAGE_ADD_INCREMENTAL_CACHED
             )
-            and not _sparse_native_lifecycle_enabled_for_metadata()
         ):
             update = _try_page_add_incremental(
                 controller,
@@ -3429,40 +2823,7 @@ def _try_update_same_page_resolved_row_ptr_step_state(
     visible = replay_arena.carriers.resolver_visible_seqused_k_by_head_i32
     if not isinstance(visible, torch.Tensor):
         return _miss("visible_tensor_missing")
-    native_lifecycle_enabled = _sparse_native_lifecycle_enabled_for_metadata()
-    source_kind = str(getattr(replay_arena, "_resolved_seqused_source_kind", "") or "")
-    if native_lifecycle_enabled:
-        if source_kind != "sparse_dynamic_state":
-            return _miss("native_visible_source_kind_unsupported")
-        if not _resolved_row_ptr_current_visible_source_matches_binding(
-            controller=controller,
-            attn_metadata=attn_metadata,
-            replay_arena=replay_arena,
-            batch_size=batch_size_i,
-            launch_plan=launch_plan,
-        ):
-            return _miss("native_visible_source_mismatch")
-        if not _sparse_native_rrp_state_covers_step(
-            controller=controller,
-            step_authority=step_authority,
-            delta=delta,
-            batch_size=batch_size_i,
-            block_size=int(block_size),
-            num_kv_heads=int(num_kv_heads),
-            max_pages_per_row=int(replay_arena.max_pages_per_row),
-            require_visible_lengths=True,
-        ):
-            sparse_dynamic_state = getattr(controller, "_sparse_native_batch_state", None)
-            state_reason = str(
-                getattr(sparse_dynamic_state, "last_failure_reason", "") or ""
-            )
-            return _miss(
-                "native_state_not_covering_step"
-                + (f":{state_reason}" if state_reason else "")
-            )
-        if int(visible.numel()) < batch_size_i:
-            return _miss("native_visible_source_coverage")
-    elif not _resolved_row_ptr_current_visible_source_matches_binding(
+    if not _resolved_row_ptr_current_visible_source_matches_binding(
         controller=controller,
         attn_metadata=attn_metadata,
         replay_arena=replay_arena,
@@ -3471,65 +2832,23 @@ def _try_update_same_page_resolved_row_ptr_step_state(
     ):
         return _miss("visible_source_mismatch")
 
-    if native_lifecycle_enabled and source_kind == "sparse_dynamic_state":
-        # [sync_lifecycle_live_steady_20260605]
-        # Cheap-path-first: under VLLM_SPARSE_LIFECYCLE_LIVE_STEADY and NOT
-        # spec-decode (native_gpu_lengths_authoritative False), route the steady
-        # branch through the EXISTING recent-first-aware in-place Leg-B writer
-        # instead of building the full per-row descriptor snapshot every step.
-        # try_apply_live_page_boundary diffs the LIVE PAGE TUPLES, so a same-count
-        # recent slide (the token-16 break of the count-only cut) is detected and
-        # the moved page IS written into row_table_i32. None -> verbatim heavy
-        # fallback (true layout change / no baseline).
-        update = None
-        if _sparse_native_lifecycle_live_steady_enabled():
-            _live_state = getattr(controller, "_sparse_native_batch_state", None)
-            _spec_authoritative = bool(
-                getattr(_live_state, "native_gpu_lengths_authoritative", False)
-            )
-            if not _spec_authoritative:
-                update = _try_live_steady_lifecycle_update(
-                    controller,
-                    step_authority=step_authority,
-                    delta=delta,
-                    replay_arena=replay_arena,
-                    manager=manager,
-                    batch_size=batch_size_i,
-                    block_size=int(block_size),
-                )
-        if update is None:
-            descriptor_snapshot = _sparse_native_current_descriptor_snapshot(
-                controller,
-                require_page_payload=True,
-            )
-            if descriptor_snapshot is None:
-                _g2_inner = str(getattr(getattr(controller, "_sparse_native_batch_state", None), "last_failure_reason", "") or "")
-                return _miss("native_descriptor_snapshot_missing:" + _g2_inner)
-            update = manager.update_from_descriptor_snapshot(
-                replay_arena,
-                descriptor_snapshot,
-                recent_first_page_by_row=tuple(delta.recent_first_page_by_row)[
-                    :batch_size_i
-                ],
-            )
-    else:
-        if _z_probe:
-            _z_t0 = time.perf_counter_ns()
-        row_effective_k_by_row = tuple(
-            int(v) for v in tuple(delta.row_effective_k_by_row)[:batch_size_i]
-        )
-        if len(row_effective_k_by_row) != batch_size_i:
-            return _miss("row_effective_len_mismatch")
-        update = manager.try_apply_same_page_delta(
-            replay_arena,
-            row_effective_k_by_row,
-            recent_first_page_by_row=tuple(
-                int(v) for v in tuple(delta.recent_first_page_by_row)[:batch_size_i]
-            ),
-        )
-        if _z_probe:
-            _z_t1 = time.perf_counter_ns()
-            _z_hit_before_page_add = update is not None
+    if _z_probe:
+        _z_t0 = time.perf_counter_ns()
+    row_effective_k_by_row = tuple(
+        int(v) for v in tuple(delta.row_effective_k_by_row)[:batch_size_i]
+    )
+    if len(row_effective_k_by_row) != batch_size_i:
+        return _miss("row_effective_len_mismatch")
+    update = manager.try_apply_same_page_delta(
+        replay_arena,
+        row_effective_k_by_row,
+        recent_first_page_by_row=tuple(
+            int(v) for v in tuple(delta.recent_first_page_by_row)[:batch_size_i]
+        ),
+    )
+    if _z_probe:
+        _z_t1 = time.perf_counter_ns()
+        _z_hit_before_page_add = update is not None
     if (
         update is None
         and (
@@ -3537,7 +2856,6 @@ def _try_update_same_page_resolved_row_ptr_step_state(
             if _DYNAMIC_ENV
             else _PAGE_ADD_INCREMENTAL_CACHED
         )
-        and not _sparse_native_lifecycle_enabled_for_metadata()
     ):
         update = _try_page_add_incremental(
             controller,
@@ -3865,31 +3183,6 @@ def _resolved_row_ptr_dense_seqused_k_source(
     return visible
 
 
-def _resolved_row_ptr_sparse_dynamic_visible_owner_matches_state(
-    *,
-    controller: object,
-    replay_arena: ResolvedRowPtrArena,
-    batch_size: int,
-) -> bool:
-    visible = replay_arena.carriers.resolver_visible_seqused_k_by_head_i32
-    if not isinstance(visible, torch.Tensor):
-        return False
-    if (
-        str(getattr(replay_arena, "_resolved_seqused_source_kind", "") or "")
-        != "sparse_dynamic_state"
-    ):
-        return False
-    sparse_dynamic = _sparse_native_visible_tensor(
-        getattr(controller, "_sparse_native_batch_state", None)
-    )
-    return bool(
-        isinstance(sparse_dynamic, torch.Tensor)
-        and sparse_dynamic.device == visible.device
-        and int(visible.data_ptr()) == int(sparse_dynamic.data_ptr())
-        and int(visible.numel()) >= int(batch_size)
-    )
-
-
 def _resolved_row_ptr_current_visible_source_matches_binding(
     *,
     controller: object,
@@ -3901,13 +3194,6 @@ def _resolved_row_ptr_current_visible_source_matches_binding(
     visible = replay_arena.carriers.resolver_visible_seqused_k_by_head_i32
     if not isinstance(visible, torch.Tensor):
         return False
-    if _sparse_native_lifecycle_enabled_for_metadata():
-        del attn_metadata, launch_plan
-        return _resolved_row_ptr_sparse_dynamic_visible_owner_matches_state(
-            controller=controller,
-            replay_arena=replay_arena,
-            batch_size=max(int(batch_size), int(replay_arena.batch_size)),
-        )
     if int(visible.data_ptr()) == int(replay_arena.seqused_k_i32.data_ptr()):
         return True
     arena_batch = getattr(replay_arena, "batch_seqused_k_i32", None)
@@ -4115,7 +3401,6 @@ def _bind_resolved_row_ptr_visible_seqused_source(
     slot_mapping_signature: tuple[int, ...] | None = None,
 ) -> bool:
     batch_size_i = int(batch_size)
-    native_lifecycle_enabled = _sparse_native_lifecycle_enabled_for_metadata()
 
     def _bind_arena_batch_source() -> bool:
         replay_batch = getattr(replay_arena, "batch_seqused_k_i32", None)
@@ -4142,150 +3427,6 @@ def _bind_resolved_row_ptr_visible_seqused_source(
             source_kind="arena_batch_seqused",
         )
         return True
-
-    def _bind_sparse_dynamic_source() -> bool:
-        dynamic_visible = _sparse_native_visible_tensor(sparse_dynamic_state)
-        if not (
-            isinstance(dynamic_visible, torch.Tensor)
-            and _resolved_row_ptr_visible_source_covers_arena(
-                dynamic_visible,
-                replay_arena,
-            )
-            and _resolved_row_ptr_visible_source_covers_arena(
-                dynamic_visible,
-                source_arena,
-            )
-        ):
-            return False
-        replay_arena.bind_resolved_seqused_source(
-            dynamic_visible,
-            source_kind="sparse_dynamic_state",
-        )
-        source_arena.bind_resolved_seqused_source(
-            dynamic_visible,
-            source_kind="sparse_dynamic_state",
-        )
-        return True
-
-    if native_lifecycle_enabled and sparse_dynamic_state is None:
-        del launch_plan, step_meta, device
-        return False
-
-    if (
-        native_lifecycle_enabled
-        and os.environ.get("VLLM_SPARSE_FORCE_ARENA_BATCH_VISIBLE", "0") == "1"
-    ):
-        del launch_plan, step_meta, device
-        return bool(_bind_arena_batch_source())
-
-    if sparse_dynamic_state is not None and step_authority is not None:
-        covers_step = getattr(sparse_dynamic_state, "covers_step", None)
-        if callable(covers_step):
-            def _note_sparse_dynamic_failure(reason: str) -> None:
-                if native_lifecycle_enabled and hasattr(
-                    sparse_dynamic_state, "last_failure_reason"
-                ):
-                    try:
-                        current = getattr(
-                            sparse_dynamic_state, "last_failure_reason", None
-                        )
-                        if not current:
-                            setattr(
-                                sparse_dynamic_state, "last_failure_reason", reason
-                            )
-                    except Exception:
-                        pass
-
-            req_ids = _sparse_native_str_tuple(
-                getattr(step_authority, "req_ids", tuple()),
-                batch_size=batch_size_i,
-            )
-            active_row_source = (
-                active_row_indices
-                if active_row_indices is not None
-                else None
-                if native_lifecycle_enabled
-                else getattr(
-                    step_authority,
-                    "active_row_indices",
-                    tuple(range(batch_size_i)),
-                )
-            )
-            active_rows = _sparse_native_int_tuple(
-                active_row_source,
-                batch_size=batch_size_i,
-            )
-            slot_signature_source = (
-                slot_mapping_signature
-                if slot_mapping_signature is not None
-                else None
-                if native_lifecycle_enabled
-                else getattr(step_authority, "slot_by_row", tuple(range(batch_size_i)))
-            )
-            slot_signature = _sparse_native_int_tuple(
-                slot_signature_source,
-                batch_size=batch_size_i,
-            )
-            q_lens = _sparse_native_int_tuple(
-                getattr(step_authority, "q_lens_by_row", tuple()),
-                batch_size=batch_size_i,
-            )
-            row_mode_class = _sparse_native_str_tuple(
-                getattr(step_authority, "row_mode_by_row", tuple()),
-                batch_size=batch_size_i,
-            )
-            row_values = _sparse_native_int_tuple(
-                row_effective_k_by_row,
-                batch_size=batch_size_i,
-            )
-            launch_values = _sparse_native_int_tuple(
-                launch_effective_k_by_row,
-                batch_size=batch_size_i,
-            )
-            step_id = _sparse_native_int_value(getattr(step_authority, "epoch", -1))
-            candidate_inputs = (
-                ("step_id", step_id),
-                ("req_ids", req_ids),
-                ("active_rows", active_rows),
-                ("slot_signature", slot_signature),
-                ("q_lens", q_lens),
-                ("row_mode_class", row_mode_class),
-                ("row_values", row_values),
-            )
-            missing_inputs = tuple(
-                name for name, value in candidate_inputs if value is None
-            )
-            if missing_inputs:
-                _note_sparse_dynamic_failure(
-                    "bind_inputs_missing:" + ",".join(missing_inputs)
-                )
-            elif capacity_key is None and native_lifecycle_enabled:
-                _note_sparse_dynamic_failure("capacity_key_missing")
-            elif covers_step(
-                step_id=step_id,
-                req_ids=req_ids,
-                active_row_indices=active_rows,
-                slot_mapping_signature=slot_signature,
-                q_lens_by_row=q_lens,
-                row_mode_class=row_mode_class,
-                capacity_key=capacity_key,
-                row_effective_k_by_row=row_values,
-                launch_effective_k_by_row=(
-                    launch_values if launch_values is not None else row_values
-                ),
-                native_gpu_lengths_authoritative=bool(
-                    getattr(sparse_dynamic_state, "native_gpu_lengths_authoritative", False)
-                ),
-            ):
-                if _bind_sparse_dynamic_source():
-                    return True
-                if native_lifecycle_enabled:
-                    _note_sparse_dynamic_failure("sparse_dynamic_visible_unavailable")
-                return False
-        if native_lifecycle_enabled:
-            return False
-    elif native_lifecycle_enabled:
-        return False
 
     del launch_plan, step_meta, device
     return bool(_bind_arena_batch_source())
@@ -4386,8 +3527,6 @@ def _same_page_minimal_reject_reason(
         template.max_seqlen_k_capacity
     ):
         return "max_seqlen_k_capacity_exceeded"
-    if _sparse_native_lifecycle_enabled_for_metadata():
-        return "native_lifecycle_path"
     return ""
 
 
@@ -4585,6 +3724,8 @@ def _try_apply_same_page_minimal_metadata_update(
         decode_rows=tuple(range(batch_size)),
     )
     controller.step_bound_meta = previous_step_bound_meta
+    # [T4-FORENSIC 2026-07-10] 拆开旧 ready_event 相位:SBM 刷新与 event 机器分账。
+    _mark("same_page_minimal_sbm_refresh")
 
     same_page_update_kernel_count = int(update.carrier_update_kernel_count) + int(
         getattr(rrp_update, "update_kernel_count", 0)
@@ -4597,6 +3738,9 @@ def _try_apply_same_page_minimal_metadata_update(
         attn_metadata=attn_metadata,
         device=replay_bind_device_t,
         update_kernel_count=int(same_page_update_kernel_count),
+        profile_phase_us=(
+            mb_phase_us if (mb_profile_enabled or steady_phase_enabled) else None
+        ),
     )
     _mark("same_page_minimal_ready_event")
 
@@ -4841,17 +3985,6 @@ def _try_run_steady_decode_metadata_fast_path_inner(
         decode_rows=decode_rows,
     )
     controller.step_bound_meta = previous_step_bound_meta
-    if _sparse_native_lifecycle_enabled_for_metadata() and not (
-        _sparse_native_update_visible_state_from_delta(
-            controller=controller,
-            step_authority=step_authority,
-            delta=delta,
-            step_bound_meta=getattr(controller, "step_bound_meta", None),
-            page_size=int(block_size),
-            update_source="steady_decode_metadata_fast_path",
-        )
-    ):
-        return _miss("native_visible_state_update_miss")
 
     compact_layout_generation = int(getattr(launch_plan, "compact_meta_epoch", -1))
     step_decode_cache_key = _make_step_decode_cache_key(
@@ -5004,7 +4137,7 @@ def _try_run_steady_decode_metadata_fast_path_inner(
             row_effective_k_by_row=tuple(delta.row_effective_k_by_row),
             batch_size=batch_size,
             device=torch.device(replay_bind_device),
-            sparse_dynamic_state=getattr(controller, "_sparse_native_batch_state", None),
+            sparse_dynamic_state=None,
         )
     _publish_rrp_visible_source_debug_attrs(attn_metadata, rrp_visible_debug_fields)
     if mb_profile_enabled:
@@ -5070,6 +4203,12 @@ def _try_run_steady_decode_metadata_fast_path_inner(
                 / 1000.0,
                 "phase_us": dict(mb_phase_us),
                 "rrp_update_kind": str(getattr(rrp_update, "kind", "")),
+                "ultra_first_miss_reason": str(
+                    getattr(controller, "_forensic_ultra_first_miss_reason", "")
+                ),
+                "ultra_first_rrp_miss_reason": str(
+                    getattr(controller, "_forensic_ultra_first_rrp_miss_reason", "")
+                ),
                 **rrp_visible_debug_fields,
                 "total_us": float(time.perf_counter_ns() - mb_total_start_ns)
                 / 1000.0,
@@ -5095,16 +4234,29 @@ def _try_run_ultra_steady_decode_metadata_fast_path(
     mb_phase_us: dict[str, float],
 ) -> bool:
     del kv_cache_spec
+
+    def _wrapper_miss(reason: str) -> bool:
+        # Wrapper-gate misses record onto the same miss-reason channel the
+        # inner fast path owns, so per-step diagnostics always reflect THIS
+        # attempt (the inner path resets the attribute on entry; wrapper
+        # exits previously left a stale value behind).
+        setattr(
+            controller,
+            "_decode_runtime_steady_fast_path_miss_reason",
+            str(reason),
+        )
+        return False
+
     if previous_step_bound_meta is None:
-        return False
+        return _wrapper_miss("ultra_gate:previous_step_bound_meta_missing")
     if not bool(getattr(step_authority, "is_decode_only", False)):
-        return False
+        return _wrapper_miss("ultra_gate:not_decode_only")
     cached_kv_specs = _try_get_decode_runtime_cached_kv_specs(
         controller,
         prefer_cache=True,
     )
     if cached_kv_specs is None:
-        return False
+        return _wrapper_miss("ultra_gate:kv_spec_cache_missing")
     block_size_i, num_kv_heads_i, _head_dim_i, _kv_dtype_value = cached_kv_specs
     batch_size = int(getattr(step_authority, "batch_size", 0))
     if not _try_bind_decode_seq_lens_source_no_copy(
@@ -5112,10 +4264,10 @@ def _try_run_ultra_steady_decode_metadata_fast_path(
         step_meta=step_meta,
         batch_size=batch_size,
     ):
-        return False
+        return _wrapper_miss("ultra_gate:seq_lens_source_bind_failed")
     q_start_loc = getattr(step_authority, "q_start_loc", None)
     if q_start_loc is None or len(q_start_loc) < batch_size + 1:
-        return False
+        return _wrapper_miss("ultra_gate:q_start_loc_coverage")
     layer_effective_refresh_by_row = getattr(
         step_authority,
         "layer_effective_refresh_by_row",
@@ -5125,7 +4277,7 @@ def _try_run_ultra_steady_decode_metadata_fast_path(
         layer_effective_refresh_by_row is None
         or len(layer_effective_refresh_by_row) < batch_size
     ):
-        return False
+        return _wrapper_miss("ultra_gate:layer_effective_refresh_coverage")
     return _try_run_steady_decode_metadata_fast_path(
         controller,
         attn_metadata=attn_metadata,
@@ -6076,28 +5228,11 @@ def _maybe_bind_resolved_row_ptr_replay_metadata(
             return tuple(int(v) for v in value_tuple[:live_batch_size_i])
         return tuple()
 
-    def _live_rows_all_dense() -> bool:
-        row_mode_source = getattr(step_authority, "row_mode_by_row", None)
-        if row_mode_source is None or isinstance(row_mode_source, torch.Tensor):
-            return False
-        try:
-            row_modes = tuple(row_mode_source)[:live_batch_size_i]
-        except Exception:
-            return False
-        if len(row_modes) != live_batch_size_i:
-            return False
-        for value in row_modes:
-            try:
-                if int(value) != int(_ROW_MODE_DENSE):
-                    return False
-                continue
-            except Exception:
-                pass
-            if str(value).strip().lower() not in ("0", "dense", "native"):
-                return False
-        return True
-
-    native_lifecycle_enabled = _sparse_native_lifecycle_enabled_for_metadata()
+    # [LIFECYCLE-OFF-ONLY 2026-07-10] native lifecycle 整臂下线:本区原
+    # ON 专属的 live-row 投影/graph launch-effective 视图/native 批状态取值
+    # 全部删除,三元式塌缩到 OFF 值;capacity_key 的 "full" 构造提为无条件
+    # (_sparse_native_capacity_key 全仓零写点,getattr 恒 None,
+    # RESIDENCY-CAPACITY-MEMO 依赖此键)。
     decode_delta_for_launch = getattr(self, "_decode_runtime_delta", None)
     if (
         decode_delta_for_launch is not None
@@ -6113,77 +5248,21 @@ def _maybe_bind_resolved_row_ptr_replay_metadata(
         sparse_launch_effective_k_by_live_row = _project_launch_effective_live_rows(
             getattr(launch_plan, "launch_effective_k_len_cpu", None)
         )
-    if (
-        native_lifecycle_enabled
-        and len(sparse_launch_effective_k_by_live_row) != live_batch_size_i
-        and _live_rows_all_dense()
-    ):
-        sparse_dynamic_state = getattr(self, "_sparse_native_batch_state", None)
-        launch_cpu_getter = getattr(sparse_dynamic_state, "launch_effective_k_cpu", None)
-        if callable(launch_cpu_getter):
-            sparse_launch_effective_k_by_live_row = _project_launch_effective_live_rows(
-                launch_cpu_getter()
-            )
-        if len(sparse_launch_effective_k_by_live_row) != live_batch_size_i:
-            sparse_launch_effective_k_by_live_row = _project_launch_effective_live_rows(
-                context_kv_len_by_row
-            )
-    sparse_launch_effective_k_by_graph_row = (
-        tuple(
-            int(v)
-            for v in _project_rrp_row_tuple(
-                tuple(sparse_launch_effective_k_by_live_row),
-                default=inactive_dummy_k,
-                arena_batch_size=batch_size_i,
-                active_arena_row_indices=live_arena_rows,
-            )
-        )
-        if native_lifecycle_enabled
-        and len(sparse_launch_effective_k_by_live_row) == live_batch_size_i
-        else tuple()
-    )
     launch_plan_for_visible_source = launch_plan
-    if native_lifecycle_enabled and sparse_launch_effective_k_by_graph_row:
-        launch_plan_for_visible_source = _resolved_row_ptr_graph_launch_effective_view(
-            controller=self,
-            launch_plan=launch_plan,
-            launch_effective_k_by_row=sparse_launch_effective_k_by_graph_row,
-            batch_size=batch_size_i,
-            device=device,
-        )
-        launch_effective_source = _resolved_row_ptr_launch_effective_k_len_source(
-            launch_plan=launch_plan_for_visible_source,
-            batch_size=batch_size_i,
-            device=device,
-        )
-        launch_effective_covers_rows = _resolved_row_ptr_launch_effective_covers_rows(
-            launch_plan=launch_plan_for_visible_source,
-            row_effective_k_by_row=row_effective_k_by_row,
-            batch_size=batch_size_i,
-        )
-    sparse_native_capacity_key = getattr(self, "_sparse_native_capacity_key", None)
-    if native_lifecycle_enabled:
-        sparse_launch_effective_k_by_row = sparse_launch_effective_k_by_live_row
-    else:
-        sparse_launch_effective_k_by_row = getattr(
-            getattr(self, "_decode_runtime_delta", None),
-            "launch_effective_k_by_row",
-            tuple(),
-        )
-    if sparse_native_capacity_key is None and not native_lifecycle_enabled:
-        sparse_native_capacity_key = (
-            "full",
-            batch_size_i,
-            block_size_i,
-            num_kv_heads_i,
-            int(replay_arena.max_pages_per_row),
-        )
-    sparse_bind_batch_size = live_batch_size_i if native_lifecycle_enabled else batch_size_i
-    sparse_bind_row_effective_k_by_row = (
-        sparse_visible_k_by_live_row
-        if native_lifecycle_enabled
-        else tuple(row_effective_k_by_row[:batch_size_i])
+    sparse_launch_effective_k_by_row = getattr(
+        getattr(self, "_decode_runtime_delta", None),
+        "launch_effective_k_by_row",
+        tuple(),
     )
+    sparse_native_capacity_key = (
+        "full",
+        batch_size_i,
+        block_size_i,
+        num_kv_heads_i,
+        int(replay_arena.max_pages_per_row),
+    )
+    sparse_bind_batch_size = batch_size_i
+    sparse_bind_row_effective_k_by_row = tuple(row_effective_k_by_row[:batch_size_i])
     compact_offset_tokens_by_row = (0,) * batch_size_i
     live_compact_offset_tokens_by_row = (0,) * live_batch_size_i
     row_effective_k_i32_gpu = (
@@ -6231,69 +5310,8 @@ def _maybe_bind_resolved_row_ptr_replay_metadata(
         compact_capacity_pages,
     ) = _resolved_row_ptr_lease_snapshot(self, lease=lease, device=device)
     _mark_phase("lease_snapshot")
-    descriptor_payload = None
-    if native_lifecycle_enabled:
-        try:
-            descriptor_payload = build_resolved_row_ptr_descriptor_payload(
-                batch_size=live_batch_size_i,
-                canonical_block_table=worker_block_table_i32,
-                compact_ready_by_batch_row=live_compact_ready_by_batch_row,
-                row_effective_k_by_row=sparse_visible_k_by_live_row,
-                page_size=block_size_i,
-                reserved_manager_block_ids=reserved_manager_block_ids_arg,
-                slot_by_row=live_slot_by_row,
-                compact_valid_tokens_by_row=live_compact_valid_tokens_by_row,
-                compact_offset_tokens_by_row=live_compact_offset_tokens_by_row,
-                recent_first_page_by_row=live_recent_first_page_by_row,
-                canonical_row_index_by_batch_row=tuple(range(live_batch_size_i)),
-                compact_capacity_pages=compact_capacity_pages,
-                max_pages_per_row=int(replay_arena.max_pages_per_row),
-                reserved_manager_block_ids_cpu=reserved_manager_block_ids,
-                canonical_block_table_cpu=worker_block_table_cpu,
-            )
-        except Exception as exc:
-            sparse_dynamic_state = getattr(self, "_sparse_native_batch_state", None)
-            invalidator = getattr(sparse_dynamic_state, "invalidate_for_step_failure", None)
-            if callable(invalidator):
-                invalidator(
-                    step_id=int(getattr(step_authority, "epoch", -1)),
-                    reason="rrp_descriptor_payload_build_failed:" + type(exc).__name__,
-                )
-            self._resolved_row_ptr_metadata_ready = False
-            self._resolved_row_ptr_replay_metadata_binding = None
-            binding_by_key.pop(arena_key, None)
-            return
-        step_bound_meta_for_descriptor = getattr(self, "step_bound_meta", None)
-        if step_bound_meta_for_descriptor is not None:
-            step_bound_meta_for_descriptor.rrp_descriptor_epoch = int(
-                getattr(step_authority, "epoch", -1)
-            )
-            step_bound_meta_for_descriptor.affine_descriptor_by_row = (
-                descriptor_payload.affine_descriptor_by_row
-            )
-            step_bound_meta_for_descriptor.row_table_pages_by_row = (
-                descriptor_payload.row_table_pages_by_row
-            )
-            step_bound_meta_for_descriptor.segment_pages_by_row = (
-                descriptor_payload.segment_pages_by_row
-            )
-        launch_for_state = (
-            sparse_launch_effective_k_by_row
-            if len(tuple(sparse_launch_effective_k_by_row)) == live_batch_size_i
-            else sparse_visible_k_by_live_row
-        )
-        if not _sparse_native_update_visible_state(
-            controller=self,
-            step_authority=step_authority,
-            row_effective_k_by_row=sparse_visible_k_by_live_row,
-            launch_effective_k_by_row=launch_for_state,
-            descriptor_payload=descriptor_payload,
-            update_source="metadata_builder_rrp_descriptor_payload",
-        ):
-            self._resolved_row_ptr_metadata_ready = False
-            self._resolved_row_ptr_replay_metadata_binding = None
-            binding_by_key.pop(arena_key, None)
-            return
+    # [LIFECYCLE-OFF-ONLY] 原 ON 专属 descriptor_payload 构建/native visible
+    # state 更新/绑定失败早退整块删除;native 批状态参数塌缩为 None 字面量。
     visible_source_bound = _bind_resolved_row_ptr_visible_seqused_source(
         replay_arena=replay_arena,
         source_arena=source_arena,
@@ -6301,23 +5319,14 @@ def _maybe_bind_resolved_row_ptr_replay_metadata(
         step_meta=getattr(self, "step_meta", None),
         batch_size=sparse_bind_batch_size,
         device=device,
-        sparse_dynamic_state=getattr(self, "_sparse_native_batch_state", None),
+        sparse_dynamic_state=None,
         row_effective_k_by_row=sparse_bind_row_effective_k_by_row,
         launch_effective_k_by_row=sparse_launch_effective_k_by_row,
         step_authority=step_authority,
         capacity_key=sparse_native_capacity_key,
-        active_row_indices=getattr(self, "_sparse_native_active_row_indices", None),
-        slot_mapping_signature=getattr(
-            self,
-            "_sparse_native_slot_mapping_signature",
-            None,
-        ),
+        active_row_indices=None,
+        slot_mapping_signature=None,
     )
-    if native_lifecycle_enabled and not bool(visible_source_bound):
-        self._resolved_row_ptr_metadata_ready = False
-        self._resolved_row_ptr_replay_metadata_binding = None
-        binding_by_key.pop(arena_key, None)
-        return
     replay_visible = replay_arena.carriers.resolver_visible_seqused_k_by_head_i32
     source_visible = source_arena.carriers.resolver_visible_seqused_k_by_head_i32
     if (
@@ -6537,7 +5546,7 @@ def _maybe_bind_resolved_row_ptr_replay_metadata(
         row_effective_k_by_row=tuple(row_effective_k_by_row),
         batch_size=batch_size_i,
         device=device,
-        sparse_dynamic_state=getattr(self, "_sparse_native_batch_state", None),
+        sparse_dynamic_state=None,
     )
     _publish_rrp_visible_source_debug_attrs(attn_metadata, rrp_visible_debug_fields)
     _mark_phase("bind_metadata_attrs")
@@ -6854,6 +5863,12 @@ def maybe_build_step_decode_data_from_metadata_impl(
     # excludes the preamble (it gains its own key); offline diffs against
     # pre-instrumentation runs must group the two keys.
     _mark_mb_phase("mb_preamble")
+    if mb_profile_enabled:
+        # [ultra-miss forensics] shadow attrs, fresh per step; snapshotted
+        # right after an ultra miss below (before the second steady attempt
+        # resets/overwrites the product miss-reason channels).
+        self._forensic_ultra_first_miss_reason = ""
+        self._forensic_ultra_first_rrp_miss_reason = ""
 
     if _try_run_ultra_steady_decode_metadata_fast_path(
         self,
@@ -6890,6 +5905,14 @@ def maybe_build_step_decode_data_from_metadata_impl(
     # cache read. Same _mark_mb_phase machinery / same env gates; unarmed =
     # no-op, zero new env, no execution-semantics change.
     _mark_mb_phase("ultra_miss_probe")
+    if mb_profile_enabled:
+        # [ultra-miss forensics] capture the FIRST attempt's miss reasons.
+        self._forensic_ultra_first_miss_reason = str(
+            getattr(self, "_decode_runtime_steady_fast_path_miss_reason", "")
+        )
+        self._forensic_ultra_first_rrp_miss_reason = str(
+            getattr(self, "_decode_runtime_rrp_step_state_miss_reason", "")
+        )
 
     with _mb_record_function("sfi::mb.misc"):
         # 解析 KV cache 真实规格
@@ -7265,6 +6288,13 @@ def maybe_build_step_decode_data_from_metadata_impl(
                     f"epoch={step_authority.epoch} batch={step_authority.batch_size}"
                 ) from exc
         _mark_mb_phase("prefill_global_meta_build")
+        # [T3-FORENSIC 2026-07-10] 窗口0:launch_plan_build 段(每主体步)。
+        # 盖住分类 collect(_collect_decode_delta_packet)与 FULL_RECOMPILE
+        # seed 重算的双算面;累积进窗口1 同一 profiler,dump 复用窗口1 的
+        # 落盘点(下一 FULL_RECOMPILE 步),env 未设=永不构造零税。
+        _mb_lpb_prof = _mb_commit_cprofile() if _mb_cprofile_dir() else None
+        if _mb_lpb_prof is not None:
+            _mb_lpb_prof.enable()
         # CompactRecentLaunchPlan is the step-level source for compact layout
         # generation. Build it once before the decode cache key so the key does
         # not walk per-layer compact epochs.
@@ -7436,6 +6466,10 @@ def maybe_build_step_decode_data_from_metadata_impl(
                                 getattr(self, "_decode_runtime_reason", "full_recompile")
                             ),
                         )
+        # [T3-FORENSIC] 窗口0关闭(与窗口1 无重叠:窗口1 enable 在本函数
+        # 更下游的 FULL_RECOMPILE 分支)。
+        if _mb_lpb_prof is not None:
+            _mb_lpb_prof.disable()
         _mark_mb_phase("launch_plan_build")
 
         _compact_launch_plan = (
@@ -7669,6 +6703,16 @@ def maybe_build_step_decode_data_from_metadata_impl(
             self._decode_logf_stage_bound_signature = None
     _mark_mb_phase("logf_plan_staging")
 
+    # [T2-FORENSIC] commit 步窗口1:layer_state_refresh→dispatch_plan_build。
+    # rrp_bind 同步吸收段被窗口排除;env 未设=None,零判速税。
+    _mb_commit_prof = None
+    if _mb_cprofile_dir() and (
+        _decode_runtime_mode_for_controller(self) is DecodeRuntimeMode.FULL_RECOMPILE
+    ):
+        _mb_commit_prof = _mb_commit_cprofile()
+        if _mb_commit_prof is not None:
+            _mb_commit_prof.enable()
+
     with _mb_record_function("sfi::mb.misc"):
         # seqused_k_gpu 应由 build_for_sparse 从 attn_metadata.seq_lens 赋值（line 127）；
         # 回退路径的同步 CPU→GPU copy 已移除——若仍为 None 则 fail-fast 暴露根因。
@@ -7745,31 +6789,19 @@ def maybe_build_step_decode_data_from_metadata_impl(
                 for v in tuple(step_authority.is_prefill_by_row)[:_batch_size_i]
             )
         )
+        # [FASTEST-PATH-SWEEP 2026-07-10] VLLM_SPARSE_ABLATE_LAYER_REFRESH
+        # ablation 旋钮(每步活 env 读)与 VLLM_SPARSE_LSR_PROBE 探针
+        # (每步 env 读+每层 5 站点残税)已删——LSR 取证使命被
+        # VLLM_SPARSE_MB_CPROFILE_DIR(函数级 ncalls+分相,严格更强)接替,
+        # 破案后拆;ablation 属实验废墟,无旋钮原则。
         layer_states_for_refresh = (
             tuple()
-            if skip_layer_state_refresh or pure_prefill_step or os.environ.get("VLLM_SPARSE_ABLATE_LAYER_REFRESH") == "1"
+            if skip_layer_state_refresh or pure_prefill_step
             else tuple(self.layer_states.values())
         )
         decode_runtime_layer_states_traversal_count += int(
             len(layer_states_for_refresh)
         )
-        _lsr_bucket = None
-        if os.environ.get("VLLM_SPARSE_LSR_PROBE") == "1":
-            _lsr_bucket = (
-                "logf"
-                if (
-                    _decode_runtime_mode_for_controller(self) is DecodeRuntimeMode.FULL_RECOMPILE
-                    and str(getattr(getattr(self, "_decode_runtime_state", None), "last_reason", "")) == "logf_generation_changed"
-                )
-                else "other"
-            )
-            if not hasattr(self, "_lsr_acc"):
-                self._lsr_acc = {}
-                __import__("atexit").register(
-                    lambda: print("[LSR_PROBE] " + str(getattr(self, "_lsr_acc", {})), flush=True)
-                )
-            _lsr_b0 = self._lsr_acc.setdefault(_lsr_bucket, {"align": 0.0, "build_branch": 0.0, "steps": 0})
-            _lsr_b0["steps"] += 1
         # P12 lever-2 (2026-06-12): cross-layer slot-state consistency check
         # HOISTED from after the loop (same call, same raise semantics; runs
         # on every non-fast-path step exactly as before, loop empty or not).
@@ -7789,8 +6821,12 @@ def maybe_build_step_decode_data_from_metadata_impl(
         # first layer that takes the launch-view refresh leg (post-align, so
         # the value equals what every layer would compute for itself).
         _p12l2_active_slots = None
+        # [T2-HOST-DIET 2026-07-10] 步级不变量包 hoist 目标。Lazy:由第一个
+        # cache-miss 层(post-align)构建,commit 步 36 层共享一份;非 commit
+        # 步该分支不触发=零成本。论证同 P12 active_slots(跨层 slot 一致性
+        # 已在循环前验证)。
+        _lsc_step_invariants = None
         for state in layer_states_for_refresh:
-            _lsr_t0 = time.perf_counter_ns() if _lsr_bucket is not None else 0
             if (
                 state.last_active_request_ids == _sa_req_ids
                 and state.slot_signature64 == global_slot_signature_step
@@ -7809,15 +6845,22 @@ def maybe_build_step_decode_data_from_metadata_impl(
                     slot_by_request=global_slot_map_step,
                 )
                 state.last_active_request_ids = _sa_req_ids
-            if _lsr_bucket is not None:
-                _lsr_b = self._lsr_acc.setdefault(_lsr_bucket, {"align": 0.0, "build_branch": 0.0, "steps": 0})
-                _lsr_b["align"] += (time.perf_counter_ns() - _lsr_t0) / 1000.0
-                _lsr_t0 = time.perf_counter_ns()
             layer_effective_refresh_by_row = layer_effective_refresh_by_row_step
             # Inline _make_step_cache_key from pre-computed row semantic prefix.
             # force_dense=False, force_compact_off=False are constants in this loop.
             cache_key = _ck_prefix_active + (state.compact_meta_epoch, False, False)
             if state.step_cache_key != cache_key:
+                if _lsc_step_invariants is None:
+                    _lsc_step_invariants = build_step_cache_invariants(
+                        state=state,
+                        step_meta=step_meta,
+                        step_authority=step_authority,
+                        step_bound_meta=self.step_bound_meta,
+                        device=state.device,
+                        force_dense=False,
+                        force_compact_off=False,
+                        layer_effective_refresh_by_row=layer_effective_refresh_by_row,
+                    )
                 _build_layer_step_cache(
                     state=state,
                     step_meta=step_meta,
@@ -7837,6 +6880,8 @@ def maybe_build_step_decode_data_from_metadata_impl(
                     # down so build_layer_step_cache_impl skips the duplicate
                     # _make_step_cache_key 9-tuple rebuild.
                     precomputed_cache_key=cache_key,
+                    # [T2-HOST-DIET 2026-07-10] commit 步 36 层共享步级不变量包。
+                    step_invariants=_lsc_step_invariants,
                 )
             elif (
                 _skip_page_sparse_refresh
@@ -7861,7 +6906,6 @@ def maybe_build_step_decode_data_from_metadata_impl(
                         int(state.request_id_to_slot.get(_p12l2_rid, -1))
                         for _p12l2_rid in step_meta.req_ids[:_batch_size_i]
                     )
-                _lsr_view_t0 = time.perf_counter_ns() if _lsr_bucket is not None else 0
                 refresh_selected_launch_view_for_current_step(
                     state=state,
                     step_meta=step_meta,
@@ -7877,18 +6921,6 @@ def maybe_build_step_decode_data_from_metadata_impl(
                     precomputed_active_slots=_p12l2_active_slots,
                     precomputed_cache_key=cache_key,
                 )
-                if _lsr_bucket is not None:
-                    # LSR probe third bucket (P12 spec 5.2): time the
-                    # launch-view refresh branch separately. build_branch
-                    # below keeps its existing meaning (all three legs).
-                    _lsr_bv = self._lsr_acc.setdefault(_lsr_bucket, {"align": 0.0, "build_branch": 0.0, "steps": 0})
-                    _lsr_bv["view_refresh"] = _lsr_bv.get("view_refresh", 0.0) + (
-                        (time.perf_counter_ns() - _lsr_view_t0) / 1000.0
-                    )
-                    _lsr_bv["view_refresh_calls"] = int(_lsr_bv.get("view_refresh_calls", 0)) + 1
-            if _lsr_bucket is not None:
-                _lsr_b = self._lsr_acc.setdefault(_lsr_bucket, {"align": 0.0, "build_branch": 0.0, "steps": 0})
-                _lsr_b["build_branch"] += (time.perf_counter_ns() - _lsr_t0) / 1000.0
             if (
                 int(getattr(state, "step_cache_plan_version", -1)) != decode_plan_version
                 and bool(getattr(state, "step_cache_cached_launch_ready", False))
@@ -8326,6 +7358,8 @@ def maybe_build_step_decode_data_from_metadata_impl(
             self.step_decode_cache_key = None
             self.step_decode_plan_version = -1
             self.step_dispatch_plan = None
+            if _mb_commit_prof is not None:
+                _mb_commit_prof.disable()
             return
 
         # decode：把 meta64[2] out_ptr 融合进跨层 pack（一次 kernel），避免 dispatcher 每层 patch。
@@ -8560,6 +7594,8 @@ def maybe_build_step_decode_data_from_metadata_impl(
             self.step_decode_cache_key = None
             self.step_decode_plan_version = -1
             self.step_dispatch_plan = None
+            if _mb_commit_prof is not None:
+                _mb_commit_prof.disable()
             return
 
         # 构建 StepDecodeData（list 索引）
@@ -8607,25 +7643,17 @@ def maybe_build_step_decode_data_from_metadata_impl(
                     batch_size=step_authority.batch_size,
                 )
         _mark_mb_phase("dispatch_plan_build")
+        # [T2-FORENSIC] 窗口1关闭(rrp_bind 同步吸收段不采样)。
+        if _mb_commit_prof is not None:
+            _mb_commit_prof.disable()
 
         replay_bind_device = (
             step_meta.seqused_k_gpu.device
             if isinstance(step_meta.seqused_k_gpu, torch.Tensor)
             else next(iter(self.layer_states.values())).device
         )
-        _decode_delta_for_visible_state = getattr(self, "_decode_runtime_delta", None)
-        if _sparse_native_lifecycle_enabled_for_metadata() and isinstance(
-            _decode_delta_for_visible_state,
-            DecodeDeltaPacket,
-        ):
-            _sparse_native_update_visible_state_from_delta(
-                controller=self,
-                step_authority=step_authority,
-                delta=_decode_delta_for_visible_state,
-                step_bound_meta=getattr(self, "step_bound_meta", None),
-                page_size=int(block_size_i),
-                update_source="metadata_builder_resolved_row_ptr_bind",
-            )
+        # [LIFECYCLE-OFF-ONLY 2026-07-10] native lifecycle 整臂下线(用户拍板:
+        # 唯速度,保 OFF 删 ON);此处原 ON 专属 visible-state 逐步维护块已删。
         _maybe_bind_resolved_row_ptr_replay_metadata(
             self,
             attn_metadata=attn_metadata,
@@ -8636,12 +7664,18 @@ def maybe_build_step_decode_data_from_metadata_impl(
         )
         _mark_mb_phase("resolved_row_ptr_bind")
 
+        # [T2-FORENSIC] 窗口2:build_step_bound_meta_final。
+        if _mb_commit_prof is not None:
+            _mb_commit_prof.enable()
         build_step_bound_meta_from_metadata_impl(
             self,
             attn_metadata=attn_metadata,
             kv_cache_spec=kv_cache_spec,
         )
         _mark_mb_phase("build_step_bound_meta_final")
+        if _mb_commit_prof is not None:
+            _mb_commit_prof.disable()
+            _mb_commit_cprofile_dump()
         if mb_profile_enabled:
             _decode_runtime_state_profile = getattr(
                 self, "_decode_runtime_state", None
@@ -8703,7 +7737,7 @@ def maybe_build_step_decode_data_from_metadata_impl(
                     row_effective_k_by_row=tuple(_row_effective_debug),
                     batch_size=int(getattr(step_authority, "batch_size", 0)),
                     device=_device_debug,
-                    sparse_dynamic_state=getattr(self, "_sparse_native_batch_state", None),
+                    sparse_dynamic_state=None,
                 )
             _publish_rrp_visible_source_debug_attrs(attn_metadata, _rrp_visible_debug_fields)
             _append_mb_profile(
@@ -8748,6 +7782,12 @@ def maybe_build_step_decode_data_from_metadata_impl(
                     ),
                     "decode_runtime_mode": _decode_runtime_mode_value,
                     "decode_runtime_reason": str(decode_runtime_reason),
+                    "ultra_first_miss_reason": str(
+                        getattr(self, "_forensic_ultra_first_miss_reason", "")
+                    ),
+                    "ultra_first_rrp_miss_reason": str(
+                        getattr(self, "_forensic_ultra_first_rrp_miss_reason", "")
+                    ),
                     "runtime_classification_current": bool(
                         runtime_classification_current
                     ),
@@ -8907,11 +7947,8 @@ def build_step_bound_meta_from_metadata_impl(
         "compact_recent_launch_plan",
         None,
     )
-    _carry_desc_prev = getattr(self, "step_bound_meta", None)
-    _carry_desc_affine = getattr(_carry_desc_prev, "affine_descriptor_by_row", tuple())
-    _carry_desc_row_table = getattr(_carry_desc_prev, "row_table_pages_by_row", tuple())
-    _carry_desc_segment = getattr(_carry_desc_prev, "segment_pages_by_row", tuple())
-    _carry_desc_epoch = getattr(_carry_desc_prev, "rrp_descriptor_epoch", -1)
+    # [T2-HOST-DIET 2026-07-10] VLLM_FIX_CARRY_DESC_BUILD 死实验枝已删
+    # (默认恒 OFF,判据基线全部未开;每步 5 getattr + __import__ + env 读纯税)。
     self.step_bound_meta = None
     if step_authority is None or step_ctx is None:
         self._compact_recent_launch_template = None
@@ -8963,16 +8000,33 @@ def build_step_bound_meta_from_metadata_impl(
             f"mask={len(step_authority.logf_mask_by_row)} "
             f"batch={batch_size}"
         )
-    q_lens_by_row = step_authority.q_lens_by_row[:batch_size]
-    context_kv_len_by_row = step_authority.context_kv_len_by_row[:batch_size]
-    logits_last_n_by_row = step_authority.logits_last_n_by_row[:batch_size]
-    logits_capacity_by_row = step_authority.logits_capacity_by_row[:batch_size]
-    logf_mask_by_row = step_authority.logf_mask_by_row[:batch_size]
+    # [T2-HOST-DIET 2026-07-10] 逐行 tuple(int) 规范化一次;签名/StepBoundMeta/
+    # canonical/logf-prefix 全复用,消除同一 8 元组的三重重物化(值等价:
+    # 底层已是 int 序列,int() 规范化不改比较语义,且与 steady 路径
+    # _refresh_step_bound_meta_for_steady_delta 的规范化口径一致)。
+    q_lens_by_row = tuple(
+        int(v) for v in step_authority.q_lens_by_row[:batch_size]
+    )
+    context_kv_len_by_row = tuple(
+        int(v) for v in step_authority.context_kv_len_by_row[:batch_size]
+    )
+    logits_last_n_by_row = tuple(
+        int(v) for v in step_authority.logits_last_n_by_row[:batch_size]
+    )
+    logits_capacity_by_row = tuple(
+        int(v) for v in step_authority.logits_capacity_by_row[:batch_size]
+    )
+    logf_mask_by_row = tuple(
+        int(v) for v in step_authority.logf_mask_by_row[:batch_size]
+    )
+    row_mode_by_row = tuple(
+        int(v) for v in step_authority.row_mode_by_row[:batch_size]
+    )
     logf_attn_rows = tuple(
-        row for row in step_authority.logf_attn_rows if 0 <= row < batch_size
+        int(row) for row in step_authority.logf_attn_rows if 0 <= row < batch_size
     )
     prefill_rows = tuple(
-        row for row in step_authority.prefill_rows if 0 <= row < batch_size
+        int(row) for row in step_authority.prefill_rows if 0 <= row < batch_size
     )
     prefill_set = set(prefill_rows)
     decode_rows = tuple(row for row in range(batch_size) if row not in prefill_set)
@@ -9010,8 +8064,8 @@ def build_step_bound_meta_from_metadata_impl(
             "bound-meta build requires packed req_meta buffers"
         )
     bound_meta_signature = tuple(bound_meta_signature) + (
-        tuple(int(v) for v in step_authority.row_mode_by_row[:batch_size]),
-        tuple(int(v) for v in step_authority.logf_mask_by_row[:batch_size]),
+        row_mode_by_row,
+        logf_mask_by_row,
     )
     layer_bound_cache_key = (
         id(step_decode_data),
@@ -9035,18 +8089,26 @@ def build_step_bound_meta_from_metadata_impl(
     else:
         layer_count = len(step_decode_data.layer_data)
         layer_bound_list: List[Optional[BoundLayerMeta]] = [None] * layer_count
+        # [T2-HOST-DIET 2026-07-10] 36 层循环的步级不变量提环外
+        # (int()/bool()/shape 逐层重转 ×36 → 一次)。
+        _lb_block_size = int(step_decode_data.block_size)
+        _lb_num_kv_heads = int(step_decode_data.num_kv_heads)
+        _lb_head_dim = int(step_decode_data.head_dim)
+        _lb_i32_layers = int(req_meta_i32_all.shape[0])
+        _lb_i64_layers = int(req_meta_i64_all.shape[0])
+        _hint_all_compact = bool(step_authority.hint_all_compact)
+        _hint_has_log_f = bool(step_authority.hint_has_log_f)
+        _hint_log_f_eq1 = bool(step_authority.hint_log_f_eq1)
+        _hint_log_f_gt1 = bool(step_authority.hint_log_f_gt1)
         for layer_index, layer_data in enumerate(step_decode_data.layer_data):
             if layer_data is None:
                 continue
-            if (
-                layer_index >= req_meta_i32_all.shape[0]
-                or layer_index >= req_meta_i64_all.shape[0]
-            ):
+            if layer_index >= _lb_i32_layers or layer_index >= _lb_i64_layers:
                 raise RuntimeError(
                     "bound-meta layer index out of req_meta range: "
                     f"layer_index={layer_index} "
-                    f"i32_layers={int(req_meta_i32_all.shape[0])} "
-                    f"i64_layers={int(req_meta_i64_all.shape[0])}"
+                    f"i32_layers={_lb_i32_layers} "
+                    f"i64_layers={_lb_i64_layers}"
                 )
             k_compact = layer_data.k_compact
             v_compact = layer_data.v_compact
@@ -9062,15 +8124,15 @@ def build_step_bound_meta_from_metadata_impl(
                 )
                 if has_compact_layout:
                     k_compact, v_compact = state_ref.get_compact_kv_views(
-                        block_size=int(step_decode_data.block_size),
-                        num_kv_heads=int(step_decode_data.num_kv_heads),
-                        head_dim=int(step_decode_data.head_dim),
+                        block_size=_lb_block_size,
+                        num_kv_heads=_lb_num_kv_heads,
+                        head_dim=_lb_head_dim,
                     )
                     token_positions = state_ref.get_compact_token_positions_view(
-                        block_size=int(step_decode_data.block_size),
-                        num_kv_heads=int(step_decode_data.num_kv_heads),
+                        block_size=_lb_block_size,
+                        num_kv_heads=_lb_num_kv_heads,
                         device=state_ref.device,
-                        rows=int(step_authority.batch_size),
+                        rows=batch_size,
                     )
                 all_compact = bool(getattr(state_ref, "step_cache_all_compact", all_compact))
                 if has_compact_layout:
@@ -9085,10 +8147,10 @@ def build_step_bound_meta_from_metadata_impl(
                 v_compact=v_compact,
                 token_positions=token_positions,
                 compact_kv_len_max=compact_kv_len_max,
-                all_compact=bool(step_authority.hint_all_compact and all_compact),
-                hint_has_log_f=bool(step_authority.hint_has_log_f),
-                hint_log_f_eq1=bool(step_authority.hint_log_f_eq1),
-                hint_log_f_gt1=bool(step_authority.hint_log_f_gt1),
+                all_compact=bool(_hint_all_compact and all_compact),
+                hint_has_log_f=_hint_has_log_f,
+                hint_log_f_eq1=_hint_log_f_eq1,
+                hint_log_f_gt1=_hint_log_f_gt1,
             )
         layer_bound_tuple = tuple(layer_bound_list)
         self._step_bound_layer_bound_cache = (
@@ -9117,7 +8179,7 @@ def build_step_bound_meta_from_metadata_impl(
         refresh_bundle=refresh_bundle,
         recent_cap=int(step_authority.recent_cap),
         sink_tokens=int(step_authority.sink_tokens),
-        canonical_real_kv_len_cpu=tuple(int(v) for v in context_kv_len_by_row),
+        canonical_real_kv_len_cpu=context_kv_len_by_row,
         req_set_hash=int(step_authority.req_set_hash),
         row_phase_hash=int(step_authority.row_phase_hash),
         plan_signature=tuple(step_authority.plan_signature),
@@ -9139,11 +8201,6 @@ def build_step_bound_meta_from_metadata_impl(
             step_row_mode_by_row=step_envelope.row_mode_by_row,
         )
     self.step_bound_meta = step_bound_meta
-    if __import__("os").environ.get("VLLM_FIX_CARRY_DESC_BUILD") == "1" and _carry_desc_affine:
-        step_bound_meta.affine_descriptor_by_row = _carry_desc_affine
-        step_bound_meta.row_table_pages_by_row = _carry_desc_row_table
-        step_bound_meta.segment_pages_by_row = _carry_desc_segment
-        step_bound_meta.rrp_descriptor_epoch = _carry_desc_epoch
     final_launch_plan = step_bound_meta.compact_recent_launch_plan
     descriptor_cpu_i32 = getattr(
         self, "_compact_recent_launch_plan_descriptor_cpu_i32", None
@@ -9177,12 +8234,12 @@ def build_step_bound_meta_from_metadata_impl(
         int(step_authority.step_identity_token),
         int(batch_size),
         int(step_authority.max_batch_size),
-        tuple(int(v) for v in logits_capacity_by_row),
-        tuple(int(v) for v in q_lens_by_row),
-        tuple(int(v) for v in logf_mask_by_row),
-        tuple(int(v) for v in logf_attn_rows),
+        logits_capacity_by_row,
+        q_lens_by_row,
+        logf_mask_by_row,
+        logf_attn_rows,
         int(step_authority.logf_stride_head),
-        max((int(v) for v in logits_capacity_by_row), default=0),
+        max(logits_capacity_by_row, default=0),
     )
     if (
         int(getattr(self, "_decode_logf_stage_token", -1))

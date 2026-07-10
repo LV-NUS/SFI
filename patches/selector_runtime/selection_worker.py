@@ -63,11 +63,11 @@ def _compact_gather_stride_tokens(owner: object, state: object, block_size: int)
     return int(owner._compact_stride_tokens(block_size))
 
 
-def _rebuild_ptr_buffer_name(
-    base_name: str,
+def _rebuild_ptr_buffer_layer_suffix(
     payloads: Sequence[SelectorBatchPayload],
 ) -> str:
-    """Scope cached pointer arrays by layer segment to avoid ready-group ping-pong."""
+    """[W2a 2026-07-09] 层段后缀一次推导(六个 ptr buffer 名共享同一 payloads,
+    原实现每个名字重复遍历 payloads 推导同一后缀)。返回 ":layers_..." 或 ""。"""
     state_layer_indices: List[int] = []
     for payload_index, payload in enumerate(payloads):
         state = getattr(payload, "state", None)
@@ -76,7 +76,7 @@ def _rebuild_ptr_buffer_name(
             state_layer_index = int(getattr(payload, "layer_index", payload_index))
         state_layer_indices.append(int(state_layer_index))
     if not state_layer_indices:
-        return str(base_name)
+        return ""
 
     first_layer = int(state_layer_indices[0])
     contiguous = all(
@@ -88,7 +88,15 @@ def _rebuild_ptr_buffer_name(
         suffix = f"layers_{first_layer}_{last_layer}_n{len(state_layer_indices)}"
     else:
         suffix = "layers_" + "_".join(str(int(v)) for v in state_layer_indices)
-    return f"{base_name}:{suffix}"
+    return f":{suffix}"
+
+
+def _rebuild_ptr_buffer_name(
+    base_name: str,
+    payloads: Sequence[SelectorBatchPayload],
+) -> str:
+    """Scope cached pointer arrays by layer segment to avoid ready-group ping-pong."""
+    return f"{base_name}{_rebuild_ptr_buffer_layer_suffix(payloads)}"
 
 
 
@@ -218,12 +226,14 @@ def rebuild_compact_slots_batched_layers_from_selection_impl(
     use_cuda_ptr_arrays = bool(_REBUILD_PTRS_PINNED_CACHED)
     use_ptr_arrays = bool(use_cuda_ptr_arrays)
     use_pinned_ptrs = bool(_REBUILD_PTRS_PINNED_CACHED and use_ptr_arrays)
-    flat_k_ptrs_name = _rebuild_ptr_buffer_name("flat_k_ptrs", payloads)
-    flat_v_ptrs_name = _rebuild_ptr_buffer_name("flat_v_ptrs", payloads)
-    compact_k_ptrs_name = _rebuild_ptr_buffer_name("compact_k_ptrs", payloads)
-    compact_v_ptrs_name = _rebuild_ptr_buffer_name("compact_v_ptrs", payloads)
-    compact_pos_ptrs_name = _rebuild_ptr_buffer_name("compact_pos_ptrs", payloads)
-    block_table_ptrs_name = _rebuild_ptr_buffer_name("block_table_ptrs", payloads)
+    # [W2a 2026-07-09] 后缀一次推导,六名共享(原六次重复遍历 payloads)。
+    _ptr_layer_suffix = _rebuild_ptr_buffer_layer_suffix(payloads)
+    flat_k_ptrs_name = f"flat_k_ptrs{_ptr_layer_suffix}"
+    flat_v_ptrs_name = f"flat_v_ptrs{_ptr_layer_suffix}"
+    compact_k_ptrs_name = f"compact_k_ptrs{_ptr_layer_suffix}"
+    compact_v_ptrs_name = f"compact_v_ptrs{_ptr_layer_suffix}"
+    compact_pos_ptrs_name = f"compact_pos_ptrs{_ptr_layer_suffix}"
+    block_table_ptrs_name = f"block_table_ptrs{_ptr_layer_suffix}"
 
     # ------------------------------------------------------------------
     # A 路线：CPU 元数据写回优化
@@ -314,42 +324,48 @@ def rebuild_compact_slots_batched_layers_from_selection_impl(
             sink_lens_ref.append(int(sink_len))
             persist_lens_ref.append(int(persist_len))
             kv_lens_ref.append(int(kv_len))
-    writer_sink_tokens = int(sum(sink_lens_ref)) * int(layers) * int(num_kv_heads)
-    writer_persist_tokens = int(sum(persist_lens_ref)) * int(layers) * int(num_kv_heads)
-    writer_actual_tokens = int(sum(kv_lens_ref)) * int(layers) * int(num_kv_heads)
-    writer_dtype_bytes = int(first.key_cache.element_size()) if first.key_cache is not None else 0
-    writer_bytes_per_token = int(head_dim_ref) * int(writer_dtype_bytes) * 4 + 4
-    writer_sink_io_bytes = int(writer_sink_tokens) * int(writer_bytes_per_token)
-    writer_persist_io_bytes = int(writer_persist_tokens) * int(writer_bytes_per_token)
-    writer_k_read_bytes = int(writer_actual_tokens) * int(head_dim_ref) * int(writer_dtype_bytes)
-    writer_v_read_bytes = int(writer_k_read_bytes)
-    writer_k_write_bytes = int(writer_k_read_bytes)
-    writer_v_write_bytes = int(writer_k_read_bytes)
-    writer_pos_write_bytes = int(writer_actual_tokens) * 4
-    writer_total_io_bytes = (
-        int(writer_k_read_bytes)
-        + int(writer_v_read_bytes)
-        + int(writer_k_write_bytes)
-        + int(writer_v_write_bytes)
-        + int(writer_pos_write_bytes)
-    )
-    setattr(self, "_last_writer_sink_tokens", int(writer_sink_tokens))
-    setattr(self, "_last_writer_persist_tokens", int(writer_persist_tokens))
-    setattr(self, "_last_writer_sink_io_bytes", int(writer_sink_io_bytes))
-    setattr(self, "_last_writer_persist_io_bytes", int(writer_persist_io_bytes))
-    setattr(self, "_last_writer_token_tiles_estimated", 0)
-    setattr(self, "_last_writer_active_token_tiles_estimated", 0)
-    setattr(self, "_last_writer_cta_count_estimated", 0)
-    setattr(self, "_last_writer_active_cta_count_estimated", 0)
-    setattr(self, "_last_writer_tokens_per_cta", 0)
-    setattr(self, "_last_writer_actual_tokens", int(writer_actual_tokens))
-    setattr(self, "_last_writer_k_read_bytes", int(writer_k_read_bytes))
-    setattr(self, "_last_writer_v_read_bytes", int(writer_v_read_bytes))
-    setattr(self, "_last_writer_k_write_bytes", int(writer_k_write_bytes))
-    setattr(self, "_last_writer_v_write_bytes", int(writer_v_write_bytes))
-    setattr(self, "_last_writer_pos_write_bytes", int(writer_pos_write_bytes))
-    setattr(self, "_last_writer_total_io_bytes", int(writer_total_io_bytes))
-    setattr(self, "_last_writer_effective_io_gbps", -1.0)
+    # [WRITER-TELEMETRY-GATE 2026-07-09] 遥测聚合(3×sum+字节数学+17 setattr,
+    # cProfile 实测 ~200µs/chunk)唯一读者=flush_worker
+    # _capture_writer_kernel_variant,且只在 profile accum 档被调——非取证档
+    # 纯浪费,按同一 latch 门控。sink/persist/kv_lens_ref 列表是 per-layer
+    # meta 写回的功能输入,保持无条件计算。
+    if getattr(self, "_active_flush_profile_accum", None) is not None:
+        writer_sink_tokens = int(sum(sink_lens_ref)) * int(layers) * int(num_kv_heads)
+        writer_persist_tokens = int(sum(persist_lens_ref)) * int(layers) * int(num_kv_heads)
+        writer_actual_tokens = int(sum(kv_lens_ref)) * int(layers) * int(num_kv_heads)
+        writer_dtype_bytes = int(first.key_cache.element_size()) if first.key_cache is not None else 0
+        writer_bytes_per_token = int(head_dim_ref) * int(writer_dtype_bytes) * 4 + 4
+        writer_sink_io_bytes = int(writer_sink_tokens) * int(writer_bytes_per_token)
+        writer_persist_io_bytes = int(writer_persist_tokens) * int(writer_bytes_per_token)
+        writer_k_read_bytes = int(writer_actual_tokens) * int(head_dim_ref) * int(writer_dtype_bytes)
+        writer_v_read_bytes = int(writer_k_read_bytes)
+        writer_k_write_bytes = int(writer_k_read_bytes)
+        writer_v_write_bytes = int(writer_k_read_bytes)
+        writer_pos_write_bytes = int(writer_actual_tokens) * 4
+        writer_total_io_bytes = (
+            int(writer_k_read_bytes)
+            + int(writer_v_read_bytes)
+            + int(writer_k_write_bytes)
+            + int(writer_v_write_bytes)
+            + int(writer_pos_write_bytes)
+        )
+        setattr(self, "_last_writer_sink_tokens", int(writer_sink_tokens))
+        setattr(self, "_last_writer_persist_tokens", int(writer_persist_tokens))
+        setattr(self, "_last_writer_sink_io_bytes", int(writer_sink_io_bytes))
+        setattr(self, "_last_writer_persist_io_bytes", int(writer_persist_io_bytes))
+        setattr(self, "_last_writer_token_tiles_estimated", 0)
+        setattr(self, "_last_writer_active_token_tiles_estimated", 0)
+        setattr(self, "_last_writer_cta_count_estimated", 0)
+        setattr(self, "_last_writer_active_cta_count_estimated", 0)
+        setattr(self, "_last_writer_tokens_per_cta", 0)
+        setattr(self, "_last_writer_actual_tokens", int(writer_actual_tokens))
+        setattr(self, "_last_writer_k_read_bytes", int(writer_k_read_bytes))
+        setattr(self, "_last_writer_v_read_bytes", int(writer_v_read_bytes))
+        setattr(self, "_last_writer_k_write_bytes", int(writer_k_write_bytes))
+        setattr(self, "_last_writer_v_write_bytes", int(writer_v_write_bytes))
+        setattr(self, "_last_writer_pos_write_bytes", int(writer_pos_write_bytes))
+        setattr(self, "_last_writer_total_io_bytes", int(writer_total_io_bytes))
+        setattr(self, "_last_writer_effective_io_gbps", -1.0)
     layer_infos: List[Tuple] = []  # tuple: (payload, has_rebuild, row_tensor, reset_slot_commits)
     # [DETERMINISTIC-SLOT-SOURCE 2026-07-03] row_list 值→device 张量缓存。
     # [REBUILD-H2D-STAGING] writer-graph ON（默认）时从"本次调用内"升级为
@@ -458,12 +474,18 @@ def rebuild_compact_slots_batched_layers_from_selection_impl(
             residency_sig_key = tuple(residency_sig)
         else:
             residency_sig_key = residency_sig
+        # [PTR-SIG-DEGEN 2026-07-09] 删两个恒增世代计数:compact_generation/
+        # compact_page_residency_generation 每 refresh 必增,把六组 ptr buffer
+        # 的签名打成每 chunk 恒 miss→全量 republish(6×H2D+event/chunk,cProfile
+        # 实测 ~490µs/chunk,连带 uaf 守卫/current_stream/env 读 6×)。ptr buffer
+        # 内容=per-layer 基址,与世代无关:双代写偏移走 slot_tensor 的 sub-slot
+        # 编码(DUAL-GEN-L2a-B),翻代只改 narrow 偏移不改基址(取证定谳)。
+        # 失效链不减弱:六签名均为 (data_ptr, layer_cache_sig) 对——realloc/
+        # rebind 由 data_ptr fail-close,物理页迁移由 residency_sig 承担。
         return (
             getattr(payload, "cache_key", None),
             int(getattr(payload, "layer_index", layer_idx)),
             int(getattr(state, "layer_index", layer_idx)),
-            int(getattr(state, "compact_generation", 0)),
-            int(getattr(state, "compact_page_residency_generation", 0)),
             residency_sig_key,
         )
 
@@ -700,44 +722,48 @@ def rebuild_compact_slots_batched_layers_from_selection_impl(
         if kv_lens_ref
         else 0
     )
-    writer_tokens_per_cta = 0
-    writer_token_tiles_estimated = 0
-    writer_active_token_tiles_estimated = 0
-    writer_cta_count_estimated = 0
-    writer_active_cta_count_estimated = 0
-    if int(stride_tokens_ref) > 0:
-        requested_tile_tokens = int(_WRITER_TOKEN_TILE_CACHED)
-        if requested_tile_tokens > 0:
-            writer_grid_tokens = max(1, int(writer_active_max_tokens))
-            max_grid_z = 65535
-            min_tile_for_grid_z = (int(writer_grid_tokens) + max_grid_z - 1) // max_grid_z
-            writer_tokens_per_cta = max(1, int(requested_tile_tokens), int(min_tile_for_grid_z))
-            writer_token_tiles_estimated = max(
-                1,
-                (int(writer_grid_tokens) + int(writer_tokens_per_cta) - 1)
-                // int(writer_tokens_per_cta),
+    # [WRITER-TELEMETRY-GATE 2026-07-09] tile/CTA 估算段=纯遥测(唯一读者
+    # =_capture_writer_kernel_variant,profile accum 档),同 latch 门控;
+    # writer_active_max_tokens 是 launch 功能输入,保持在门控外。
+    if getattr(self, "_active_flush_profile_accum", None) is not None:
+        writer_tokens_per_cta = 0
+        writer_token_tiles_estimated = 0
+        writer_active_token_tiles_estimated = 0
+        writer_cta_count_estimated = 0
+        writer_active_cta_count_estimated = 0
+        if int(stride_tokens_ref) > 0:
+            requested_tile_tokens = int(_WRITER_TOKEN_TILE_CACHED)
+            if requested_tile_tokens > 0:
+                writer_grid_tokens = max(1, int(writer_active_max_tokens))
+                max_grid_z = 65535
+                min_tile_for_grid_z = (int(writer_grid_tokens) + max_grid_z - 1) // max_grid_z
+                writer_tokens_per_cta = max(1, int(requested_tile_tokens), int(min_tile_for_grid_z))
+                writer_token_tiles_estimated = max(
+                    1,
+                    (int(writer_grid_tokens) + int(writer_tokens_per_cta) - 1)
+                    // int(writer_tokens_per_cta),
+                )
+                writer_active_token_tiles_estimated = sum(
+                    (min(max(0, int(kv_len)), int(stride_tokens_ref)) + int(writer_tokens_per_cta) - 1)
+                    // int(writer_tokens_per_cta)
+                    for kv_len in kv_lens_ref
+                    if int(kv_len) > 0
+                )
+            else:
+                writer_tokens_per_cta = int(stride_tokens_ref)
+                writer_token_tiles_estimated = 1 if batch > 0 else 0
+                writer_active_token_tiles_estimated = sum(1 for kv_len in kv_lens_ref if int(kv_len) > 0)
+            writer_cta_count_estimated = (
+                int(layers) * int(batch) * int(num_kv_heads) * int(writer_token_tiles_estimated)
             )
-            writer_active_token_tiles_estimated = sum(
-                (min(max(0, int(kv_len)), int(stride_tokens_ref)) + int(writer_tokens_per_cta) - 1)
-                // int(writer_tokens_per_cta)
-                for kv_len in kv_lens_ref
-                if int(kv_len) > 0
+            writer_active_cta_count_estimated = (
+                int(layers) * int(num_kv_heads) * int(writer_active_token_tiles_estimated)
             )
-        else:
-            writer_tokens_per_cta = int(stride_tokens_ref)
-            writer_token_tiles_estimated = 1 if batch > 0 else 0
-            writer_active_token_tiles_estimated = sum(1 for kv_len in kv_lens_ref if int(kv_len) > 0)
-        writer_cta_count_estimated = (
-            int(layers) * int(batch) * int(num_kv_heads) * int(writer_token_tiles_estimated)
-        )
-        writer_active_cta_count_estimated = (
-            int(layers) * int(num_kv_heads) * int(writer_active_token_tiles_estimated)
-        )
-    setattr(self, "_last_writer_token_tiles_estimated", int(writer_token_tiles_estimated))
-    setattr(self, "_last_writer_active_token_tiles_estimated", int(writer_active_token_tiles_estimated))
-    setattr(self, "_last_writer_cta_count_estimated", int(writer_cta_count_estimated))
-    setattr(self, "_last_writer_active_cta_count_estimated", int(writer_active_cta_count_estimated))
-    setattr(self, "_last_writer_tokens_per_cta", int(writer_tokens_per_cta))
+        setattr(self, "_last_writer_token_tiles_estimated", int(writer_token_tiles_estimated))
+        setattr(self, "_last_writer_active_token_tiles_estimated", int(writer_active_token_tiles_estimated))
+        setattr(self, "_last_writer_cta_count_estimated", int(writer_cta_count_estimated))
+        setattr(self, "_last_writer_active_cta_count_estimated", int(writer_active_cta_count_estimated))
+        setattr(self, "_last_writer_tokens_per_cta", int(writer_tokens_per_cta))
 
     block_table_ref = payloads[0].block_table
     if block_table_ref.dtype != torch.int32:

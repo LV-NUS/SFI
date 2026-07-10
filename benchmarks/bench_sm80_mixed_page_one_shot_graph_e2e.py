@@ -1335,6 +1335,12 @@ def _copy_sparse_metadata_profile_env_for_diagnostic(env: dict[str, str]) -> Non
     for key in (
         "VLLM_SPARSE_MB_PROFILE_LOG",
         "VLLM_SPARSE_RRP_PREP_PROFILE_LOG",
+        # [T1-FORENSIC 2026-07-09] refresh flush host cProfile 采样目录
+        # (名字含 PROFILE 命中 gate-D 通配清洗,须显式回填诊断 child)。
+        "VLLM_SPARSE_REFRESH_CPROFILE_DIR",
+        # [T2-FORENSIC 2026-07-10] 世代 commit 步 metadata builder host 分相
+        # cProfile 采样目录(同上须回填)。
+        "VLLM_SPARSE_MB_CPROFILE_DIR",
     ):
         value = os.environ.get(key, "").strip()
         if value:
@@ -1686,10 +1692,11 @@ def _build_gate_d_sparse_env(
         route_trace_path=route_trace_path or Path(""),
     )
     _clear_gate_d_trace_profile_env(env)
-    _copy_mixed_page_kernel_profile_env_for_diagnostic(env)
-    _copy_sparse_metadata_profile_env_for_diagnostic(env)
-    _copy_torch_profiler_env_for_diagnostic(env)
-    _copy_step_profile_env_for_diagnostic(env)
+    # [GATE-D-SPEED-ENV-PURITY 2026-07-10] _copy_*_for_diagnostic 系列从本共用
+    # 构建函数移出,只在 diagnostic_env 调用点施加:此前 speed child 也被回填
+    # profile env,与 _copy_torch_profiler_env_for_diagnostic 自身注释("仅诊断
+    # child 回填,speed child 保持无 profiler,不扰测速")矛盾;测速纯净性由
+    # 上面的 _clear_gate_d_trace_profile_env 单点保证。
     _apply_gate_d_backend_env(args, env)
     if _gate_d_backend(args) == BACKEND_FA4_SM100:
         env["VLLM_ATTENTION_BACKEND"] = "FLASH_ATTN_VLLM_V1"
@@ -2500,39 +2507,8 @@ def _gate_d_payload(
         )
     )
     semantic_gate_reasons = _semantic_gate_reasons(mode, semantic_output_health)
-    sparse_native_lifecycle_required = bool(
-        mode != "dense"
-        and _env_flag_enabled(speed_env, "VLLM_SPARSE_NATIVE_LIFECYCLE")
-    )
+    sparse_native_lifecycle_required = False
     sparse_native_lifecycle_gate_reasons: list[str] = []
-    if sparse_native_lifecycle_required:
-        rrp_visible_source_kind = str(
-            _route_summary_proof_value("rrp_visible_source_kind", "") or ""
-        )
-        rrp_dynamic_covers = bool(
-            _route_summary_proof_value(
-                "rrp_sparse_dynamic_state_covers_rows", False
-            )
-        )
-        rrp_dynamic_failure = str(
-            _route_summary_proof_value(
-                "rrp_sparse_dynamic_state_failure_reason", ""
-            )
-            or ""
-        )
-        if rrp_visible_source_kind != "sparse_dynamic_state":
-            sparse_native_lifecycle_gate_reasons.append(
-                "rrp_visible_source_not_sparse_dynamic_state:"
-                f"{rrp_visible_source_kind or 'missing'}"
-            )
-        if not rrp_dynamic_covers:
-            sparse_native_lifecycle_gate_reasons.append(
-                "rrp_sparse_dynamic_state_not_covering_rows"
-            )
-        if rrp_dynamic_failure:
-            sparse_native_lifecycle_gate_reasons.append(
-                "rrp_sparse_dynamic_state_failure:" + rrp_dynamic_failure
-            )
     steady_records = _steady_prefill_profile_records(refresh_profile)
     production_gate_passed = bool(
         result.returncode == 0
@@ -3190,6 +3166,12 @@ def _run_gate_d_mode(args: argparse.Namespace) -> int:
     )
     _copy_refresh_micro_profile_env_for_diagnostic(diagnostic_env)
     _copy_selector_profile_env_for_diagnostic(diagnostic_env)
+    # [GATE-D-SPEED-ENV-PURITY 2026-07-10] 自 _build_gate_d_sparse_env 移入的
+    # diagnostic-only 回填(speed child 不再泄入 profile env)。
+    _copy_mixed_page_kernel_profile_env_for_diagnostic(diagnostic_env)
+    _copy_sparse_metadata_profile_env_for_diagnostic(diagnostic_env)
+    _copy_torch_profiler_env_for_diagnostic(diagnostic_env)
+    _copy_step_profile_env_for_diagnostic(diagnostic_env)
     if args.selector_pipeline_cpu_profile_output:
         diagnostic_env["VLLM_SPARSE_PIPELINE_CPU_PROFILE"] = "1"
         diagnostic_env["VLLM_SPARSE_PIPELINE_CPU_PROFILE_LOG"] = str(

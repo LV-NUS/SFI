@@ -37,6 +37,212 @@ def _selected_ready_trace_path() -> str:
     return os.environ.get("VLLM_SPARSE_SELECTED_READY_TRACE_LOG", "").strip()
 
 
+class StepCacheInvariants:
+    """[T2-HOST-DIET 2026-07-10] build_layer_step_cache_impl 的步级不变量包。
+
+    世代 commit 步 36 层 cache 全 miss 时,预备段(标量提取/合同校验/plan
+    取用/seqused 合同/veto 行分类/page-sparse 门/trace 开关)只依赖 step 级
+    输入,却曾被每层重算 36 遍(cProfile 定谳:controller 三连+函数内
+    import+env 读 46 次/步)。由 build_step_cache_invariants 每步构建一次并
+    thread 进 impl(P12 precomputed_cache_key/active_slots 同款惯用法);
+    无 bundle 的调用方(测试/view-refresh 腿)由 impl 自建,单实现零漂移。
+
+    slot_by_row 取自首个 post-align miss 层:跨层 slot 一致性在
+    metadata-builder 循环前已由 _validate_layer_slot_signature_consistency
+    验证,align 对共享步输入确定(与 P12 active_slots hoist 同一论证)。
+    """
+
+    __slots__ = (
+        "force_dense",
+        "force_compact_off",
+        "batch_size",
+        "max_batch_size",
+        "block_size",
+        "decode_plan_version",
+        "plan",
+        "plan_valid",
+        "seqused_k_gpu",
+        "slot_by_row",
+        "want_compact_by_row",
+        "request_selected_rows",
+        "any_selected",
+        "page_sparse_gate_on",
+        "trace_enabled",
+    )
+
+    def __init__(
+        self,
+        *,
+        force_dense: bool,
+        force_compact_off: bool,
+        batch_size: int,
+        max_batch_size: int,
+        block_size: int,
+        decode_plan_version: int,
+        plan: object,
+        plan_valid: bool,
+        seqused_k_gpu: torch.Tensor,
+        slot_by_row: Tuple[int, ...],
+        want_compact_by_row: Tuple[bool, ...],
+        request_selected_rows: Tuple[bool, ...],
+        any_selected: bool,
+        page_sparse_gate_on: bool,
+        trace_enabled: bool,
+    ) -> None:
+        self.force_dense = force_dense
+        self.force_compact_off = force_compact_off
+        self.batch_size = batch_size
+        self.max_batch_size = max_batch_size
+        self.block_size = block_size
+        self.decode_plan_version = decode_plan_version
+        self.plan = plan
+        self.plan_valid = plan_valid
+        self.seqused_k_gpu = seqused_k_gpu
+        self.slot_by_row = slot_by_row
+        self.want_compact_by_row = want_compact_by_row
+        self.request_selected_rows = request_selected_rows
+        self.any_selected = any_selected
+        self.page_sparse_gate_on = page_sparse_gate_on
+        self.trace_enabled = trace_enabled
+
+
+def build_step_cache_invariants(
+    *,
+    state: LayerState,
+    step_meta: "StepMeta",
+    step_authority: "StepAuthority",
+    step_bound_meta: Optional["StepBoundMeta"],
+    device: torch.device,
+    force_dense: bool,
+    force_compact_off: bool,
+    layer_effective_refresh_by_row: Tuple[bool, ...],
+) -> StepCacheInvariants:
+    """步级不变量构建(原 impl 预备段原样搬迁,校验 raise 文案不变)。"""
+    batch_size = int(step_authority.batch_size)
+    max_batch_size = int(step_authority.max_batch_size)
+    block_size = int(step_meta.block_size)
+    compact_threshold = int(step_authority.compact_bootstrap_threshold)
+    req_ids = step_authority.req_ids
+    decode_plan_version = int(getattr(step_authority, "decode_plan_version", -1))
+    context_kv_len_cpu = step_authority.context_kv_len_by_row
+    if int(step_meta.epoch) != int(step_authority.epoch):
+        raise RuntimeError(
+            "step cache carrier epoch mismatch between StepMeta and StepAuthority; "
+            f"meta_epoch={int(step_meta.epoch)} auth_epoch={int(step_authority.epoch)}"
+        )
+    if int(step_meta.batch_size) != batch_size:
+        raise RuntimeError(
+            "step cache carrier batch mismatch between StepMeta and StepAuthority; "
+            f"meta_batch={int(step_meta.batch_size)} auth_batch={batch_size}"
+        )
+    if (
+        len(req_ids) < batch_size
+        or len(context_kv_len_cpu) < batch_size
+        or len(step_authority.bootstrap_done_by_row) < batch_size
+        or len(step_authority.q_lens_by_row) < batch_size
+        or len(step_authority.is_prefill_by_row) < batch_size
+        or len(step_authority.short_dense_by_row) < batch_size
+    ):
+        raise RuntimeError(
+            "step cache requires full StepAuthority row coverage "
+            f"(batch={batch_size}, req={len(req_ids)}, context={len(context_kv_len_cpu)}, "
+            f"bootstrap={len(step_authority.bootstrap_done_by_row)}, "
+            f"q_lens={len(step_authority.q_lens_by_row)}, "
+            f"is_prefill={len(step_authority.is_prefill_by_row)}, "
+            f"short_dense={len(step_authority.short_dense_by_row)})"
+        )
+    if len(layer_effective_refresh_by_row) < batch_size:
+        raise RuntimeError(
+            "step cache missing layer_effective_refresh_by_row rows; "
+            f"rows={len(layer_effective_refresh_by_row)} batch={batch_size}"
+        )
+    plan = (
+        getattr(step_bound_meta, "compact_recent_launch_plan", None)
+        if step_bound_meta is not None
+        else None
+    )
+    plan_valid = plan is not None and bool(getattr(plan, "valid", False))
+    seqused_k_gpu = step_meta.canonical_real_kv_len_i32_gpu
+    if (
+        not isinstance(seqused_k_gpu, torch.Tensor)
+        or seqused_k_gpu.device != device
+        or seqused_k_gpu.dtype != torch.int32
+        or seqused_k_gpu.dim() != 1
+        or int(seqused_k_gpu.numel()) != int(batch_size)
+    ):
+        raise RuntimeError(
+            "post_kernel_worker requires canonical_real_kv_len_i32_gpu to satisfy contract; "
+            f"batch_size={int(batch_size)}"
+        )
+    # veto 行分类:除 compact_ready(经 state.compact_kv_len,真 per-layer)外,
+    # use_compact 判定链全为步级输入。原 per-layer 循环的 q_len 读取是死读
+    # (不参与判定),不再保留。
+    slot_by_row = tuple(
+        int(state.request_id_to_slot.get(req_id, -1)) for req_id in req_ids
+    )
+    want_compact_list = []
+    for row in range(len(req_ids)):
+        bootstrap_done = bool(step_authority.bootstrap_done_by_row[row])
+        is_prefill = bool(step_authority.is_prefill_by_row[row])
+        is_refresh = bool(layer_effective_refresh_by_row[row])
+        context_kv_len = int(context_kv_len_cpu[row])
+        short_dense = bool(step_authority.short_dense_by_row[row])
+        if (not short_dense) and compact_threshold > 0 and context_kv_len <= compact_threshold:
+            # Keep semantic parity with previous threshold-derived behavior.
+            short_dense = True
+        want_compact_list.append(
+            not (
+                force_dense
+                or force_compact_off
+                or is_prefill
+                or (not bootstrap_done)
+                or short_dense
+                or is_refresh
+            )
+        )
+    request_selected_rows = tuple(
+        bool(v) for v in getattr(step_authority, "use_compact_by_row", tuple())[:batch_size]
+    )
+    any_selected = any(request_selected_rows)
+    # page-sparse 门(操作数全步级;import 从 per-layer 函数体提为 per-step,
+    # 保持函数内 import 以避免模块环)。
+    from patches.sparse_constants import should_skip_page_sparse_state
+    from patches.patch_installer import _get_global_controller
+
+    _ctrl_peripheral = _get_global_controller()
+    _attn_mode_peripheral = str(
+        getattr(
+            getattr(_ctrl_peripheral, "config", None),
+            "attn_mode",
+            "compact_recent",
+        )
+    )
+    page_sparse_gate_on = (
+        not should_skip_page_sparse_state(_attn_mode_peripheral)
+        and not force_dense
+        and int(batch_size) > 0
+        and bool(getattr(step_meta, "has_decode_row", False))
+        and any_selected
+    )
+    return StepCacheInvariants(
+        force_dense=bool(force_dense),
+        force_compact_off=bool(force_compact_off),
+        batch_size=batch_size,
+        max_batch_size=max_batch_size,
+        block_size=block_size,
+        decode_plan_version=decode_plan_version,
+        plan=plan,
+        plan_valid=plan_valid,
+        seqused_k_gpu=seqused_k_gpu,
+        slot_by_row=slot_by_row,
+        want_compact_by_row=tuple(want_compact_list),
+        request_selected_rows=request_selected_rows,
+        any_selected=any_selected,
+        page_sparse_gate_on=page_sparse_gate_on,
+        trace_enabled=bool(_selected_ready_trace_path()),
+    )
+
+
 def _append_selected_ready_trace(event: dict[str, object]) -> None:
     path = _selected_ready_trace_path()
     if not path:
@@ -193,16 +399,19 @@ def _mark_selected_scope_terminal_if_needed(
 ) -> bool:
     handle = getattr(step_authority, "selected_scope_wait_handle", None)
     if handle is None or bool(getattr(handle, "is_ready", False)):
-        _append_selected_ready_trace(
-            {
-                "event": "selected_scope_publish_skipped",
-                "reason": "handle_missing_or_ready",
-                "epoch": int(getattr(step_authority, "epoch", -1)),
-                "layer_index": int(getattr(state, "layer_index", -1)),
-                "handle_id": id(handle),
-                "handle_ready": bool(getattr(handle, "is_ready", False)) if handle is not None else None,
-            }
-        )
+        # [T2-HOST-DIET] trace 关闭时不再白构造事件 dict(id/getattr/int 全做
+        # 再被 append 丢弃;cProfile 定谳 360 次/取证轮)。
+        if _selected_ready_trace_path():
+            _append_selected_ready_trace(
+                {
+                    "event": "selected_scope_publish_skipped",
+                    "reason": "handle_missing_or_ready",
+                    "epoch": int(getattr(step_authority, "epoch", -1)),
+                    "layer_index": int(getattr(state, "layer_index", -1)),
+                    "handle_id": id(handle),
+                    "handle_ready": bool(getattr(handle, "is_ready", False)) if handle is not None else None,
+                }
+            )
         return False
 
     from patches.fa3_native.scope_async import mark_layer_commit_terminal
@@ -248,13 +457,17 @@ def build_layer_step_cache_impl(
     layer_effective_refresh_by_row: Tuple[bool, ...],
     step_bound_meta: Optional["StepBoundMeta"] = None,
     precomputed_cache_key: Optional[Tuple[object, ...]] = None,
+    step_invariants: Optional[StepCacheInvariants] = None,
 ) -> None:
     """为该层构建 step 缓存（每层每 step 只执行一次）。
 
     从 StepAuthority（语义单源）和 StepMeta（张量载体）中提取数据，
     构建该层所需的 GPU tensors，供 dispatcher 直接使用。
 
-    slot 分配是 per-layer 的，所以 slot_by_row 和 use_compact 在这里计算。
+    [T2-HOST-DIET 2026-07-10] slot map 在 metadata-builder 循环内已对齐到
+    步级全局 map 且跨层一致性预验证,故 slot_by_row 与 use_compact 的 veto
+    链均为步级不变量,走 step_invariants(调用方 thread 或本函数自建)。
+    真 per-layer 的只剩 compact_ready(state.compact_kv_len)与 state 字段写。
 
     ⚠️ 性能优化：compact 相关的 2 个 GPU tensor (compact_kv_len, compact_offset)
     只在 compact_meta_epoch 或 req_ids 变化时重建。在 decode 稳态，这些值是稳定的，
@@ -315,45 +528,34 @@ def build_layer_step_cache_impl(
     ):
         return  # bail-out: no validation, no pack_req_meta, no page_sparse branch, no sync
 
-    batch_size = int(step_authority.batch_size)
-    max_batch_size = int(step_authority.max_batch_size)
-    block_size = int(step_meta.block_size)
-    compact_threshold = int(step_authority.compact_bootstrap_threshold)
-    req_ids = step_authority.req_ids
-    decode_plan_version = int(getattr(step_authority, "decode_plan_version", -1))
-    context_kv_len_cpu = step_authority.context_kv_len_by_row
-    if int(step_meta.epoch) != int(step_authority.epoch):
-        raise RuntimeError(
-            "step cache carrier epoch mismatch between StepMeta and StepAuthority; "
-            f"meta_epoch={int(step_meta.epoch)} auth_epoch={int(step_authority.epoch)}"
+    # [T2-HOST-DIET 2026-07-10] 步级不变量:调用方 thread 则直接用(commit 步
+    # 36 层共享一份),否则自建(测试/view-refresh 腿,单实现零漂移)。
+    # force 标志护栏 fail-close:bundle 与本调用不一致=错传,响亮 raise。
+    if step_invariants is None:
+        step_invariants = build_step_cache_invariants(
+            state=state,
+            step_meta=step_meta,
+            step_authority=step_authority,
+            step_bound_meta=step_bound_meta,
+            device=device,
+            force_dense=force_dense,
+            force_compact_off=force_compact_off,
+            layer_effective_refresh_by_row=layer_effective_refresh_by_row,
         )
-    if int(step_meta.batch_size) != batch_size:
-        raise RuntimeError(
-            "step cache carrier batch mismatch between StepMeta and StepAuthority; "
-            f"meta_batch={int(step_meta.batch_size)} auth_batch={batch_size}"
-        )
-    if (
-        len(req_ids) < batch_size
-        or len(context_kv_len_cpu) < batch_size
-        or len(step_authority.bootstrap_done_by_row) < batch_size
-        or len(step_authority.q_lens_by_row) < batch_size
-        or len(step_authority.is_prefill_by_row) < batch_size
-        or len(step_authority.short_dense_by_row) < batch_size
+    elif (
+        bool(step_invariants.force_dense) != bool(force_dense)
+        or bool(step_invariants.force_compact_off) != bool(force_compact_off)
     ):
         raise RuntimeError(
-            "step cache requires full StepAuthority row coverage "
-            f"(batch={batch_size}, req={len(req_ids)}, context={len(context_kv_len_cpu)}, "
-            f"bootstrap={len(step_authority.bootstrap_done_by_row)}, "
-            f"q_lens={len(step_authority.q_lens_by_row)}, "
-            f"is_prefill={len(step_authority.is_prefill_by_row)}, "
-            f"short_dense={len(step_authority.short_dense_by_row)})"
+            "step_invariants force flags diverge from call flags; "
+            f"inv=({step_invariants.force_dense},{step_invariants.force_compact_off}) "
+            f"call=({force_dense},{force_compact_off})"
         )
-    refresh_by_row_signature = layer_effective_refresh_by_row
-    if len(refresh_by_row_signature) < batch_size:
-        raise RuntimeError(
-            "step cache missing layer_effective_refresh_by_row rows; "
-            f"rows={len(refresh_by_row_signature)} batch={batch_size}"
-        )
+    inv = step_invariants
+    batch_size = inv.batch_size
+    max_batch_size = inv.max_batch_size
+    block_size = inv.block_size
+    decode_plan_version = inv.decode_plan_version
 
     # cache_key already computed at the top-level bail-out (content signature).
     # Slow path reuses it for persist at the end; no duplicate compute.
@@ -363,16 +565,11 @@ def build_layer_step_cache_impl(
     # source of truth for compact descriptors. We still keep cache_key +
     # plan_version so the per-layer bail-out remains content-sensitive, but
     # the tensor-existence check is delegated to `plan.valid`.
-    _slow_plan = (
-        getattr(step_bound_meta, "compact_recent_launch_plan", None)
-        if step_bound_meta is not None
-        else None
-    )
+    _slow_plan = inv.plan
     compact_cache_valid = (
         state.step_cache_key == cache_key
         and int(getattr(state, "step_cache_plan_version", -1)) == decode_plan_version
-        and _slow_plan is not None
-        and bool(getattr(_slow_plan, "valid", False))
+        and inv.plan_valid
     )
 
     if compact_cache_valid:
@@ -382,43 +579,24 @@ def build_layer_step_cache_impl(
         use_compact_list = None
     else:
         # ❌ cache miss: 仍按 per-row 规则计算 use_compact 以维护 step_cache_has_compact
-        # / step_cache_all_compact 预计算值。不再回填任何 compact_kv_len/offset
-        # CPU/GPU 载体——plan 在 step 开头由 build_compact_recent_launch_plan 一次
-        # 构建并通过 H2D 推到 GPU，当前 step 的所有层共享。
+        # / step_cache_all_compact 预计算值。veto 链为步级不变量(inv.want_compact_by_row),
+        # 真 per-layer 输入只剩 compact_ready(state.compact_kv_len)。
+        _want_compact = inv.want_compact_by_row
+        _slot_by_row = inv.slot_by_row
+        _compact_kv_len = state.compact_kv_len
+        _ckl_len = len(_compact_kv_len)
         use_compact_list = []
-        for row, req_id in enumerate(req_ids):
-            slot = state.request_id_to_slot.get(req_id, -1)
-
-            bootstrap_done = bool(step_authority.bootstrap_done_by_row[row])
-            q_len = int(step_authority.q_lens_by_row[row])
-            is_prefill = bool(step_authority.is_prefill_by_row[row])
-            is_refresh = bool(refresh_by_row_signature[row])
-            context_kv_len = int(context_kv_len_cpu[row])
-            short_dense = bool(step_authority.short_dense_by_row[row])
-            if (not short_dense) and compact_threshold > 0 and context_kv_len <= compact_threshold:
-                # Keep semantic parity with previous threshold-derived behavior.
-                short_dense = True
-
-            compact_ready = (
-                slot >= 0
-                and slot < len(state.compact_kv_len)
-                and state.compact_kv_len[slot] > 0
+        for row in range(len(_want_compact)):
+            slot = _slot_by_row[row]
+            use_compact_list.append(
+                1
+                if (
+                    _want_compact[row]
+                    and 0 <= slot < _ckl_len
+                    and _compact_kv_len[slot] > 0
+                )
+                else 0
             )
-            use_compact = False
-            if force_dense or force_compact_off:
-                pass
-            elif is_prefill:
-                pass
-            elif not bootstrap_done:
-                pass
-            elif short_dense:
-                pass
-            elif is_refresh:
-                pass
-            elif compact_ready:
-                use_compact = True
-
-            use_compact_list.append(1 if use_compact else 0)
         state._cached_is_compact_gpu = None
 
     # ⚠️ 性能优化：使用 max_batch_size 预分配 buffer，避免热路径 slice
@@ -428,18 +606,7 @@ def build_layer_step_cache_impl(
     if state.step_cache_req_meta_i64 is None or state.step_cache_req_meta_i64.shape[0] < max_batch_size:
         state.step_cache_req_meta_i64 = torch.empty((max_batch_size, 4), dtype=torch.int64, device=device)
 
-    seqused_k_gpu = step_meta.canonical_real_kv_len_i32_gpu
-    if (
-        not isinstance(seqused_k_gpu, torch.Tensor)
-        or seqused_k_gpu.device != device
-        or seqused_k_gpu.dtype != torch.int32
-        or seqused_k_gpu.dim() != 1
-        or int(seqused_k_gpu.numel()) != int(batch_size)
-    ):
-        raise RuntimeError(
-            "post_kernel_worker requires canonical_real_kv_len_i32_gpu to satisfy contract; "
-            f"batch_size={int(batch_size)}"
-        )
+    seqused_k_gpu = inv.seqused_k_gpu
 
     # ⚠️ 调用 GPU kernel 打包 meta（传入整个 buffer + num_seqs，避免 slice）
     if not skip_meta_pack:
@@ -497,34 +664,16 @@ def build_layer_step_cache_impl(
 
     page_sparse_metadata: Optional[dict[str, object]] = None
     page_sparse_enabled = False
-    request_selected_rows = tuple(
-        bool(v) for v in getattr(step_authority, "use_compact_by_row", tuple())[:batch_size]
-    )
+    request_selected_rows = inv.request_selected_rows
     # ---------------------------------------------------------------------
     # SCAFFOLDING skip block B (peripheral companion §5.2.B)
     # Gate on 时跳过 page-sparse metadata 构建;既有 line 742+ disabled-branch
     # 自动处理 state 清理 + early return.
     # 默认 off: 行为 bit-identical. 切 on 见 spec §5.4.
     # Phase 6 无 gate 删除时一并移除.
+    # [T2-HOST-DIET] 门操作数全步级 → inv.page_sparse_gate_on 一次求值。
     # ---------------------------------------------------------------------
-    from patches.sparse_constants import should_skip_page_sparse_state
-    from patches.patch_installer import _get_global_controller
-    _ctrl_peripheral = _get_global_controller()
-    _attn_mode_peripheral = str(
-        getattr(
-            getattr(_ctrl_peripheral, "config", None),
-            "attn_mode",
-            "compact_recent",
-        )
-    )
-    _skip_page_sparse_peripheral = should_skip_page_sparse_state(_attn_mode_peripheral)
-    if (
-        not _skip_page_sparse_peripheral
-        and not force_dense
-        and int(batch_size) > 0
-        and bool(getattr(step_meta, "has_decode_row", False))
-        and any(request_selected_rows)
-    ):
+    if inv.page_sparse_gate_on:
         page_sparse_metadata = build_layer_page_sparse_metadata(
             step_meta=step_meta,
             request_id_to_slot=state.request_id_to_slot,
@@ -541,7 +690,7 @@ def build_layer_step_cache_impl(
             device=device,
         )
         page_sparse_enabled = bool(page_sparse_metadata["use_sparse"])
-        if _selected_ready_trace_path():
+        if inv.trace_enabled:
             _append_selected_ready_trace(
                 {
                     "event": "page_sparse_metadata_built",
@@ -602,7 +751,7 @@ def build_layer_step_cache_impl(
         state.step_cache_cached_status_ok = False
         state.step_cache_cached_freshness_ok = False
         state.step_cache_cached_launch_ready = False
-        if _selected_ready_trace_path():
+        if inv.trace_enabled:
             _append_selected_ready_trace(
                 {
                     "event": "page_sparse_disabled",
@@ -615,7 +764,7 @@ def build_layer_step_cache_impl(
                     "handle_id": id(getattr(step_authority, "selected_scope_wait_handle", None)),
                 }
             )
-        if not any(request_selected_rows):
+        if not inv.any_selected:
             _mark_selected_scope_terminal_if_needed(
                 state=state,
                 step_authority=step_authority,

@@ -141,7 +141,9 @@ def _load_ext(*, force: bool = False) -> Optional[torch.nn.Module]:
         return None
     if not force and not _should_enable():
         return None
-    prebuilt = load_prebuilt_extension("selector_log_s_ext")
+    # [FLFP-ILP4 2026-07-10] kernel 改动随 ext 名 bump(prebuilt 按名取件不看
+    # hash,BIND-CPP dg2 先例):旧预编件绝不能按旧名装上。
+    prebuilt = load_prebuilt_extension("selector_log_s_ext_ilp4")
     if prebuilt is not None and all(
         hasattr(prebuilt, name) for name in _REQUIRED_EXT_SYMBOLS
     ):
@@ -489,6 +491,46 @@ __device__ __forceinline__ float sigmoid_tanh_clip(float x) {
 } // namespace
 
 
+// [FLFP-ILP4 2026-07-10] Pass2/3 的 log_r_raw 单点取值 helper:cache 命中读
+// cache,miss 走与原两处 inline 重算逐字同序的表达式(编译期内联,数值逐位
+// 等价)。仅供保序 ILP 展开消重复文本,不改任何数学。
+__device__ __forceinline__ float flfp_log_r_raw_at(
+    const float* __restrict__ log_r_cache,
+    const float* __restrict__ key_norms,
+    int m,
+    int k,
+    int K,
+    int stride_kn_m,
+    int stride_kn_k,
+    int token_lo,
+    float denom_pos,
+    float eps,
+    float gamma,
+    float prior_pos_power_f,
+    float beta,
+    float prior_pos_eta,
+    float prior_weight_l2,
+    float prior_weight_pos) {
+    if (log_r_cache != nullptr) {
+        return log_r_cache[m * K + k];
+    }
+    float kn = key_norms[m * stride_kn_m + k * stride_kn_k];
+    kn = fmaxf(kn, eps);
+    float log_pi = -gamma * logf(kn);
+    float pos_norm = (static_cast<float>(k - token_lo)) / denom_pos;
+    pos_norm = fmaxf(0.0f, fminf(1.0f, pos_norm));
+    float pos_norm_pos = fmaxf(pos_norm, eps);
+    float pos_shaped = expf(prior_pos_power_f * logf(pos_norm_pos));
+    if (pos_norm <= 0.0f) {
+        pos_shaped = 0.0f;
+    }
+    float base_delta = -beta * pos_shaped;
+    float one_minus = fmaxf(1.0f - pos_norm, eps);
+    base_delta = base_delta + prior_pos_eta * logf(one_minus);
+    float log_delta = base_delta;
+    return prior_weight_l2 * log_pi + prior_weight_pos * log_delta;
+}
+
 template <typename scalar_t>
 __global__ void fused_log_f_prior_kernel(
     const scalar_t* __restrict__ scores,
@@ -826,13 +868,65 @@ __global__ void fused_log_f_prior_kernel(
     float denom_r = (max_r > min_val) ? (max_r + logf(fmaxf(sum_r, eps))) : min_val;
 
     // Pass 2: ff/rr/fr and tail stats
+    // [FLFP-ILP4 2026-07-10] 保序四路展开:每迭代并发发射 4 个 k 的 load 链
+    // (占用 13%/1 block/SM 档的延迟遮蔽靠线程内 ILP),累加仍是单累加器按
+    // 原 k 升序逐位相同的加法序;OOB 贡献显式 0.0f(+0.0f 恒等,累加器非
+    // ±0 场景),OOB 支路的 NaN(denom_r=-inf 时)经 select 丢弃不入账。
+    // 规约树/blockDim/shm 布局一字未动(λ 数值链锁死面,T1 定谳)。
     float local_ff = 0.0f;
     float local_rr = 0.0f;
     float local_fr = 0.0f;
     float local_prob_sum = 0.0f;
     float local_pos_sum = 0.0f;
 
-    for (int k = tid; k < K; k += blockDim.x) {
+    const int flfp_stride = blockDim.x;
+    int flfp_k_base = tid;
+    for (; flfp_k_base + 3 * flfp_stride < K; flfp_k_base += 4 * flfp_stride) {
+        float c_ff[4];
+        float c_rr[4];
+        float c_fr[4];
+        float c_p[4];
+        float c_ppos[4];
+        #pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            int k = flfp_k_base + u * flfp_stride;
+            bool flfp_valid = (k >= token_lo) && (k < token_hi);
+            float log_f = out[m * K + k];
+            float lp = min_val;
+            if (log_f > min_val && denom_f > min_val) {
+                lp = log_f - denom_f;
+            }
+            float pos_norm = (static_cast<float>(k - token_lo)) / denom_pos;
+            pos_norm = fmaxf(0.0f, fminf(1.0f, pos_norm));
+            float log_r_raw = flfp_log_r_raw_at(
+                log_r_cache, key_norms, m, k, K, stride_kn_m, stride_kn_k,
+                token_lo, denom_pos, eps, gamma, prior_pos_power_f, beta,
+                prior_pos_eta, prior_weight_l2, prior_weight_pos);
+            float log_r = log_r_raw - denom_r;
+            c_ff[u] = flfp_valid ? expf(2.0f * lp) : 0.0f;
+            c_rr[u] = flfp_valid ? expf(2.0f * log_r) : 0.0f;
+            c_fr[u] = flfp_valid ? expf(lp + log_r) : 0.0f;
+            if (lambda_tail_kappa > 0.0f) {
+                float p = flfp_valid ? expf(lp) : 0.0f;
+                c_p[u] = p;
+                c_ppos[u] = p * pos_norm;
+            } else {
+                c_p[u] = 0.0f;
+                c_ppos[u] = 0.0f;
+            }
+        }
+        #pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            local_ff += c_ff[u];
+            local_rr += c_rr[u];
+            local_fr += c_fr[u];
+            if (lambda_tail_kappa > 0.0f) {
+                local_prob_sum += c_p[u];
+                local_pos_sum += c_ppos[u];
+            }
+        }
+    }
+    for (int k = flfp_k_base; k < K; k += flfp_stride) {
         if (k < token_lo || k >= token_hi) {
             continue;
         }
@@ -910,8 +1004,38 @@ __global__ void fused_log_f_prior_kernel(
     float log_lambda = lambda_s[1];
 
     // Pass 3: denom_fused (cache fused_raw in out to avoid recompute)
+    // [FLFP-ILP4] max 为序无关(fmaxf 交换结合,输入无 NaN 入链:OOB 经
+    // select 换 min_val);存储按 valid 谓词化(OOB 保持 Pass1 写下的
+    // min_val,与原 continue 语义逐位一致)。
     float local_max_fused = min_val;
-    for (int k = tid; k < K; k += blockDim.x) {
+    flfp_k_base = tid;
+    for (; flfp_k_base + 3 * flfp_stride < K; flfp_k_base += 4 * flfp_stride) {
+        #pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            int k = flfp_k_base + u * flfp_stride;
+            bool flfp_valid = (k >= token_lo) && (k < token_hi);
+            float log_f = out[m * K + k];
+            float lp = min_val;
+            if (log_f > min_val && denom_f > min_val) {
+                lp = log_f - denom_f;
+            }
+            float log_r_raw = flfp_log_r_raw_at(
+                log_r_cache, key_norms, m, k, K, stride_kn_m, stride_kn_k,
+                token_lo, denom_pos, eps, gamma, prior_pos_power_f, beta,
+                prior_pos_eta, prior_weight_l2, prior_weight_pos);
+            float log_r = log_r_raw - denom_r;
+            float a = log_one_minus + lp;
+            float b = log_lambda + log_r;
+            float mval = fmaxf(a, b);
+            float fused_raw = mval + logf(expf(a - mval) + expf(b - mval));
+            if (flfp_valid) {
+                out[m * K + k] = fused_raw;
+            }
+            local_max_fused = fmaxf(
+                local_max_fused, flfp_valid ? fused_raw : min_val);
+        }
+    }
+    for (int k = flfp_k_base; k < K; k += flfp_stride) {
         if (k < token_lo || k >= token_hi) {
             continue;
         }
@@ -952,8 +1076,27 @@ __global__ void fused_log_f_prior_kernel(
     }
 
     float max_fused = block_reduce_max(local_max_fused);
+    // [FLFP-ILP4] sum_fused:同 Pass2 保序单累加器展开;OOB 读值=Pass1 的
+    // min_val(Pass3 谓词化未触碰),贡献显式 0。
     float local_sum_fused = 0.0f;
-    for (int k = tid; k < K; k += blockDim.x) {
+    flfp_k_base = tid;
+    for (; flfp_k_base + 3 * flfp_stride < K; flfp_k_base += 4 * flfp_stride) {
+        float c_sf[4];
+        #pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            int k = flfp_k_base + u * flfp_stride;
+            bool flfp_valid = (k >= token_lo) && (k < token_hi);
+            float fused_raw = out[m * K + k];
+            c_sf[u] = (flfp_valid && fused_raw > min_val && max_fused > min_val)
+                ? expf(fused_raw - max_fused)
+                : 0.0f;
+        }
+        #pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            local_sum_fused += c_sf[u];
+        }
+    }
+    for (int k = flfp_k_base; k < K; k += flfp_stride) {
         if (k < token_lo || k >= token_hi) {
             continue;
         }
@@ -967,7 +1110,18 @@ __global__ void fused_log_f_prior_kernel(
     float denom_fused = (max_fused > min_val) ? (max_fused + logf(fmaxf(sum_fused, eps))) : min_val;
 
     // Pass 4: write fused (normalize cached fused_raw)
-    for (int k = tid; k < K; k += blockDim.x) {
+    // [FLFP-ILP4] 双臂皆写,纯逐 k 独立,自由展开。
+    flfp_k_base = tid;
+    for (; flfp_k_base + 3 * flfp_stride < K; flfp_k_base += 4 * flfp_stride) {
+        #pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            int k = flfp_k_base + u * flfp_stride;
+            bool flfp_valid = (k >= token_lo) && (k < token_hi);
+            float fused_raw = out[m * K + k];
+            out[m * K + k] = flfp_valid ? (fused_raw - denom_fused) : min_val;
+        }
+    }
+    for (int k = flfp_k_base; k < K; k += flfp_stride) {
         if (k < token_lo || k >= token_hi) {
             out[m * K + k] = min_val;
             continue;
@@ -2182,7 +2336,7 @@ void reduce_log_f_pre_scratch_scalar_cuda(
 
     try:
         _MODULE = load_inline(
-            name="selector_log_s_ext",
+            name="selector_log_s_ext_ilp4",
             cpp_sources=cpp_source,
             cuda_sources=cuda_source,
             functions=None,

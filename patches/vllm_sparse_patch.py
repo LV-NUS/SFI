@@ -815,10 +815,12 @@ def _build_layer_step_cache(
     layer_effective_refresh_by_row: Tuple[bool, ...],
     step_bound_meta: Optional["StepBoundMeta"] = None,
     precomputed_cache_key: Optional[Tuple[object, ...]] = None,
+    step_invariants: Optional[object] = None,
 ) -> None:
     # M5 Part B2 (2026-04-24): plumb step_bound_meta to the impl so the
     # per-layer bail-out can consult CompactRecentLaunchPlan.valid.
     # P12 lever-2 (2026-06-12): plumb precomputed_cache_key the same way.
+    # [T2-HOST-DIET 2026-07-10]: plumb step_invariants(步级不变量包)同款。
     build_impl = _load_post_kernel_impls()
     return build_impl(
         state=state,
@@ -832,6 +834,7 @@ def _build_layer_step_cache(
         layer_effective_refresh_by_row=layer_effective_refresh_by_row,
         step_bound_meta=step_bound_meta,
         precomputed_cache_key=precomputed_cache_key,
+        step_invariants=step_invariants,
     )
 # -----------------------------------------------------------------------------
 # Controller keyed by cache pointer

@@ -28,10 +28,6 @@ __all__ = [
     "_SELECTOR_PIPELINE_UNIFIED_CACHED",
     "_SELECTOR_LOGS_CACHE_R_CACHED",
     "_ONE_SHOT_ASYNC_BOOTSTRAP_CACHED",
-    "_NATIVE_LIFECYCLE_CACHED",
-    "_LIFECYCLE_LIVE_STEADY_CACHED",
-    "_LIFECYCLE_LIVE_STEADY_ASSERT_CACHED",
-    "_LIFECYCLE_ONLY_FOR_SPEC_CACHED",
     "_RRP_SAME_PAGE_SKIP_REVALIDATION_CACHED",
     "_CLEAN_METADATA_CACHED",
     "_PAGE_ADD_INCREMENTAL_CACHED",
@@ -174,20 +170,6 @@ _ONE_SHOT_ASYNC_BOOTSTRAP_CACHED = (
     os.environ.get("VLLM_SPARSE_ONE_SHOT_ASYNC_BOOTSTRAP", "0") == "1"
 )
 # --- STEADY-decode metadata hot-path deployment flags (phase_h FIND #1) ---
-# Cached deployment toggles only; _VLLM_SPARSE_SESSION_SPEC stays a LIVE read
-# (sticky runtime latch in patch_installer) and is NOT cached here.
-_NATIVE_LIFECYCLE_CACHED = (
-    os.environ.get("VLLM_SPARSE_NATIVE_LIFECYCLE", "0").strip() == "1"
-)
-_LIFECYCLE_LIVE_STEADY_CACHED = (
-    os.environ.get("VLLM_SPARSE_LIFECYCLE_LIVE_STEADY", "0").strip() == "1"
-)
-_LIFECYCLE_LIVE_STEADY_ASSERT_CACHED = (
-    os.environ.get("VLLM_SPARSE_LIFECYCLE_LIVE_STEADY_ASSERT", "0").strip() == "1"
-)
-_LIFECYCLE_ONLY_FOR_SPEC_CACHED = (
-    os.environ.get("VLLM_SPARSE_LIFECYCLE_ONLY_FOR_SPEC") == "1"
-)
 _RRP_SAME_PAGE_SKIP_REVALIDATION_CACHED = (
     os.environ.get("VLLM_SPARSE_RRP_SAME_PAGE_SKIP_REVALIDATION", "1") == "1"
 )

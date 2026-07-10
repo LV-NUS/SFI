@@ -388,55 +388,7 @@ class CompactKVMixin:
             raise RuntimeError(
                 f"compact page slot {slot} is out of range for capacity {capacity_slots}"
             )
-        if (
-            block_size != int(residency.page_size)
-            or block_size != int(lease.manager_block_size)
-        ):
-            raise RuntimeError(
-                "compact page block_size mismatch: "
-                f"requested={block_size}, residency={residency.page_size}, "
-                f"lease={lease.manager_block_size}"
-            )
-        if (
-            num_kv_heads != int(residency.num_heads)
-            or num_kv_heads != int(state.num_kv_heads)
-        ):
-            raise RuntimeError(
-                "compact page num_kv_heads mismatch: "
-                f"requested={num_kv_heads}, residency={residency.num_heads}, "
-                f"state={state.num_kv_heads}"
-            )
-        state_head_dim = getattr(state, "head_dim", None)
-        if head_dim != int(residency.head_dim) or (
-            state_head_dim is not None and head_dim != int(state_head_dim)
-        ):
-            raise RuntimeError(
-                "compact page head_dim mismatch: "
-                f"requested={head_dim}, residency={residency.head_dim}, "
-                f"state={state_head_dim}"
-            )
-
         stride_tokens = int(lease.compact_blocks_per_slot) * block_size
-        if int(state.compact_stride_tokens) != stride_tokens:
-            raise RuntimeError(
-                "compact page stride_tokens mismatch: "
-                f"state={state.compact_stride_tokens}, expected={stride_tokens}"
-            )
-        if int(state.compact_stride_blocks) != int(lease.compact_blocks_per_slot):
-            raise RuntimeError(
-                "compact page stride_blocks mismatch: "
-                f"state={state.compact_stride_blocks}, expected={lease.compact_blocks_per_slot}"
-            )
-        if int(state.compact_stride_block_size) != block_size:
-            raise RuntimeError(
-                "compact page stride block_size mismatch: "
-                f"state={state.compact_stride_block_size}, requested={block_size}"
-            )
-        if capacity_tokens > stride_tokens:
-            raise RuntimeError(
-                f"compact capacity {capacity_tokens} exceeds page-backed stride {stride_tokens}"
-            )
-
         required_slots = max(int(state.batch_size), slot + 1)
         if required_slots > capacity_slots:
             raise RuntimeError(
@@ -450,58 +402,48 @@ class CompactKVMixin:
         required_tokens = required_slots * stride_tokens
         arena_k = state.compact_arena_k
         arena_v = state.compact_arena_v
-        if not isinstance(arena_k, torch.Tensor) or not isinstance(arena_v, torch.Tensor):
-            raise RuntimeError("compact page arena K/V views must be tensors")
-        expected_shape = (total_tokens, num_kv_heads, head_dim)
-        for name, tensor in (("K", arena_k), ("V", arena_v)):
-            if tuple(tensor.shape) != expected_shape:
-                raise RuntimeError(
-                    f"compact page arena {name} shape mismatch: "
-                    f"actual={tuple(tensor.shape)}, expected={expected_shape}"
-                )
-            if tensor.dtype != dtype:
-                raise RuntimeError(
-                    f"compact page arena {name} dtype mismatch: "
-                    f"actual={tensor.dtype}, expected={dtype}"
-                )
-            if tensor.device != state.device:
-                raise RuntimeError(
-                    f"compact page arena {name} device mismatch: "
-                    f"actual={tensor.device}, expected={state.device}"
-                )
-            if tensor.stride() != (num_kv_heads * head_dim, head_dim, 1):
-                raise RuntimeError(
-                    f"compact page arena {name} must be token-major viewable without copy; "
-                    f"stride={tuple(tensor.stride())}"
-                )
-        state_dtype = getattr(state, "kv_cache_dtype", None)
-        if state_dtype is not None and state_dtype != dtype:
-            raise RuntimeError(
-                f"compact page state kv_cache_dtype mismatch: state={state_dtype}, requested={dtype}"
+        # [RESIDENCY-CAPACITY-MEMO 2026-07-09] 静态合同校验按签名 memo:refresh
+        # 链每 chunk×每层全验一遍不变量,实测 ~500µs/chunk host 且结论恒同。
+        # 签名=residency/lease 身份+全部静态配置;现值身份=arena K/V data_ptr+
+        # arena 容量——lease 换代/arena rebind/容量变化任一 miss 即全验,
+        # fail-fast 语义不变。slot 与 required 上界、required 容量下界、pos
+        # 形状与视图段不入 memo,照旧每次执行。
+        static_sig = (
+            id(residency),
+            id(lease),
+            int(capacity_tokens),
+            int(num_kv_heads),
+            int(head_dim),
+            dtype,
+            int(block_size),
+        )
+        identity_now = (
+            int(arena_k.data_ptr()) if isinstance(arena_k, torch.Tensor) else -1,
+            int(arena_v.data_ptr()) if isinstance(arena_v, torch.Tensor) else -1,
+            int(state.compact_arena_capacity_tokens),
+        )
+        cached_sig = getattr(state, "_residency_capacity_ok_sig", None)
+        if (
+            cached_sig is None
+            or cached_sig[0] != static_sig
+            or cached_sig[1] != identity_now
+        ):
+            CompactKVMixin._validate_residency_compact_static_contract(
+                state=state,
+                residency=residency,
+                lease=lease,
+                capacity_tokens=capacity_tokens,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                dtype=dtype,
+                block_size=block_size,
+                stride_tokens=stride_tokens,
+                total_tokens=total_tokens,
+                arena_k=arena_k,
+                arena_v=arena_v,
             )
-
+            state._residency_capacity_ok_sig = (static_sig, identity_now)
         metadata = state.compact_metadata_buffers
-        expected_storage_ptr = int(getattr(metadata, "kv_storage_data_ptr", 0) or 0)
-        if expected_storage_ptr <= 0:
-            raise RuntimeError("compact page metadata is missing KV storage identity")
-        for name, tensor in (("K", arena_k), ("V", arena_v)):
-            if CompactKVMixin._storage_data_ptr(tensor) != expected_storage_ptr:
-                raise RuntimeError(
-                    f"compact page arena {name} is not backed by reserved page KV storage"
-                )
-        expected_k_data_ptr = int(getattr(metadata, "compact_k_data_ptr", 0) or 0)
-        expected_v_data_ptr = int(getattr(metadata, "compact_v_data_ptr", 0) or 0)
-        if expected_k_data_ptr <= 0 or expected_v_data_ptr <= 0:
-            raise RuntimeError("compact page metadata is missing reserved K/V view identity")
-        if int(arena_k.data_ptr()) != expected_k_data_ptr:
-            raise RuntimeError("compact page arena K is not the reserved K view")
-        if int(arena_v.data_ptr()) != expected_v_data_ptr:
-            raise RuntimeError("compact page arena V is not the reserved V view")
-        if int(state.compact_arena_capacity_tokens) < total_tokens:
-            raise RuntimeError(
-                "compact page arena capacity is smaller than reserved capacity: "
-                f"actual={state.compact_arena_capacity_tokens}, expected={total_tokens}"
-            )
         if int(state.compact_arena_capacity_tokens) < required_tokens:
             raise RuntimeError(
                 "compact page arena capacity is smaller than required slots: "
@@ -557,6 +499,25 @@ class CompactKVMixin:
         ):
             return
 
+        # [SLOT-VIEW-MEMO 2026-07-09] (slot,off) 粒度视图 memo:重建循环的
+        # narrow 三连(实测 84 次/chunk=~3.5 层×8 slot×3)对同 (slot,off,
+        # stride) 恒产出同一 view(纯 view 无拷贝语义)。off 已含代偏移——双代
+        # 两个 off 自然各占一条,首翻建满后恒命中。anchor=(K/V 基址,pos 对象
+        # id,stride,gen_stride):arena rebind/realloc、pos 重分配、几何变化
+        # 任一变 → 整表重建(miss=全量 narrow,非跳过)。
+        _view_anchor = (
+            int(arena_k.data_ptr()),
+            int(arena_v.data_ptr()),
+            id(state.compact_arena_pos),
+            int(stride_tokens),
+            int(gen_stride_tokens),
+        )
+        _view_memo = getattr(state, "_compact_slot_view_memo", None)
+        if _view_memo is None or _view_memo[0] != _view_anchor:
+            _view_memo = (_view_anchor, {})
+            state._compact_slot_view_memo = _view_memo
+        _view_by_key = _view_memo[1]
+        _arena_pos_local = state.compact_arena_pos
         for idx in range(required_slots):
             if idx >= len(state.compact_read_gen):
                 state.compact_read_gen.append(0)
@@ -568,15 +529,143 @@ class CompactKVMixin:
             )
             state.compact_capacity[idx] = stride_tokens
             state.compact_offset_tokens[idx] = off
-            state.compact_k[idx] = arena_k.narrow(0, off, stride_tokens)
-            state.compact_v[idx] = arena_v.narrow(0, off, stride_tokens)
-            state.compact_pos[idx] = state.compact_arena_pos.narrow(1, off, stride_tokens)
+            _views = _view_by_key.get((idx, off))
+            if _views is None:
+                _views = (
+                    arena_k.narrow(0, off, stride_tokens),
+                    arena_v.narrow(0, off, stride_tokens),
+                    _arena_pos_local.narrow(1, off, stride_tokens),
+                )
+                _view_by_key[(idx, off)] = _views
+            state.compact_k[idx] = _views[0]
+            state.compact_v[idx] = _views[1]
+            state.compact_pos[idx] = _views[2]
             if idx >= len(state.compact_pad_zeroed_len):
                 state.compact_pad_zeroed_len.append(-1)
         state.compact_views_bound_slots = max(
             int(getattr(state, "compact_views_bound_slots", 0)),
             int(required_slots),
         )
+
+    @staticmethod
+    def _validate_residency_compact_static_contract(
+        *,
+        state: "LayerState",
+        residency: object,
+        lease: object,
+        capacity_tokens: int,
+        num_kv_heads: int,
+        head_dim: int,
+        dtype: torch.dtype,
+        block_size: int,
+        stride_tokens: int,
+        total_tokens: int,
+        arena_k: object,
+        arena_v: object,
+    ) -> None:
+        """[RESIDENCY-CAPACITY-MEMO] 静态合同全验(memo miss 时执行)。
+
+        逐项校验原 `_ensure_residency_compact_capacity` 的静态不变量原文;
+        通过后由调用方以 (static_sig, identity_now) 记签名,签名/身份任一
+        变化即回到这里重验,fail-fast 语义与历史逐位一致。
+        """
+        if (
+            block_size != int(residency.page_size)
+            or block_size != int(lease.manager_block_size)
+        ):
+            raise RuntimeError(
+                "compact page block_size mismatch: "
+                f"requested={block_size}, residency={residency.page_size}, "
+                f"lease={lease.manager_block_size}"
+            )
+        if (
+            num_kv_heads != int(residency.num_heads)
+            or num_kv_heads != int(state.num_kv_heads)
+        ):
+            raise RuntimeError(
+                "compact page num_kv_heads mismatch: "
+                f"requested={num_kv_heads}, residency={residency.num_heads}, "
+                f"state={state.num_kv_heads}"
+            )
+        state_head_dim = getattr(state, "head_dim", None)
+        if head_dim != int(residency.head_dim) or (
+            state_head_dim is not None and head_dim != int(state_head_dim)
+        ):
+            raise RuntimeError(
+                "compact page head_dim mismatch: "
+                f"requested={head_dim}, residency={residency.head_dim}, "
+                f"state={state_head_dim}"
+            )
+        if int(state.compact_stride_tokens) != stride_tokens:
+            raise RuntimeError(
+                "compact page stride_tokens mismatch: "
+                f"state={state.compact_stride_tokens}, expected={stride_tokens}"
+            )
+        if int(state.compact_stride_blocks) != int(lease.compact_blocks_per_slot):
+            raise RuntimeError(
+                "compact page stride_blocks mismatch: "
+                f"state={state.compact_stride_blocks}, expected={lease.compact_blocks_per_slot}"
+            )
+        if int(state.compact_stride_block_size) != block_size:
+            raise RuntimeError(
+                "compact page stride block_size mismatch: "
+                f"state={state.compact_stride_block_size}, requested={block_size}"
+            )
+        if capacity_tokens > stride_tokens:
+            raise RuntimeError(
+                f"compact capacity {capacity_tokens} exceeds page-backed stride {stride_tokens}"
+            )
+        if not isinstance(arena_k, torch.Tensor) or not isinstance(arena_v, torch.Tensor):
+            raise RuntimeError("compact page arena K/V views must be tensors")
+        expected_shape = (total_tokens, num_kv_heads, head_dim)
+        for name, tensor in (("K", arena_k), ("V", arena_v)):
+            if tuple(tensor.shape) != expected_shape:
+                raise RuntimeError(
+                    f"compact page arena {name} shape mismatch: "
+                    f"actual={tuple(tensor.shape)}, expected={expected_shape}"
+                )
+            if tensor.dtype != dtype:
+                raise RuntimeError(
+                    f"compact page arena {name} dtype mismatch: "
+                    f"actual={tensor.dtype}, expected={dtype}"
+                )
+            if tensor.device != state.device:
+                raise RuntimeError(
+                    f"compact page arena {name} device mismatch: "
+                    f"actual={tensor.device}, expected={state.device}"
+                )
+            if tensor.stride() != (num_kv_heads * head_dim, head_dim, 1):
+                raise RuntimeError(
+                    f"compact page arena {name} must be token-major viewable without copy; "
+                    f"stride={tuple(tensor.stride())}"
+                )
+        state_dtype = getattr(state, "kv_cache_dtype", None)
+        if state_dtype is not None and state_dtype != dtype:
+            raise RuntimeError(
+                f"compact page state kv_cache_dtype mismatch: state={state_dtype}, requested={dtype}"
+            )
+        metadata = state.compact_metadata_buffers
+        expected_storage_ptr = int(getattr(metadata, "kv_storage_data_ptr", 0) or 0)
+        if expected_storage_ptr <= 0:
+            raise RuntimeError("compact page metadata is missing KV storage identity")
+        for name, tensor in (("K", arena_k), ("V", arena_v)):
+            if CompactKVMixin._storage_data_ptr(tensor) != expected_storage_ptr:
+                raise RuntimeError(
+                    f"compact page arena {name} is not backed by reserved page KV storage"
+                )
+        expected_k_data_ptr = int(getattr(metadata, "compact_k_data_ptr", 0) or 0)
+        expected_v_data_ptr = int(getattr(metadata, "compact_v_data_ptr", 0) or 0)
+        if expected_k_data_ptr <= 0 or expected_v_data_ptr <= 0:
+            raise RuntimeError("compact page metadata is missing reserved K/V view identity")
+        if int(arena_k.data_ptr()) != expected_k_data_ptr:
+            raise RuntimeError("compact page arena K is not the reserved K view")
+        if int(arena_v.data_ptr()) != expected_v_data_ptr:
+            raise RuntimeError("compact page arena V is not the reserved V view")
+        if int(state.compact_arena_capacity_tokens) < total_tokens:
+            raise RuntimeError(
+                "compact page arena capacity is smaller than reserved capacity: "
+                f"actual={state.compact_arena_capacity_tokens}, expected={total_tokens}"
+            )
 
     @staticmethod
     def _storage_data_ptr(tensor: torch.Tensor) -> int:

@@ -39,7 +39,12 @@ def _append_capture_layout_profile(payload: dict[str, object]) -> None:
 
 # ---- VLLM_SPARSE_CAPTURE_LAYOUT_PROBE (#6 diagnostic, in-memory, atexit flush; env-OFF) ----
 _CAPTURE_LAYOUT_PROBE_ENABLED = os.getenv("VLLM_SPARSE_CAPTURE_LAYOUT_PROBE", "0") == "1"
-_DECODE_OUTPTR_SKIP_LL_ENABLED = os.getenv("VLLM_SPARSE_DECODE_OUTPTR_SKIP_LIVE_LENGTHS", "0") == "1"
+# [T6-LL-SKIP-LAND 2026-07-10] VLLM_SPARSE_DECODE_OUTPTR_SKIP_LIVE_LENGTHS 旋钮
+# 删除,skip_live_lengths 形参转正默认生效(无旋钮原则)。byte-safe 定谳
+# (SM100 旧档设计原文):decode out_ptr prebuild 只读 capture_row_by_batch_row
+# +capture_scores 指针/stride,不读 live-lengths;同 step refresh 相首层调用
+# (skip=False)在任何 live-lengths 读者之前按 live_lengths_key 重建。
+# 必须 per-call 粒度,不能 layout 级(meta_pack/payload_worker 也读 live-lengths)。
 _COLDBUF_PREDRAIN_PROBE = os.getenv("VLLM_SPARSE_COLDBUF_PREDRAIN_PROBE", "0") == "1"
 _CAPTURE_LAYOUT_PROBE_ACC: dict = {}
 
@@ -519,7 +524,7 @@ def get_step_capture_layout_impl(
             if layout.row_list_cpu is None:
                 layout.row_list_cpu = list(row_list)
             live_lengths_rebuilt = False
-            if not (skip_live_lengths and _DECODE_OUTPTR_SKIP_LL_ENABLED) and not (
+            if not skip_live_lengths and not (
                 prepared_bound
                 and _prepared_live_metadata_ready(
                     layout=layout,
@@ -565,7 +570,11 @@ def get_step_capture_layout_impl(
             # [LAYOUT-STEP-MEMO 2026-07-06] reuse_same_step 全路径完成=layout
             # 对本 (step, chunk) 自洽，置 memo 供同 chunk 后续层零成本复用。
             # 跨 step rebuild 路径不置位（epoch 变化使旧 token 天然失配）。
-            if layout_step_memo_token is not None:
+            # [T6-LL-SKIP-LAND 2026-07-10] skip_live_lengths 调用不置位:memo
+            # 只能由全保真通道(live lengths 已按本 step 重建)建立,防 skip
+            # 调用把陈旧 live lengths 定格给同 chunk 后续层(今日调用序不可达,
+            # 结构性闩死)。
+            if layout_step_memo_token is not None and not skip_live_lengths:
                 layout.step_memo_token = layout_step_memo_token
             return layout
 
@@ -640,26 +649,56 @@ def get_step_capture_layout_impl(
                 out=layout.slot_tensor_i32,
             )
 
-        row_tensor = cached_sequence_to_device(
-            row_list,
-            dtype=torch.long,
-            device=device,
-            cache_name="row_i64",
-            stage_cache=layout.small_tensor_stage,
-            out=layout.row_tensor,
+        # [T6-LAYOUT-GEN-MEMO 2026-07-10] 跨世代结构 memo(旧档 §10.23 设计,
+        # 键=slot_list/req 序):row 结构与上次上传值等价(锚=row_list_cpu 逐值
+        # 相等,该字段只在成功上传后写入)且载体有效时,row 双精度 H2D 重传与
+        # capture_row 反向映射的 fill/scatter 重建均为同值重做 → 跳过;任一
+        # 锚/载体不满足=全量重建(fail-close),不做部分复用。
+        _row_structure_unchanged = (
+            not row_key_changed
+            and isinstance(layout.row_tensor, torch.Tensor)
+            and layout.row_tensor.device == device
+            and layout.row_tensor.dtype == torch.long
+            and int(layout.row_tensor.numel()) == len(row_list)
+            and isinstance(layout.row_tensor_i32, torch.Tensor)
+            and layout.row_tensor_i32.device == device
+            and layout.row_tensor_i32.dtype == torch.int32
+            and int(layout.row_tensor_i32.numel()) == len(row_list)
+            and layout.row_list_cpu == list(row_list)
         )
-        layout.row_tensor = row_tensor
-        layout.row_tensor_i32 = cached_sequence_to_device(
-            row_list,
-            dtype=torch.int32,
-            device=device,
-            cache_name="row_i32",
-            stage_cache=layout.small_tensor_stage,
-            out=layout.row_tensor_i32,
-        )
-        layout.row_list_cpu = list(row_list)
+        if _row_structure_unchanged:
+            row_tensor = layout.row_tensor
+        else:
+            row_tensor = cached_sequence_to_device(
+                row_list,
+                dtype=torch.long,
+                device=device,
+                cache_name="row_i64",
+                stage_cache=layout.small_tensor_stage,
+                out=layout.row_tensor,
+            )
+            layout.row_tensor = row_tensor
+            layout.row_tensor_i32 = cached_sequence_to_device(
+                row_list,
+                dtype=torch.int32,
+                device=device,
+                cache_name="row_i32",
+                stage_cache=layout.small_tensor_stage,
+                out=layout.row_tensor_i32,
+            )
+            layout.row_list_cpu = list(row_list)
         layout.slot_row_map_key = row_key
-        self._ensure_capture_row_by_batch_row(layout=layout, step_context=step_context, device=device)
+        if not (
+            _row_structure_unchanged
+            and isinstance(layout.capture_row_by_batch_row_i32, torch.Tensor)
+            and layout.capture_row_by_batch_row_i32.device == device
+            and layout.capture_row_by_batch_row_i32.dtype == torch.int32
+            and isinstance(layout.active_capture_row_by_batch_row_i32, torch.Tensor)
+            and int(layout.active_capture_row_by_batch_row_i32.numel())
+            == int(step_context.num_reqs)
+        ):
+            # 反向映射内容=f(row_tensor 内容, num_reqs);两者均未变时为同值重做。
+            self._ensure_capture_row_by_batch_row(layout=layout, step_context=step_context, device=device)
 
         if not step_context.seq_lens:
             raise RuntimeError(
@@ -669,7 +708,7 @@ def get_step_capture_layout_impl(
             )
         cap_tensor = _get_step_plan_cap_tensor()
         live_lengths_rebuilt = False
-        if not (skip_live_lengths and _DECODE_OUTPTR_SKIP_LL_ENABLED) and not (
+        if not skip_live_lengths and not (
             prepared_bound
             and _prepared_live_metadata_ready(
                 layout=layout,

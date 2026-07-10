@@ -7,6 +7,10 @@ import time
 
 _log = logging.getLogger(__name__)
 
+# [T1-FORENSIC 2026-07-09] refresh 链 host 分相取证:目录非空时对每次 refresh
+# flush 的 host 段做 cProfile 采样并落 pstats(取证发专用;默认空=零判速税)。
+_REFRESH_CPROFILE_DIR = os.environ.get("VLLM_SPARSE_REFRESH_CPROFILE_DIR", "")
+
 
 def _bootstrap_full_kv_handoff_trace_fields() -> dict[str, bool]:
     fields: dict[str, bool] = {"bootstrap_full_kv_handoff": True}
@@ -694,7 +698,7 @@ def flush_prefill_batches_impl(
                 _capture_writer_kernel_variant(profile_accum)
             return bool(fused_ok)
 
-        def _run_refresh() -> None:
+        def _run_refresh_body() -> None:
             if not refresh_payloads:
                 return
             if do_profile:
@@ -939,6 +943,27 @@ def flush_prefill_batches_impl(
                 prof.micro_rebuild_ns = _mt3 - _mt1
             if not fused_ok:
                 raise RuntimeError("refresh compact rebuild: fused gather failed")
+
+        def _run_refresh() -> None:
+            # [T1-FORENSIC 2026-07-09] 取证发专用 host 分相采样(默认目录空,
+            # 走 else 原路径零开销);cProfile 扭曲判速,取证发与判速发分离。
+            if not (_REFRESH_CPROFILE_DIR and refresh_payloads):
+                _run_refresh_body()
+                return
+            import cProfile
+
+            profiler = cProfile.Profile()
+            profiler.enable()
+            try:
+                _run_refresh_body()
+            finally:
+                profiler.disable()
+                profiler.dump_stats(
+                    os.path.join(
+                        _REFRESH_CPROFILE_DIR,
+                        f"refresh_host_{os.getpid()}_{time.time_ns()}.pstats",
+                    )
+                )
 
         def _run_prefill() -> None:
             if not prefill_payloads:

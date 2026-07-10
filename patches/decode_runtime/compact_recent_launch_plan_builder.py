@@ -306,6 +306,8 @@ def build_compact_recent_launch_plan(
 
     n_slots_kv = len(compact_kv_len_list)
     n_slots_off = len(compact_offset_tokens_list)
+    # [T3-PLAN-TAIL-DIET 2026-07-10] 主循环内 int(page_size) 每行重转 ×5 提环外。
+    page_size_i = int(page_size)
 
     for row in range(batch_size):
         real = max(0, int(real_kv_len_by_row[row]))
@@ -330,12 +332,12 @@ def build_compact_recent_launch_plan(
             if kv_len_aligned > 0 and slot < n_slots_off:
                 requires_compact_kv = True
                 offset_tokens = max(0, int(compact_offset_tokens_list[slot]))
-                base_block = offset_tokens // int(page_size)
+                base_block = offset_tokens // page_size_i
                 visible_recent = min(
-                    max(0, real - first * int(page_size)),
-                    count * int(page_size),
+                    max(0, real - first * page_size_i),
+                    count * page_size_i,
                 )
-                host_static_k_bound = kv_len_aligned + count * int(page_size)
+                host_static_k_bound = kv_len_aligned + count * page_size_i
             else:
                 if kv_len_raw <= 0:
                     raise RuntimeError(
@@ -352,7 +354,7 @@ def build_compact_recent_launch_plan(
             base_block = 0
             offset_tokens = 0
             first = 0
-            count = (real + int(page_size) - 1) // int(page_size)
+            count = (real + page_size_i - 1) // page_size_i
             visible_recent = real
             host_static_k_bound = real
 
@@ -436,32 +438,28 @@ def build_compact_recent_launch_plan(
         step_identity_token=_int_attr_or_default(step_bound_meta, "step_identity_token", 0),
         req_set_hash=_int_attr_or_default(step_bound_meta, "req_set_hash", 0),
         row_phase_hash=_int_attr_or_default(step_bound_meta, "row_phase_hash", 0),
-        slot_signature=tuple(int(slot_by_row[row]) for row in range(batch_size)),
+        # [T3-PLAN-TAIL-DIET 2026-07-10] 尾段 12 趟 per-row 逐元素重扫全为同值
+        # 重做:主循环出口的 8 个 list 元素已是纯 Python int(int()/整型算术
+        # 产出,LAUNCH-PLAN-BATCH-WRITE 注同一论证),头部输入元组已 int/bool
+        # 规范化且长度恰为主循环行数——tuple(list) 一次 C 层拷贝逐位等价。
+        slot_signature=slot_by_row[:batch_size],
         use_compact_signature=tuple(
-            1 if bool(use_compact_by_row[row]) else 0 for row in range(batch_size)
+            1 if v else 0 for v in use_compact_by_row[:batch_size]
         ),
         compact_meta_epoch=_int_attr_or_default(canonical_state, "compact_meta_epoch", -1),
-        compact_valid_tokens_cpu=tuple(
-            int(v) for v in compact_valid_tokens_list[:batch_size]
-        ),
-        compact_offset_tokens_cpu=tuple(
-            int(v) for v in compact_offset_tokens_gathered[:batch_size]
-        ),
-        recent_first_cpu=tuple(int(v) for v in recent_first_list[:batch_size]),
-        recent_count_cpu=tuple(int(v) for v in recent_count_list[:batch_size]),
-        request_recent_len_cpu=tuple(
-            int(v) for v in request_recent_len_list[:batch_size]
-        ),
-        launch_effective_k_len_cpu=tuple(
-            int(v) for v in launch_effective_k_len_list[:batch_size]
-        ),
+        compact_valid_tokens_cpu=tuple(compact_valid_tokens_list),
+        compact_offset_tokens_cpu=tuple(compact_offset_tokens_gathered),
+        recent_first_cpu=tuple(recent_first_list),
+        recent_count_cpu=tuple(recent_count_list),
+        request_recent_len_cpu=tuple(request_recent_len_list),
+        launch_effective_k_len_cpu=tuple(launch_effective_k_len_list),
         full_recent_only=all(
-            int(compact_valid_tokens_list[row]) == 0 and int(recent_first_list[row]) == 0
-            for row in range(batch_size)
+            v == 0 and f == 0
+            for v, f in zip(compact_valid_tokens_list, recent_first_list)
         ),
         requires_compact_kv=bool(requires_compact_kv),
     )
-    plan.real_kv_len_cpu = tuple(int(v) for v in real_kv_len_by_row[:batch_size])
+    plan.real_kv_len_cpu = tuple(real_kv_len_by_row[:batch_size])
     plan._descriptor_i32 = descriptor_i32
     return plan
 
