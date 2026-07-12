@@ -874,6 +874,25 @@ static inline torch::Tensor ensure_int32_contig(const torch::Tensor& t) {
     return t.to(torch::kInt32).contiguous();
 }
 
+// [刀A ENSURE-DEDUP 2026-07-12] exact-form 快路：目标 dtype/contiguous/shape 全中时
+// 直接返回原 tensor，跳过 ensure+reshape 的 dispatcher/TensorImpl churn。生产
+// with_bounds decode 路径喂进来的 row_lo/row_hi/token_lo/token_hi 本就是精确形态的
+// int32 contiguous 持久 buffer，此前每层(入口->topk_cuda->run_log_s)重复 ensure+
+// reshape 全是纯 host 税。非精确形态回落旧路径 = 合法域行为逐位不变。
+static inline torch::Tensor to_flat_i32(const torch::Tensor& t, at::IntArrayRef shape) {
+    if (t.scalar_type() == torch::kInt32 && t.is_contiguous() && t.sizes().equals(shape)) {
+        return t;
+    }
+    return ensure_int32_contig(t).reshape(shape);
+}
+
+static inline torch::Tensor to_flat_contig(const torch::Tensor& t, at::IntArrayRef shape) {
+    if (t.is_contiguous() && t.sizes().equals(shape)) {
+        return t;
+    }
+    return ensure_contig(t).reshape(shape);
+}
+
 static inline torch::Tensor ensure_f32_contig(const torch::Tensor& t) {
     if (!t.defined()) {
         return t;
@@ -2754,13 +2773,16 @@ std::vector<torch::Tensor> selector_pipeline_logits_topk_cuda(
     int64_t R = G * W;
 
     auto scores_flat = scores_c.reshape({M, R, K});
-    auto row_lo_flat = ensure_int32_contig(row_lo).reshape({M, R});
-    auto row_hi_flat = ensure_int32_contig(row_hi).reshape({M, R});
-    auto key_norms_flat = ensure_contig(key_norms).reshape({M, K});
-    auto token_lo_flat = ensure_int32_contig(token_lo).reshape({L * B, H});
-    auto token_hi_flat = ensure_int32_contig(token_hi).reshape({L * B, H});
-    auto token_lo_flat_full = token_lo_flat.reshape({M});
-    auto token_hi_flat_full = token_hi_flat.reshape({M});
+    // [刀A ENSURE-DEDUP 2026-07-12] with_bounds 入口已喂精确形态时以下全为零拷贝
+    // 零 dispatch 直通；token_*_flat_full 直接从入参派生(入参常为 {M} 精确形态,
+    // 避免 {M}->{L*B,H}->{M} 的往返 reshape)。
+    auto row_lo_flat = to_flat_i32(row_lo, {M, R});
+    auto row_hi_flat = to_flat_i32(row_hi, {M, R});
+    auto key_norms_flat = to_flat_contig(key_norms, {M, K});
+    auto token_lo_flat = to_flat_i32(token_lo, {L * B, H});
+    auto token_hi_flat = to_flat_i32(token_hi, {L * B, H});
+    auto token_lo_flat_full = to_flat_i32(token_lo, {M});
+    auto token_hi_flat_full = to_flat_i32(token_hi, {M});
     const bool do_profile = pipeline_cpu_profile_enabled();
     int64_t t0 = 0;
     int64_t t1 = 0;
@@ -2937,13 +2959,14 @@ std::vector<torch::Tensor> selector_pipeline_pre_denom_topk_cuda(
 
     auto scores_flat = scores_c.reshape({M, R, K});
     auto denom_flat = denom_c.reshape({M, R});
-    auto row_lo_flat = ensure_int32_contig(row_lo).reshape({M, R});
-    auto row_hi_flat = ensure_int32_contig(row_hi).reshape({M, R});
-    auto key_norms_flat = ensure_contig(key_norms).reshape({M, K});
-    auto token_lo_flat = ensure_int32_contig(token_lo).reshape({L * B, H});
-    auto token_hi_flat = ensure_int32_contig(token_hi).reshape({L * B, H});
-    auto token_lo_flat_full = token_lo_flat.reshape({M});
-    auto token_hi_flat_full = token_hi_flat.reshape({M});
+    // [刀A ENSURE-DEDUP 2026-07-12] 同 logits 版：精确形态直通(见 to_flat_* 头注)。
+    auto row_lo_flat = to_flat_i32(row_lo, {M, R});
+    auto row_hi_flat = to_flat_i32(row_hi, {M, R});
+    auto key_norms_flat = to_flat_contig(key_norms, {M, K});
+    auto token_lo_flat = to_flat_i32(token_lo, {L * B, H});
+    auto token_hi_flat = to_flat_i32(token_hi, {L * B, H});
+    auto token_lo_flat_full = to_flat_i32(token_lo, {M});
+    auto token_hi_flat_full = to_flat_i32(token_hi, {M});
     const bool do_profile = pipeline_cpu_profile_enabled();
     int64_t t0 = 0;
     int64_t t1 = 0;
@@ -3339,28 +3362,28 @@ std::vector<torch::Tensor> selector_pipeline_logits_topk_with_bounds_impl(
     // Reshape scores: [L, B, H_total, W, K] -> [L, B, H_kv, G, W, K]
     auto scores_kv = scores.reshape({L, B, H, G, W, K});
 
-    auto row_lo_i32 = ensure_int32_contig(row_lo);
-    auto row_hi_i32 = ensure_int32_contig(row_hi);
-    TORCH_CHECK(row_lo_i32.numel() == M * R || row_lo_i32.numel() == M * G,
+    // [刀A ENSURE-DEDUP 2026-07-12] decode 生产形态(row_lo/hi = {M,G} int32
+    // contiguous 持久 buffer, W==1 => {M,R}) 走精确形态直通；W>1 扩展臂保持原路径。
+    TORCH_CHECK(row_lo.numel() == M * R || row_lo.numel() == M * G,
                 "row_lo shape mismatch with scores");
-    TORCH_CHECK(row_hi_i32.numel() == M * R || row_hi_i32.numel() == M * G,
+    TORCH_CHECK(row_hi.numel() == M * R || row_hi.numel() == M * G,
                 "row_hi shape mismatch with scores");
     torch::Tensor row_lo_final, row_hi_final;
-    if (row_lo_i32.numel() == M * R) {
-        row_lo_final = row_lo_i32.reshape({M, R});
+    if (row_lo.numel() == M * R) {
+        row_lo_final = to_flat_i32(row_lo, {M, R});
     } else {
-        row_lo_final = row_lo_i32.reshape({M, G}).unsqueeze(-1).expand({M, G, W}).reshape({M, R}).contiguous();
+        row_lo_final = ensure_int32_contig(row_lo).reshape({M, G}).unsqueeze(-1).expand({M, G, W}).reshape({M, R}).contiguous();
     }
-    if (row_hi_i32.numel() == M * R) {
-        row_hi_final = row_hi_i32.reshape({M, R});
+    if (row_hi.numel() == M * R) {
+        row_hi_final = to_flat_i32(row_hi, {M, R});
     } else {
-        row_hi_final = row_hi_i32.reshape({M, G}).unsqueeze(-1).expand({M, G, W}).reshape({M, R}).contiguous();
+        row_hi_final = ensure_int32_contig(row_hi).reshape({M, G}).unsqueeze(-1).expand({M, G, W}).reshape({M, R}).contiguous();
     }
 
     // token_lo and token_hi from head_sink and recent_start
-    // Reshape: [L, B, H] -> [M]
-    auto token_lo = head_sink.reshape({M}).to(at::kInt).contiguous();
-    auto token_hi = recent_start.reshape({M}).to(at::kInt).contiguous();
+    // Reshape: [L, B, H] -> [M]（int32 contiguous 输入 = 单 view，免 to/contiguous 往返）
+    auto token_lo = to_flat_i32(head_sink, {M});
+    auto token_hi = to_flat_i32(recent_start, {M});
 
     // Key norms: [L, B, H_kv, K] is already correct shape
     auto key_norms_c = ensure_contig(key_norms);
@@ -3633,12 +3656,11 @@ std::vector<torch::Tensor> selector_pipeline_pre_denom_topk_with_bounds_impl(
 
     auto scores_kv = scores.reshape({L, B, H, G, W, K});
 
-    auto row_lo_i32 = ensure_int32_contig(row_lo);
-    auto row_hi_i32 = ensure_int32_contig(row_hi);
-    TORCH_CHECK(row_lo_i32.numel() == M * R, "row_lo shape mismatch with scores");
-    TORCH_CHECK(row_hi_i32.numel() == M * R, "row_hi shape mismatch with scores");
-    auto row_lo_final = row_lo_i32.reshape({M, R});
-    auto row_hi_final = row_hi_i32.reshape({M, R});
+    // [刀A ENSURE-DEDUP 2026-07-12] 精确形态直通（同 logits with_bounds 入口）。
+    TORCH_CHECK(row_lo.numel() == M * R, "row_lo shape mismatch with scores");
+    TORCH_CHECK(row_hi.numel() == M * R, "row_hi shape mismatch with scores");
+    auto row_lo_final = to_flat_i32(row_lo, {M, R});
+    auto row_hi_final = to_flat_i32(row_hi, {M, R});
 
     torch::Tensor denom_kv;
     if (denom.dim() == 3) {
@@ -3660,8 +3682,8 @@ std::vector<torch::Tensor> selector_pipeline_pre_denom_topk_with_bounds_impl(
         TORCH_CHECK(false, "denom must be [L,B,H_total] or [L,B,H_kv,G] or [L,B,H_kv,G,1]");
     }
 
-    auto token_lo = ensure_int32_contig(head_sink).reshape({M});
-    auto token_hi = ensure_int32_contig(recent_start).reshape({M});
+    auto token_lo = to_flat_i32(head_sink, {M});
+    auto token_hi = to_flat_i32(recent_start, {M});
     auto key_norms_c = ensure_contig(key_norms);
 
     auto idx_result = selector_pipeline_pre_denom_topk_cuda(
@@ -3897,6 +3919,11 @@ std::vector<torch::Tensor> selector_pipeline_pre_denom_topk_with_bounds_workspac
     return _MODULE
 
 
+# [刀E ENTRY-MEMO 2026-07-12] with_bounds 四入口 callable 单槽缓存
+# (module 身份键;force reload 产生新 module 对象 => 自动失效重解析)。
+_WB_ENTRY_CACHE: Optional[tuple] = None
+
+
 def _require_ext(*, force: bool = False) -> torch.nn.Module:
     mod = _load_ext(force=force)
     if mod is None:
@@ -4121,35 +4148,48 @@ def pipeline_logits_topk_with_bounds(
         int(slice_end),
         log_r_cache,
     )
+    # [刀E ENTRY-MEMO 2026-07-12] 四入口 callable 按 module 身份解析一次
+    # (旧=每调用 hasattr+属性查找);缺口时 None => 原 raise 语义逐字保留。
+    global _WB_ENTRY_CACHE
+    _ec = _WB_ENTRY_CACHE
+    if _ec is None or _ec[0] is not mod:
+        _ec = (
+            mod,
+            mod.selector_pipeline_logits_topk_with_bounds,
+            getattr(mod, "selector_pipeline_logits_topk_with_bounds_workspace", None),
+            getattr(mod, "selector_pipeline_logits_topk_with_bounds_out", None),
+            getattr(mod, "selector_pipeline_logits_topk_with_bounds_workspace_out", None),
+        )
+        _WB_ENTRY_CACHE = _ec
     if selected_indices_out is None and pipeline_workspaces is None:
-        result = mod.selector_pipeline_logits_topk_with_bounds(*args)
+        result = _ec[1](*args)
     elif selected_indices_out is None:
-        if not hasattr(mod, "selector_pipeline_logits_topk_with_bounds_workspace"):
+        if _ec[2] is None:
             raise RuntimeError(
                 "selector_pipeline_ext workspace path requires rebuilt extension entrypoint"
             )
         workspace_a, workspace_b = pipeline_workspaces
-        result = mod.selector_pipeline_logits_topk_with_bounds_workspace(
+        result = _ec[2](
             *args,
             workspace_a,
             workspace_b,
         )
     elif pipeline_workspaces is None:
-        if not hasattr(mod, "selector_pipeline_logits_topk_with_bounds_out"):
+        if _ec[3] is None:
             raise RuntimeError(
                 "selector_pipeline_ext selected_indices_out path requires rebuilt extension entrypoint"
             )
-        result = mod.selector_pipeline_logits_topk_with_bounds_out(
+        result = _ec[3](
             *args,
             selected_indices_out,
         )
     else:
-        if not hasattr(mod, "selector_pipeline_logits_topk_with_bounds_workspace_out"):
+        if _ec[4] is None:
             raise RuntimeError(
                 "selector_pipeline_ext workspace selected_indices_out path requires rebuilt extension entrypoint"
             )
         workspace_a, workspace_b = pipeline_workspaces
-        result = mod.selector_pipeline_logits_topk_with_bounds_workspace_out(
+        result = _ec[4](
             *args,
             workspace_a,
             workspace_b,

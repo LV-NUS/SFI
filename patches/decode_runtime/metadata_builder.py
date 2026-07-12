@@ -32,6 +32,11 @@ _METADATA_TIMING_LOG_CACHED = os.environ.get(_METADATA_TIMING_LOG_ENV, "")
 # cProfile 扭曲相位时长,取证发与判速发分离,同 flush_worker REFRESH_CPROFILE_DIR)。
 _MB_CPROFILE_DIR_ENV = "VLLM_SPARSE_MB_CPROFILE_DIR"
 _MB_CPROFILE_DIR_CACHED = os.environ.get(_MB_CPROFILE_DIR_ENV, "").strip()
+# [U14-ZERO-ALLOC-2-8 2026-07-12] Z-RRP diagnostic probe gate 在每个 steady
+# delta 步的 rrp_step_state 解析入口读一次(默认 OFF)。按既定 _DYNAMIC_ENV /
+# _<NAME>_CACHED 约定 hoist 到 import 时;pytest / VLLM_SPARSE_DYNAMIC_ENV 下
+# 消费点仍走活读。默认 OFF → 缓存布尔与活读逐位同,仅省每步一次 os.environ.get。
+_Z_RRP_PROBE_CACHED = os.environ.get("VLLM_SPARSE_Z_RRP_PROBE") == "1"
 _METADATA_TIMING_FLUSH_EVERY_ENV = "VLLM_SPARSE_METADATA_TIMING_FLUSH_EVERY"
 _RRP_PREP_PROFILE_LOG_ENV = "VLLM_SPARSE_RRP_PREP_PROFILE_LOG"
 _RRP_READY_EVENT_ATTR = "mixed_page_resolver_replay_ready_event"
@@ -2615,7 +2620,12 @@ def _try_update_same_page_resolved_row_ptr_step_state(
 ) -> object | None:
     setattr(controller, "_decode_runtime_rrp_step_state_miss_reason", "")
     # [Z-RRP-PROBE] diagnostic-only (env, default off) — 7.9ms plateau hunt.
-    _z_probe = os.environ.get("VLLM_SPARSE_Z_RRP_PROBE") == "1"
+    # [U14-ZERO-ALLOC-2-8 2026-07-12] env-cache(生产期免每步 os.environ.get)。
+    _z_probe = (
+        (os.environ.get("VLLM_SPARSE_Z_RRP_PROBE") == "1")
+        if _DYNAMIC_ENV
+        else _Z_RRP_PROBE_CACHED
+    )
     _z_t0 = _z_t1 = 0
     _z_hit_before_page_add = False
 
@@ -7242,8 +7252,15 @@ def maybe_build_step_decode_data_from_metadata_impl(
                     _compact_staging = torch.empty((max_batch_size,), device="cpu", dtype=torch.int32)
                 # [ALLOC-COUNT-TRUTH][合入注记 07-12] fresh pinned 每 fill +1(整建步频,原单例仅首分配计数)。
                 decode_runtime_per_step_allocation_count += 1
-                for _ci in range(batch_size):
-                    _compact_staging[_ci] = 1 if row_mode_by_row[_ci] == int(_ROW_MODE_COMPACT) else 0
+                # [U14-ZERO-ALLOC-2-9 2026-07-12] 逐行 torch 标量 setitem
+                # (×bs,~4.75µs/次=38µs/步 @bs8) → list-comp + numpy 视图整段
+                # 向量化赋值(~sub-µs)。_compact_staging 是 fresh pinned int32
+                # 连续 1D 缓冲,.numpy() 共享存储;下方 copy_ 读同一内存=逐位不变。
+                _rm_compact = int(_ROW_MODE_COMPACT)
+                _compact_staging.numpy()[:batch_size] = [
+                    1 if row_mode_by_row[_ci] == _rm_compact else 0
+                    for _ci in range(batch_size)
+                ]
                 self._decode_row_is_compact_i32[:batch_size].copy_(
                     _compact_staging[:batch_size],
                     non_blocking=True,

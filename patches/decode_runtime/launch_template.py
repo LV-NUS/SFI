@@ -176,16 +176,21 @@ def apply_launch_template_row_delta(
         template.descriptor_cpu_i32,
         pin_memory=non_blocking,
     )
+    # [U14-ZERO-ALLOC-2-1 2026-07-12] 逐行 torch 标量 setitem(每 delta 步
+    # 2·bs~4·bs 次,实测 ~4.75µs/次=76µs/步 @bs8,含 replay 步) → numpy 视图
+    # 整行向量化赋值(~sub-µs)。descriptor_cpu 是 fresh pinned int32 连续镜像,
+    # .numpy() 返回共享存储视图;下方 :192 H2D copy_ 读同一内存 → 语义逐位不变。
+    # tuple→int32 slice 赋值域与旧标量路径同(request_recent_len 等已由
+    # _tuple_from_rows 走 int() 归一,行/列切片长度均 == batch_size)。
+    descriptor_np = descriptor_cpu.numpy()
     if bool(recent_window_changed):
-        for row in range(batch_size):
-            descriptor_cpu[2, row] = recent_first[row]
-            descriptor_cpu[3, row] = recent_count[row]
-            descriptor_cpu[4, row] = request_recent_len[row]
-            descriptor_cpu[5, row] = launch_effective_k[row]
+        descriptor_np[2, :batch_size] = recent_first
+        descriptor_np[3, :batch_size] = recent_count
+        descriptor_np[4, :batch_size] = request_recent_len
+        descriptor_np[5, :batch_size] = launch_effective_k
     else:
-        for row in range(batch_size):
-            descriptor_cpu[4, row] = request_recent_len[row]
-            descriptor_cpu[5, row] = launch_effective_k[row]
+        descriptor_np[4, :batch_size] = request_recent_len
+        descriptor_np[5, :batch_size] = launch_effective_k
 
     if bool(update_gpu):
         descriptor_row_start = 2 if bool(recent_window_changed) else 4

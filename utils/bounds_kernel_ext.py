@@ -404,6 +404,22 @@ def _require_ext() -> torch.nn.Module:
     return mod
 
 
+# [刀E BOUNDS-WRAPPER-MEMO 2026-07-12] decode 生产路径每 chunk 以同一批持久
+# buffer(ensure_selector_decode_bounds_buffers 六件 + refresh 状态 kv_lengths/
+# seq_full)调用本 wrapper——每次重复的 stride 抽取/out 六件逐项校验/~22 个 int()
+# 封送 = 纯 host 税(~数十 µs/call)。单槽身份 memo:
+#   - key = (七 tensor 的 id + 六标量);value 内保存对全部 tensor 的强引用 =>
+#     旧对象存活期间 id 不可能被复用 => 假命中结构上不可构造(cfg id-memo 同款
+#     论证,见 selection_worker._pipeline_cfg_cache)。
+#   - 命中防线:三件 data_ptr 哨兵(kv_lengths/seq_full/out[0])——resize_ 等
+#     就地重分配改 data_ptr 即刻降级全量重验;这些 kernel 拥有的持久 buffer
+#     在树内无 transpose_/set_ 类元数据原地改写面。
+#   - 仅 out 非 None 且 seq_full 无需 dtype 转换的形态可 memo(其余走原路径,
+#     行为逐位不变);无 env 旋钮(默认落地纪律)。
+_DECODE_MEMO_KEY: Optional[tuple] = None
+_DECODE_MEMO_VAL: Optional[tuple] = None
+
+
 def compute_bounds_decode(
     kv_lengths: torch.Tensor,
     seq_full: Optional[torch.Tensor],
@@ -439,6 +455,28 @@ def compute_bounds_decode(
         - row_lo: [M, G] where M = L * B * H_kv
         - row_hi: [M, G]
     """
+    global _DECODE_MEMO_KEY, _DECODE_MEMO_VAL
+    if out is not None:
+        _mk = (
+            id(kv_lengths),
+            id(seq_full),
+            id(out[0]), id(out[1]), id(out[2]), id(out[3]), id(out[4]), id(out[5]),
+            int(num_kv_heads), int(num_queries_per_kv), int(kv_len_total),
+            int(sink_cfg), int(recent_cfg), int(block_size),
+        )
+        if _mk == _DECODE_MEMO_KEY:
+            _mv = _DECODE_MEMO_VAL
+            # data_ptr 哨兵×3:就地重分配(resize_ 类)即降级全量重验路径。
+            if (
+                kv_lengths.data_ptr() == _mv[2]
+                and (seq_full is None or seq_full.data_ptr() == _mv[3])
+                and out[0].data_ptr() == _mv[4]
+            ):
+                _mv[5].compute_bounds_decode(*_mv[1])
+                return _mv[0]
+    else:
+        _mk = None
+
     mod = _require_ext()
 
     # Extract strides for kv_lengths (supports non-contiguous/broadcast views without memory copy)
@@ -514,7 +552,7 @@ def compute_bounds_decode(
         sf_stride_h = sf_stride_i32[2]
 
     # Call CUDA kernel with stride parameters
-    mod.compute_bounds_decode(
+    _call_args = (
         kv_lengths,
         seq_full_i32,
         kv_len_head,
@@ -530,6 +568,22 @@ def compute_bounds_decode(
         # seq_full strides (0 if seq_full is None)
         int(sf_stride_l), int(sf_stride_b), int(sf_stride_h),
     )
+    mod.compute_bounds_decode(*_call_args)
+
+    _result = (kv_len_head, head_sink, recent_start, allowed_lengths, row_lo, row_hi)
+    # [刀E BOUNDS-WRAPPER-MEMO] 仅 out 持久形态且 seq_full 未发生 dtype 转换时
+    # 才可 memo(转换会缓存过期的 i32 副本);key 中全部 id 对应的对象都被
+    # value(args/result 强引用)钉住 => id 复用不可构造。
+    if _mk is not None and (seq_full is None or seq_full_i32 is seq_full):
+        _DECODE_MEMO_KEY = _mk
+        _DECODE_MEMO_VAL = (
+            _result,
+            _call_args,
+            kv_lengths.data_ptr(),
+            seq_full.data_ptr() if seq_full is not None else 0,
+            out[0].data_ptr(),
+            mod,
+        )
 
     return kv_len_head, head_sink, recent_start, allowed_lengths, row_lo, row_hi
 

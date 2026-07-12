@@ -20,6 +20,7 @@ __all__ = [
     "_RELEASE_ON_IDLE_CACHED",
     "_REBUILD_PTRS_PINNED_CACHED",
     "_WRITER_TOKEN_TILE_CACHED",
+    "_WRITER_INPUT_BTABLE_CHECK_CACHED",
     "_SELECTOR_TRUSTED_SHAPES_CACHED",
     "_SELECTOR_FAST_SIG_CACHED",
     "_SELECTOR_CPP_PREPROC_CACHED",
@@ -131,6 +132,12 @@ _REBUILD_PTRS_PINNED_CACHED = os.environ.get("VLLM_SPARSE_REBUILD_PTRS_PINNED", 
 # steady 全 skip 0.80→0.24ms、cold 全拷贝 5.97→2.15ms;128=kMaxSharedTileTokens
 # 上限,相1 满活跃。tile 只改并行拆分不改写集合(每 (t,vi) 单写手)=逐位等价。
 _WRITER_TOKEN_TILE_CACHED: int = int(os.environ.get("VLLM_SPARSE_WRITER_TOKEN_TILE", "128") or "0")
+# [WRITER-ENQUEUE-DIET 2026-07-12 ext批] 诊断档 btable 前置断言开关(默认关)。
+# 旧形态=writer 每次 dispatch 热路径 os.environ.get;循 _DYNAMIC_ENV 惯例迁到
+# import 期缓存(pytest 域消费点走 if _DYNAMIC_ENV else CACHED 双臂)。
+_WRITER_INPUT_BTABLE_CHECK_CACHED = (
+    os.environ.get("VLLM_SPARSE_WRITER_INPUT_BTABLE_CHECK", "0") == "1"
+)
 
 # ---------------------------------------------------------------------------
 # Selector / rebuild experiment switches

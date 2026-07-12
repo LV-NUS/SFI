@@ -25,6 +25,7 @@ from patches.sparse_constants import (
     _SELECTOR_FIXED_SHAPE_TOPK_CACHED,
     _SELECTOR_TOPK_GRAPH_CACHED,  # #13 STAGE-0 captured selector graph (default OFF)
     _WRITER_TOKEN_TILE_CACHED,
+    _WRITER_INPUT_BTABLE_CHECK_CACHED,
 )
 from patches.selector_runtime.selected_out_ring import SelectedOutRing, SlotStableOverrides
 from patches.sparse_types import SelectorBatchPayload, continuous_producer_enabled
@@ -1091,11 +1092,15 @@ def rebuild_compact_slots_batched_layers_from_selection_impl(
         )
 
     writer_token_tile = int(_WRITER_TOKEN_TILE_CACHED)
-    if not hasattr(ext, "gather_compact_kv_into_arena_ptrs_tiled_autolen_skip_unchanged"):
-        raise RuntimeError(
-            "CUDA compact writer requires "
-            "gather_compact_kv_into_arena_ptrs_tiled_autolen_skip_unchanged"
-        )
+    # [WRITER-ENQUEUE-DIET 2026-07-12] ext 入口存在性按 ext 对象身份验一次
+    # (旧=每 dispatch hasattr);缺口 raise 语义逐字保留。
+    if getattr(self, "_writer_ext_entry_checked_for", None) is not ext:
+        if not hasattr(ext, "gather_compact_kv_into_arena_ptrs_tiled_autolen_skip_unchanged"):
+            raise RuntimeError(
+                "CUDA compact writer requires "
+                "gather_compact_kv_into_arena_ptrs_tiled_autolen_skip_unchanged"
+            )
+        self._writer_ext_entry_checked_for = ext
     writer_kernel_variant = (
         "ptr_tiled_autolen_skip_unchanged"
         if writer_token_tile > 0
@@ -1171,11 +1176,17 @@ def rebuild_compact_slots_batched_layers_from_selection_impl(
             *writer_launch_args
         )
 
-    if os.environ.get("VLLM_SPARSE_WRITER_INPUT_BTABLE_CHECK") == "1":
+    if (
+        os.environ.get("VLLM_SPARSE_WRITER_INPUT_BTABLE_CHECK") == "1"
+        if _DYNAMIC_ENV
+        else _WRITER_INPUT_BTABLE_CHECK_CACHED
+    ):
         # [诊断档,默认关] launch 前 host 侧断言 btable 有效区非负。graph/eager
         # trap 后 CUDA printf 缓冲丢失拿不到坐标,这里用 python 栈+完整值取证;
         # 若本检查通过而 kernel 仍 trap = 毒写发生在 launch~执行窗内(跨流并发
         # 写实锤)。同步 D2H 仅诊断档开销。
+        # [WRITER-ENQUEUE-DIET 2026-07-12] 热路径 env 读迁 import 期缓存
+        # (_DYNAMIC_ENV 双臂惯例,pytest 域语义不变)。
         for _ci, _info in enumerate(layer_infos):
             _pl = _info[0]
             _rows = [int(r) for r in _pl.row_list]
