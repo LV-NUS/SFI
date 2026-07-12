@@ -15,6 +15,7 @@ import triton
 import triton.language as tl
 
 from utils.req_meta_flag_codec import REQ_META_SINK_SHIFT, validate_sink_tokens
+from utils.req_meta_pack_ext import require_ext as _require_req_meta_pack_ext
 
 REQ_META_SINK_SHIFT_CONST = tl.constexpr(REQ_META_SINK_SHIFT)
 
@@ -34,7 +35,13 @@ def _range(name: str):
 
 # -----------------------------------------------------------------------------
 # Fast-path meta packing (decode, no logits): fuse many tiny torch ops into one
-# triton launch to reduce per-layer fixed overhead.
+# launch to reduce per-layer fixed overhead.
+#
+# [#17-P1 PACK-CUDA 2026-07-12] 生产发射已迁 C++ ext
+# (utils/req_meta_pack_ext, 单 CUDA kernel 发射, host 开销远低于 Triton
+# launcher)。下方 @triton.jit kernel 保留为逐位对拍 oracle(仅
+# tests/test_req_meta_pack_ext_bitwise.py 消费): 生产走 C++, Triton 留
+# oracle。改 C++ kernel 语义必须同步改 Triton oracle 并过对拍。
 # -----------------------------------------------------------------------------
 
 @triton.jit
@@ -163,20 +170,20 @@ def pack_req_meta_decode_fast(
         raise ValueError("req_meta tensors must have contiguous (or wider) row strides")
 
     with _range("sparse.pack_req_meta_decode_fast"):
-        _kernel_pack_req_meta_decode_fast[(batch,)](
+        _require_req_meta_pack_ext().pack_req_meta_decode_fast(
             seqused_k,
             is_compact_i32,
             compact_kv_len_i32,
             compact_offset_tokens_i64,
             req_meta_i32,
             req_meta_i64,
-            meta_i32_stride0=meta_i32_stride0,
-            meta_i64_stride0=meta_i64_stride0,
-            block_size=int(block_size),
-            recent_cap=max(0, int(recent_cap)),
-            sink_tokens=int(validated_sink_tokens),
-            num_warps=1,
-            num_stages=1,
+            int(meta_i32_stride0),
+            int(meta_i64_stride0),
+            int(batch),
+            int(block_size),
+            max(0, int(recent_cap)),
+            int(validated_sink_tokens),
+            int(REQ_META_SINK_SHIFT),
         )
 
 @triton.jit
@@ -425,7 +432,7 @@ def pack_req_meta_decode_fast_layers(
     compact_offset_stride1 = int(compact_offset_tokens_i64.stride(1))
 
     with _range("sparse.pack_req_meta_decode_fast_layers"):
-        _kernel_pack_req_meta_decode_fast_layers[(layers, batch)](
+        _require_req_meta_pack_ext().pack_req_meta_decode_fast_layers(
             seqused_k,
             is_compact_i32,
             compact_kv_len_i32,
@@ -446,21 +453,22 @@ def pack_req_meta_decode_fast_layers(
             layer_logf_enable_i32,
             req_meta_i32,
             req_meta_i64,
-            is_compact_stride0=is_compact_stride0,
-            is_compact_stride1=is_compact_stride1,
-            compact_kv_len_stride0=compact_kv_len_stride0,
-            compact_kv_len_stride1=compact_kv_len_stride1,
-            compact_offset_stride0=compact_offset_stride0,
-            compact_offset_stride1=compact_offset_stride1,
-            meta_i32_stride0=meta_i32_stride0,
-            meta_i32_stride1=meta_i32_stride1,
-            meta_i64_stride0=meta_i64_stride0,
-            meta_i64_stride1=meta_i64_stride1,
-            block_size=int(block_size),
-            recent_cap=max(0, int(recent_cap)),
-            sink_tokens=int(validated_sink_tokens),
-            num_warps=1,
-            num_stages=1,
+            int(is_compact_stride0),
+            int(is_compact_stride1),
+            int(compact_kv_len_stride0),
+            int(compact_kv_len_stride1),
+            int(compact_offset_stride0),
+            int(compact_offset_stride1),
+            int(meta_i32_stride0),
+            int(meta_i32_stride1),
+            int(meta_i64_stride0),
+            int(meta_i64_stride1),
+            int(layers),
+            int(batch),
+            int(block_size),
+            max(0, int(recent_cap)),
+            int(validated_sink_tokens),
+            int(REQ_META_SINK_SHIFT),
         )
 
 # -----------------------------------------------------------------------------
@@ -667,7 +675,7 @@ def pack_req_meta_prefill_fast_layers(
         raise ValueError("req_meta tensors must have contiguous (or wider) row strides")
 
     with _range("sparse.pack_req_meta_prefill_fast_layers"):
-        _kernel_pack_req_meta_prefill_fast_layers[(layers, batch)](
+        _require_req_meta_pack_ext().pack_req_meta_prefill_fast_layers(
             seqused_k,
             cu_seqlens_q,
             log_f_last_n_i32,
@@ -691,255 +699,13 @@ def pack_req_meta_prefill_fast_layers(
             slot_in_chunk_by_layer_i32,
             req_meta_i32,
             req_meta_i64,
-            meta_i32_stride0=meta_i32_stride0,
-            meta_i32_stride1=meta_i32_stride1,
-            meta_i64_stride0=meta_i64_stride0,
-            meta_i64_stride1=meta_i64_stride1,
-            recent_cap=max(0, int(recent_cap)),
-            sink_tokens=int(validated_sink_tokens),
-            num_warps=1,
-            num_stages=1,
+            int(meta_i32_stride0),
+            int(meta_i32_stride1),
+            int(meta_i64_stride0),
+            int(meta_i64_stride1),
+            int(layers),
+            int(batch),
+            max(0, int(recent_cap)),
+            int(validated_sink_tokens),
+            int(REQ_META_SINK_SHIFT),
         )
-
-# -----------------------------------------------------------------------------
-# Fused compact gather (refresh/compact rebuild): copy K/V + token positions
-# into compact arena in one Triton launch.
-# -----------------------------------------------------------------------------
-
-
-
-
-
-
-
-
-
-
-@triton.jit
-def kernel_log_f_pre_from_logits_scratch_lastn_gt1(
-    req_meta_i32_ptr,  # [num_seqs, 7]
-    req_meta_i64_ptr,  # [num_seqs, 4]
-    num_seqs: tl.constexpr,
-    num_query_heads: tl.constexpr,
-    req_meta_i32_stride_row: tl.int64,
-    req_meta_i32_stride_col: tl.int64,
-    req_meta_i64_stride_row: tl.int64,
-    req_meta_i64_stride_col: tl.int64,
-    BLOCK_T: tl.constexpr,
-    MAX_R: tl.constexpr,
-    LOGF_OUT_FP32: tl.constexpr,
-    ALPHA: tl.constexpr,
-):
-    """last_n>1：从 per-layer logits scratch 计算 log_f_pre 与 denom_f。
-
-    约定（仅 dense log_f 场景，use_compact==0）：
-    - meta64[1]：scratch_ptr（fp32，布局 [Hq, last_n, K]）
-    - meta64[2]：out_ptr（fp16，布局 [Hq, K]），写 log_f_pre
-    - meta64[3]：denom_ptr（fp32，布局 [Hq]），写 denom_f=logsumexp(log_f_pre)
-
-    scratch 无效 token 位置需为 -inf（min_val）。
-    """
-    pid_seq = tl.program_id(0)
-    pid_h = tl.program_id(1)
-    if pid_seq >= num_seqs or pid_h >= num_query_heads:
-        return
-
-    meta32_row_ptr = req_meta_i32_ptr + pid_seq * req_meta_i32_stride_row
-    meta64_row_ptr = req_meta_i64_ptr + pid_seq * req_meta_i64_stride_row
-
-    log_f_stride_head_i32 = tl.load(meta32_row_ptr + 1 * req_meta_i32_stride_col).to(tl.int32)
-    logits_last_n = tl.load(meta32_row_ptr + 2 * req_meta_i32_stride_col).to(tl.int32)
-    logits_capacity = tl.load(meta32_row_ptr + 4 * req_meta_i32_stride_col).to(tl.int32)
-    flags = tl.load(meta32_row_ptr + 5 * req_meta_i32_stride_col)
-
-    use_compact = (flags & 1) != 0
-    use_log_f = ((flags & 8) != 0) & (use_compact == 0)
-    if ((not use_log_f) or (logits_last_n <= 1)) or ((logits_capacity <= 0) or (log_f_stride_head_i32 <= 0)):
-        return
-
-    scratch_base_ptr = tl.load(meta64_row_ptr + 1 * req_meta_i64_stride_col).to(tl.int64)
-    out_base_ptr = tl.load(meta64_row_ptr + 2 * req_meta_i64_stride_col).to(tl.int64)
-    denom_base_ptr = tl.load(meta64_row_ptr + 3 * req_meta_i64_stride_col).to(tl.int64)
-    if (scratch_base_ptr == 0) or ((out_base_ptr == 0) or (denom_base_ptr == 0)):
-        return
-
-    min_val = -3.402823466e38
-    alpha = tl.full([], ALPHA, tl.float32)
-    use_mean = tl.abs(alpha) < 1.0e-6
-
-    scratch_ptr = tl.cast(scratch_base_ptr, tl.pointer_type(tl.float32))
-    out_ptr = tl.cast(out_base_ptr, tl.pointer_type(tl.float32 if LOGF_OUT_FP32 else tl.float16))
-    denom_ptr = tl.cast(denom_base_ptr, tl.pointer_type(tl.float32))
-
-    cap_i64 = logits_capacity.to(tl.int64)
-    stride_pad_i64 = log_f_stride_head_i32.to(tl.int64)
-    # [F2-STRIDE-PAD-FAILFAST 2026-07-11 EXT审计] 旧 tl.maximum(stride, cap)
-    # 把 0<stride<capacity 的布局违约静默"修复"成按 cap 跨行 = 静默错读
-    # (违无 fallback 纪律)。改为仅 <=0 哨兵落 capacity(与 C++ 版
-    # out_stride_head_i32>0 的哨兵语义同款);违约域由 wrapper host 校验
-    # raise。合法域(0 哨兵 / stride>=cap)数值与旧式逐位一致。
-    stride_pad_i64 = tl.where(stride_pad_i64 > 0, stride_pad_i64, cap_i64)
-    stride_row = stride_pad_i64
-    max_r = tl.minimum(logits_last_n, MAX_R)
-    stride_head_scratch = logits_last_n.to(tl.int64) * stride_pad_i64
-    stride_head_out = stride_pad_i64
-
-    # --- pass1: row_lse ---
-    r_ids = tl.arange(0, MAX_R)
-    row_max = tl.full([MAX_R], min_val, tl.float32)
-    row_sum = tl.zeros([MAX_R], tl.float32)
-    row_has = tl.zeros([MAX_R], tl.int1)
-
-    num_blocks = tl.cdiv(logits_capacity, BLOCK_T)
-    for j in range(0, num_blocks):
-        offs = j * BLOCK_T + tl.arange(0, BLOCK_T)
-        mask_k = offs < logits_capacity
-        base = pid_h.to(tl.int64) * stride_head_scratch + offs.to(tl.int64)
-        for r in tl.static_range(0, MAX_R):
-            r_ok = r < max_r
-            r_mask = r_ids == r
-            vals = tl.load(scratch_ptr + base + r * stride_row, mask=mask_k & r_ok, other=min_val)
-            finite = vals > min_val
-            blk_max = tl.max(tl.where(finite, vals, min_val), axis=0)
-            row_has = tl.where(r_mask & r_ok, row_has | (blk_max > min_val), row_has)
-            row_max = tl.where(r_mask & r_ok, tl.maximum(row_max, blk_max), row_max)
-
-    row_max = tl.where(row_has, row_max, 0.0)
-    for j in range(0, num_blocks):
-        offs = j * BLOCK_T + tl.arange(0, BLOCK_T)
-        mask_k = offs < logits_capacity
-        base = pid_h.to(tl.int64) * stride_head_scratch + offs.to(tl.int64)
-        for r in tl.static_range(0, MAX_R):
-            r_ok = r < max_r
-            r_mask = r_ids == r
-            vals = tl.load(scratch_ptr + base + r * stride_row, mask=mask_k & r_ok, other=min_val)
-            row_has_r = tl.max(tl.where(r_mask, row_has.to(tl.int32), 0), axis=0).to(tl.int1)
-            row_max_r = tl.max(tl.where(r_mask, row_max, min_val), axis=0)
-            finite = (vals > min_val) & row_has_r & r_ok
-            v = tl.where(finite, vals, row_max_r)
-            exp = tl.exp(v - row_max_r)
-            row_sum = tl.where(
-                r_mask & r_ok,
-                row_sum + tl.sum(tl.where(finite, exp, 0.0), axis=0),
-                row_sum,
-            )
-
-    row_lse = row_max + tl.log(row_sum + 1.0e-20)
-    row_lse = tl.where(row_has, row_lse, min_val)
-    row_count = tl.sum(tl.where((tl.arange(0, MAX_R) < max_r) & row_has, 1, 0), axis=0)
-    row_count_f = tl.maximum(tl.where(row_count > 0, row_count.to(tl.float32), 1.0), 1.0)
-
-    # --- pass2: log_f_pre + denom ---
-    token_max = tl.full([], min_val, tl.float32)
-    token_sum = tl.zeros([], tl.float32)
-    for j in range(0, num_blocks):
-        offs = j * BLOCK_T + tl.arange(0, BLOCK_T)
-        mask_k = offs < logits_capacity
-        base = pid_h.to(tl.int64) * stride_head_scratch + offs.to(tl.int64)
-
-        if use_mean:
-            acc = tl.zeros([BLOCK_T], tl.float32)
-            has_tok = tl.zeros([BLOCK_T], tl.int1)
-            for r in tl.static_range(0, MAX_R):
-                r_ok = r < max_r
-                r_mask = r_ids == r
-                row_has_r = tl.max(tl.where(r_mask, row_has.to(tl.int32), 0), axis=0).to(tl.int1)
-                row_lse_r = tl.max(tl.where(r_mask, row_lse, min_val), axis=0)
-                vals = tl.load(scratch_ptr + base + r * stride_row, mask=mask_k & r_ok, other=min_val)
-                valid = (vals > min_val) & row_has_r & r_ok
-                acc += tl.where(valid, vals - row_lse_r, 0.0)
-                has_tok = has_tok | valid
-            log_f_pre = tl.where(has_tok, acc / row_count_f, min_val)
-        else:
-            amax = tl.full([BLOCK_T], min_val, tl.float32)
-            for r in tl.static_range(0, MAX_R):
-                r_ok = r < max_r
-                r_mask = r_ids == r
-                row_has_r = tl.max(tl.where(r_mask, row_has.to(tl.int32), 0), axis=0).to(tl.int1)
-                row_lse_r = tl.max(tl.where(r_mask, row_lse, min_val), axis=0)
-                vals = tl.load(scratch_ptr + base + r * stride_row, mask=mask_k & r_ok, other=min_val)
-                valid = (vals > min_val) & row_has_r & r_ok
-                a = tl.where(valid, alpha * (vals - row_lse_r), min_val)
-                amax = tl.maximum(amax, a)
-            amax = tl.where(amax > min_val, amax, 0.0)
-
-            asum = tl.zeros([BLOCK_T], tl.float32)
-            has_tok = tl.zeros([BLOCK_T], tl.int1)
-            for r in tl.static_range(0, MAX_R):
-                r_ok = r < max_r
-                r_mask = r_ids == r
-                row_has_r = tl.max(tl.where(r_mask, row_has.to(tl.int32), 0), axis=0).to(tl.int1)
-                row_lse_r = tl.max(tl.where(r_mask, row_lse, min_val), axis=0)
-                vals = tl.load(scratch_ptr + base + r * stride_row, mask=mask_k & r_ok, other=min_val)
-                valid = (vals > min_val) & row_has_r & r_ok
-                a = tl.where(valid, alpha * (vals - row_lse_r), min_val)
-                asum += tl.where(valid, tl.exp(a - amax), 0.0)
-                has_tok = has_tok | valid
-            lse = amax + tl.log(asum + 1.0e-20)
-            log_f_pre = tl.where(has_tok, (lse - tl.log(row_count_f)) / alpha, min_val)
-
-        out_offsets = pid_h.to(tl.int64) * stride_head_out + offs.to(tl.int64)
-        if LOGF_OUT_FP32:
-            tl.store(out_ptr + out_offsets, log_f_pre.to(tl.float32), mask=mask_k)
-        else:
-            tl.store(out_ptr + out_offsets, log_f_pre.to(tl.float16), mask=mask_k)
-
-        blk_max = tl.max(log_f_pre, axis=0)
-        m_new = tl.maximum(token_max, blk_max)
-        m_new_safe = tl.where(m_new > min_val, m_new, 0.0)
-        token_max_safe = tl.where(token_max > min_val, token_max, 0.0)
-        token_sum = token_sum * tl.exp(token_max_safe - m_new_safe) + tl.sum(
-            tl.where(log_f_pre > min_val, tl.exp(log_f_pre - m_new_safe), 0.0),
-            axis=0,
-        )
-        token_max = m_new
-
-    denom = tl.where(token_max > min_val, token_max + tl.log(token_sum + 1.0e-20), 0.0)
-    tl.store(denom_ptr + pid_h.to(tl.int64), denom)
-
-def _launch_log_f_pre_from_logits_scratch_lastn_gt1(
-    *,
-    req_meta_i32: torch.Tensor,
-    req_meta_i64: torch.Tensor,
-    num_seqs: int,
-    num_query_heads: int,
-    log_f_out_fp32: bool,
-    alpha: float,
-) -> None:
-    # [F2-STRIDE-PAD-FAILFAST 2026-07-11 EXT审计] kernel 侧已不再静默"修复"
-    # 布局违约(见 kernel 内注)。违约域在此 fail-fast:col1(stride_head)
-    # 必须 ==0(哨兵→kernel 落 capacity)或 >= col4(capacity)。本 wrapper
-    # 仅测试/oracle 调用面(生产走 C++ reduce_log_f_pre_scratch_cuda),
-    # 一次 D2H 小拷贝的校验成本可接受。
-    _n = int(num_seqs)
-    if _n > 0 and req_meta_i32.numel() > 0:
-        _meta_host = req_meta_i32[:_n].detach().cpu()
-        _stride_head = _meta_host[:, 1]
-        _cap = _meta_host[:, 4]
-        _bad = (_stride_head > 0) & (_stride_head < _cap)
-        if bool(_bad.any()):
-            _row = int(_bad.nonzero()[0].item())
-            raise ValueError(
-                "log_f_pre lastn_gt1: meta row "
-                f"{_row} has 0 < stride_head({int(_stride_head[_row])}) < "
-                f"capacity({int(_cap[_row])}) — layout contract violation "
-                "(the kernel would mis-stride across scratch rows)"
-            )
-    grid = (int(num_seqs), int(num_query_heads))
-    kernel_log_f_pre_from_logits_scratch_lastn_gt1[grid](
-        req_meta_i32,
-        req_meta_i64,
-        num_seqs=int(num_seqs),
-        num_query_heads=int(num_query_heads),
-        req_meta_i32_stride_row=req_meta_i32.stride(0),
-        req_meta_i32_stride_col=req_meta_i32.stride(1),
-        req_meta_i64_stride_row=req_meta_i64.stride(0),
-        req_meta_i64_stride_col=req_meta_i64.stride(1),
-        BLOCK_T=256,
-        MAX_R=16,
-        LOGF_OUT_FP32=bool(log_f_out_fp32),
-        ALPHA=float(alpha),
-        num_warps=4,
-        num_stages=2,
-    )
-

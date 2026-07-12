@@ -2,8 +2,8 @@
 
 The alpha-fair scoring pipeline itself runs in the CUDA C++ selector exts
 (utils/selector_log_s_ext.py, utils/selector_soft_nms_ext.py,
-utils/selector_cross_head_ext.py); the Triton reference kernels used by their
-contract tests live in triton_kernel/alpha_selector_kernel.py.
+utils/selector_cross_head_ext.py); the pure-torch reference used by their
+contract tests lives in tests/reference_log_f_prior.py.
 """
 
 from __future__ import annotations
