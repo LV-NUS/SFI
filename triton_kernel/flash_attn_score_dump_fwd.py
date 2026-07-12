@@ -143,6 +143,17 @@ def pack_req_meta_decode_fast(
         raise ValueError("req_meta tensors missing required columns")
     if block_size <= 0:
         raise ValueError("block_size must be positive")
+    # [F3-PACK-INPUT-LEN 2026-07-11 EXT审计] kernel 按 +pid 读四个输入到
+    # batch-1 行，此前单层版对它们零长度校验（layers 版已有 seqused_k 等价
+    # 检查）——短 buffer = GPU 越界读。补齐同款合同。
+    if int(seqused_k.numel()) < batch:
+        raise ValueError("seqused_k length is smaller than num_seqs")
+    if int(is_compact_i32.numel()) < batch:
+        raise ValueError("is_compact_i32 length is smaller than num_seqs")
+    if int(compact_kv_len_i32.numel()) < batch:
+        raise ValueError("compact_kv_len_i32 length is smaller than num_seqs")
+    if int(compact_offset_tokens_i64.numel()) < batch:
+        raise ValueError("compact_offset_tokens_i64 length is smaller than num_seqs")
     validated_sink_tokens = validate_sink_tokens(int(sink_tokens))
 
     # Strides are in elements (not bytes) for triton pointer arithmetic.
@@ -350,6 +361,19 @@ def pack_req_meta_decode_fast_layers(
         raise ValueError("block_size must be positive")
     if seqused_k.numel() < batch:
         raise ValueError("seqused_k length is smaller than num_seqs")
+    # [F3-PACK-COMPACT-SHAPE 2026-07-11 EXT审计] kernel 以 layer*stride0 +
+    # pid*stride1 索引到 (layers-1, batch-1)；此前对 compact 三输入只查 dim
+    # ——过小的 [layers, batch] 面 = GPU 越界读。补 shape 合同。
+    for _name, _t in (
+        ("is_compact_i32", is_compact_i32),
+        ("compact_kv_len_i32", compact_kv_len_i32),
+        ("compact_offset_tokens_i64", compact_offset_tokens_i64),
+    ):
+        if int(_t.shape[0]) < layers or int(_t.shape[1]) < batch:
+            raise ValueError(
+                f"{_name} shape {tuple(_t.shape)} smaller than required "
+                f"[num_layers={layers}, num_seqs={batch}]"
+            )
     validated_sink_tokens = validate_sink_tokens(int(sink_tokens))
 
     if log_f_mask_i32 is None:
@@ -749,7 +773,12 @@ def kernel_log_f_pre_from_logits_scratch_lastn_gt1(
 
     cap_i64 = logits_capacity.to(tl.int64)
     stride_pad_i64 = log_f_stride_head_i32.to(tl.int64)
-    stride_pad_i64 = tl.maximum(stride_pad_i64, cap_i64)
+    # [F2-STRIDE-PAD-FAILFAST 2026-07-11 EXT审计] 旧 tl.maximum(stride, cap)
+    # 把 0<stride<capacity 的布局违约静默"修复"成按 cap 跨行 = 静默错读
+    # (违无 fallback 纪律)。改为仅 <=0 哨兵落 capacity(与 C++ 版
+    # out_stride_head_i32>0 的哨兵语义同款);违约域由 wrapper host 校验
+    # raise。合法域(0 哨兵 / stride>=cap)数值与旧式逐位一致。
+    stride_pad_i64 = tl.where(stride_pad_i64 > 0, stride_pad_i64, cap_i64)
     stride_row = stride_pad_i64
     max_r = tl.minimum(logits_last_n, MAX_R)
     stride_head_scratch = logits_last_n.to(tl.int64) * stride_pad_i64
@@ -877,6 +906,25 @@ def _launch_log_f_pre_from_logits_scratch_lastn_gt1(
     log_f_out_fp32: bool,
     alpha: float,
 ) -> None:
+    # [F2-STRIDE-PAD-FAILFAST 2026-07-11 EXT审计] kernel 侧已不再静默"修复"
+    # 布局违约(见 kernel 内注)。违约域在此 fail-fast:col1(stride_head)
+    # 必须 ==0(哨兵→kernel 落 capacity)或 >= col4(capacity)。本 wrapper
+    # 仅测试/oracle 调用面(生产走 C++ reduce_log_f_pre_scratch_cuda),
+    # 一次 D2H 小拷贝的校验成本可接受。
+    _n = int(num_seqs)
+    if _n > 0 and req_meta_i32.numel() > 0:
+        _meta_host = req_meta_i32[:_n].detach().cpu()
+        _stride_head = _meta_host[:, 1]
+        _cap = _meta_host[:, 4]
+        _bad = (_stride_head > 0) & (_stride_head < _cap)
+        if bool(_bad.any()):
+            _row = int(_bad.nonzero()[0].item())
+            raise ValueError(
+                "log_f_pre lastn_gt1: meta row "
+                f"{_row} has 0 < stride_head({int(_stride_head[_row])}) < "
+                f"capacity({int(_cap[_row])}) — layout contract violation "
+                "(the kernel would mis-stride across scratch rows)"
+            )
     grid = (int(num_seqs), int(num_query_heads))
     kernel_log_f_pre_from_logits_scratch_lastn_gt1[grid](
         req_meta_i32,

@@ -1923,15 +1923,37 @@ torch::Tensor workspace_2d_or_empty(
     return torch::empty({rows, cols}, ref.options().dtype(dtype));
 }
 
+// [ENV-PARSE-SINGLE-DIALECT 2026-07-11 EXT审计·仅卫生] 这两个 gate 在 python
+// 侧各有严格镜像判定（本文件 python 段: os.environ.get(...) == "1"），而旧
+// C++ 侧用 atoi==1 接受 "01"/"1x" 等前缀形态 => 同一进程对同一 env 值 C++/
+// python 判定分裂（C++ ON / python OFF 的隐性路由撕裂）。统一为严格 "0"/"1"
+// 枚举；其它值 fail-fast（无 fallback 纪律：坏值不再产生分裂路由）。生产
+// 形态恒为显式 "0"/"1"（python 段 import 期 coherence shim 保证），零行为变化。
 bool selector_fuse_nms_cross_enabled() {
     const char* env = std::getenv("VLLM_SPARSE_SELECTOR_FUSE_NMS_CROSS");
-    return env != nullptr && std::atoi(env) == 1;
+    if (env == nullptr) {
+        return false;
+    }
+    const bool is_one = env[0] == '1' && env[1] == '\0';
+    const bool is_zero = env[0] == '0' && env[1] == '\0';
+    TORCH_CHECK(is_one || is_zero,
+                "VLLM_SPARSE_SELECTOR_FUSE_NMS_CROSS must be '0' or '1', got '",
+                env, "'");
+    return is_one;
 }
 
 // fa4_selector_fixed_shape_topk: env gate for fixed-shape (k == k_head) post_topk.
 bool selector_fixed_shape_topk_enabled() {
     const char* env = std::getenv("VLLM_SPARSE_SELECTOR_FIXED_SHAPE_TOPK");
-    return env != nullptr && std::atoi(env) == 1;
+    if (env == nullptr) {
+        return false;
+    }
+    const bool is_one = env[0] == '1' && env[1] == '\0';
+    const bool is_zero = env[0] == '0' && env[1] == '\0';
+    TORCH_CHECK(is_one || is_zero,
+                "VLLM_SPARSE_SELECTOR_FIXED_SHAPE_TOPK must be '0' or '1', got '",
+                env, "'");
+    return is_one;
 }
 
 size_t fused_nms_cross_shm_bytes(int64_t H, int block_k, int window) {
@@ -1982,6 +2004,15 @@ torch::Tensor run_soft_nms(
     int pad = win / 2;
     int tile_len = threads + 2 * pad;
     size_t shm_size = sizeof(float) * static_cast<size_t>(tile_len);
+    // [NMS-SHM-FAILFAST 2026-07-11 EXT审计·理论可达] win 只被钳到 K；大 window
+    // 使动态 shm 超过 48KB 默认上限时 launch 会静默失败（无 launch check），
+    // workspace 旧值被原样返回 = 静默错值。fail-fast：超限直接 raise（不加
+    // 自动降级，无 fallback 纪律），launch 后补 C10_CUDA_KERNEL_LAUNCH_CHECK。
+    constexpr size_t kMaxDynamicShmemBytes = 48 * 1024;
+    TORCH_CHECK(shm_size <= kMaxDynamicShmemBytes,
+                "run_soft_nms: nms_window=", win, " needs ", shm_size,
+                " bytes dynamic shared memory (>48KB SM default limit); "
+                "reduce the window");
 
     AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, log_s_c.scalar_type(), "soft_nms_bounds", [&] {
         soft_nms_bounds_kernel<scalar_t><<<blocks, threads, shm_size, stream>>>(
@@ -2002,6 +2033,7 @@ torch::Tensor run_soft_nms(
             static_cast<float>(alpha),
             out.data_ptr<scalar_t>());
     });
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
 }
 
@@ -2036,10 +2068,16 @@ torch::Tensor run_cross_head(
     auto out = out_flat.reshape({N, H, K});
     int threads = 128;
     if (const char* env = std::getenv("VLLM_SPARSE_SELECTOR_CROSS_HEAD_BLOCK_K")) {
+        // [CROSS-HEAD-ENV-DOMAIN 2026-07-11 EXT审计·理论可达] 旧逻辑只认 64，
+        // 其它值静默保持 128 且跳过 else 臂的 shm 自适应选择 = env 放行域大于
+        // 实现路由域（32/打错字全被静默吞）。收窄：显式值必须 ∈ {64,128}，
+        // 否则 raise；显式 128 同样受下方统一 shm fail-fast 约束，不再静默
+        // 越过 48KB 检查。
         int parsed = std::atoi(env);
-        if (parsed == 64) {
-            threads = 64;
-        }
+        TORCH_CHECK(parsed == 64 || parsed == 128,
+                    "VLLM_SPARSE_SELECTOR_CROSS_HEAD_BLOCK_K must be 64 or 128, got '",
+                    env, "'");
+        threads = parsed;
     } else {
         size_t shm_bytes_128 = sizeof(int) * static_cast<size_t>(H) * 2
             + sizeof(float) * static_cast<size_t>(H) * static_cast<size_t>(128);
@@ -2051,6 +2089,13 @@ torch::Tensor run_cross_head(
     dim3 blocks(static_cast<unsigned int>(N), static_cast<unsigned int>((K + block_k - 1) / block_k));
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     size_t shm_bytes = sizeof(int) * static_cast<size_t>(H) * 2 + sizeof(float) * static_cast<size_t>(H) * static_cast<size_t>(block_k);
+    // [CROSS-HEAD-SHM-FAILFAST 2026-07-11 EXT审计·理论可达] 与 run_soft_nms
+    // 同款：超 48KB 的 launch 会静默失败并返回 workspace 旧值。fail-fast。
+    constexpr size_t kMaxDynamicShmemBytes = 48 * 1024;
+    TORCH_CHECK(shm_bytes <= kMaxDynamicShmemBytes,
+                "run_cross_head: H=", H, " block_k=", block_k, " needs ",
+                shm_bytes,
+                " bytes dynamic shared memory (>48KB SM default limit)");
 
     AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, log_s_c.scalar_type(), "cross_head_mutex_bounds", [&] {
         if (block_k == 128) {
@@ -2093,6 +2138,7 @@ torch::Tensor run_cross_head(
                 out.data_ptr<scalar_t>());
         }
     });
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
 }
 
@@ -2219,6 +2265,7 @@ torch::Tensor run_soft_nms_cross_head(
                 out.data_ptr<scalar_t>());
         }
     });
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
 }
 

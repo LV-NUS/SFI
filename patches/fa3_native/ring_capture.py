@@ -1,16 +1,13 @@
 """Pure, unit-testable host-side logic for the per-G capture RING + WAR fence (FIX-1/FIX-2)."""
 from __future__ import annotations
 
+# [REDUCE-GROUP-SINGLE-SOURCE 2026-07-11 EXT审计·随手批] 本文件旧携第二份
+# validate_reduce_group（静默 return 0 = fallback 形态），与生产（sparse_
+# constants 的 raise 判定）语义漂移 = 双真源。真源收敛到 runtime_contracts
+# （纯 stdlib 合同件），此处 re-export 保 __all__/调用面不变。
+from patches.runtime_contracts import validate_reduce_group
+
 __all__ = ["validate_reduce_group", "ring_depth", "ring_scratch_slot", "tape_slot", "RingWarFence"]
-
-
-def validate_reduce_group(reduce_group: int, capture_chunk: int) -> int:
-    g = int(reduce_group)
-    if g not in (0, 1, 2, 4):
-        return 0
-    if g > 0 and (int(capture_chunk) % g) != 0:
-        return 0
-    return g
 
 
 def ring_depth(reduce_group: int, in_flight: int) -> int:

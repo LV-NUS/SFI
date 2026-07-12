@@ -30,849 +30,6 @@ _ALPHA_NUM_STAGES_OVERRIDE = _read_int_env("VLLM_ALPHA_NUM_STAGES", 0)
 _ALPHA_LSE_1PASS_CACHED = os.environ.get("VLLM_SPARSE_ALPHA_LSE_1PASS", "1") == "1"
 
 
-@triton.jit
-def _cross_head_mutex_kernel(
-    log_s_ptr,
-    mask_ptr,
-    out_ptr,
-    stride_s_n,
-    stride_s_h,
-    stride_s_k,
-    stride_m_n,
-    stride_m_h,
-    stride_m_k,
-    H,
-    K,
-    alpha_cross,
-    temperature,
-    eps,
-    BLOCK_K: tl.constexpr,
-    BLOCK_H: tl.constexpr,
-):
-    pid_n = tl.program_id(0)
-    pid_k = tl.program_id(1)
-
-    offs_k = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
-    offs_h = tl.arange(0, BLOCK_H)
-
-    mask_k = offs_k < K
-    mask_h = offs_h < H
-
-    ptr_s = log_s_ptr + pid_n * stride_s_n + offs_h[:, None] * stride_s_h + offs_k[None, :] * stride_s_k
-    ptr_m = mask_ptr + pid_n * stride_m_n + offs_h[:, None] * stride_m_h + offs_k[None, :] * stride_m_k
-    ptr_o = out_ptr + pid_n * stride_s_n + offs_h[:, None] * stride_s_h + offs_k[None, :] * stride_s_k
-
-    in_bounds = mask_h[:, None] & mask_k[None, :]
-    scores = tl.load(ptr_s, mask=in_bounds, other=0.0)
-    mask_val = tl.load(ptr_m, mask=in_bounds, other=0).to(tl.int1)
-
-    scores_f = scores.to(tl.float32)
-    min_val = -3.402823466e38
-    masked_logits = tl.where(mask_val, scores_f / temperature, min_val)
-
-    max_h = tl.max(masked_logits, axis=0)
-    exp = tl.exp(masked_logits - max_h)
-    exp = tl.where(mask_val, exp, 0.0)
-    sum_h = tl.sum(exp, axis=0)
-    sum_h = tl.where(sum_h > 0.0, sum_h, 1.0)
-    r = exp / sum_h
-
-    log_r = tl.log(tl.maximum(r, eps))
-    adjusted = scores_f + alpha_cross * log_r
-    out = tl.where(mask_val, adjusted, scores_f)
-
-    tl.store(ptr_o, out.to(scores.dtype), mask=in_bounds)
-
-
-@triton.jit
-def _cross_head_mutex_kernel_bounds(
-    log_s_ptr,
-    lo_ptr,
-    hi_ptr,
-    out_ptr,
-    stride_s_n,
-    stride_s_h,
-    stride_s_k,
-    stride_lo_n,
-    stride_lo_h,
-    stride_hi_n,
-    stride_hi_h,
-    H,
-    K,
-    alpha_cross,
-    temperature,
-    eps,
-    BLOCK_K: tl.constexpr,
-    BLOCK_H: tl.constexpr,
-):
-    pid_n = tl.program_id(0)
-    pid_k = tl.program_id(1)
-
-    offs_k = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
-    offs_h = tl.arange(0, BLOCK_H)
-
-    mask_k = offs_k < K
-    mask_h = offs_h < H
-
-    lo = tl.load(lo_ptr + pid_n * stride_lo_n + offs_h * stride_lo_h, mask=mask_h, other=0).to(tl.int32)
-    hi = tl.load(hi_ptr + pid_n * stride_hi_n + offs_h * stride_hi_h, mask=mask_h, other=0).to(tl.int32)
-    lo = tl.maximum(lo, 0)
-    hi = tl.minimum(hi, K)
-
-    in_bounds = mask_h[:, None] & mask_k[None, :]
-    ptr_s = log_s_ptr + pid_n * stride_s_n + offs_h[:, None] * stride_s_h + offs_k[None, :] * stride_s_k
-    ptr_o = out_ptr + pid_n * stride_s_n + offs_h[:, None] * stride_s_h + offs_k[None, :] * stride_s_k
-    scores = tl.load(ptr_s, mask=in_bounds, other=0.0)
-
-    kk = offs_k[None, :].to(tl.int32)
-    mask_val = (kk >= lo[:, None]) & (kk < hi[:, None])
-    mask_val = mask_val & in_bounds
-
-    scores_f = scores.to(tl.float32)
-    min_val = -3.402823466e38
-    masked_logits = tl.where(mask_val, scores_f / temperature, min_val)
-
-    max_h = tl.max(masked_logits, axis=0)
-    exp = tl.exp(masked_logits - max_h)
-    exp = tl.where(mask_val, exp, 0.0)
-    sum_h = tl.sum(exp, axis=0)
-    sum_h = tl.where(sum_h > 0.0, sum_h, 1.0)
-    r = exp / sum_h
-
-    log_r = tl.log(tl.maximum(r, eps))
-    adjusted = scores_f + alpha_cross * log_r
-    out = tl.where(mask_val, adjusted, scores_f)
-
-    tl.store(ptr_o, out.to(scores.dtype), mask=in_bounds)
-
-
-@triton.jit
-def _cross_head_softmax_kernel(
-    log_s_ptr,
-    mask_ptr,
-    r_ptr,
-    stride_s_n,
-    stride_s_h,
-    stride_s_k,
-    stride_m_n,
-    stride_m_h,
-    stride_m_k,
-    stride_r_n,
-    stride_r_h,
-    stride_r_k,
-    H,
-    K,
-    temperature,
-    BLOCK_K: tl.constexpr,
-    BLOCK_H: tl.constexpr,
-):
-    pid_n = tl.program_id(0)
-    pid_k = tl.program_id(1)
-
-    offs_k = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
-    offs_h = tl.arange(0, BLOCK_H)
-    mask_k = offs_k < K
-    mask_h = offs_h < H
-
-    ptr_s = log_s_ptr + pid_n * stride_s_n + offs_h[:, None] * stride_s_h + offs_k[None, :] * stride_s_k
-    ptr_m = mask_ptr + pid_n * stride_m_n + offs_h[:, None] * stride_m_h + offs_k[None, :] * stride_m_k
-    ptr_r = r_ptr + pid_n * stride_r_n + offs_h[:, None] * stride_r_h + offs_k[None, :] * stride_r_k
-
-    in_bounds = mask_h[:, None] & mask_k[None, :]
-    scores = tl.load(ptr_s, mask=in_bounds, other=0.0)
-    mask_val = tl.load(ptr_m, mask=in_bounds, other=0).to(tl.int1)
-
-    scores_f = scores.to(tl.float32)
-    min_val = -3.402823466e38
-    masked_logits = tl.where(mask_val, scores_f / temperature, min_val)
-
-    max_h = tl.max(masked_logits, axis=0)
-    exp = tl.exp(masked_logits - max_h)
-    exp = tl.where(mask_val, exp, 0.0)
-    sum_h = tl.sum(exp, axis=0)
-    sum_h = tl.where(sum_h > 0.0, sum_h, 1.0)
-    r = exp / sum_h
-    r = tl.where(mask_val, r, 0.0)
-
-    tl.store(ptr_r, r, mask=in_bounds)
-
-
-@triton.jit
-def _cross_head_softmax_kernel_bounds(
-    log_s_ptr,
-    lo_ptr,
-    hi_ptr,
-    r_ptr,
-    stride_s_n,
-    stride_s_h,
-    stride_s_k,
-    stride_lo_n,
-    stride_lo_h,
-    stride_hi_n,
-    stride_hi_h,
-    stride_r_n,
-    stride_r_h,
-    stride_r_k,
-    H,
-    K,
-    temperature,
-    BLOCK_K: tl.constexpr,
-    BLOCK_H: tl.constexpr,
-):
-    pid_n = tl.program_id(0)
-    pid_k = tl.program_id(1)
-
-    offs_k = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
-    offs_h = tl.arange(0, BLOCK_H)
-    mask_k = offs_k < K
-    mask_h = offs_h < H
-
-    lo = tl.load(lo_ptr + pid_n * stride_lo_n + offs_h * stride_lo_h, mask=mask_h, other=0).to(tl.int32)
-    hi = tl.load(hi_ptr + pid_n * stride_hi_n + offs_h * stride_hi_h, mask=mask_h, other=0).to(tl.int32)
-    lo = tl.maximum(lo, 0)
-    hi = tl.minimum(hi, K)
-
-    in_bounds = mask_h[:, None] & mask_k[None, :]
-    ptr_s = log_s_ptr + pid_n * stride_s_n + offs_h[:, None] * stride_s_h + offs_k[None, :] * stride_s_k
-    ptr_r = r_ptr + pid_n * stride_r_n + offs_h[:, None] * stride_r_h + offs_k[None, :] * stride_r_k
-    scores = tl.load(ptr_s, mask=in_bounds, other=0.0)
-
-    kk = offs_k[None, :].to(tl.int32)
-    mask_val = (kk >= lo[:, None]) & (kk < hi[:, None])
-    mask_val = mask_val & in_bounds
-
-    scores_f = scores.to(tl.float32)
-    min_val = -3.402823466e38
-    masked_logits = tl.where(mask_val, scores_f / temperature, min_val)
-
-    max_h = tl.max(masked_logits, axis=0)
-    exp = tl.exp(masked_logits - max_h)
-    exp = tl.where(mask_val, exp, 0.0)
-    sum_h = tl.sum(exp, axis=0)
-    sum_h = tl.where(sum_h > 0.0, sum_h, 1.0)
-    r = exp / sum_h
-    r = tl.where(mask_val, r, 0.0)
-
-    tl.store(ptr_r, r, mask=in_bounds)
-
-
-@triton.jit
-def _cross_head_smooth_adjust_kernel(
-    log_s_ptr,
-    mask_ptr,
-    r_ptr,
-    kernel_ptr,
-    out_ptr,
-    stride_s_n,
-    stride_s_h,
-    stride_s_k,
-    stride_m_n,
-    stride_m_h,
-    stride_m_k,
-    stride_r_n,
-    stride_r_h,
-    stride_r_k,
-    H,
-    K,
-    alpha_cross,
-    beta_local,
-    eps,
-    BLOCK_K: tl.constexpr,
-    BLOCK_H: tl.constexpr,
-    WND: tl.constexpr,
-):
-    pid_n = tl.program_id(0)
-    pid_k = tl.program_id(1)
-
-    offs_k = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
-    offs_h = tl.arange(0, BLOCK_H)
-    mask_k = offs_k < K
-    mask_h = offs_h < H
-
-    ptr_s = log_s_ptr + pid_n * stride_s_n + offs_h[:, None] * stride_s_h + offs_k[None, :] * stride_s_k
-    ptr_m = mask_ptr + pid_n * stride_m_n + offs_h[:, None] * stride_m_h + offs_k[None, :] * stride_m_k
-    ptr_r = r_ptr + pid_n * stride_r_n + offs_h[:, None] * stride_r_h + offs_k[None, :] * stride_r_k
-    ptr_o = out_ptr + pid_n * stride_s_n + offs_h[:, None] * stride_s_h + offs_k[None, :] * stride_s_k
-
-    in_bounds = mask_h[:, None] & mask_k[None, :]
-    scores = tl.load(ptr_s, mask=in_bounds, other=0.0)
-    mask_val = tl.load(ptr_m, mask=in_bounds, other=0).to(tl.int1)
-    r = tl.load(ptr_r, mask=in_bounds, other=0.0)
-
-    scores_f = scores.to(tl.float32)
-    r_f = r.to(tl.float32)
-
-    smooth = tl.zeros([BLOCK_H, BLOCK_K], dtype=tl.float32)
-    for offset in range(-WND, WND + 1):
-        w = tl.load(kernel_ptr + (offset + WND))
-        idx = offs_k + offset
-        valid_k = (idx >= 0) & (idx < K)
-        ptr_r_off = r_ptr + pid_n * stride_r_n + offs_h[:, None] * stride_r_h + idx[None, :] * stride_r_k
-        r_off = tl.load(ptr_r_off, mask=mask_h[:, None] & valid_k[None, :], other=0.0)
-        smooth += r_off.to(tl.float32) * w
-
-    smooth = tl.where(mask_val, smooth, 0.0)
-
-    log_r = tl.log(tl.maximum(r_f, eps))
-    log_smooth = tl.log(tl.maximum(smooth, eps))
-    adjusted = scores_f + alpha_cross * log_r + beta_local * log_smooth
-    out = tl.where(mask_val, adjusted, scores_f)
-
-    tl.store(ptr_o, out.to(scores.dtype), mask=in_bounds)
-
-
-@triton.jit
-def _cross_head_smooth_adjust_kernel_bounds(
-    log_s_ptr,
-    lo_ptr,
-    hi_ptr,
-    r_ptr,
-    kernel_ptr,
-    out_ptr,
-    stride_s_n,
-    stride_s_h,
-    stride_s_k,
-    stride_lo_n,
-    stride_lo_h,
-    stride_hi_n,
-    stride_hi_h,
-    stride_r_n,
-    stride_r_h,
-    stride_r_k,
-    H,
-    K,
-    alpha_cross,
-    beta_local,
-    eps,
-    BLOCK_K: tl.constexpr,
-    BLOCK_H: tl.constexpr,
-    WND: tl.constexpr,
-):
-    pid_n = tl.program_id(0)
-    pid_k = tl.program_id(1)
-
-    offs_k = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
-    offs_h = tl.arange(0, BLOCK_H)
-    mask_k = offs_k < K
-    mask_h = offs_h < H
-
-    lo = tl.load(lo_ptr + pid_n * stride_lo_n + offs_h * stride_lo_h, mask=mask_h, other=0).to(tl.int32)
-    hi = tl.load(hi_ptr + pid_n * stride_hi_n + offs_h * stride_hi_h, mask=mask_h, other=0).to(tl.int32)
-    lo = tl.maximum(lo, 0)
-    hi = tl.minimum(hi, K)
-
-    in_bounds = mask_h[:, None] & mask_k[None, :]
-
-    ptr_s = log_s_ptr + pid_n * stride_s_n + offs_h[:, None] * stride_s_h + offs_k[None, :] * stride_s_k
-    ptr_r = r_ptr + pid_n * stride_r_n + offs_h[:, None] * stride_r_h + offs_k[None, :] * stride_r_k
-    ptr_o = out_ptr + pid_n * stride_s_n + offs_h[:, None] * stride_s_h + offs_k[None, :] * stride_s_k
-
-    scores = tl.load(ptr_s, mask=in_bounds, other=0.0)
-    r = tl.load(ptr_r, mask=in_bounds, other=0.0)
-
-    kk = offs_k[None, :].to(tl.int32)
-    mask_val = (kk >= lo[:, None]) & (kk < hi[:, None])
-    mask_val = mask_val & in_bounds
-
-    scores_f = scores.to(tl.float32)
-    r_f = r.to(tl.float32)
-
-    smooth = tl.zeros([BLOCK_H, BLOCK_K], dtype=tl.float32)
-    for offset in range(-WND, WND + 1):
-        w = tl.load(kernel_ptr + (offset + WND))
-        idx = offs_k + offset
-        valid_k = (idx >= 0) & (idx < K)
-        ptr_r_off = r_ptr + pid_n * stride_r_n + offs_h[:, None] * stride_r_h + idx[None, :] * stride_r_k
-        r_off = tl.load(ptr_r_off, mask=mask_h[:, None] & valid_k[None, :], other=0.0)
-        smooth += r_off.to(tl.float32) * w
-
-    smooth = tl.where(mask_val, smooth, 0.0)
-
-    log_r = tl.log(tl.maximum(r_f, eps))
-    log_smooth = tl.log(tl.maximum(smooth, eps))
-    adjusted = scores_f + alpha_cross * log_r + beta_local * log_smooth
-    out = tl.where(mask_val, adjusted, scores_f)
-
-    tl.store(ptr_o, out.to(scores.dtype), mask=in_bounds)
-
-
-@triton.jit
-def _soft_nms_kernel(
-    log_s_ptr,
-    mask_ptr,
-    out_ptr,
-    stride_s_n,
-    stride_s_h,
-    stride_s_k,
-    stride_m_n,
-    stride_m_h,
-    stride_m_k,
-    stride_o_n,
-    stride_o_h,
-    stride_o_k,
-    H,
-    K,
-    alpha,
-    BLOCK_K: tl.constexpr,
-    WND: tl.constexpr,
-):
-    pid_nh = tl.program_id(0)
-    pid_k = tl.program_id(1)
-
-    offs_k = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
-    mask_k = offs_k < K
-
-    n = pid_nh // H
-    h = pid_nh - n * H
-
-    ptr_s = log_s_ptr + n * stride_s_n + h * stride_s_h + offs_k * stride_s_k
-    ptr_m = mask_ptr + n * stride_m_n + h * stride_m_h + offs_k * stride_m_k
-    ptr_o = out_ptr + n * stride_o_n + h * stride_o_h + offs_k * stride_o_k
-
-    scores = tl.load(ptr_s, mask=mask_k, other=-3.402823466e38)
-    mask_val = tl.load(ptr_m, mask=mask_k, other=0).to(tl.int1)
-    scores_f = scores.to(tl.float32)
-    scores_f = tl.where(mask_val, scores_f, -3.402823466e38)
-
-    pad = WND // 2
-    # 兼容旧版本 Triton：避免使用 tl.full_like（部分环境缺失该 API）
-    pooled = tl.zeros([BLOCK_K], dtype=tl.float32) + (-3.402823466e38)
-    for offset in range(-pad, pad + 1):
-        idx = offs_k + offset
-        in_bounds = (idx >= 0) & (idx < K)
-        ptr_off = log_s_ptr + n * stride_s_n + h * stride_s_h + idx * stride_s_k
-        ptr_m_off = mask_ptr + n * stride_m_n + h * stride_m_h + idx * stride_m_k
-        val = tl.load(ptr_off, mask=in_bounds, other=-3.402823466e38).to(tl.float32)
-        m_off = tl.load(ptr_m_off, mask=in_bounds, other=0).to(tl.int1)
-        val = tl.where(m_off, val, -3.402823466e38)
-        pooled = tl.maximum(pooled, val)
-
-    delta = tl.maximum(pooled - scores_f, 0.0)
-    out = scores_f - alpha * delta
-    out = tl.where(mask_val, out, scores_f)
-
-    tl.store(ptr_o, out.to(scores.dtype), mask=mask_k)
-
-
-def _select_block_h(num_heads: int) -> int:
-    if num_heads <= 8:
-        return 8
-    if num_heads <= 16:
-        return 16
-    if num_heads <= 32:
-        return 32
-    return 64
-
-
-def cross_head_mutex_triton(
-    log_s_all: torch.Tensor,
-    mask: torch.Tensor,
-    alpha_cross: float,
-    temperature: float,
-    window: int,
-    power: float,
-    eps: float = 1.0e-12,
-) -> torch.Tensor:
-    if alpha_cross <= 0.0 or log_s_all.numel() == 0:
-        return log_s_all
-    if log_s_all.shape != mask.shape:
-        raise ValueError("mask must match log_s_all")
-
-    orig_shape = log_s_all.shape
-    if log_s_all.dim() == 2:
-        log_s = log_s_all.unsqueeze(0)
-        mask_view = mask.unsqueeze(0)
-    elif log_s_all.dim() == 3:
-        log_s = log_s_all
-        mask_view = mask
-    elif log_s_all.dim() == 4:
-        flat = log_s_all.shape[0] * log_s_all.shape[1]
-        log_s = log_s_all.reshape(flat, log_s_all.shape[2], log_s_all.shape[3])
-        mask_view = mask.reshape(flat, mask.shape[2], mask.shape[3])
-    else:
-        raise ValueError("log_s_all must be [H, K], [B, H, K], or [L, B, H, K]")
-
-    if log_s.dim() != 3:
-        raise ValueError("invalid log_s shape after reshape")
-
-    num_batches, num_heads, kv_len = log_s.shape
-    block_h = _select_block_h(num_heads)
-    if num_heads > block_h:
-        raise ValueError(f"num_heads {num_heads} exceeds supported block {block_h}")
-
-    block_k = 128
-    grid = (num_batches, triton.cdiv(kv_len, block_k))
-    num_warps = 4 if block_h <= 32 else 8
-
-    # Cache strides to avoid repeated Python→C++ round-trips.
-    s_s0, s_s1, s_s2 = log_s.stride(0), log_s.stride(1), log_s.stride(2)
-    s_m0, s_m1, s_m2 = mask_view.stride(0), mask_view.stride(1), mask_view.stride(2)
-
-    out = torch.empty_like(log_s)
-
-    if power <= 0.0 or window <= 0 or kv_len <= 1:
-        _cross_head_mutex_kernel[grid](
-            log_s,
-            mask_view,
-            out,
-            s_s0, s_s1, s_s2,
-            s_m0, s_m1, s_m2,
-            num_heads,
-            kv_len,
-            float(alpha_cross),
-            float(max(temperature, 1.0e-6)),
-            float(eps),
-            BLOCK_K=block_k,
-            BLOCK_H=block_h,
-            num_warps=num_warps,
-        )
-    else:
-        r = torch.empty((num_batches, num_heads, kv_len), device=log_s.device, dtype=torch.float32)
-        s_r0, s_r1, s_r2 = r.stride(0), r.stride(1), r.stride(2)
-        _cross_head_softmax_kernel[grid](
-            log_s,
-            mask_view,
-            r,
-            s_s0, s_s1, s_s2,
-            s_m0, s_m1, s_m2,
-            s_r0, s_r1, s_r2,
-            num_heads,
-            kv_len,
-            float(max(temperature, 1.0e-6)),
-            BLOCK_K=block_k,
-            BLOCK_H=block_h,
-            num_warps=num_warps,
-        )
-
-        kernel = _build_gaussian_kernel_tensor(int(window), log_s.device, torch.float32)
-        _cross_head_smooth_adjust_kernel[grid](
-            log_s,
-            mask_view,
-            r,
-            kernel,
-            out,
-            s_s0, s_s1, s_s2,
-            s_m0, s_m1, s_m2,
-            s_r0, s_r1, s_r2,
-            num_heads,
-            kv_len,
-            float(alpha_cross),
-            float(max(power, 0.0)),
-            float(eps),
-            BLOCK_K=block_k,
-            BLOCK_H=block_h,
-            WND=int(window),
-            num_warps=num_warps,
-        )
-
-    if log_s_all.dim() == 2:
-        return out.squeeze(0)
-    if log_s_all.dim() == 4:
-        return out.reshape(orig_shape)
-    return out
-
-
-def cross_head_mutex_triton_bounds(
-    log_s_all: torch.Tensor,
-    token_lo: torch.Tensor,
-    token_hi: torch.Tensor,
-    alpha_cross: float,
-    temperature: float,
-    window: int,
-    power: float,
-    eps: float = 1.0e-12,
-) -> torch.Tensor:
-    """cross-head mutex（bounds 版本）：不物化 [N,H,K] 的 bool mask。"""
-    if alpha_cross <= 0.0 or log_s_all.numel() == 0:
-        return log_s_all
-    if not log_s_all.is_cuda:
-        raise RuntimeError("cross_head_mutex_triton_bounds requires CUDA tensors")
-
-    orig_shape = log_s_all.shape
-    if log_s_all.dim() == 2:
-        log_s = log_s_all.unsqueeze(0)
-        lo_view = token_lo.unsqueeze(0) if token_lo.dim() == 1 else token_lo
-        hi_view = token_hi.unsqueeze(0) if token_hi.dim() == 1 else token_hi
-    elif log_s_all.dim() == 3:
-        log_s = log_s_all
-        lo_view = token_lo
-        hi_view = token_hi
-    elif log_s_all.dim() == 4:
-        flat = log_s_all.shape[0] * log_s_all.shape[1]
-        log_s = log_s_all.reshape(flat, log_s_all.shape[2], log_s_all.shape[3])
-        lo_view = token_lo.reshape(flat, token_lo.shape[-1])
-        hi_view = token_hi.reshape(flat, token_hi.shape[-1])
-    else:
-        raise ValueError("log_s_all must be [H,K], [B,H,K], or [L,B,H,K]")
-
-    if log_s.dim() != 3:
-        raise ValueError("invalid log_s shape after reshape")
-    if lo_view.dim() != 2 or hi_view.dim() != 2:
-        raise ValueError("token_lo/token_hi must be [N,H] (or broadcastable)")
-    if lo_view.shape[0] != log_s.shape[0] or hi_view.shape[0] != log_s.shape[0]:
-        raise ValueError("token_lo/token_hi batch dimension mismatch with log_s")
-    if lo_view.shape[1] != log_s.shape[1] or hi_view.shape[1] != log_s.shape[1]:
-        raise ValueError("token_lo/token_hi head dimension mismatch with log_s")
-
-    num_batches, num_heads, kv_len = log_s.shape
-    block_h = _select_block_h(num_heads)
-    if num_heads > block_h:
-        raise ValueError(f"num_heads {num_heads} exceeds supported block {block_h}")
-
-    lo_i32 = (
-        lo_view
-        if (lo_view.device == log_s.device and lo_view.dtype == torch.int32)
-        else lo_view.to(device=log_s.device, dtype=torch.int32)
-    )
-    hi_i32 = (
-        hi_view
-        if (hi_view.device == log_s.device and hi_view.dtype == torch.int32)
-        else hi_view.to(device=log_s.device, dtype=torch.int32)
-    )
-
-    block_k = 128
-    grid = (num_batches, triton.cdiv(kv_len, block_k))
-    num_warps = 4 if block_h <= 32 else 8
-
-    # Cache strides to avoid repeated Python→C++ round-trips.
-    s_s0, s_s1, s_s2 = log_s.stride(0), log_s.stride(1), log_s.stride(2)
-    s_lo0, s_lo1 = lo_i32.stride(0), lo_i32.stride(1)
-    s_hi0, s_hi1 = hi_i32.stride(0), hi_i32.stride(1)
-
-    out = torch.empty_like(log_s)
-
-    if power <= 0.0 or window <= 0 or kv_len <= 1:
-        _cross_head_mutex_kernel_bounds[grid](
-            log_s,
-            lo_i32,
-            hi_i32,
-            out,
-            s_s0, s_s1, s_s2,
-            s_lo0, s_lo1,
-            s_hi0, s_hi1,
-            num_heads,
-            kv_len,
-            float(alpha_cross),
-            float(max(temperature, 1.0e-6)),
-            float(eps),
-            BLOCK_K=block_k,
-            BLOCK_H=block_h,
-            num_warps=num_warps,
-        )
-    else:
-        r = torch.empty((num_batches, num_heads, kv_len), device=log_s.device, dtype=torch.float32)
-        s_r0, s_r1, s_r2 = r.stride(0), r.stride(1), r.stride(2)
-        _cross_head_softmax_kernel_bounds[grid](
-            log_s,
-            lo_i32,
-            hi_i32,
-            r,
-            s_s0, s_s1, s_s2,
-            s_lo0, s_lo1,
-            s_hi0, s_hi1,
-            s_r0, s_r1, s_r2,
-            num_heads,
-            kv_len,
-            float(max(temperature, 1.0e-6)),
-            BLOCK_K=block_k,
-            BLOCK_H=block_h,
-            num_warps=num_warps,
-        )
-        kernel = _build_gaussian_kernel_tensor(int(window), log_s.device, torch.float32)
-        _cross_head_smooth_adjust_kernel_bounds[grid](
-            log_s,
-            lo_i32,
-            hi_i32,
-            r,
-            kernel,
-            out,
-            s_s0, s_s1, s_s2,
-            s_lo0, s_lo1,
-            s_hi0, s_hi1,
-            s_r0, s_r1, s_r2,
-            num_heads,
-            kv_len,
-            float(alpha_cross),
-            float(max(power, 0.0)),
-            float(eps),
-            BLOCK_K=block_k,
-            BLOCK_H=block_h,
-            WND=int(window),
-            num_warps=num_warps,
-        )
-
-    if log_s_all.dim() == 2:
-        return out.squeeze(0)
-    if log_s_all.dim() == 4:
-        return out.reshape(orig_shape)
-    return out
-
-
-def soft_nms_triton(
-    log_s: torch.Tensor,
-    mask: torch.Tensor,
-    window: int,
-    alpha: float,
-) -> torch.Tensor:
-    if log_s.numel() == 0:
-        return log_s
-    if not log_s.is_cuda or not mask.is_cuda:
-        raise RuntimeError("soft_nms_triton requires CUDA tensors")
-    if log_s.shape != mask.shape:
-        raise ValueError("log_s/mask shape mismatch")
-    if log_s.dim() != 3:
-        raise ValueError("log_s must be [N, H, K]")
-
-    N, H, K = log_s.shape
-    if N == 0 or H == 0 or K == 0:
-        return log_s
-    win = int(max(1, min(window, K)))
-    out = torch.empty_like(log_s)
-
-    # Static grid — BLOCK_K=128 is a compile-time constant.
-    grid = (N * H, triton.cdiv(K, 128))
-
-    # Cache strides to avoid repeated Python→C++ round-trips.
-    s_s0, s_s1, s_s2 = log_s.stride(0), log_s.stride(1), log_s.stride(2)
-    s_m0, s_m1, s_m2 = mask.stride(0), mask.stride(1), mask.stride(2)
-    s_o0, s_o1, s_o2 = out.stride(0), out.stride(1), out.stride(2)
-
-    _soft_nms_kernel[grid](
-        log_s,
-        mask,
-        out,
-        s_s0, s_s1, s_s2,
-        s_m0, s_m1, s_m2,
-        s_o0, s_o1, s_o2,
-        H,
-        K,
-        alpha,
-        BLOCK_K=128,
-        WND=win,
-    )
-    return out
-
-
-@triton.jit
-def _soft_nms_kernel_bounds(
-    log_s_ptr,
-    lo_ptr,
-    hi_ptr,
-    out_ptr,
-    stride_s_n,
-    stride_s_h,
-    stride_s_k,
-    stride_lo_n,
-    stride_lo_h,
-    stride_hi_n,
-    stride_hi_h,
-    stride_o_n,
-    stride_o_h,
-    stride_o_k,
-    H,
-    K,
-    alpha,
-    BLOCK_K: tl.constexpr,
-    WND: tl.constexpr,
-):
-    pid_nh = tl.program_id(0)
-    pid_k = tl.program_id(1)
-
-    offs_k = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
-    mask_k = offs_k < K
-
-    n = pid_nh // H
-    h = pid_nh - n * H
-
-    lo = tl.load(lo_ptr + n * stride_lo_n + h * stride_lo_h).to(tl.int32)
-    hi = tl.load(hi_ptr + n * stride_hi_n + h * stride_hi_h).to(tl.int32)
-    lo = tl.maximum(lo, 0)
-    hi = tl.minimum(hi, K)
-
-    ptr_s = log_s_ptr + n * stride_s_n + h * stride_s_h + offs_k * stride_s_k
-    ptr_o = out_ptr + n * stride_o_n + h * stride_o_h + offs_k * stride_o_k
-
-    scores = tl.load(ptr_s, mask=mask_k, other=-float("inf"))
-    scores_f = scores.to(tl.float32)
-    kk = offs_k.to(tl.int32)
-    mask_val = (kk >= lo) & (kk < hi) & mask_k
-    scores_masked = tl.where(mask_val, scores_f, -float("inf"))
-
-    pad = WND // 2
-    pooled = tl.zeros([BLOCK_K], dtype=tl.float32) + (-float("inf"))
-    for offset in range(-pad, pad + 1):
-        idx = offs_k + offset
-        in_bounds = (idx >= 0) & (idx < K)
-        ptr_off = log_s_ptr + n * stride_s_n + h * stride_s_h + idx * stride_s_k
-        val = tl.load(ptr_off, mask=in_bounds, other=-float("inf")).to(tl.float32)
-        kk_off = idx.to(tl.int32)
-        m_off = (kk_off >= lo) & (kk_off < hi) & in_bounds
-        val = tl.where(m_off, val, -float("inf"))
-        pooled = tl.maximum(pooled, val)
-
-    delta = tl.maximum(pooled - scores_masked, 0.0)
-    out_valid = scores_f - alpha * delta
-    # masked-out positions must remain unchanged by contract (they are already -inf on input in mainline).
-    out = tl.where(mask_val, out_valid, scores_f)
-
-    tl.store(ptr_o, out.to(scores.dtype), mask=mask_k)
-
-
-def soft_nms_triton_bounds(
-    log_s_all: torch.Tensor,
-    token_lo: torch.Tensor,
-    token_hi: torch.Tensor,
-    window: int,
-    alpha: float,
-) -> torch.Tensor:
-    """soft-nms（bounds 版本）：不物化 [N,H,K] 的 bool mask。"""
-    if log_s_all.numel() == 0:
-        return log_s_all
-    if not log_s_all.is_cuda:
-        raise RuntimeError("soft_nms_triton_bounds requires CUDA tensors")
-    if log_s_all.dim() != 3:
-        raise ValueError("log_s_all must be [N, H, K]")
-    if token_lo.dim() != 2 or token_hi.dim() != 2:
-        raise ValueError("token_lo/token_hi must be [N, H]")
-    if token_lo.shape != token_hi.shape:
-        raise ValueError("token_lo/token_hi shape mismatch")
-    if token_lo.shape[0] != log_s_all.shape[0] or token_lo.shape[1] != log_s_all.shape[1]:
-        raise ValueError("token_lo/token_hi mismatch with log_s_all shape")
-
-    N, H, K = log_s_all.shape
-    if N == 0 or H == 0 or K == 0:
-        return log_s_all
-    win = int(max(1, min(window, K)))
-    out = torch.empty_like(log_s_all)
-    lo_i32 = token_lo.to(device=log_s_all.device, dtype=torch.int32)
-    hi_i32 = token_hi.to(device=log_s_all.device, dtype=torch.int32)
-
-    # Static grid — BLOCK_K=128 is a compile-time constant.
-    grid = (N * H, triton.cdiv(K, 128))
-
-    # Cache strides to avoid repeated Python→C++ round-trips.
-    s_s0, s_s1, s_s2 = log_s_all.stride(0), log_s_all.stride(1), log_s_all.stride(2)
-    s_lo0, s_lo1 = lo_i32.stride(0), lo_i32.stride(1)
-    s_hi0, s_hi1 = hi_i32.stride(0), hi_i32.stride(1)
-    s_o0, s_o1, s_o2 = out.stride(0), out.stride(1), out.stride(2)
-
-    _soft_nms_kernel_bounds[grid](
-        log_s_all,
-        lo_i32,
-        hi_i32,
-        out,
-        s_s0, s_s1, s_s2,
-        s_lo0, s_lo1,
-        s_hi0, s_hi1,
-        s_o0, s_o1, s_o2,
-        H,
-        K,
-        float(alpha),
-        BLOCK_K=128,
-        WND=win,
-    )
-    return out
-
 
 @triton.jit
 def _alpha_fuse_from_log_probs_bounds_rows1_kernel(
@@ -1246,6 +403,16 @@ def alpha_fuse_from_log_probs_bounds_rows1_triton(
         num_blocks_bucket = ((int(num_blocks) + 15) // 16) * 16
     # 避免过大的 NUM_BLOCKS 触发 Triton 代码膨胀（长 prompt 下会显著增加编译时间）。
     num_blocks_bucket = int(min(int(num_blocks_bucket), 128))
+    # [A2-ROWS1-K-DOMAIN 2026-07-11 EXT审计] 与 A1 同款 static_range 覆盖域
+    # 断言。本路径 k<=4096（>4096 已分流 chunked 版），默认 block_k 下
+    # NUM_BLOCKS<=32 恒安全；唯 block_k 入参很小（<32）时 cdiv 会越过 128
+    # 封顶 => 尾列静默丢失 + out 未写区垃圾。fail-fast 关死。
+    if int(num_blocks_bucket) * int(block_k) < int(k):
+        raise RuntimeError(
+            "alpha_fuse_from_log_probs_bounds_rows1_triton: K="
+            f"{int(k)} exceeds the scan domain NUM_BLOCKS*BLOCK_K="
+            f"{int(num_blocks_bucket) * int(block_k)}; raise block_k"
+        )
     grid = (m,)
     _alpha_fuse_from_log_probs_bounds_rows1_kernel[grid](
         log_probs,
@@ -1996,15 +1163,18 @@ def _row_lse_from_logits_bounds_kernel(
     max_val = min_val
     count = 0.0
 
-    lo = tl.load(lo_ptr + pid_m * stride_lo_m + pid_r * stride_lo_r).to(tl.int32)
-    hi = tl.load(hi_ptr + pid_m * stride_hi_m + pid_r * stride_hi_r).to(tl.int32)
+    lo = tl.load(lo_ptr + pid_m.to(tl.int64) * stride_lo_m + pid_r.to(tl.int64) * stride_lo_r).to(tl.int32)
+    hi = tl.load(hi_ptr + pid_m.to(tl.int64) * stride_hi_m + pid_r.to(tl.int64) * stride_hi_r).to(tl.int32)
 
     for block_start in tl.static_range(0, NUM_BLOCKS):
         idx = block_start * BLOCK_K + offs_k
         mask_k = idx < K
         in_bounds = mask_k & (idx >= lo) & (idx < hi)
 
-        ptr = logits_ptr + pid_m * stride_l_m + pid_r * stride_l_r + idx * stride_l_k
+        # [A3-I64-OFFSET 2026-07-11 EXT审计] [M,R,K] 总元素 >=2^31 时 i32 基址
+        # 乘法回绕 => OOB。对照 flash_attn_score_dump_fwd(lastn_gt1)全 i64
+        # 纪律，逐项显式提升（先 .to(tl.int64) 再乘，不能只提升和式）。
+        ptr = logits_ptr + pid_m.to(tl.int64) * stride_l_m + pid_r.to(tl.int64) * stride_l_r + idx.to(tl.int64) * stride_l_k
         vals = tl.load(ptr, mask=mask_k, other=min_val).to(tl.float32)
         finite = vals > min_val
         valid = in_bounds & finite
@@ -2023,7 +1193,10 @@ def _row_lse_from_logits_bounds_kernel(
         mask_k = idx < K
         in_bounds = mask_k & (idx >= lo) & (idx < hi)
 
-        ptr = logits_ptr + pid_m * stride_l_m + pid_r * stride_l_r + idx * stride_l_k
+        # [A3-I64-OFFSET 2026-07-11 EXT审计] [M,R,K] 总元素 >=2^31 时 i32 基址
+        # 乘法回绕 => OOB。对照 flash_attn_score_dump_fwd(lastn_gt1)全 i64
+        # 纪律，逐项显式提升（先 .to(tl.int64) 再乘，不能只提升和式）。
+        ptr = logits_ptr + pid_m.to(tl.int64) * stride_l_m + pid_r.to(tl.int64) * stride_l_r + idx.to(tl.int64) * stride_l_k
         vals = tl.load(ptr, mask=mask_k, other=min_val).to(tl.float32)
         finite = vals > min_val
         valid = in_bounds & finite
@@ -2036,9 +1209,9 @@ def _row_lse_from_logits_bounds_kernel(
     lse = max_val + tl.log(sum_exp)
     lse = tl.where(has_vals, lse, min_val)
 
-    tl.store(row_lse_ptr + pid_m * stride_lse_m + pid_r * stride_lse_r, lse)
+    tl.store(row_lse_ptr + pid_m.to(tl.int64) * stride_lse_m + pid_r.to(tl.int64) * stride_lse_r, lse)
     tl.store(
-        row_valid_ptr + pid_m * stride_valid_m + pid_r * stride_valid_r,
+        row_valid_ptr + pid_m.to(tl.int64) * stride_valid_m + pid_r.to(tl.int64) * stride_valid_r,
         has_vals.to(tl.int8),
     )
 
@@ -2076,8 +1249,8 @@ def _row_lse_from_logits_bounds_1pass_kernel(
     offs_k = tl.arange(0, BLOCK_K)
     min_val = -3.402823466e38
 
-    lo = tl.load(lo_ptr + pid_m * stride_lo_m + pid_r * stride_lo_r).to(tl.int32)
-    hi = tl.load(hi_ptr + pid_m * stride_hi_m + pid_r * stride_hi_r).to(tl.int32)
+    lo = tl.load(lo_ptr + pid_m.to(tl.int64) * stride_lo_m + pid_r.to(tl.int64) * stride_lo_r).to(tl.int32)
+    hi = tl.load(hi_ptr + pid_m.to(tl.int64) * stride_hi_m + pid_r.to(tl.int64) * stride_hi_r).to(tl.int32)
 
     max_val = min_val
     sum_exp = 0.0
@@ -2088,7 +1261,10 @@ def _row_lse_from_logits_bounds_1pass_kernel(
         mask_k = idx < K
         in_bounds = mask_k & (idx >= lo) & (idx < hi)
 
-        ptr = logits_ptr + pid_m * stride_l_m + pid_r * stride_l_r + idx * stride_l_k
+        # [A3-I64-OFFSET 2026-07-11 EXT审计] [M,R,K] 总元素 >=2^31 时 i32 基址
+        # 乘法回绕 => OOB。对照 flash_attn_score_dump_fwd(lastn_gt1)全 i64
+        # 纪律，逐项显式提升（先 .to(tl.int64) 再乘，不能只提升和式）。
+        ptr = logits_ptr + pid_m.to(tl.int64) * stride_l_m + pid_r.to(tl.int64) * stride_l_r + idx.to(tl.int64) * stride_l_k
         vals = tl.load(ptr, mask=mask_k, other=min_val).to(tl.float32)
         finite = vals > min_val
         valid = in_bounds & finite
@@ -2110,9 +1286,9 @@ def _row_lse_from_logits_bounds_1pass_kernel(
     lse = max_val + tl.log(sum_exp)
     lse = tl.where(has_vals, lse, min_val)
 
-    tl.store(row_lse_ptr + pid_m * stride_lse_m + pid_r * stride_lse_r, lse)
+    tl.store(row_lse_ptr + pid_m.to(tl.int64) * stride_lse_m + pid_r.to(tl.int64) * stride_lse_r, lse)
     tl.store(
-        row_valid_ptr + pid_m * stride_valid_m + pid_r * stride_valid_r,
+        row_valid_ptr + pid_m.to(tl.int64) * stride_valid_m + pid_r.to(tl.int64) * stride_valid_r,
         has_vals.to(tl.int8),
     )
 
@@ -2157,7 +1333,7 @@ def _log_f_mean_probs_from_logits_bounds_kernel(
     mask_k = offs_k < K
 
     min_val = -3.402823466e38
-    row_count = tl.load(row_counts_ptr + pid_m * stride_counts).to(tl.float32)
+    row_count = tl.load(row_counts_ptr + pid_m.to(tl.int64) * stride_counts).to(tl.float32)
     has_rows = row_count > 0.0
     row_count = tl.where(has_rows, row_count, 1.0)
 
@@ -2171,14 +1347,16 @@ def _log_f_mean_probs_from_logits_bounds_kernel(
         prob_sum = tl.zeros([BLOCK_K], dtype=tl.float32)
 
     for r in tl.static_range(0, R):
-        row_has = tl.load(row_valid_ptr + pid_m * stride_valid_m + r * stride_valid_r).to(tl.int1)
-        row_lse = tl.load(row_lse_ptr + pid_m * stride_lse_m + r * stride_lse_r).to(tl.float32)
-        lo = tl.load(lo_ptr + pid_m * stride_lo_m + r * stride_lo_r).to(tl.int32)
-        hi = tl.load(hi_ptr + pid_m * stride_hi_m + r * stride_hi_r).to(tl.int32)
+        # [A3-I64-OFFSET 2026-07-11] r*stride_* 为 constexpr 常量折叠(python
+        # 任意精度)，无需提升；pid_m 项显式 i64。
+        row_has = tl.load(row_valid_ptr + pid_m.to(tl.int64) * stride_valid_m + r * stride_valid_r).to(tl.int1)
+        row_lse = tl.load(row_lse_ptr + pid_m.to(tl.int64) * stride_lse_m + r * stride_lse_r).to(tl.float32)
+        lo = tl.load(lo_ptr + pid_m.to(tl.int64) * stride_lo_m + r * stride_lo_r).to(tl.int32)
+        hi = tl.load(hi_ptr + pid_m.to(tl.int64) * stride_hi_m + r * stride_hi_r).to(tl.int32)
 
         in_bounds = mask_k & (offs_k >= lo) & (offs_k < hi)
 
-        ptr = logits_ptr + pid_m * stride_l_m + r * stride_l_r + offs_k * stride_l_k
+        ptr = logits_ptr + pid_m.to(tl.int64) * stride_l_m + r * stride_l_r + offs_k.to(tl.int64) * stride_l_k
         vals = tl.load(ptr, mask=mask_k, other=min_val).to(tl.float32)
         finite = vals > min_val
         valid = row_has & in_bounds & finite
@@ -2208,11 +1386,11 @@ def _log_f_mean_probs_from_logits_bounds_kernel(
 
     log_f = tl.where(has_rows, log_f, min_val)
 
-    tl.store(out_log_f_ptr + pid_m * stride_out_m + offs_k * stride_out_k, log_f, mask=mask_k)
+    tl.store(out_log_f_ptr + pid_m.to(tl.int64) * stride_out_m + offs_k.to(tl.int64) * stride_out_k, log_f, mask=mask_k)
     if STORE_MEAN:
         mean_probs = prob_sum / row_count
         mean_probs = tl.where(has_rows, mean_probs, 0.0)
-        tl.store(out_mean_ptr + pid_m * stride_mean_m + offs_k * stride_mean_k, mean_probs, mask=mask_k)
+        tl.store(out_mean_ptr + pid_m.to(tl.int64) * stride_mean_m + offs_k.to(tl.int64) * stride_mean_k, mean_probs, mask=mask_k)
 
 
 def log_f_mean_probs_from_logits_bounds_triton(
@@ -2262,6 +1440,20 @@ def log_f_mean_probs_from_logits_bounds_triton(
         num_blocks_bucket = ((int(num_blocks) + 15) // 16) * 16
     # 避免过大的 NUM_BLOCKS 触发 Triton 代码膨胀（长 prompt 下会显著增加编译时间）。
     num_blocks_bucket = int(min(int(num_blocks_bucket), 128))
+    # [A1-LSE-K-DOMAIN 2026-07-11 EXT审计·triton A1 长 ctx 真雷] 上一行的
+    # 128 封顶 + BLOCK_K<=512 意味着 LSE kernel 的 static_range 覆盖上限
+    # = 512*128 = 65536 列；K 超过它时 row-LSE 只扫前 65536 列而下游
+    # _log_f_mean_probs kernel 照写全部 K 列 => LSE 偏小 / log_f 整片偏大，
+    # 纯静默（K=64k 恰贴边，128k 即踩；large_k 测试只到 8192）。fail-fast：
+    # 覆盖域不足直接 raise（不静默截断，无 fallback 纪律）。需要 >64k 时先
+    # 泛化 kernel 扫描域（runtime cdiv 循环）再放开此门。
+    if int(num_blocks_bucket) * int(block_k) < int(k):
+        raise RuntimeError(
+            "log_f_mean_probs_from_logits_bounds_triton: K="
+            f"{int(k)} exceeds the LSE scan domain NUM_BLOCKS*BLOCK_K="
+            f"{int(num_blocks_bucket) * int(block_k)} (static_range cap 128); "
+            "rows beyond it would be silently dropped from the LSE"
+        )
     use_1pass = _ALPHA_LSE_1PASS_CACHED
     lse_kernel = _row_lse_from_logits_bounds_1pass_kernel if use_1pass else _row_lse_from_logits_bounds_kernel
     lse_kernel[grid_lse](
@@ -2529,28 +1721,3 @@ def log_f_mean_probs_from_log_f_pre_denom_bounds_triton(
     else:
         mean_probs_out = mean_probs
     return log_f, mean_probs_out, row_counts
-
-
-
-_GAUSSIAN_KERNEL_CACHE: dict[Tuple[int, torch.device, torch.dtype], torch.Tensor] = {}
-
-
-def _build_gaussian_kernel_tensor(
-    window: int, device: torch.device, dtype: torch.dtype
-) -> torch.Tensor:
-    length = 2 * window + 1
-    key = (length, device, dtype)
-    cached = _GAUSSIAN_KERNEL_CACHE.get(key)
-    if cached is not None:
-        return cached
-
-    radius = (length - 1) // 2
-    positions = torch.arange(-radius, radius + 1, device=device, dtype=dtype)
-    sigma = max(window / 2.0, 1.0)
-    kernel = torch.exp(-0.5 * (positions / max(sigma, 1.0e-6)) ** 2)
-    kernel[radius] = 0.0
-    total = kernel.sum().clamp_min(1.0)
-    kernel = kernel / total
-    kernel = kernel.contiguous()
-    _GAUSSIAN_KERNEL_CACHE[key] = kernel
-    return kernel

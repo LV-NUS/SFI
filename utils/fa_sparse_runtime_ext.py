@@ -1286,6 +1286,9 @@ void gather_compact_kv_into_arena_ptrs(
     int64_t compact_pos_stride_tok,
     int64_t block_table_stride0,
     int64_t block_table_stride1) {
+    // [PAGE-SIZE-GUARD 2026-07-11 EXT审计·理论可达] kernel 以 pos/page_size 取
+    // 页号，page_size==0 = 整数除零 UB（clamp 后静默读错页）。host fail-fast。
+    TORCH_CHECK(page_size > 0, "gather_compact_kv_into_arena_ptrs: page_size must be positive, got ", page_size);
     TORCH_CHECK(flat_k_ptrs.dim() == 1, "flat_k_ptrs must be [L]");
     int L = static_cast<int>(flat_k_ptrs.size(0));
     TORCH_CHECK(L > 0, "flat_k_ptrs must be non-empty");
@@ -1415,6 +1418,8 @@ void gather_compact_kv_into_arena_ptrs_tiled(
     int64_t block_table_stride1,
     int64_t tile_tokens,
     int64_t max_total_tokens) {
+    // [PAGE-SIZE-GUARD 2026-07-11] 同 gather_compact_kv_into_arena_ptrs。
+    TORCH_CHECK(page_size > 0, "gather_compact_kv_into_arena_ptrs_tiled: page_size must be positive, got ", page_size);
     TORCH_CHECK(flat_k_ptrs.dim() == 1, "flat_k_ptrs must be [L]");
     int L = static_cast<int>(flat_k_ptrs.size(0));
     TORCH_CHECK(L > 0, "flat_k_ptrs must be non-empty");
@@ -1563,6 +1568,9 @@ void gather_compact_kv_into_arena_ptrs_tiled_autolen_impl(
     int64_t k_head,
     int64_t threshold_tokens,
     bool skip_unchanged) {
+    // [PAGE-SIZE-GUARD 2026-07-11] 同 gather_compact_kv_into_arena_ptrs；
+    // autolen/skip_unchanged 两转发入口经由本 impl，一处关死。
+    TORCH_CHECK(page_size > 0, "gather_compact_kv_into_arena_ptrs_tiled_autolen: page_size must be positive, got ", page_size);
     TORCH_CHECK(flat_k_ptrs.dim() == 1, "flat_k_ptrs must be [L]");
     int L = static_cast<int>(flat_k_ptrs.size(0));
     TORCH_CHECK(L > 0, "flat_k_ptrs must be non-empty");
@@ -1856,6 +1864,8 @@ void gather_compact_kv_into_arena(
                 "row_tensor must be [L, B]");
     TORCH_CHECK(slot_tensor.dim() == 1, "slot_tensor must be [B]");
 
+    // [PAGE-SIZE-GUARD 2026-07-11] 同 gather_compact_kv_into_arena_ptrs。
+    TORCH_CHECK(page_size > 0, "gather_compact_kv_into_arena: page_size must be positive, got ", page_size);
     int B = static_cast<int>(selected_indices.size(1));
     int H_kv = static_cast<int>(selected_indices.size(2));
     int k_persist = static_cast<int>(selected_indices.size(3));

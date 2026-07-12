@@ -865,23 +865,42 @@ def _marshal_canonical_cpu(canonical_cpu: object, canonical_width: int):
 
 def _build_buffers(kwargs: dict):
     """Marshal all v2 inputs into buffers. Returns a (positional_args, keepalive)
-    tuple ready to splat into the C++ entrypoint. Raises on any input that cannot
-    be safely marshalled (caller falls through to Python)."""
+    tuple ready to splat into the C++ entrypoint. Raises (ValueError) on any
+    input that cannot be safely marshalled or that violates the length
+    contract; the caller ([BIND-CPP-FAILFAST 2026-07-09]) fails fast on it."""
     bufs: list = []  # keep-alive: tensors backing every data_ptr passed to C++
 
-    def buf(seq) -> int:
+    # [RRP-BIND-ARRAYLEN 2026-07-11 EXT审计·仅卫生] C++ 侧对下面七个数组一律
+    # 按 batch ∈ [0, batch_size) 索引（v2 源: canon_row_v[b]/compact_ready_in
+    # [batch]/row_effk[batch]/cvt_v[batch]/cot_v[batch]/slot_v[batch]/
+    # rfp_v[batch]），但 ABI 只传 data_ptr 不传长度——短数组 = C++ 越界读。
+    # 在封送点做显式长度合同（ValueError 与 C++ 几何合同异常同型）。
+    expected_len = int(kwargs["batch_size"])
+
+    def buf(seq, name: str) -> int:
         t = _as_i32_buffer(seq)
+        # 合同取 >=（覆盖 C++ 读域即安全）：短数组必拒；容量式载体（若有
+        # padding 尾）不误伤。
+        if int(t.numel()) < expected_len:
+            raise ValueError(
+                f"rrp_bind_host_ext: {name} has {int(t.numel())} elements, "
+                f"shorter than batch_size={expected_len} (C++ reads "
+                f"[0, batch_size) => OOB)"
+            )
         bufs.append(t)
         return t.data_ptr()
 
-    row_effk_ptr = buf(kwargs["row_effective_k_by_row"])
+    row_effk_ptr = buf(kwargs["row_effective_k_by_row"], "row_effective_k_by_row")
     # compact_ready as int32 (0/1); generator avoids an intermediate list.
-    compact_ready_ptr = buf(1 if v else 0 for v in kwargs["compact_ready_by_batch"])
-    slot_ptr = buf(kwargs["slot_by_row"])
-    cvt_ptr = buf(kwargs["compact_valid_tokens_by_row"])
-    cot_ptr = buf(kwargs["compact_offset_tokens_by_row"])
-    rfp_ptr = buf(kwargs["recent_first_page_by_row"])
-    canon_row_ptr = buf(kwargs["canonical_row_by_batch"])
+    compact_ready_ptr = buf(
+        (1 if v else 0 for v in kwargs["compact_ready_by_batch"]),
+        "compact_ready_by_batch",
+    )
+    slot_ptr = buf(kwargs["slot_by_row"], "slot_by_row")
+    cvt_ptr = buf(kwargs["compact_valid_tokens_by_row"], "compact_valid_tokens_by_row")
+    cot_ptr = buf(kwargs["compact_offset_tokens_by_row"], "compact_offset_tokens_by_row")
+    rfp_ptr = buf(kwargs["recent_first_page_by_row"], "recent_first_page_by_row")
+    canon_row_ptr = buf(kwargs["canonical_row_by_batch"], "canonical_row_by_batch")
 
     reserved_cpu_values = kwargs["reserved_cpu_values"]
     if reserved_cpu_values is None:

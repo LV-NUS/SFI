@@ -11,7 +11,7 @@ import os
 import sys
 from typing import Optional
 
-from patches.runtime_contracts import validate_capture_inflight
+from patches.runtime_contracts import validate_capture_inflight, validate_reduce_group
 
 __all__ = [
     "_DYNAMIC_ENV",
@@ -243,18 +243,18 @@ except ValueError as _rg_exc:
         "VLLM_SPARSE_CAPTURE_REDUCE_GROUP must be an integer in (0, 1, 2, 4); "
         f"got {os.environ.get('VLLM_SPARSE_CAPTURE_REDUCE_GROUP')!r}"
     ) from _rg_exc
-if _CAPTURE_REDUCE_GROUP not in (0, 1, 2, 4):
+# [REDUCE-GROUP-SINGLE-SOURCE 2026-07-11 EXT审计·随手批] 域判定唯一真源
+# = runtime_contracts.validate_reduce_group（与 validate_capture_inflight 同居
+# 的纯合同件）。此前 fa3_native/ring_capture.py 携带第二份实现且语义已漂移
+# （静默 return 0 vs 此处 raise）= 测试测的不是生产路径。判定逻辑与
+# [REDUCE-GROUP-DOMAIN 收窄 2026-07-11] 逐位同判；此处仅补 env 语境后上抛。
+try:
+    _CAPTURE_REDUCE_GROUP = validate_reduce_group(_CAPTURE_REDUCE_GROUP, _CAPTURE_CHUNK)
+except ValueError as _rg_domain_exc:
     raise ValueError(
-        f"VLLM_SPARSE_CAPTURE_REDUCE_GROUP={_CAPTURE_REDUCE_GROUP} unsupported; "
-        "allowed=(0, 1, 2, 4)"
-    )
-if _CAPTURE_REDUCE_GROUP > 0 and (_CAPTURE_CHUNK % _CAPTURE_REDUCE_GROUP) != 0:
-    raise ValueError(
-        f"VLLM_SPARSE_CAPTURE_REDUCE_GROUP={_CAPTURE_REDUCE_GROUP} does not divide "
-        f"_CAPTURE_CHUNK={_CAPTURE_CHUNK}; the per-G raw ring requires "
-        "_CAPTURE_CHUNK % G == 0 (set a dividing G, or G=0 for the explicit "
-        "chunk-deep diagnostic mode)"
-    )
+        f"VLLM_SPARSE_CAPTURE_REDUCE_GROUP={_CAPTURE_REDUCE_GROUP} invalid: "
+        f"{_rg_domain_exc}"
+    ) from _rg_domain_exc
 
 # ---------------------------------------------------------------------------
 # Refresh stream management

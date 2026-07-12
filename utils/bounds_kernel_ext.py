@@ -294,6 +294,33 @@ void compute_bounds_decode_cuda(
     // Strides for seq_full [L, B, H_kv]
     int64_t sf_stride_l, int64_t sf_stride_b, int64_t sf_stride_h) {
 
+    // [BOUNDS-EXT-CONTRACT 2026-07-11 EXT审计·仅卫生] C++ 体原零 TORCH_CHECK
+    // （校验全在 python wrapper —— 直调 .so 无护栏 = 防守洼地）。补齐入口
+    // 合同：dtype 枚举路由（else 臂原为 "Assume int32" 静默放行域）/ CUDA
+    // 驻留 / 输出六件 contiguous+int32+numel（kernel 无输出 stride 参数，
+    // 线性写 = 死合同）/ 几何为正 + int32 索引域不溢出。
+    TORCH_CHECK(kv_lengths.is_cuda(), "kv_lengths must be CUDA");
+    TORCH_CHECK(
+        kv_lengths.scalar_type() == torch::kInt64 || kv_lengths.scalar_type() == torch::kInt32,
+        "kv_lengths must be int64 or int32");
+    TORCH_CHECK(L > 0 && B > 0 && H_kv > 0 && G > 0,
+                "L/B/H_kv/G must be positive, got ", L, "/", B, "/", H_kv, "/", G);
+    const int64_t m64 = L * B * H_kv;
+    TORCH_CHECK(m64 * G <= 2147483647LL, "L*B*H_kv*G overflows int32 indexing");
+    auto check_out_i32 = [](const torch::Tensor& t, int64_t numel_min, const char* name) {
+        TORCH_CHECK(t.is_cuda(), name, " must be CUDA");
+        TORCH_CHECK(t.scalar_type() == torch::kInt32, name, " must be int32");
+        TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
+        TORCH_CHECK(t.numel() >= numel_min, name, " numel ", t.numel(),
+                    " smaller than required ", numel_min);
+    };
+    check_out_i32(kv_len_head_out, m64, "kv_len_head_out");
+    check_out_i32(head_sink_out, m64, "head_sink_out");
+    check_out_i32(recent_start_out, m64, "recent_start_out");
+    check_out_i32(allowed_lengths_out, m64, "allowed_lengths_out");
+    check_out_i32(row_lo_out, m64 * G, "row_lo_out");
+    check_out_i32(row_hi_out, m64 * G, "row_hi_out");
+
     int M = L * B * H_kv;
     int H_total = H_kv * G;
 
@@ -304,6 +331,9 @@ void compute_bounds_decode_cuda(
 
     const int32_t* seq_full_ptr = nullptr;
     if (seq_full_opt.has_value() && seq_full_opt.value().defined()) {
+        TORCH_CHECK(seq_full_opt.value().is_cuda(), "seq_full must be CUDA");
+        TORCH_CHECK(seq_full_opt.value().scalar_type() == torch::kInt32,
+                    "seq_full must be int32");
         seq_full_ptr = seq_full_opt.value().data_ptr<int32_t>();
     }
 
@@ -323,7 +353,7 @@ void compute_bounds_decode_cuda(
             kv_stride_l, kv_stride_b, kv_stride_h,
             sf_stride_l, sf_stride_b, sf_stride_h);
     } else {
-        // Assume int32
+        // int32 (dtype domain enforced by the entry CHECK above)
         compute_bounds_decode_kernel_i32<<<blocks, threads, 0, stream>>>(
             kv_lengths.data_ptr<int32_t>(),
             seq_full_ptr,
@@ -338,6 +368,11 @@ void compute_bounds_decode_cuda(
             kv_stride_l, kv_stride_b, kv_stride_h,
             sf_stride_l, sf_stride_b, sf_stride_h);
     }
+    // (手写 launch check：本文件 include 面未证含 C10_CUDA_KERNEL_LAUNCH_CHECK
+    // 所在头，用 cudaGetLastError 等价形态，零新增 include。)
+    const cudaError_t launch_err = cudaGetLastError();
+    TORCH_CHECK(launch_err == cudaSuccess,
+                "compute_bounds_decode launch failed: ", cudaGetErrorString(launch_err));
     }
 """
 

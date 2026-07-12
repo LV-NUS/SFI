@@ -1185,6 +1185,11 @@ std::vector<torch::Tensor> fused_log_f_prior_impl(
     int threads = 256;
     if (const char* env = std::getenv("VLLM_SPARSE_SELECTOR_LOGS_THREADS")) {
         int parsed = std::atoi(env);
+        // [THREADS-WARP-ALIGN] non-multiple-of-32 blockDim would make the
+        // full-mask __shfl_down_sync reductions UB in the last warp.
+        // (2026-07-11 EXT审计·姊妹同步: selector_pipeline_ext.py 同名段已带
+        // 此对齐，本独立版漏同步——逐字补齐。)
+        parsed &= ~31;
         if (parsed >= 64 && parsed <= 1024) {
             threads = parsed;
         }
@@ -2030,7 +2035,13 @@ void reduce_log_f_pre_scratch_cuda(
     TORCH_CHECK(req_meta_i64.is_cuda(), "req_meta_i64 must be CUDA");
     TORCH_CHECK(req_meta_i32.scalar_type() == torch::kInt32, "req_meta_i32 must be int32");
     TORCH_CHECK(req_meta_i64.scalar_type() == torch::kInt64, "req_meta_i64 must be int64");
-    TORCH_CHECK(req_meta_i32.dim() == 2 && req_meta_i32.size(1) >= 8, "req_meta_i32 must be [N,>=8]");
+    // [ACCUM-META-WIDTH 2026-07-11 EXT审计高危#2] flags bit4 (accum) rows read
+    // meta cols 8/9 (prev_rows/prev_capacity) inside the kernel; a >=8 contract
+    // admits an 8-col tensor whose bit4 rows would read past the row end
+    // (silent OOB -> wrong merge math). The kernel cannot see the column count,
+    // so the host contract must cover the widest field the kernel may touch:
+    // require >=10 unconditionally (production gt1 meta is always 10 cols).
+    TORCH_CHECK(req_meta_i32.dim() == 2 && req_meta_i32.size(1) >= 10, "req_meta_i32 must be [N,>=10]");
     TORCH_CHECK(req_meta_i64.dim() == 2 && req_meta_i64.size(1) >= 4, "req_meta_i64 must be [N,>=4]");
     TORCH_CHECK(num_seqs >= 0, "num_seqs must be non-negative");
     TORCH_CHECK(num_query_heads >= 0, "num_query_heads must be non-negative");
@@ -2463,17 +2474,9 @@ def reduce_log_f_pre_scratch_cuda(
     scratch_in_fp16: bool = False,
 ) -> None:
     mod = _require_ext(force=True)
-    if req_meta_i32.dim() == 2 and int(req_meta_i32.size(1)) == 7:
-        meta_i32_v2 = torch.zeros(
-            (int(req_meta_i32.size(0)), 8),
-            device=req_meta_i32.device,
-            dtype=req_meta_i32.dtype,
-        )
-        meta_i32_v2[:, :7] = req_meta_i32
-        row_stride = torch.maximum(meta_i32_v2[:, 1], meta_i32_v2[:, 4])
-        meta_i32_v2[:, 7] = row_stride
-        meta_i32_v2[:, 1] = meta_i32_v2[:, 2] * row_stride
-        req_meta_i32 = meta_i32_v2
+    # [TRITON-RETIRE 2026-07-12] 7 列 legacy 桥（升格 col1←last_n*pad/col7←pad
+    # 的 8 列适配）已删：生产 pack 恒 10 列，[N,>=10] 合同下桥产物必被拒；
+    # 窄 meta 一律由 C++ TORCH_CHECK fail-fast。
     mod.reduce_log_f_pre_scratch(
         req_meta_i32,
         req_meta_i64,
