@@ -4068,10 +4068,28 @@ def _prebuild_capture_buffers(runner, controller) -> None:
             scratch_storage_shape,
             extra_key,
         )
-        if cache_map.get(scratch_key) is not None:
-            continue
-        cache_map[scratch_key] = torch.empty(
-            scratch_storage_shape, device=dev, dtype=scratch_dtype
+        scratch_cache_hit = cache_map.get(scratch_key) is not None
+        if not scratch_cache_hit:
+            cache_map[scratch_key] = torch.empty(
+                scratch_storage_shape, device=dev, dtype=scratch_dtype
+            )
+        from patches.fa3_native.forward_capture import log_capture_scratch_probe
+
+        log_capture_scratch_probe(
+            source="prebuild",
+            cache_key=scratch_key,
+            cache_hit=bool(scratch_cache_hit),
+            scratch_storage_shape=scratch_storage_shape,
+            scratch_dtype=scratch_dtype,
+            element_size_bytes=int(torch.finfo(scratch_dtype).bits // 8),
+            actual_rows=None,
+            bucket_rows=int(producer_rows_worst),
+            heads=int(num_heads),
+            last_n=int(last_n),
+            capture_k=int(kv_max_bucket),
+            reduce_group=int(_reduce_group),
+            in_flight=int(_CAPTURE_IN_FLIGHT),
+            key_kind=str(extra_key[0]),
         )
 
     # (4) Stamp the live buckets now that the arena reserve + all num_chunks scratch
@@ -12754,6 +12772,7 @@ def _run_capture_only_mixed_forward(
             num_heads=query.shape[1],
             device=query.device,
             capture_plan=capture_plan_active_by_slot,
+            layout=prefill_layout,
         )
         if payload is None:
             raise RuntimeError("native FA3 capture mixed route failed to build prefill payload")

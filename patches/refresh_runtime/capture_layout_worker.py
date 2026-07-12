@@ -5,6 +5,7 @@ import os
 import logging
 import time
 import atexit
+from dataclasses import dataclass
 from typing import List, Optional
 
 import torch
@@ -94,6 +95,188 @@ def _capture_layout_probe_flush() -> None:
 if _CAPTURE_LAYOUT_PROBE_ENABLED:
     atexit.register(_capture_layout_probe_flush)
 # ---- end CAPTURE_LAYOUT_PROBE ----
+
+
+def _prefill_slot_by_row_source(step_context: object) -> Optional[tuple[int, ...]]:
+    """Return the immutable step-level slot map used by layout row resolution.
+
+    LayerState is per-layer, so its fallback ``slot_batch_rows_cpu`` cannot prove
+    that a layout is reusable across layers.  Memoization is therefore enabled
+    only when the step publishes an immutable slot map.
+    """
+
+    step_envelope = getattr(step_context, "step_envelope_v2", None)
+    step_authority = getattr(step_context, "step_authority", None)
+    for owner in (step_envelope, step_authority):
+        slot_by_row = getattr(owner, "slot_by_row", None)
+        if isinstance(slot_by_row, tuple) and slot_by_row:
+            return slot_by_row
+    return None
+
+
+def _prefill_step_layout_memo_keys(
+    *,
+    layout: StepCaptureLayout,
+    step_context: object,
+    chunk_id: int,
+    buf_id: int,
+    slot_list: List[int],
+    num_heads: int,
+    device: torch.device,
+    kv_needed: int,
+    bound_meta: object,
+    slot_by_row: Optional[tuple[int, ...]],
+    arena: object,
+    arena_intent: object,
+    prepared_only: bool,
+    skip_live_lengths: bool,
+) -> tuple[tuple[object, ...], tuple[object, ...]]:
+    """Build scalar/value and strong-reference halves of the reuse proof."""
+
+    value_key: tuple[object, ...] = (
+        "prefill_prepared_v1",
+        int(getattr(step_context, "epoch", -1)),
+        int(getattr(step_context, "step_handle_id", -1)),
+        int(getattr(step_context, "step_handle_generation", -1)),
+        int(chunk_id),
+        int(buf_id),
+        tuple(int(v) for v in slot_list),
+        int(num_heads),
+        str(device),
+        int(kv_needed),
+        bool(prepared_only),
+        bool(skip_live_lengths),
+        id(layout),
+        int(getattr(layout, "epoch", -1)),
+        int(getattr(layout, "step_handle_id", -1)),
+        int(getattr(layout, "step_handle_generation", -1)),
+        int(getattr(layout, "kv_max", -1)),
+        int(getattr(layout, "lease_generation", -1)),
+        tuple(int(v) for v in getattr(layout, "slot_list", tuple())),
+        tuple(
+            int(v) for v in (getattr(layout, "row_list_cpu", None) or tuple())
+        ),
+    )
+    reference_key = (
+        bound_meta,
+        getattr(bound_meta, "bound_meta_signature", None),
+        getattr(bound_meta, "logits_last_n_by_row", None),
+        getattr(bound_meta, "logits_capacity_by_row", None),
+        getattr(bound_meta, "context_kv_len_by_row", None),
+        getattr(bound_meta, "q_lens_by_row", None),
+        slot_by_row,
+        arena,
+        arena_intent,
+        getattr(layout, "slot_list", None),
+        getattr(layout, "slot_to_capture_row", None),
+        getattr(layout, "slot_row_map_key", None),
+        getattr(layout, "live_lengths_key", None),
+        getattr(layout, "slot_tensor", None),
+        getattr(layout, "slot_tensor_i32", None),
+        getattr(layout, "row_tensor", None),
+        getattr(layout, "row_tensor_i32", None),
+        getattr(layout, "capture_row_by_batch_row_i32", None),
+        getattr(layout, "active_capture_row_by_batch_row_i32", None),
+        getattr(layout, "seq_lens_batch", None),
+        getattr(layout, "seq_lens_batch_i32", None),
+        getattr(layout, "kv_lengths", None),
+        getattr(layout, "kv_len_per_row_i32", None),
+        getattr(layout, "chunk_lengths", None),
+        getattr(layout, "capture_scores", None),
+        getattr(layout, "log_f_denoms", None),
+        getattr(layout, "row_list_cpu", None),
+        getattr(layout, "seq_lens_cpu", None),
+        getattr(layout, "kv_len_per_row_cpu", None),
+    )
+    return value_key, reference_key
+
+
+@dataclass(frozen=True, slots=True)
+class _PrefillStepLayoutMemo:
+    """Fail-closed proof that a prepared prefill layout is layer-invariant."""
+
+    value_key: tuple[object, ...]
+    reference_key: tuple[object, ...]
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        layout: StepCaptureLayout,
+        step_context: object,
+        chunk_id: int,
+        buf_id: int,
+        slot_list: List[int],
+        num_heads: int,
+        device: torch.device,
+        kv_needed: int,
+        bound_meta: object,
+        slot_by_row: tuple[int, ...],
+        arena: object,
+        arena_intent: object,
+    ) -> "_PrefillStepLayoutMemo":
+        value_key, reference_key = _prefill_step_layout_memo_keys(
+            layout=layout,
+            step_context=step_context,
+            chunk_id=chunk_id,
+            buf_id=buf_id,
+            slot_list=slot_list,
+            num_heads=num_heads,
+            device=device,
+            kv_needed=kv_needed,
+            bound_meta=bound_meta,
+            slot_by_row=slot_by_row,
+            arena=arena,
+            arena_intent=arena_intent,
+            prepared_only=True,
+            skip_live_lengths=False,
+        )
+        return cls(value_key=value_key, reference_key=reference_key)
+
+    def matches(
+        self,
+        *,
+        layout: StepCaptureLayout,
+        step_context: object,
+        chunk_id: int,
+        buf_id: int,
+        slot_list: List[int],
+        num_heads: int,
+        device: torch.device,
+        kv_needed: int,
+        bound_meta: object,
+        slot_by_row: Optional[tuple[int, ...]],
+        arena: object,
+        arena_intent: object,
+        prepared_only: bool,
+        skip_live_lengths: bool,
+    ) -> bool:
+        if not prepared_only or skip_live_lengths or slot_by_row is None:
+            return False
+        value_key, reference_key = _prefill_step_layout_memo_keys(
+            layout=layout,
+            step_context=step_context,
+            chunk_id=chunk_id,
+            buf_id=buf_id,
+            slot_list=slot_list,
+            num_heads=num_heads,
+            device=device,
+            kv_needed=kv_needed,
+            bound_meta=bound_meta,
+            slot_by_row=slot_by_row,
+            arena=arena,
+            arena_intent=arena_intent,
+            prepared_only=prepared_only,
+            skip_live_lengths=skip_live_lengths,
+        )
+        return (
+            self.value_key == value_key
+            and len(self.reference_key) == len(reference_key)
+            and all(
+                expected is actual
+                for expected, actual in zip(self.reference_key, reference_key)
+            )
+        )
 
 
 def get_step_capture_layout_impl(
@@ -295,8 +478,7 @@ def get_step_capture_layout_impl(
     # [LAYOUT-STEP-MEMO 2026-07-06] refresh 布局在同 step 同 chunk 内逐层重建
     # 是纯冗余（rows/cap tensor/live lengths/cpu tensors/lease 全同值重做，
     # 实测 X 账单单点 ~100-250µs/层）：chunk 首层走完整 reuse_same_step 路径
-    # 后置 memo，同 chunk 2..N 层直接返回。仅 refresh 相（prefill 走 arena
-    # prepared-bind，其 reservation 消费语义不做短路）。
+    # 后置 memo，同 chunk 2..N 层直接返回。
     layout_step_memo_token = None
     if phase == "refresh" and layout is not None:
         layout_step_memo_token = (
@@ -308,9 +490,44 @@ def get_step_capture_layout_impl(
         if layout.step_memo_token == layout_step_memo_token:
             _mark_phase("reuse_step_memo")
             return layout
+    arena = getattr(self, "prefill_capture_meta_arena", None)
+    arena_intent = getattr(self, "_prefill_capture_arena_intent", None)
+    prefill_slot_by_row = _prefill_slot_by_row_source(step_context)
+    if phase == "prefill" and layout is not None:
+        prefill_memo = getattr(layout, "prefill_step_layout_memo", None)
+        if isinstance(prefill_memo, _PrefillStepLayoutMemo) and prefill_memo.matches(
+            layout=layout,
+            step_context=step_context,
+            chunk_id=int(chunk_id),
+            buf_id=int(buf_id),
+            slot_list=slot_list,
+            num_heads=int(num_heads),
+            device=device,
+            kv_needed=int(kv_needed),
+            bound_meta=bound_meta,
+            slot_by_row=prefill_slot_by_row,
+            arena=arena,
+            arena_intent=arena_intent,
+            prepared_only=bool(prepared_only),
+            skip_live_lengths=bool(skip_live_lengths),
+        ):
+            _mark_phase("reuse_prefill_step_memo")
+            _emit(
+                "reuse_prefill_step_memo",
+                buf_id=int(buf_id),
+                kv_needed=int(kv_needed),
+                kv_max=int(kv_max),
+                layout_kv_max=int(layout.kv_max),
+                row_count=int(len(getattr(layout, "row_list_cpu", None) or tuple())),
+                live_lengths_rebuilt=False,
+                arena_bind_status="memo_hit",
+            )
+            return layout
+        # Drop all strong references held by a stale proof before the fallback
+        # path rebinds and validates the layout.
+        layout.prefill_step_layout_memo = None
     prepared_bound = False
     if prepared_only:
-        arena = getattr(self, "prefill_capture_meta_arena", None)
         if arena is None:
             _emit(
                 "sync_expansion_miss",
@@ -380,6 +597,23 @@ def get_step_capture_layout_impl(
             )
             prepared_layout.lease_generation = int(lease.generation)
             _mark_phase("prepared_fast_ready")
+            if not skip_live_lengths and prefill_slot_by_row is not None:
+                prepared_layout.prefill_step_layout_memo = (
+                    _PrefillStepLayoutMemo.create(
+                        layout=prepared_layout,
+                        step_context=step_context,
+                        chunk_id=int(chunk_id),
+                        buf_id=int(buf_id),
+                        slot_list=prepared_slot_list,
+                        num_heads=int(num_heads),
+                        device=device,
+                        kv_needed=int(kv_needed),
+                        bound_meta=bound_meta,
+                        slot_by_row=prefill_slot_by_row,
+                        arena=arena,
+                        arena_intent=arena_intent,
+                    )
+                )
             _emit(
                 "prepared_bind",
                 buf_id=int(buf_id),

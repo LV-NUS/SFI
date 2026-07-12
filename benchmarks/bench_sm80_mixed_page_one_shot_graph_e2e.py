@@ -51,6 +51,8 @@ from benchmarks.bench_sm80_mixed_page_full_cudagraph_phase1 import (
     _sparse_controller_payload,
     _tail,
 )
+from benchmarks.scheduler_contract import resolve_benchmark_max_num_seqs
+from utils.selector_cache_identity import selector_cache_abi_key_for_python
 from benchmarks.sm80_run_pair import (
     ALLOWED_TRACE_ENV_KEYS,
     LEGACY_MIDDLE_NATIVE_CANONICAL_KEY,
@@ -80,6 +82,7 @@ DEFERRED_BRIDGE_ENV_KEYS = (
     "VLLM_SPARSE_DEFERRED_PRODUCER_GROUPS_PER_STEP",
 )
 SPEED_CHILD_ROUTE_TRACE_ENV = "VLLM_SPARSE_SPEED_CHILD_ROUTE_TRACE"
+SELECTOR_PIPELINE_ARTIFACT_PREFIX = "SFI_SELECTOR_PIPELINE_ARTIFACT="
 
 
 def _env_truthy_value(value: object) -> bool:
@@ -96,9 +99,7 @@ SELECTOR_PIPELINE_CPU_PROFILE_ENV_KEYS = (
     "VLLM_SPARSE_ASYNC_PRODUCER_GPU_PROFILE",
 )
 DEFERRED_BRIDGE_GRAPH_POLICIES = ("evict_recapture_once",)
-GT1_SELECTOR_TORCH_EXTENSIONS_DIR = (
-    _REPO_ROOT / "tmp" / "torch_extensions" / "sm80_gt1"
-)
+GT1_SELECTOR_TORCH_EXTENSIONS_ROOT = _REPO_ROOT / "tmp" / "torch_extensions"
 BS2_LONG_CAP128_PRESET = "bs2long-cap128"
 BS2_LONG_CAP128_PROMPT = "benchmarks/needle_prompt_two_parts.txt"
 BS2_LONG_CAP128_BATCH_SIZE = 2
@@ -315,6 +316,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     argv_list = list(sys.argv[1:] if argv is None else argv)
     parser.add_argument("--output", required=True)
     parser.add_argument("--summary-output", default="")
+    parser.add_argument("--run-nonce", default="")
     parser.add_argument(
         "--mode",
         choices=("legacy", "dense", "sparse"),
@@ -371,6 +373,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--fa3-upstream-root", default=DEFAULT_FA3_UPSTREAM_ROOT)
     parser.add_argument("--cuda-visible-devices", default="0")
     parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument(
+        "--max-num-seqs",
+        type=int,
+        default=0,
+        help=(
+            "vLLM scheduler concurrency cap (0 = --batch-size). Values below "
+            "the request batch are rejected because they change benchmark "
+            "scheduling instead of only constraining engine capacity."
+        ),
+    )
     parser.add_argument(
         "--split-context-prompts",
         action="store_true",
@@ -609,6 +621,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args.repeat_semantics = "legacy_alias_for_max_new_tokens"
     if args.batch_size <= 0:
         parser.error("--batch-size must be > 0")
+    try:
+        _effective_max_num_seqs(args)
+    except ValueError as exc:
+        parser.error(str(exc))
     if args.timeout_s <= 0:
         parser.error("--timeout-s must be > 0")
     if args.compact_blocks_per_slot <= 0:
@@ -770,7 +786,17 @@ def _argv_has_option(argv: list[str], option: str) -> bool:
 
 
 def _effective_max_new_tokens(args: argparse.Namespace) -> int:
-    return int(getattr(args, "max_new_tokens_effective", args.iters))
+    value = getattr(args, "max_new_tokens_effective", None)
+    if value is None:
+        value = getattr(args, "iters", 1)
+    return int(value)
+
+
+def _effective_max_num_seqs(args: argparse.Namespace) -> int:
+    return resolve_benchmark_max_num_seqs(
+        batch_size=int(args.batch_size),
+        configured=int(getattr(args, "max_num_seqs", 0) or 0),
+    )
 
 
 def _producer_mode(args: argparse.Namespace) -> str:
@@ -893,7 +919,6 @@ def _default_sparse_outputs_path(output: Path) -> Path:
 def _phase2_controller_payload(args: argparse.Namespace) -> dict[str, object]:
     payload = _sparse_controller_payload(args)
     producer_mode = _producer_mode(args)
-    payload["producer_mode"] = producer_mode
     payload["one_shot_bootstrap_only"] = True
     payload["continuous_producer_enabled"] = _phase2_continuous_producer_enabled(args)
     payload["refresh_coalesce_window"] = int(args.refresh_coalesce_window)
@@ -1075,7 +1100,11 @@ def _apply_gt1_full_cudagraph_refresh_env(
 ) -> None:
     if not _producer_mode_requires_gt1(args):
         return
-    env.setdefault("TORCH_EXTENSIONS_DIR", str(GT1_SELECTOR_TORCH_EXTENSIONS_DIR))
+    if not str(env.get("TORCH_EXTENSIONS_DIR", "") or "").strip():
+        abi_key = selector_cache_abi_key_for_python(str(args.python))
+        env["TORCH_EXTENSIONS_DIR"] = str(
+            GT1_SELECTOR_TORCH_EXTENSIONS_ROOT / f"sm80_gt1_{abi_key}"
+        )
     env.setdefault("VLLM_SPARSE_FULL_CUDAGRAPH_REPLAY_REFRESH_BATCHED_FLUSH", "1")
     env.setdefault("VLLM_SPARSE_FULL_CUDAGRAPH_REPLAY_REFRESH_DEFER_TO_DEADLINE", "1")
     env["VLLM_SPARSE_REFRESH_ENQUEUE_STAGGER"] = "1"
@@ -1110,15 +1139,30 @@ def _prewarm_gt1_selector_extensions(
         str(args.python),
         "-c",
         (
+            "import hashlib, json, sys; from pathlib import Path; "
             "from utils.bounds_kernel_ext import _require_ext as _bounds; "
             "from utils.bounds_prefill_kernel_ext import _require_ext as _bounds_prefill; "
             "from utils.fa_sparse_runtime_ext import _load_ext as _fa_sparse; "
             "from utils.selector_batch_ext import _load_ext as _selector_batch; "
             "from utils.selector_key_norms_ext import _require_ext as _key_norms; "
             "from utils.selector_log_s_ext import _require_ext as _log_s; "
+            "from utils.selector_pipeline_identity import ("
+            "SELECTOR_PIPELINE_SEMANTIC_VERSION as _pipeline_expected_semantic_version); "
             "from utils.selector_pipeline_ext import _require_ext as _pipeline; "
             "_bounds(); _bounds_prefill(); _fa_sparse(force=True); _selector_batch(); "
-            "_key_norms(force=True); _log_s(force=True); _pipeline(force=True); "
+            "_key_norms(force=True); _log_s(force=True); _pipeline_mod = _pipeline(force=True); "
+            "_pipeline_semantic_version = int(_pipeline_mod.selector_pipeline_semantic_version()); "
+            "(_pipeline_semantic_version == int(_pipeline_expected_semantic_version)) or "
+            "sys.exit(f'selector pipeline semantic mismatch: actual={_pipeline_semantic_version} '"
+            "+ f'expected={_pipeline_expected_semantic_version}'); "
+            "_pipeline_path = Path(_pipeline_mod.__file__).resolve(); "
+            "_pipeline_sha256 = hashlib.sha256(_pipeline_path.read_bytes()).hexdigest(); "
+            f"print({SELECTOR_PIPELINE_ARTIFACT_PREFIX!r} + json.dumps({{"
+            "'path': str(_pipeline_path), "
+            "'semantic_version': _pipeline_semantic_version, "
+            "'expected_semantic_version': int(_pipeline_expected_semantic_version), "
+            "'sha256': _pipeline_sha256"
+            "}, sort_keys=True)); "
             "print('gt1_selector_extensions_ready')"
         ),
     ]
@@ -1137,6 +1181,43 @@ def _prewarm_gt1_selector_extensions(
     )
 
 
+def _selector_pipeline_artifact_from_prewarm_stdout(
+    stdout: str,
+) -> dict[str, object] | None:
+    for line in reversed(str(stdout or "").splitlines()):
+        if not line.startswith(SELECTOR_PIPELINE_ARTIFACT_PREFIX):
+            continue
+        try:
+            raw = json.loads(line[len(SELECTOR_PIPELINE_ARTIFACT_PREFIX) :])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if not isinstance(raw, dict):
+            return None
+        path = str(raw.get("path", "") or "")
+        sha256 = str(raw.get("sha256", "") or "").lower()
+        try:
+            semantic_version = int(raw.get("semantic_version", -1))
+            expected_semantic_version = int(
+                raw.get("expected_semantic_version", -1)
+            )
+        except (TypeError, ValueError):
+            return None
+        if (
+            not path
+            or semantic_version <= 0
+            or expected_semantic_version <= 0
+            or re.fullmatch(r"[0-9a-f]{64}", sha256) is None
+        ):
+            return None
+        return {
+            "path": path,
+            "semantic_version": semantic_version,
+            "expected_semantic_version": expected_semantic_version,
+            "sha256": sha256,
+        }
+    return None
+
+
 def _selector_extension_prewarm_payload(
     result: Phase1CommandResult | None,
 ) -> dict[str, object]:
@@ -1144,7 +1225,7 @@ def _selector_extension_prewarm_payload(
         return {
             "selector_extension_prewarm_enabled": False,
         }
-    return {
+    payload: dict[str, object] = {
         "selector_extension_prewarm_enabled": True,
         "selector_extension_prewarm_command": list(result.command),
         "selector_extension_prewarm_returncode": int(result.returncode),
@@ -1152,6 +1233,84 @@ def _selector_extension_prewarm_payload(
         "selector_extension_prewarm_stdout_tail": _tail(result.stdout),
         "selector_extension_prewarm_stderr_tail": _tail(result.stderr),
     }
+    artifact = _selector_pipeline_artifact_from_prewarm_stdout(result.stdout)
+    if artifact is not None:
+        payload["selector_pipeline_artifact"] = artifact
+    return payload
+
+
+def _selector_pipeline_artifact_postflight(
+    prewarm_artifact: dict[str, object],
+) -> dict[str, object]:
+    artifact_path = Path(str(prewarm_artifact.get("path", "") or ""))
+    payload: dict[str, object] = {"path": str(artifact_path)}
+    try:
+        digest = _file_sha256(artifact_path)
+    except OSError as exc:
+        payload.update({"sha256": "", "read_error": f"{type(exc).__name__}: {exc}"})
+    else:
+        payload["sha256"] = digest
+    return payload
+
+
+def _apply_selector_extension_prewarm_payload(
+    payload: dict[str, Any],
+    result: Phase1CommandResult | None,
+) -> None:
+    prewarm_payload = _selector_extension_prewarm_payload(result)
+    payload.update(prewarm_payload)
+    artifact = prewarm_payload.get("selector_pipeline_artifact")
+    run_provenance = payload.get("run_provenance")
+    if not isinstance(artifact, dict):
+        # Non-GT1 producer modes do not prewarm selector extensions by design.
+        # Fail closed only when a prewarm was actually attempted but failed to
+        # produce a well-formed artifact record.
+        if result is None:
+            return
+        artifact_reasons = ["selector_pipeline_artifact_missing_or_invalid"]
+        payload["selector_pipeline_artifact_reasons"] = artifact_reasons
+        payload["gate_passed"] = False
+        payload["production_gate_passed"] = False
+        if isinstance(run_provenance, dict):
+            run_provenance["selector_pipeline_artifact_reasons"] = list(
+                artifact_reasons
+            )
+        return
+
+    prewarm_artifact = dict(artifact)
+    postflight_artifact = _selector_pipeline_artifact_postflight(prewarm_artifact)
+    mutated = bool(
+        postflight_artifact.get("path") != prewarm_artifact.get("path")
+        or postflight_artifact.get("sha256") != prewarm_artifact.get("sha256")
+    )
+    artifact_reasons: list[str] = []
+    if int(prewarm_artifact.get("semantic_version", -1)) != int(
+        prewarm_artifact.get("expected_semantic_version", -1)
+    ):
+        artifact_reasons.append("selector_pipeline_semantic_version_mismatch")
+    if mutated:
+        artifact_reasons.append("selector_artifact_mutated_after_prewarm")
+    payload.update(
+        {
+            "selector_pipeline_artifact_prewarm": prewarm_artifact,
+            "selector_pipeline_artifact_postflight": postflight_artifact,
+            "selector_pipeline_artifact_mutated_after_prewarm": mutated,
+            "selector_pipeline_artifact_reasons": artifact_reasons,
+        }
+    )
+    if isinstance(run_provenance, dict):
+        run_provenance.update(
+            {
+                "selector_pipeline_artifact": prewarm_artifact,
+                "selector_pipeline_artifact_prewarm": prewarm_artifact,
+                "selector_pipeline_artifact_postflight": postflight_artifact,
+                "selector_pipeline_artifact_mutated_after_prewarm": mutated,
+                "selector_pipeline_artifact_reasons": list(artifact_reasons),
+            }
+        )
+    if artifact_reasons:
+        payload["gate_passed"] = False
+        payload["production_gate_passed"] = False
 
 
 def _build_phase2_env(
@@ -1279,6 +1438,8 @@ def _build_no_eos_diagnostic_command(args: argparse.Namespace) -> list[str]:
         str(args.cuda_visible_devices),
         "--batch-size",
         str(args.batch_size),
+        "--max-num-seqs",
+        str(_effective_max_num_seqs(args)),
         "--gpu-mem-util",
         str(args.gpu_mem_util),
         "--timeout-s",
@@ -1528,8 +1689,16 @@ def _run_provenance_payload(
 ) -> dict[str, Any]:
     git_head = _run_text_command(["git", "rev-parse", "HEAD"], timeout_s=5.0)
     git_status = _run_text_command(["git", "status", "--short"], timeout_s=5.0)
-    capture_chunk = int(env.get("VLLM_SPARSE_CAPTURE_CHUNK", "14") or "14")
-    writer_token_tile = int(env.get("VLLM_SPARSE_WRITER_TOKEN_TILE", "128") or "0")
+    # Keep provenance on the same source of truth as the runtime. A hard-coded
+    # fallback here mislabeled the promoted default-18 execution as chunk 14,
+    # which in turn selected the wrong output anchor in postflight tooling.
+    from patches.sparse_constants import (
+        resolve_capture_chunk,
+        resolve_writer_token_tile,
+    )
+
+    capture_chunk = resolve_capture_chunk(env)
+    writer_token_tile = resolve_writer_token_tile(env)
     refresh_stream_priority = int(
         env.get("VLLM_SPARSE_REFRESH_STREAM_PRIORITY", "0") or "0"
     )
@@ -1538,6 +1707,7 @@ def _run_provenance_payload(
     )
     refresh_rebuild_max_delay_steps_env = int(refresh_rebuild_max_delay_steps)
     return {
+        "run_nonce": str(getattr(args, "run_nonce", "") or ""),
         "git_head": _first_stdout_line(git_head),
         "git_status_short": str(git_status.get("stdout", "") or ""),
         "git_head_command": git_head,
@@ -1547,6 +1717,7 @@ def _run_provenance_payload(
         "model": str(args.model),
         "prompt": str(args.prompt),
         "batch_size": int(args.batch_size),
+        "max_num_seqs": _effective_max_num_seqs(args),
         "warmup": int(args.warmup),
         "output_len": _effective_max_new_tokens(args),
         "max_new_tokens": _effective_max_new_tokens(args),
@@ -1629,6 +1800,21 @@ def _run_provenance_payload(
         "one_shot_ready_chunk": str(env.get("VLLM_SPARSE_ONE_SHOT_READY_CHUNK", "") or ""),
         "cuda_visible_devices_arg": str(args.cuda_visible_devices),
         "cuda_visible_devices_env": str(env.get("CUDA_VISIBLE_DEVICES", "") or ""),
+        "runner_kv_preflight_status": str(
+            env.get("SFI_RUNNER_KV_PREFLIGHT_STATUS", "") or ""
+        ),
+        "runner_gpu_lock_mode": str(
+            env.get("SFI_RUNNER_GPU_LOCK_MODE", "") or ""
+        ),
+        "runner_fa3_preflight_status": str(
+            env.get("SFI_RUNNER_FA3_PREFLIGHT_STATUS", "") or ""
+        ),
+        "runner_selector_cache_root": str(
+            env.get("SFI_RUNNER_SELECTOR_CACHE_ROOT", "") or ""
+        ),
+        "runner_corpus_token_status": str(
+            env.get("SFI_RUNNER_CORPUS_TOKEN_STATUS", "") or ""
+        ),
         "fa3_so": _file_provenance(
             _resolve_fa3_so_path(args),
             sha256=fa3_so_sha256,
@@ -1654,6 +1840,8 @@ def _build_gate_d_dense_command(
         str(args.prompt),
         "--batch-size",
         str(int(args.batch_size)),
+        "--max-num-seqs",
+        str(_effective_max_num_seqs(args)),
         "--max-new-tokens",
         str(_effective_max_new_tokens(args)),
         "--disable-cascade-attn",
@@ -2122,6 +2310,7 @@ def _gate_d_config(
         "legacy_iters": int(getattr(args, "legacy_iters", args.iters)),
         "iters_semantics": "legacy_alias_for_max_new_tokens",
         "batch_size": int(args.batch_size),
+        "max_num_seqs": _effective_max_num_seqs(args),
         "warmup": int(args.warmup),
         "full_cuda_graph": bool(args.full_cuda_graph),
         "backend": _gate_d_backend(args),
@@ -2197,6 +2386,7 @@ def _continuous_refresh_payloads_from_sources(
 def _async_producer_writer_count_from_sources(
     refresh_profile: list[dict[str, Any]],
     hook_profile_summary: dict[str, Any] | None,
+    producer_route_summary: dict[str, Any] | None = None,
 ) -> tuple[int, str]:
     """Return writer-completion evidence without treating enqueue as writer work."""
     profile_writer_count = _max_int_from_records(
@@ -2213,8 +2403,17 @@ def _async_producer_writer_count_from_sources(
         0,
     )
     hook_writer_count = hook_drained_count if hook_deferred_count > 0 else 0
+    route_writer_count = _as_int(
+        (producer_route_summary or {}).get(
+            "async_producer_writer_complete_count",
+            0,
+        ),
+        0,
+    )
     if profile_writer_count > 0:
         return int(profile_writer_count), "refresh_profile"
+    if route_writer_count > 0:
+        return int(route_writer_count), "route_writer_complete"
     if hook_writer_count > 0:
         return int(hook_writer_count), "full_cudagraph_hook_pre_consume_drain"
     return 0, "missing"
@@ -2292,6 +2491,49 @@ def _boundary_diagnostics_payload(metrics: dict[str, Any]) -> dict[str, Any]:
             boundary_diagnostics.get("first_emit_step_wall_us"),
             -1.0,
         ),
+    }
+
+
+def _output_completion_gate(
+    records: list[dict[str, Any]],
+    *,
+    expected_request_count: int,
+    expected_output_tokens: int,
+    require_exact_length: bool,
+) -> dict[str, Any]:
+    """Validate request cardinality and fixed-length decode completion."""
+    token_lengths = [
+        len(record.get("token_ids", []))
+        if isinstance(record.get("token_ids"), list)
+        else -1
+        for record in records
+    ]
+    reasons: list[str] = []
+    if len(records) != int(expected_request_count):
+        reasons.append(
+            "output_record_count_mismatch:"
+            f"actual={len(records)}:expected={int(expected_request_count)}"
+        )
+    if require_exact_length and any(
+        length != int(expected_output_tokens) for length in token_lengths
+    ):
+        reasons.append(
+            "output_token_count_mismatch:"
+            f"min={min(token_lengths, default=-1)}:"
+            f"max={max(token_lengths, default=-1)}:"
+            f"expected={int(expected_output_tokens)}"
+        )
+    return {
+        "required": True,
+        "exact_length_required": bool(require_exact_length),
+        "passed": not reasons,
+        "reasons": reasons,
+        "actual_request_count": len(records),
+        "expected_request_count": int(expected_request_count),
+        "token_lengths": token_lengths,
+        "min_output_tokens": min(token_lengths, default=-1),
+        "max_output_tokens": max(token_lengths, default=-1),
+        "expected_output_tokens": int(expected_output_tokens),
     }
 
 
@@ -2401,6 +2643,12 @@ def _gate_d_payload(
         )
     )
     output_records = output_records or _canonical_output_records(outputs_path)
+    output_length_gate = _output_completion_gate(
+        output_records,
+        expected_request_count=int(getattr(args, "batch_size", 1) or 1),
+        expected_output_tokens=_effective_max_new_tokens(args),
+        require_exact_length=not bool(getattr(args, "respect_eos", False)),
+    )
     refresh_profile = refresh_profile or []
     hook_profile_summary = hook_profile_summary or {}
     selector_pipeline_cpu_profile = selector_pipeline_cpu_profile or []
@@ -2503,6 +2751,7 @@ def _gate_d_payload(
     ) = _async_producer_writer_count_from_sources(
         refresh_profile,
         hook_profile_summary,
+        producer_route_summary,
     )
     producer_gate_reasons: list[str] = []
     if mode != "dense":
@@ -2552,6 +2801,7 @@ def _gate_d_payload(
         and route_proof_passed
         and speed_child_route_proof_passed
         and producer_gate_passed
+        and bool(output_length_gate["passed"])
         and not semantic_gate_reasons
         and not sparse_native_lifecycle_gate_reasons
     )
@@ -2851,6 +3101,8 @@ def _gate_d_payload(
         ),
         "gate_passed": production_gate_passed,
         "production_gate_passed": production_gate_passed,
+        "output_length_gate": output_length_gate,
+        "output_length_gate_passed": bool(output_length_gate["passed"]),
         "semantic_output_health": semantic_output_health,
         "prefill_steady_profile_count": int(len(steady_records)),
         "dense_fa3_proof": dense_fa3_proof or {},
@@ -3174,7 +3426,7 @@ def _run_gate_d_mode(args: argparse.Namespace) -> int:
                 gpu_after=gpu_after,
             ),
         )
-        payload.update(_selector_extension_prewarm_payload(selector_prewarm_result))
+        _apply_selector_extension_prewarm_payload(payload, selector_prewarm_result)
         output_path.write_text(
             json.dumps(payload, ensure_ascii=True, indent=2, allow_nan=False),
             encoding="utf-8",
@@ -3416,7 +3668,7 @@ def _run_gate_d_mode(args: argparse.Namespace) -> int:
     if workload_plan_count_mismatches:
         payload["gate_passed"] = False
         payload["production_gate_passed"] = False
-    payload.update(_selector_extension_prewarm_payload(selector_prewarm_result))
+    _apply_selector_extension_prewarm_payload(payload, selector_prewarm_result)
     payload["full_cudagraph_hook_profile_summary_scope"] = "measurement_window"
     payload["full_cudagraph_hook_profile_measurement_markers_present"] = bool(
         hook_profile_measurement_markers_present

@@ -23,6 +23,7 @@ try:
         maybe_apply_chat_template,
         output_payload_from_generation,
     )
+    from benchmarks.scheduler_contract import resolve_benchmark_max_num_seqs
     from benchmarks.vllm_profiler_scope import (
         build_vllm_torch_profiler_config,
         maybe_start_vllm_torch_profile,
@@ -44,6 +45,7 @@ except ModuleNotFoundError:
         maybe_apply_chat_template,
         output_payload_from_generation,
     )
+    from scheduler_contract import resolve_benchmark_max_num_seqs  # type: ignore[no-redef]
     from vllm_profiler_scope import (  # type: ignore[no-redef]
         build_vllm_torch_profiler_config,
         maybe_start_vllm_torch_profile,
@@ -136,6 +138,7 @@ def _decode_run_config(args: argparse.Namespace, *, prompt_count: int) -> dict[s
         "prompt": str(args.prompt),
         "prompt_count": int(prompt_count),
         "batch_size": int(args.batch_size),
+        "max_num_seqs": _effective_max_num_seqs(args),
         "split_context_prompts": bool(args.split_context_prompts),
         "max_new_tokens": int(args.max_new_tokens),
         "respect_eos": bool(args.respect_eos),
@@ -160,6 +163,17 @@ def _engine_args_accepts(name: str) -> bool:
     except Exception:
         return True
     return name in getattr(EngineArgs, "__dataclass_fields__", {})
+
+
+def _effective_max_num_seqs(args: argparse.Namespace) -> int:
+    return resolve_benchmark_max_num_seqs(
+        batch_size=int(args.batch_size),
+        configured=int(getattr(args, "max_num_seqs", 0) or 0),
+    )
+
+
+def _scheduler_engine_kwargs(args: argparse.Namespace) -> dict[str, object]:
+    return {"max_num_seqs": _effective_max_num_seqs(args)}
 
 
 def _visible_gpus_all_have_nvlink() -> tuple[bool, str]:
@@ -278,6 +292,16 @@ def main() -> None:
     parser.add_argument("--prompt", default="benchmarks/needle_prompt_part1.txt")
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument(
+        "--max-num-seqs",
+        type=int,
+        default=0,
+        help=(
+            "vLLM scheduler concurrency cap (0 = --batch-size). Benchmark "
+            "parents pass the request batch explicitly to keep dense/sparse "
+            "engine capacity comparable."
+        ),
+    )
+    parser.add_argument(
         "--split-context-prompts",
         action="store_true",
         help="Treat each Context: segment as one request instead of repeating the full file.",
@@ -371,6 +395,12 @@ def main() -> None:
         help="Optional comma-separated cudagraph capture sizes override, e.g. '1,2,4,8'.",
     )
     args = parser.parse_args()
+    if int(args.batch_size) <= 0:
+        parser.error("--batch-size must be > 0")
+    try:
+        _effective_max_num_seqs(args)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     repo_root = _setup_repo_imports()
     _install_transformers_register_shim()
@@ -407,6 +437,7 @@ def main() -> None:
         "compilation_config": compilation_config,
         "disable_cascade_attn": bool(args.disable_cascade_attn),
     }
+    engine_kwargs.update(_scheduler_engine_kwargs(args))
     if int(engine_kwargs["tensor_parallel_size"]) > 1 and (
         os.environ.get("VLLM_SPARSE_FORCE_DISABLE_CUSTOM_AR", "") == "1"
     ):

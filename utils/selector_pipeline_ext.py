@@ -5,25 +5,31 @@
 # mapped to -1 by a value-sentinel test (picked value <= -3.0e38f, the
 # finite min_val sentinel) instead of a data-dependent k_eff column cutoff.
 # The C++/CUDA ext source lives in the r-strings below; editing them changes
-# the load_inline source hash -> JIT recompile. With the env ON the prebuilt
-# .so is REJECTED (see _fixed_shape_topk_required / _load_ext) because a
-# stale prebuilt was compiled from source WITHOUT this kernel and would
-# silently run the OFF path (same discipline as VLLM_SPARSE_SELECTOR_FUSE_NMS_CROSS).
+# the load_inline source hash -> JIT recompile. A prebuilt is accepted only
+# when its exact semantic version and required entrypoints match this source;
+# that version also proves the fixed-shape kernel is present.
 
 from __future__ import annotations
 
 import os
-import sys
 from typing import Optional
 
 import torch
 from torch.utils.cpp_extension import load_inline
 from utils.torch_extension_cache import load_prebuilt_extension
 from utils.ext_toolchain import configure_jit_toolchain_or_raise
+from utils.selector_pipeline_identity import (
+    SELECTOR_PIPELINE_EXTENSION_NAME,
+    SELECTOR_PIPELINE_SEMANTIC_VERSION,
+    render_selector_pipeline_cpp_source,
+)
 
 _MODULE: Optional[torch.nn.Module] = None
 _LOAD_ERROR: Optional[Exception] = None
-_SELECTOR_PIPELINE_SEMANTIC_VERSION = 2026071201
+# Backward-compatible aliases for existing callers; identity is owned by the
+# lightweight module above so postflight checks do not import torch/CUDA code.
+_SELECTOR_PIPELINE_SEMANTIC_VERSION = SELECTOR_PIPELINE_SEMANTIC_VERSION
+_SELECTOR_PIPELINE_EXTENSION_NAME = SELECTOR_PIPELINE_EXTENSION_NAME
 
 
 def _should_enable() -> bool:
@@ -36,10 +42,6 @@ def _workspace_required() -> bool:
 
 def _selected_indices_out_required() -> bool:
     return os.environ.get("VLLM_SPARSE_SELECTOR_SELECTED_INDICES_OUT", "1") == "1"
-
-
-def _fused_nms_cross_required() -> bool:
-    return os.environ.get("VLLM_SPARSE_SELECTOR_FUSE_NMS_CROSS", "1") == "1"
 
 
 # Durable, profile-INDEPENDENT firing signal for the default-ON FUSE_NMS_CROSS
@@ -74,15 +76,6 @@ def _fuse_fire_trace() -> None:
 # "0"/"1" is always respected.
 if os.environ.get("VLLM_SPARSE_SELECTOR_FUSE_NMS_CROSS") is None:
     os.environ["VLLM_SPARSE_SELECTOR_FUSE_NMS_CROSS"] = "1"
-
-
-def _fixed_shape_topk_required() -> bool:
-    # Live env read; coherent with patches.sparse_constants
-    # _SELECTOR_FIXED_SHAPE_TOPK_CACHED via that module's import-time F1 shim
-    # (it exports the resolved default when the operator left the env unset),
-    # so a future constants-side default flip cannot silently accept a stale
-    # prebuilt compiled without the fixed-shape kernel.
-    return os.environ.get("VLLM_SPARSE_SELECTOR_FIXED_SHAPE_TOPK", "0") == "1"
 
 
 def _module_satisfies_runtime_requirements(module: torch.nn.Module) -> bool:
@@ -132,15 +125,13 @@ def _load_ext(*, force: bool = False) -> Optional[torch.nn.Module]:
     if not force and not _should_enable():
         return None
     if not force:
-        prebuilt = load_prebuilt_extension("selector_pipeline_ext")
+        prebuilt = load_prebuilt_extension(_SELECTOR_PIPELINE_EXTENSION_NAME)
         if prebuilt is not None:
-            if _module_satisfies_runtime_requirements(
-                prebuilt
-            ) and not _fixed_shape_topk_required():
+            # The exact semantic marker covers internal kernels (including
+            # fixed-shape topk); entrypoint checks cover optional public paths.
+            if _module_satisfies_runtime_requirements(prebuilt):
                 _MODULE = prebuilt
                 return _MODULE
-            if sys.modules.get("selector_pipeline_ext") is prebuilt:
-                sys.modules.pop("selector_pipeline_ext", None)
 
     cpp_source = r"""
 #include <torch/extension.h>
@@ -808,8 +799,16 @@ std::vector<torch::Tensor> selector_pipeline_pre_denom_topk_with_bounds_workspac
     torch::Tensor workspace_b,
     torch::Tensor selected_indices_out);
 
+// Narrow diagnostic entrypoint used by the exact top-k GPU contracts. Runtime
+// production calls continue through the pipeline entrypoints below.
+torch::Tensor selector_pipeline_post_topk_contract_cuda(
+    torch::Tensor scores,
+    int64_t k_head,
+    int64_t slice_start,
+    int64_t slice_end);
+
 int64_t selector_pipeline_semantic_version() {
-    return 2026071201;
+    return __SFI_SELECTOR_PIPELINE_SEMANTIC_VERSION__;
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -839,8 +838,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "With pre-computed bounds and caller-provided selected_indices output (pre_denom)");
     m.def("selector_pipeline_pre_denom_topk_with_bounds_workspace_out", &selector_pipeline_pre_denom_topk_with_bounds_workspace_out,
           "With pre-computed bounds, caller-provided scratch workspaces, and selected_indices output (pre_denom)");
+    m.def("selector_pipeline_post_topk_contract", &selector_pipeline_post_topk_contract_cuda,
+          "Exact deterministic post-topk contract probe (CUDA)");
 }
 """
+    cpp_source = render_selector_pipeline_cpp_source(cpp_source)
 
     cuda_source = r"""
 #include <torch/extension.h>
@@ -848,11 +850,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 #include <c10/cuda/CUDAException.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include <cub/block/block_reduce.cuh>
+#include <cub/block/block_scan.cuh>
 #include <vector>
 #include <cmath>
 #include <cstdlib>
 #include <chrono>
 #include <fstream>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <unistd.h>
@@ -2507,67 +2512,6 @@ torch::Tensor post_topk(
     int64_t slice_start,
     int64_t slice_end);
 
-// [POST-TOPK-VALUE-SENTINEL 2026-07-07] count-cutoff kernel now ALSO applies
-// the value-sentinel: a picked column whose topk VALUE is the finite min_val
-// mask (v <= -3.0e38) is an in-row "no valid candidate" pick (row has fewer
-// finite candidates than k_eff, e.g. capacity==0 rows -> row_hi==1), and its
-// index MUST NOT leak into selected_indices — the writer's sel<0 sentinel
-// protocol is the only downstream guard. Rows with enough finite candidates
-// are bit-identical to the old kernel (every picked v is finite).
-__global__ void post_topk_i64_to_i32_out_kernel(
-    const int64_t* __restrict__ topk,
-    const float* __restrict__ topk_vals,
-    int32_t* __restrict__ out,
-    int64_t rows,
-    int64_t k_eff,
-    int64_t k_head,
-    int32_t start) {
-    const float MIN_VAL_THRESHOLD = -3.0e38f;
-    int64_t total = rows * k_head;
-    int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
-    for (; idx < total; idx += stride) {
-        int64_t row = idx / k_head;
-        int64_t col = idx - row * k_head;
-        int32_t value = -1;
-        if (col < k_eff) {
-            float v = topk_vals[row * k_eff + col];
-            if (v > MIN_VAL_THRESHOLD) {
-                value = static_cast<int32_t>(topk[row * k_eff + col] + start);
-            }
-        }
-        out[idx] = value;
-    }
-}
-
-// fa4_selector_fixed_shape_topk: fixed-shape value-sentinel i32-out kernel. k == k_head
-// for every row; an output slot is -1 iff its picked topk VALUE is the
-// finite min_val sentinel (value <= MIN_VAL_THRESHOLD). This reproduces the
-// k_eff<k_head -> -1 tail of the count-cutoff kernel WITHOUT a data-dependent
-// k_eff column count: a slice_len<k_head row has exactly (k_head - slice_len)
-// sentinel-scored columns -> exactly that many trailing -1 slots, same set,
-// same order (ATen sorted=false topk is unchanged on the finite region).
-__global__ void post_topk_fixed_shape_i64_to_i32_out_kernel(
-    const int64_t* __restrict__ topk,
-    const float* __restrict__ topk_vals,
-    int32_t* __restrict__ out,
-    int64_t rows,
-    int64_t k_head,
-    int32_t start) {
-    const float MIN_VAL_THRESHOLD = -3.0e38f;
-    int64_t total = rows * k_head;
-    int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
-    for (; idx < total; idx += stride) {
-        int32_t value = -1;
-        float v = topk_vals[idx];
-        if (v > MIN_VAL_THRESHOLD) {
-            value = static_cast<int32_t>(topk[idx] + start);
-        }
-        out[idx] = value;
-    }
-}
-
 // [POST-TOPK-TIE-DETERMINISM L2 2026-07-12] Deterministic top-k MEMBERSHIP.
 // ATen topk(sorted=false) leaves the MEMBERSHIP at the k-th-value tie-band
 // implementation-defined (CUDA multi-block atomic race): when the k-th largest
@@ -2576,40 +2520,230 @@ __global__ void post_topk_fixed_shape_i64_to_i32_out_kernel(
 // the selected SET drifts -> compact-page contents drift -> FA fp accumulation
 // drifts -> logits low-bit drift -> near-tie greedy flip. This resolves the tie
 // WITHOUT perturbing scores (score-zero-perturbation): tau is a bitwise copy of
-// an input value, so the gt/eq compares below are exact, never epsilon-shifted.
+// an input value, so the CUDA gt/eq compares are exact, never epsilon-shifted.
 // Two stages: (1) find the tie-band via tau = k-th largest; (2) adjudicate ONLY
 // inside the tie-band by ascending logical column index. Columns strictly above
 // tau are always kept unchanged; the remaining boundary slots are filled by the
 // SMALLEST-index tau-valued columns. Non-tie rows are BYTE-identical in set to
-// plain topk. Returns {indices_i64 [..,k] ascending, values_f32 [..,k] aligned}
-// so the downstream value-sentinel kernels/host ops stay byte-unchanged.
-static std::pair<torch::Tensor, torch::Tensor> post_topk_deterministic(
-    const torch::Tensor& scores, int64_t k) {
-    const int64_t W = scores.size(-1);
-    if (k <= 0) {
-        auto empty_i = scores.slice(-1, 0, 0).to(torch::kLong).contiguous();
-        auto empty_v = scores.slice(-1, 0, 0).contiguous();
-        return {empty_i, empty_v};
+// plain topk. The fused producer emits canonical int32 indices directly.
+//
+// [L2-CUSTOM-TWO-PASS 2026-07-12] The original correctness fix expressed
+// stage 2 as gt/eq/rank/sel/key ATen tensors plus a second topk. At production
+// R=576,W=65536 this materialized O(R*W) scratch (~0.7 GiB/rank) and launched
+// a long dispatcher chain. Keep the exact tau from ATen topk, but compact in a
+// single row-block CUDA kernel: pass 1 counts score>tau; pass 2 walks columns
+// in ascending tiles and emits every >tau plus the lowest-index ==tau columns
+// needed to reach k. BlockScan makes each tile's compaction stable, so output
+// order and membership are pure functions of the scores with no atomics.
+//
+// [L2-L1-FUSION 2026-07-13] The row kernel now writes the final canonical
+// int32 carrier directly: valid logical indices form an ascending prefix and
+// every value-sentinel slot is compacted into the -1 tail. This removes the
+// deterministic i64/f32 intermediates, the conversion launch, and the Python
+// masked-fill/sort/masked-fill chain without weakening the membership assert.
+constexpr int POST_TOPK_BLOCK_THREADS = 256;
+constexpr float POST_TOPK_MIN_VALID = -3.0e38f;
+
+union PostTopkDeterministicTempStorage {
+    cub::BlockReduce<float, POST_TOPK_BLOCK_THREADS>::TempStorage reduce_float;
+    cub::BlockReduce<int, POST_TOPK_BLOCK_THREADS>::TempStorage reduce_int;
+    cub::BlockScan<int, POST_TOPK_BLOCK_THREADS>::TempStorage scan_int;
+};
+
+__global__ void post_topk_deterministic_i32_kernel(
+    const float* __restrict__ scores,
+    int64_t score_row_stride,
+    const float* __restrict__ topk_vals,
+    int32_t* __restrict__ out_indices,
+    int64_t rows,
+    int width,
+    int k,
+    int k_head,
+    int32_t start) {
+    int64_t row = static_cast<int64_t>(blockIdx.x);
+    if (row >= rows) {
+        return;
     }
-    // Stage 1 (locate the tie-band): tau = k-th largest value. topk VALUES are
-    // exact bit-copies of the inputs, so the eq/gt compares are exact.
-    auto s1_vals = std::get<0>(scores.topk(k, -1, /*largest=*/true, /*sorted=*/false));
-    auto tau = std::get<0>(s1_vals.min(-1, /*keepdim=*/true));            // [..,1]
-    // Stage 2 (adjudicate ONLY within the tie-band, by ascending index):
-    auto gt = scores.gt(tau);                                            // strictly-in
-    auto eq = scores.eq(tau);                                            // tie-band
-    auto need = gt.sum(-1, /*keepdim=*/true).neg().add_(k);             // k - (#>tau); >=1
-    auto rank = eq.to(torch::kLong).cumsum(-1);                          // 1-based index-order rank
-    auto sel = gt.logical_or(eq.logical_and(rank.le(need)));            // exactly k trues / row
-    // Compact to ascending selected indices. Selected keys are the DISTINCT
-    // column indices (< W); unselected columns map to the sentinel W, so the
-    // k-boundary of this compaction topk is strictly tie-free -> deterministic
-    // regardless of its own (sorted) tie policy; sorted=true yields ascending.
-    auto col = torch::arange(W, scores.options().dtype(torch::kLong));   // [W]
-    auto key = torch::where(sel, col, torch::full_like(col, W));         // [..,W]
-    auto idx = std::get<0>(key.topk(k, -1, /*largest=*/false, /*sorted=*/true)).contiguous();
-    auto vals = scores.gather(-1, idx).contiguous();
-    return {idx, vals};
+
+    __shared__ PostTopkDeterministicTempStorage temp;
+    __shared__ float tau_shared;
+    __shared__ int gt_count_shared;
+    __shared__ int tie_base_shared;
+    __shared__ int selected_base_shared;
+    __shared__ int valid_base_shared;
+    __shared__ int nan_seen_shared;
+
+    const int tid = threadIdx.x;
+    const float* row_scores = scores + row * score_row_stride;
+    const float* row_topk_vals = topk_vals + row * static_cast<int64_t>(k);
+    int32_t* row_out_indices = out_indices + row * static_cast<int64_t>(k_head);
+
+    // Fail-closed storage contract: no error path may expose torch::empty
+    // garbage. Valid picks overwrite a compact prefix below; NaN or an
+    // internal short membership emit leaves an all-sentinel row.
+    for (int out_col = tid; out_col < k_head; out_col += POST_TOPK_BLOCK_THREADS) {
+        row_out_indices[out_col] = -1;
+    }
+    __syncthreads();
+
+    float local_tau = INFINITY;
+    for (int col = tid; col < k; col += POST_TOPK_BLOCK_THREADS) {
+        float value = row_topk_vals[col];
+        local_tau = value < local_tau ? value : local_tau;
+    }
+    float tau = cub::BlockReduce<float, POST_TOPK_BLOCK_THREADS>(
+        temp.reduce_float).Reduce(local_tau, cub::Min());
+    if (tid == 0) {
+        tau_shared = tau;
+    }
+    __syncthreads();
+
+    // Every score strictly above the k-th value is necessarily present in the
+    // k-value threshold sample. Count on O(k), keeping the finite fast path to
+    // one W scan. Infinities remain valid ordered values.
+    int local_gt_count = 0;
+    for (int col = tid; col < k; col += POST_TOPK_BLOCK_THREADS) {
+        local_gt_count += row_topk_vals[col] > tau_shared;
+    }
+    int gt_count = cub::BlockReduce<int, POST_TOPK_BLOCK_THREADS>(
+        temp.reduce_int).Sum(local_gt_count);
+    if (tid == 0) {
+        gt_count_shared = gt_count;
+        tie_base_shared = 0;
+        selected_base_shared = 0;
+        valid_base_shared = 0;
+        nan_seen_shared = 0;
+    }
+    __syncthreads();
+
+    const int tie_need = k - gt_count_shared;
+    for (int tile = 0; tile < width; tile += POST_TOPK_BLOCK_THREADS) {
+        int col = tile + tid;
+        float value = col < width ? row_scores[col] : 0.0f;
+        if (col < width && isnan(value)) {
+            // Error-only atomic: finite production rows never execute it.
+            atomicExch(&nan_seen_shared, 1);
+        }
+        int is_equal = col < width && value == tau_shared;
+        int equal_rank = 0;
+        int tile_equal_count = 0;
+        cub::BlockScan<int, POST_TOPK_BLOCK_THREADS>(temp.scan_int).InclusiveSum(
+            is_equal, equal_rank, tile_equal_count);
+        int selected = col < width && (
+            value > tau_shared
+            || (is_equal && tie_base_shared + equal_rank <= tie_need));
+        __syncthreads();
+
+        int selected_offset = 0;
+        int tile_selected_count = 0;
+        cub::BlockScan<int, POST_TOPK_BLOCK_THREADS>(temp.scan_int).ExclusiveSum(
+            selected, selected_offset, tile_selected_count);
+        __syncthreads();
+
+        int valid_selected = selected && value > POST_TOPK_MIN_VALID;
+        int valid_offset = 0;
+        int tile_valid_count = 0;
+        cub::BlockScan<int, POST_TOPK_BLOCK_THREADS>(temp.scan_int).ExclusiveSum(
+            valid_selected, valid_offset, tile_valid_count);
+        if (valid_selected) {
+            int out_col = valid_base_shared + valid_offset;
+            row_out_indices[out_col] = static_cast<int32_t>(col) + start;
+        }
+        __syncthreads();
+        if (tid == 0) {
+            tie_base_shared += tile_equal_count;
+            selected_base_shared += tile_selected_count;
+            valid_base_shared += tile_valid_count;
+        }
+        __syncthreads();
+    }
+
+    if (nan_seen_shared != 0 || selected_base_shared != k) {
+        for (int out_col = tid; out_col < k_head; out_col += POST_TOPK_BLOCK_THREADS) {
+            row_out_indices[out_col] = -1;
+        }
+        __syncthreads();
+        if (tid == 0) {
+            CUDA_KERNEL_ASSERT(nan_seen_shared == 0);
+            CUDA_KERNEL_ASSERT(selected_base_shared == k);
+        }
+    }
+}
+
+static torch::Tensor post_topk_deterministic_i32(
+    const torch::Tensor& scores,
+    int64_t k,
+    int64_t k_head,
+    int64_t start,
+    c10::optional<torch::Tensor> out_opt) {
+    const int64_t W = scores.size(-1);
+    TORCH_CHECK(scores.is_cuda(), "post_topk scores must be CUDA");
+    TORCH_CHECK(scores.scalar_type() == torch::kFloat32,
+                "post_topk scores must be float32");
+    TORCH_CHECK(scores.stride(-1) == 1,
+                "post_topk scores last dimension must be contiguous");
+    TORCH_CHECK(k >= 0 && k <= W, "post_topk k must be in [0,width]");
+    TORCH_CHECK(k_head >= k, "post_topk k_head must cover k");
+    TORCH_CHECK(k_head <= std::numeric_limits<int>::max()
+                    && W <= std::numeric_limits<int>::max()
+                    && start >= 0
+                    && start <= std::numeric_limits<int32_t>::max() - W,
+                "post_topk dimensions and logical indices must fit int32");
+
+    // A last-dimension narrow is intentionally supported without materializing
+    // a contiguous R*W copy. Validate that all flattened rows share one stride.
+    int64_t outer_product = 1;
+    const int64_t row_stride = scores.stride(-2);
+    for (int64_t dim = scores.dim() - 2; dim >= 0; --dim) {
+        TORCH_CHECK(scores.stride(dim) == row_stride * outer_product,
+                    "post_topk scores must have regular flattened-row strides");
+        outer_product *= scores.size(dim);
+    }
+    const int64_t rows = outer_product;
+    TORCH_CHECK(rows <= std::numeric_limits<int>::max(),
+                "post_topk row count must fit CUDA grid.x");
+
+    auto out_shape = scores.sizes().vec();
+    out_shape[out_shape.size() - 1] = k_head;
+    torch::Tensor out;
+    if (out_opt.has_value()) {
+        out = out_opt.value();
+        TORCH_CHECK(out.defined(), "selected_indices_out must be defined");
+        TORCH_CHECK(out.is_cuda(), "selected_indices_out must be CUDA");
+        TORCH_CHECK(out.dtype() == torch::kInt32, "selected_indices_out must be int32");
+        TORCH_CHECK(out.is_contiguous(), "selected_indices_out must be contiguous");
+        TORCH_CHECK(out.sizes().vec() == out_shape, "selected_indices_out shape mismatch");
+    } else {
+        out = torch::empty(out_shape, scores.options().dtype(torch::kInt32));
+    }
+    if (rows == 0) {
+        return out;
+    }
+    if (k == 0) {
+        out.fill_(-1);
+        return out;
+    }
+
+    // Stage 1: topk values are exact input bit-copies. The custom kernel
+    // reduces their minimum to tau, then performs stable membership and valid
+    // compaction directly into the final int32 output.
+    auto s1_vals = std::get<0>(
+        scores.topk(k, -1, /*largest=*/true, /*sorted=*/false)).contiguous();
+    {
+        auto stream = at::cuda::getCurrentCUDAStream();
+        post_topk_deterministic_i32_kernel<<<rows, POST_TOPK_BLOCK_THREADS, 0, stream>>>(
+            scores.data_ptr<float>(),
+            row_stride,
+            s1_vals.data_ptr<float>(),
+            out.data_ptr<int32_t>(),
+            rows,
+            static_cast<int>(W),
+            static_cast<int>(k),
+            static_cast<int>(k_head),
+            static_cast<int32_t>(start));
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+    return out;
 }
 
 torch::Tensor post_topk(
@@ -2653,120 +2787,21 @@ torch::Tensor post_topk(
                 pad_shape, MIN_VAL, fs_scores.options());
             fs_scores = torch::cat({fs_scores.contiguous(), pad_tensor}, -1);
         }
-        // [POST-TOPK-TIE-DETERMINISM L2] deterministic membership (fixed-shape arm)
-        // replaces topk(sorted=false); byte-identical set on non-tie rows.
-        auto fs_det = post_topk_deterministic(fs_scores, k_head);
-        auto fs_vals = fs_det.second.contiguous();
-        auto fs_idx = fs_det.first.contiguous();
-        int64_t fs_rows = log_s.size(0) * log_s.size(1) * log_s.size(2);
-        if (selected_indices_out_opt.has_value()) {
-            auto out = selected_indices_out_opt.value();
-            TORCH_CHECK(out.defined(), "selected_indices_out must be defined");
-            TORCH_CHECK(out.is_cuda(), "selected_indices_out must be CUDA");
-            TORCH_CHECK(out.dtype() == torch::kInt32, "selected_indices_out must be int32");
-            TORCH_CHECK(out.is_contiguous(), "selected_indices_out must be contiguous");
-            TORCH_CHECK(out.dim() == 4, "selected_indices_out must be [L,B,H,k_head]");
-            TORCH_CHECK(out.size(0) == log_s.size(0)
-                        && out.size(1) == log_s.size(1)
-                        && out.size(2) == log_s.size(2)
-                        && out.size(3) == k_head,
-                        "selected_indices_out shape mismatch");
-            int threads = 256;
-            int64_t total = fs_rows * k_head;
-            int blocks = static_cast<int>((total + threads - 1) / threads);
-            if (blocks > 65535) {
-                blocks = 65535;
-            }
-            if (blocks > 0) {
-                auto stream = at::cuda::getCurrentCUDAStream();
-                post_topk_fixed_shape_i64_to_i32_out_kernel<<<blocks, threads, 0, stream>>>(
-                    fs_idx.data_ptr<int64_t>(),
-                    fs_vals.data_ptr<float>(),
-                    out.data_ptr<int32_t>(),
-                    fs_rows,
-                    k_head,
-                    static_cast<int32_t>(fs_start));
-                C10_CUDA_KERNEL_LAUNCH_CHECK();
-            }
-            return out;
-        }
-        // Non-out alloc fallback: mirror the value-sentinel mapping on host
-        // ops so the two paths stay byte-identical. Use the SAME threshold
-        // (-3.0e38f) as the out-path kernel (post_topk_fixed_shape_*): a
-        // picked value is an empty slot iff value <= MIN_VAL_THRESHOLD, so
-        // the kernel test (v > MIN_VAL_THRESHOLD) and this mask agree on
-        // every value, not just the exact min_val sentinel.
-        const float FS_MIN_VAL_THRESHOLD = -3.0e38f;
-        auto fs_mask = fs_vals.le(FS_MIN_VAL_THRESHOLD);
-        auto fs_out = fs_idx.to(torch::kInt32);
-        if (fs_start > 0) {
-            fs_out.add_(static_cast<int>(fs_start));
-        }
-        fs_out.masked_fill_(fs_mask, -1);
-        return fs_out;
+        // [L2-L1-FUSION] fixed and variable arms share one canonical producer.
+        return post_topk_deterministic_i32(
+            fs_scores, k_head, k_head, fs_start, selected_indices_out_opt);
     }
     if (range_valid && !full_range) {
         scores = scores.narrow(-1, start, end - start);
     }
     int64_t slice_len = range_valid ? (end - start) : K;
     int64_t k_eff = k_head < slice_len ? k_head : slice_len;
-    // [POST-TOPK-TIE-DETERMINISM L2] deterministic membership (variable arm)
-    // replaces topk(sorted=false); byte-identical set on non-tie rows.
-    auto topk_det = post_topk_deterministic(scores, k_eff);
-    auto topk_vals_f32 = topk_det.second.contiguous();
-    auto topk_i64 = topk_det.first.contiguous();
-    if (selected_indices_out_opt.has_value()) {
-        auto out = selected_indices_out_opt.value();
-        TORCH_CHECK(out.defined(), "selected_indices_out must be defined");
-        TORCH_CHECK(out.is_cuda(), "selected_indices_out must be CUDA");
-        TORCH_CHECK(out.dtype() == torch::kInt32, "selected_indices_out must be int32");
-        TORCH_CHECK(out.is_contiguous(), "selected_indices_out must be contiguous");
-        TORCH_CHECK(out.dim() == 4, "selected_indices_out must be [L,B,H,k_head]");
-        TORCH_CHECK(out.size(0) == log_s.size(0)
-                    && out.size(1) == log_s.size(1)
-                    && out.size(2) == log_s.size(2)
-                    && out.size(3) == k_head,
-                    "selected_indices_out shape mismatch");
-        int64_t rows = log_s.size(0) * log_s.size(1) * log_s.size(2);
-        int threads = 256;
-        int64_t total = rows * k_head;
-        int blocks = static_cast<int>((total + threads - 1) / threads);
-        if (blocks > 65535) {
-            blocks = 65535;
-        }
-        if (blocks > 0) {
-            auto stream = at::cuda::getCurrentCUDAStream();
-            post_topk_i64_to_i32_out_kernel<<<blocks, threads, 0, stream>>>(
-                topk_i64.data_ptr<int64_t>(),
-                topk_vals_f32.data_ptr<float>(),
-                out.data_ptr<int32_t>(),
-                rows,
-                k_eff,
-                k_head,
-                static_cast<int32_t>(range_valid && start > 0 ? start : 0));
-            C10_CUDA_KERNEL_LAUNCH_CHECK();
-        }
-        return out;
-    }
-    auto topk = topk_i64.to(torch::kInt32);
-    if (range_valid && start > 0) {
-        topk.add_(static_cast<int>(start));
-    }
-    // [POST-TOPK-VALUE-SENTINEL] non-out fallback mirrors the out-path kernel:
-    // min_val-masked picks map to -1 (same -3.0e38 threshold), keeping the two
-    // paths byte-identical.
-    topk.masked_fill_(topk_vals_f32.le(-3.0e38f), -1);
-    if (k_eff < k_head) {
-        auto out = torch::full(
-            {topk.size(0), topk.size(1), topk.size(2), k_head},
-            -1,
-            topk.options());
-        if (k_eff > 0) {
-            out.narrow(-1, 0, k_eff).copy_(topk);
-        }
-        return out;
-    }
-    return topk;
+    return post_topk_deterministic_i32(
+        scores,
+        k_eff,
+        k_head,
+        range_valid && start > 0 ? start : 0,
+        selected_indices_out_opt);
 }
 
 torch::Tensor post_topk(
@@ -2775,6 +2810,14 @@ torch::Tensor post_topk(
     int64_t slice_start,
     int64_t slice_end) {
     return post_topk(log_s, k_head, slice_start, slice_end, c10::nullopt);
+}
+
+torch::Tensor selector_pipeline_post_topk_contract_cuda(
+    torch::Tensor scores,
+    int64_t k_head,
+    int64_t slice_start,
+    int64_t slice_end) {
+    return post_topk(scores, k_head, slice_start, slice_end, c10::nullopt);
 }
 
 std::vector<torch::Tensor> selector_pipeline_logits_topk_cuda(
@@ -3948,12 +3991,19 @@ std::vector<torch::Tensor> selector_pipeline_pre_denom_topk_with_bounds_workspac
 """
 
     _ensure_torch_cuda_arch_list()
+    # Keep the JIT command line independent of extension import order. The
+    # key-norms/log-s loaders already set this process-global Torch switch; if
+    # pipeline loads first without the same default, build.ninja alternates
+    # between depfile/no-depfile commands across worker processes and rebuilds
+    # the identical source on every leg. setdefault preserves an operator's
+    # explicit override and changes neither generated CUDA nor selector math.
+    os.environ.setdefault("TORCH_EXTENSION_SKIP_NVCC_GEN_DEPENDENCIES", "1")
     try:
         # [EXT-NVCC-GUARD] JIT 回落前 pin nvcc+版本预检(系统 nvcc 10.1 坑根修);
         # 失败信息进 _LOAD_ERROR,由 require/enabled 语义原样呈报。
-        configure_jit_toolchain_or_raise(ext_name="selector_pipeline_ext")
-        _MODULE = load_inline(
-            name="selector_pipeline_ext",
+        configure_jit_toolchain_or_raise(ext_name=_SELECTOR_PIPELINE_EXTENSION_NAME)
+        module = load_inline(
+            name=_SELECTOR_PIPELINE_EXTENSION_NAME,
             cpp_sources=cpp_source,
             cuda_sources=cuda_source,
             functions=None,
@@ -3961,6 +4011,19 @@ std::vector<torch::Tensor> selector_pipeline_pre_denom_topk_with_bounds_workspac
             with_cuda=True,
             verbose=False,
         )
+        if not _module_satisfies_runtime_requirements(module):
+            observed = getattr(module, "selector_pipeline_semantic_version", None)
+            try:
+                observed = int(observed()) if callable(observed) else None
+            except Exception:
+                observed = None
+            raise RuntimeError(
+                "selector pipeline JIT module failed runtime requirements; "
+                f"extension_name={_SELECTOR_PIPELINE_EXTENSION_NAME}; "
+                f"observed_semantic={observed}; "
+                f"expected_semantic={_SELECTOR_PIPELINE_SEMANTIC_VERSION}"
+            )
+        _MODULE = module
     except Exception as exc:
         _LOAD_ERROR = exc
         return None
@@ -4377,6 +4440,17 @@ def pipeline_pre_denom_topk_with_bounds(
         else:
             os.environ["VLLM_SPARSE_SELECTOR_FIXED_SHAPE_TOPK"] = _fst_prev
     return result[0]
+
+
+# Consumer-side L1 may skip canonicalization only when it receives this exact
+# source-semantic marker from the wrapper it actually called.  A mock, stale
+# wrapper, or alternate producer has no marker and therefore stays fail-closed.
+pipeline_logits_topk_with_bounds._sfi_pack_order_canonical_semantic = (
+    _SELECTOR_PIPELINE_SEMANTIC_VERSION
+)
+pipeline_pre_denom_topk_with_bounds._sfi_pack_order_canonical_semantic = (
+    _SELECTOR_PIPELINE_SEMANTIC_VERSION
+)
 
 
 __all__ = [

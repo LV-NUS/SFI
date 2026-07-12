@@ -140,8 +140,12 @@ def _normalize_selection_layers_result(
 ):
     if not isinstance(result, tuple):
         raise TypeError("alpha selection layers result must be a tuple")
-    if len(result) == 9:
+    if len(result) == 10:
+        if type(result[-1]) is not bool:
+            raise TypeError("pack_order_canonical must be bool")
         return result
+    if len(result) == 9:
+        return (*result, False)
     if len(result) == 8:
         (
             selected_indices_batch,
@@ -163,6 +167,31 @@ def _normalize_selection_layers_result(
             selected_middle_counts,
             None,
             profile_events,
+            False,
+        )
+    if len(result) == 7:
+        (
+            selected_indices_batch,
+            head_sink,
+            recent_start,
+            kv_len_head,
+            allowed_lengths,
+            profile_events,
+            pack_order_canonical,
+        ) = result
+        if type(pack_order_canonical) is not bool:
+            raise TypeError("pack_order_canonical must be bool")
+        return (
+            selected_indices_batch,
+            head_sink,
+            recent_start,
+            kv_len_head,
+            allowed_lengths,
+            None,
+            None,
+            None,
+            profile_events,
+            pack_order_canonical,
         )
     if len(result) == 6:
         (
@@ -183,6 +212,7 @@ def _normalize_selection_layers_result(
             None,
             None,
             profile_events,
+            False,
         )
     raise ValueError(f"unexpected alpha selection layers result length: {len(result)}")
 

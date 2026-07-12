@@ -18,13 +18,55 @@ from patches.sparse_types import StepCaptureLayout
 from patches.sparse_utils import _align_up_int
 
 
+def _capture_tensor_bytes(
+    *,
+    capture_chunk: int,
+    slots_cap_bucket: int,
+    num_heads: int,
+    window: int,
+    kv_max_bucket: int,
+    capture_element_size: int,
+    denom_element_size: int = 4,
+) -> tuple[int, int]:
+    """Return score/denominator storage from the arena's canonical shape."""
+    prefix = int(capture_chunk) * int(slots_cap_bucket) * int(num_heads)
+    capture_scores_bytes = (
+        prefix
+        * int(window)
+        * int(kv_max_bucket)
+        * int(capture_element_size)
+    )
+    denom_bytes = prefix * int(denom_element_size)
+    return int(capture_scores_bytes), int(denom_bytes)
+
+
 ARENA_PHASE1_QWEN06_BS2_BUDGET_BYTES = 335544320
-# 262k OOM fix: the default 320MiB budget is too small for the max_model_len
-# (262144)-bucket window=1 arena. At 32 q-heads the window=1 capture_scores
-# bucket is _CAPTURE_CHUNK(14) * slots_cap(8) * 32 * 1 * 262144 * 2B fp16 =
-# 1.75 GiB; with _CAPTURE_IN_FLIGHT(2) buf_ids the reserve projects ~3.5 GiB.
-# 4 GiB covers 2x the max-bucket arena with headroom. Still env-overridable.
-ARENA_PHASE1_QWEN06_BS2_CAP262K_BUDGET_BYTES = 4 * 1024 * 1024 * 1024
+# 262k OOM fix: size the default budget from the same chunk/in-flight sources
+# as the arena itself. A fixed 4 GiB covered chunk14 (~3.5 GiB) but silently
+# became too small after the proven default moved to chunk18 (~4.5 GiB), making
+# every 262k reservation fail before allocation. Round the exact two-buffer
+# fp16 scores+fp32-denom projection up to the next GiB; operators may still
+# override VLLM_SPARSE_CAPTURE_ARENA_BUDGET_BYTES explicitly.
+_CAP262K_BUDGET_GRAIN_BYTES = 1024 * 1024 * 1024
+_CAP262K_SLOTS_CAP_BUCKET = 8
+_CAP262K_NUM_HEADS = 32
+_CAP262K_WINDOW = 1
+_CAP262K_KV_MAX_BUCKET = 262144
+_CAP262K_CAPTURE_BYTES, _CAP262K_DENOM_BYTES = _capture_tensor_bytes(
+    capture_chunk=_CAPTURE_CHUNK,
+    slots_cap_bucket=_CAP262K_SLOTS_CAP_BUCKET,
+    num_heads=_CAP262K_NUM_HEADS,
+    window=_CAP262K_WINDOW,
+    kv_max_bucket=_CAP262K_KV_MAX_BUCKET,
+    capture_element_size=2,
+)
+_CAP262K_PROJECTED_BYTES = int(_CAPTURE_IN_FLIGHT) * (
+    _CAP262K_CAPTURE_BYTES + _CAP262K_DENOM_BYTES
+)
+ARENA_PHASE1_QWEN06_BS2_CAP262K_BUDGET_BYTES = _align_up_int(
+    _CAP262K_PROJECTED_BYTES,
+    _CAP262K_BUDGET_GRAIN_BYTES,
+)
 # Bound on dead reservation metadata. Live set/step <= _CAPTURE_IN_FLIGHT(2)
 # (ONE_SHOT_BOOTSTRAP intent), all consumed same-step before the next insert, so
 # FIFO-oldest eviction down to this cap can only drop dead prior-step entries.
@@ -177,19 +219,14 @@ def capture_bucket_bytes(
     capture_dtype: torch.dtype,
     metadata_bytes: int = 0,
 ) -> CaptureBucketBytes:
-    capture_scores_bytes = (
-        int(capture_chunk)
-        * int(slots_cap_bucket)
-        * int(num_heads)
-        * int(window)
-        * int(kv_max_bucket)
-        * _dtype_size(capture_dtype)
-    )
-    denom_bytes = (
-        int(capture_chunk)
-        * int(slots_cap_bucket)
-        * int(num_heads)
-        * _dtype_size(torch.float32)
+    capture_scores_bytes, denom_bytes = _capture_tensor_bytes(
+        capture_chunk=capture_chunk,
+        slots_cap_bucket=slots_cap_bucket,
+        num_heads=num_heads,
+        window=window,
+        kv_max_bucket=kv_max_bucket,
+        capture_element_size=_dtype_size(capture_dtype),
+        denom_element_size=_dtype_size(torch.float32),
     )
     return CaptureBucketBytes(
         capture_scores_bytes=int(capture_scores_bytes),
@@ -813,6 +850,14 @@ class SparseCaptureMetaArena:
             cache_name="live_seq_full_i64",
             stage_cache=layout.small_tensor_stage,
             out=layout.seq_lens_batch,
+        )
+        layout.seq_lens_batch_i32 = cached_sequence_to_device(
+            context_kv_cpu,
+            dtype=torch.int32,
+            device=device,
+            cache_name="live_seq_full_i32",
+            stage_cache=layout.small_tensor_stage,
+            out=layout.seq_lens_batch_i32,
         )
         kv_len = cached_sequence_to_device(
             kv_len_per_row_cpu,

@@ -23,7 +23,10 @@ from __future__ import annotations
 
 from typing import Optional, Sequence
 
+import json
+import math
 import os
+import threading
 
 import torch
 
@@ -31,14 +34,274 @@ from patches.cpu_gpu_staging import cached_sequence_to_device
 from patches.fa3_native.row_plan import MixedPageRowPlan
 from patches.sparse_types import CaptureForwardSideOutputs, StepCaptureLayout
 
-# Upper bound on distinct deferred/async-postprocess capture scratch buffers retained
-# at once. The deferred key embeds step_handle_id/generation (unique per step), so
-# without a cap this dict grew one ~235 MB fp32 scratch per step and OOM'd under a
-# continuous server load. 8 covers a few in-flight deferred steps x layer-chunk groups;
+# Defensive upper bound on deferred/async-postprocess scratch buffers. The active
+# deferred key is chunk_id-based and normally stays at num_chunks after prebuild;
+# the cap remains for other extra-key families and future key-shape regressions.
 # record_stream-deferred eviction keeps it async-UAF-safe. Raise to disable bounding.
 _FA3_CAPTURE_SCRATCH_CACHE_CAP = max(
     2, int(os.environ.get("VLLM_SPARSE_FA3_CAPTURE_SCRATCH_CACHE_CAP", "8") or "8")
 )
+
+# Default-off allocation provenance. Keep the path latched at import like the other
+# capture envs: production hot paths pay only one false branch, with no tensor readback,
+# synchronization, or file work when the probe is disabled.
+_CAPTURE_SCRATCH_PROBE_LOG = str(
+    os.environ.get("VLLM_SPARSE_CAPTURE_SCRATCH_PROBE_LOG", "") or ""
+).strip()
+_CAPTURE_SCRATCH_PROBE_SEEN: set[tuple[str, str, str]] = set()
+_CAPTURE_SCRATCH_PROBE_LOCK = threading.Lock()
+
+
+def _cached_absent_phase_mapping(
+    *,
+    batch_size: int,
+    device: torch.device,
+    cache_owner: Optional[object],
+) -> torch.Tensor:
+    """Return an immutable all--1 phase mapping retained by the controller.
+
+    The tensor is read-only capture metadata. Retaining it on the controller keeps
+    its address stable for every layer and for the lifetime of any CUDA graph that
+    references it. The cache is deliberately keyed only by allocation identity;
+    phase/step state cannot affect an all--1 value.
+    """
+    if device.type == "cuda" and device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    key = (
+        str(device.type),
+        -1 if device.index is None else int(device.index),
+        int(batch_size),
+    )
+    cache = None
+    if cache_owner is not None:
+        candidate = getattr(cache_owner, "_fa3_absent_phase_mapping_i32_by_shape", None)
+        if isinstance(candidate, dict):
+            cache = candidate
+        else:
+            cache = {}
+            setattr(cache_owner, "_fa3_absent_phase_mapping_i32_by_shape", cache)
+        cached = cache.get(key)
+        if (
+            isinstance(cached, torch.Tensor)
+            and cached.device == device
+            and cached.dtype == torch.int32
+            and cached.dim() == 1
+            and int(cached.numel()) == int(batch_size)
+        ):
+            return cached
+
+    mapping = torch.full(
+        (int(batch_size),),
+        -1,
+        device=device,
+        dtype=torch.int32,
+    )
+    if cache is not None:
+        cache[key] = mapping
+    return mapping
+
+
+def _validate_cpu_capture_rows(
+    *,
+    batch_size: int,
+    slot_in_chunk: int,
+    producer_rows: tuple[int, ...],
+    prefill_rows: tuple[int, ...],
+    decode_rows: tuple[int, ...],
+    row_capture_last_n: tuple[int, ...],
+    seqused_k: tuple[int, ...],
+    max_capture_last_n: int,
+    prefill_layout: Optional[StepCaptureLayout],
+    refresh_layout: Optional[StepCaptureLayout],
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Validate complete CPU row truth and derive trusted phase mappings.
+
+    This helper intentionally performs no tensor reads or device operations. A
+    successful return is the sole proof that permits the caller to skip redundant
+    per-layer device-side mapping assertions.
+    """
+
+    def _validate_rows(name: str, rows: tuple[int, ...]) -> set[int]:
+        row_set = set(rows)
+        if len(row_set) != len(rows):
+            raise ValueError(f"CPU row truth {name} rows must be unique")
+        if any(int(row) < 0 or int(row) >= int(batch_size) for row in rows):
+            raise ValueError(f"CPU row truth {name} rows must be within the batch")
+        return row_set
+
+    producer_set = _validate_rows("producer", producer_rows)
+    prefill_set = _validate_rows("prefill", prefill_rows)
+    decode_set = _validate_rows("decode", decode_rows)
+    if prefill_set.intersection(decode_set):
+        raise ValueError("CPU row truth prefill/decode rows must be disjoint")
+    if prefill_set.union(decode_set) != producer_set:
+        raise ValueError(
+            "CPU row truth prefill/decode row union must equal producer rows"
+        )
+    if len(row_capture_last_n) != int(batch_size):
+        raise ValueError("CPU row truth last_n length must equal batch size")
+    if len(seqused_k) != int(batch_size):
+        raise ValueError("CPU row truth seqused_k length must equal batch size")
+    if any(int(value) < 0 for value in row_capture_last_n):
+        raise ValueError("CPU row truth last_n values must be non-negative")
+    if any(int(value) < 0 for value in seqused_k):
+        raise ValueError("CPU row truth seqused_k values must be non-negative")
+    for row in producer_rows:
+        last_n = int(row_capture_last_n[int(row)])
+        if last_n < 1:
+            raise ValueError("CPU row truth producer last_n must be at least one")
+        if last_n > int(max_capture_last_n):
+            raise ValueError("CPU row truth producer last_n exceeds scratch capacity")
+        if last_n > int(seqused_k[int(row)]):
+            raise ValueError("CPU row truth producer last_n exceeds seqused_k")
+
+    def _validate_layout(
+        *,
+        name: str,
+        phase_rows: set[int],
+        layout: Optional[StepCaptureLayout],
+    ) -> tuple[int, ...]:
+        if layout is None:
+            if phase_rows:
+                raise ValueError(f"{name} producer rows require {name} output tensors")
+            return tuple(-1 for _ in range(int(batch_size)))
+
+        row_list_src = getattr(layout, "row_list_cpu", None)
+        if row_list_src is None:
+            raise ValueError(f"CPU row truth requires {name} layout row_list_cpu")
+        row_list = tuple(int(row) for row in row_list_src)
+        layout_row_set = _validate_rows(f"{name} layout", row_list)
+        slot_list = tuple(int(slot) for slot in layout.slot_list)
+        if len(row_list) != len(slot_list):
+            raise ValueError(f"{name} layout rows must align with slot_list")
+        if len(set(slot_list)) != len(slot_list):
+            raise ValueError(f"{name} layout slot_list must be unique")
+        if not phase_rows.issubset(layout_row_set):
+            raise ValueError(f"{name} layout rows do not cover phase producers")
+        if any(
+            int(layout.slot_to_capture_row.get(slot, -1)) != idx
+            for idx, slot in enumerate(slot_list)
+        ):
+            raise ValueError(f"{name} layout slot mapping is not canonical")
+        if not isinstance(layout.capture_scores, torch.Tensor) or layout.capture_scores.dim() != 5:
+            raise ValueError(
+                f"{name} layout capture_scores must be [chunk, capture_rows, heads, 1, kv]"
+            )
+        if not isinstance(layout.log_f_denoms, torch.Tensor) or layout.log_f_denoms.dim() != 3:
+            raise ValueError(
+                f"{name} layout log_f_denoms must be [chunk, capture_rows, heads]"
+            )
+        if int(slot_in_chunk) < 0 or int(slot_in_chunk) >= int(layout.capture_scores.shape[0]):
+            raise ValueError(f"{name} layout slot_in_chunk is out of range")
+        if int(slot_in_chunk) >= int(layout.log_f_denoms.shape[0]):
+            raise ValueError(f"{name} layout log_f_denoms slot_in_chunk is out of range")
+        if int(layout.capture_scores.shape[1]) < len(row_list):
+            raise ValueError(f"{name} layout capture score rows lack CPU row capacity")
+        if int(layout.log_f_denoms.shape[1]) < len(row_list):
+            raise ValueError(f"{name} layout denominator rows lack CPU row capacity")
+        if int(layout.capture_scores.shape[2]) != int(layout.num_heads):
+            raise ValueError(f"{name} layout capture score heads mismatch")
+        if int(layout.log_f_denoms.shape[2]) != int(layout.num_heads):
+            raise ValueError(f"{name} layout denominator heads mismatch")
+        if int(layout.capture_scores.shape[-1]) != int(layout.kv_max):
+            raise ValueError(f"{name} layout kv_max must match capture_scores width")
+
+        mapping = [-1] * int(batch_size)
+        for capture_row, batch_row in enumerate(row_list):
+            mapping[int(batch_row)] = int(capture_row)
+        return tuple(mapping)
+
+    return (
+        _validate_layout(
+            name="prefill",
+            phase_rows=prefill_set,
+            layout=prefill_layout,
+        ),
+        _validate_layout(
+            name="refresh",
+            phase_rows=decode_set,
+            layout=refresh_layout,
+        ),
+    )
+
+
+def log_capture_scratch_probe(
+    *,
+    source: str,
+    cache_key: object,
+    cache_hit: bool,
+    scratch_storage_shape: Sequence[int],
+    scratch_dtype: torch.dtype,
+    element_size_bytes: int,
+    actual_rows: Optional[int],
+    bucket_rows: int,
+    heads: int,
+    last_n: int,
+    capture_k: int,
+    reduce_group: Optional[int] = None,
+    in_flight: Optional[int] = None,
+    key_kind: str = "",
+) -> None:
+    """Append one allocation-shape record without affecting capture semantics.
+
+    This is deliberately best-effort: malformed paths, serialization failures, and
+    write errors are swallowed. The helper consumes CPU metadata only; callers must
+    not pass values obtained through device readback.
+    """
+    if not _CAPTURE_SCRATCH_PROBE_LOG:
+        return
+    try:
+        if reduce_group is None or in_flight is None:
+            from patches.sparse_constants import (
+                _CAPTURE_IN_FLIGHT,
+                _CAPTURE_REDUCE_GROUP,
+            )
+
+            if reduce_group is None:
+                reduce_group = int(_CAPTURE_REDUCE_GROUP)
+            if in_flight is None:
+                in_flight = int(_CAPTURE_IN_FLIGHT)
+
+        shape = tuple(int(v) for v in scratch_storage_shape)
+        key_repr = repr(cache_key)
+        seen_key = (_CAPTURE_SCRATCH_PROBE_LOG, str(source), key_repr)
+        with _CAPTURE_SCRATCH_PROBE_LOCK:
+            if seen_key in _CAPTURE_SCRATCH_PROBE_SEEN:
+                return
+            # Mark before serialization/I/O so a bad diagnostic path cannot
+            # add repeated work to every capture layer. The record describes
+            # allocation provenance, not per-step utilization.
+            _CAPTURE_SCRATCH_PROBE_SEEN.add(seen_key)
+        record = {
+            "schema": "sfi.capture_scratch_probe.v1",
+            "source": str(source),
+            "shape": list(shape),
+            "dtype": str(scratch_dtype).removeprefix("torch."),
+            "bytes": int(element_size_bytes) * math.prod(shape),
+            "actual_rows": None if actual_rows is None else int(actual_rows),
+            "bucket_rows": int(bucket_rows),
+            "heads": int(heads),
+            "last_n": int(last_n),
+            "K": int(capture_k),
+            "reduce_group": int(reduce_group),
+            "in_flight": int(in_flight),
+            "cache_hit": bool(cache_hit),
+            "key_kind": str(key_kind),
+        }
+        payload = (
+            json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode("utf-8")
+        fd = os.open(
+            _CAPTURE_SCRATCH_PROBE_LOG,
+            os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+            0o644,
+        )
+        try:
+            os.write(fd, payload)
+        finally:
+            os.close(fd)
+    except Exception:
+        return
 
 
 def _prepare_phase_outputs(
@@ -47,12 +310,25 @@ def _prepare_phase_outputs(
     batch_size: int,
     slot_in_chunk: int,
     device: torch.device | str,
+    cache_owner: Optional[object] = None,
+    validated_mapping: Optional[torch.Tensor] = None,
+    cpu_row_truth_validated: bool = False,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     device = torch.device(device)
+    if device.type == "cuda" and device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
     if layout is None:
-        mapping = torch.full((batch_size,), -1, device=device, dtype=torch.int32)
+        mapping = _cached_absent_phase_mapping(
+            batch_size=batch_size,
+            device=device,
+            cache_owner=cache_owner,
+        )
         return mapping, None, None
-    mapping = getattr(layout, "active_capture_row_by_batch_row_i32", None)
+    mapping = (
+        validated_mapping
+        if bool(cpu_row_truth_validated)
+        else getattr(layout, "active_capture_row_by_batch_row_i32", None)
+    )
     if mapping is None:
         raise ValueError("capture layout must provide active_capture_row_by_batch_row_i32")
     if mapping.device != device or mapping.dtype != torch.int32 or mapping.dim() != 1:
@@ -74,7 +350,7 @@ def _prepare_phase_outputs(
         raise ValueError("capture layout log_f_denoms rows must cover slot_list")
     if int(layout.capture_scores.shape[-1]) != int(layout.kv_max):
         raise ValueError("capture layout kv_max must match capture_scores width")
-    if capture_rows > 0:
+    if capture_rows > 0 and not bool(cpu_row_truth_validated):
         safe_mapping = torch.where(mapping >= 0, mapping, mapping.new_zeros(()))
         torch._assert_async(
             torch.logical_not(safe_mapping.max() >= capture_rows),
@@ -108,8 +384,8 @@ def prepare_capture_forward_side_outputs(
 ) -> CaptureForwardSideOutputs:
     batch_size = int(seqused_k.numel())
     device = torch.device(device)
-    seqused_k = seqused_k.to(device=device, dtype=torch.int32).reshape(batch_size)
-
+    if device.type == "cuda" and device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
     producer_rows_cpu_tuple = tuple(int(row) for row in producer_rows_cpu)
     prefill_rows_cpu_tuple = (
         tuple(int(row) for row in prefill_producer_rows_cpu)
@@ -121,18 +397,48 @@ def prepare_capture_forward_side_outputs(
         if decode_producer_rows_cpu is not None
         else tuple()
     )
-    prefill_row_set = set(prefill_rows_cpu_tuple)
-    producer_row_set = set(producer_rows_cpu_tuple)
-    row_capture_last_n_cpu_tuple = (
-        tuple(max(0, int(v)) for v in row_capture_last_n_cpu)
+    row_capture_last_n_cpu_raw = (
+        tuple(int(v) for v in row_capture_last_n_cpu)
         if row_capture_last_n_cpu is not None
         else tuple()
     )
-    seqused_k_cpu_tuple = (
-        tuple(max(0, int(v)) for v in seqused_k_cpu)
+    seqused_k_cpu_raw = (
+        tuple(int(v) for v in seqused_k_cpu)
         if seqused_k_cpu is not None
         else tuple()
     )
+    validated_phase_mappings = None
+    if (
+        row_capture_last_n_cpu is not None
+        and seqused_k_cpu is not None
+        and (
+            prefill_producer_rows_cpu is not None
+            or decode_producer_rows_cpu is not None
+        )
+    ):
+        # This validation must precede every H2D/device operation. Only its
+        # successful return authorizes the no-device-assert fast path below.
+        validated_phase_mappings = _validate_cpu_capture_rows(
+            batch_size=batch_size,
+            slot_in_chunk=int(slot_in_chunk),
+            producer_rows=producer_rows_cpu_tuple,
+            prefill_rows=prefill_rows_cpu_tuple,
+            decode_rows=decode_rows_cpu_tuple,
+            row_capture_last_n=row_capture_last_n_cpu_raw,
+            seqused_k=seqused_k_cpu_raw,
+            max_capture_last_n=int(max_capture_last_n_cpu),
+            prefill_layout=prefill_layout,
+            refresh_layout=refresh_layout,
+        )
+    cpu_row_truth_validated = validated_phase_mappings is not None
+
+    seqused_k = seqused_k.to(device=device, dtype=torch.int32).reshape(batch_size)
+    prefill_row_set = set(prefill_rows_cpu_tuple)
+    producer_row_set = set(producer_rows_cpu_tuple)
+    row_capture_last_n_cpu_tuple = tuple(
+        max(0, int(value)) for value in row_capture_last_n_cpu_raw
+    )
+    seqused_k_cpu_tuple = tuple(max(0, int(value)) for value in seqused_k_cpu_raw)
     row_is_prefill_producer_cpu_tuple = (
         tuple(row in prefill_row_set for row in range(batch_size))
         if prefill_rows_cpu_tuple or decode_rows_cpu_tuple
@@ -145,20 +451,34 @@ def prepare_capture_forward_side_outputs(
             return {}
         return {int(row): idx for idx, row in enumerate(row_list)}
 
-    active_capture_row_cpu = [-1] * batch_size
-    prefill_row_to_capture = _layout_row_to_capture(prefill_layout)
-    refresh_row_to_capture = _layout_row_to_capture(refresh_layout)
-    for batch_row in prefill_rows_cpu_tuple:
-        if 0 <= int(batch_row) < batch_size and int(batch_row) in prefill_row_to_capture:
-            active_capture_row_cpu[int(batch_row)] = int(prefill_row_to_capture[int(batch_row)])
-    for batch_row in decode_rows_cpu_tuple:
-        if 0 <= int(batch_row) < batch_size and int(batch_row) in refresh_row_to_capture:
-            active_capture_row_cpu[int(batch_row)] = int(refresh_row_to_capture[int(batch_row)])
+    if validated_phase_mappings is not None:
+        prefill_mapping_cpu, refresh_mapping_cpu = validated_phase_mappings
+    else:
+        prefill_row_to_capture = _layout_row_to_capture(prefill_layout)
+        refresh_row_to_capture = _layout_row_to_capture(refresh_layout)
+        prefill_mapping_values = [-1] * batch_size
+        refresh_mapping_values = [-1] * batch_size
+        for row, capture_row in prefill_row_to_capture.items():
+            if 0 <= int(row) < batch_size:
+                prefill_mapping_values[int(row)] = int(capture_row)
+        for row, capture_row in refresh_row_to_capture.items():
+            if 0 <= int(row) < batch_size:
+                refresh_mapping_values[int(row)] = int(capture_row)
+        prefill_mapping_cpu = tuple(prefill_mapping_values)
+        refresh_mapping_cpu = tuple(refresh_mapping_values)
 
-    has_cpu_row_truth = (
-        len(row_capture_last_n_cpu_tuple) >= batch_size
-        and (bool(prefill_rows_cpu_tuple) or bool(decode_rows_cpu_tuple))
-    )
+    active_capture_row_cpu = [-1] * batch_size
+    for batch_row in prefill_rows_cpu_tuple:
+        if 0 <= int(batch_row) < batch_size:
+            active_capture_row_cpu[int(batch_row)] = int(
+                prefill_mapping_cpu[int(batch_row)]
+            )
+    for batch_row in decode_rows_cpu_tuple:
+        if 0 <= int(batch_row) < batch_size:
+            active_capture_row_cpu[int(batch_row)] = int(
+                refresh_mapping_cpu[int(batch_row)]
+            )
+
     side_tensor_key = (
         str(device.type),
         -1 if device.index is None else int(device.index),
@@ -168,12 +488,18 @@ def prepare_capture_forward_side_outputs(
         decode_rows_cpu_tuple,
         row_capture_last_n_cpu_tuple[:batch_size],
         tuple(active_capture_row_cpu),
+        prefill_mapping_cpu,
+        refresh_mapping_cpu,
     )
     cached_side = None
-    if scratch_cache_owner is not None:
+    if cpu_row_truth_validated and scratch_cache_owner is not None:
         cached_key = getattr(scratch_cache_owner, "_fa3_capture_side_tensor_cache_key", None)
         cached_value = getattr(scratch_cache_owner, "_fa3_capture_side_tensor_cache", None)
-        if cached_key == side_tensor_key and isinstance(cached_value, tuple) and len(cached_value) == 8:
+        if (
+            cached_key == side_tensor_key
+            and isinstance(cached_value, tuple)
+            and len(cached_value) == 10
+        ):
             cached_side = cached_value
     if cached_side is not None:
         (
@@ -185,12 +511,13 @@ def prepare_capture_forward_side_outputs(
             active_capture_row_by_batch_row_i32,
             prefill_producer_rows,
             decode_producer_rows,
+            validated_prefill_mapping_i32,
+            validated_refresh_mapping_i32,
         ) = cached_side
-    elif has_cpu_row_truth:
+    elif cpu_row_truth_validated:
         capture_row_index_cpu = [-1] * batch_size
         for idx, row in enumerate(producer_rows_cpu_tuple):
-            if 0 <= int(row) < batch_size:
-                capture_row_index_cpu[int(row)] = int(idx)
+            capture_row_index_cpu[int(row)] = int(idx)
         row_capture_last_n_values = [
             int(row_capture_last_n_cpu_tuple[row]) if row in producer_row_set else 0
             for row in range(batch_size)
@@ -251,6 +578,28 @@ def prepare_capture_forward_side_outputs(
             cache_name="capture_side_decode_rows_i64",
             cache_owner=scratch_cache_owner,
         )
+        validated_prefill_mapping_i32 = (
+            cached_sequence_to_device(
+                prefill_mapping_cpu,
+                device=device,
+                dtype=torch.int32,
+                cache_name="capture_side_prefill_mapping_i32",
+                cache_owner=scratch_cache_owner,
+            )
+            if prefill_layout is not None
+            else None
+        )
+        validated_refresh_mapping_i32 = (
+            cached_sequence_to_device(
+                refresh_mapping_cpu,
+                device=device,
+                dtype=torch.int32,
+                cache_name="capture_side_refresh_mapping_i32",
+                cache_owner=scratch_cache_owner,
+            )
+            if refresh_layout is not None
+            else None
+        )
         if scratch_cache_owner is not None:
             setattr(scratch_cache_owner, "_fa3_capture_side_tensor_cache_key", side_tensor_key)
             setattr(
@@ -265,9 +614,13 @@ def prepare_capture_forward_side_outputs(
                     active_capture_row_by_batch_row_i32,
                     prefill_producer_rows,
                     decode_producer_rows,
+                    validated_prefill_mapping_i32,
+                    validated_refresh_mapping_i32,
                 ),
             )
     else:
+        validated_prefill_mapping_i32 = None
+        validated_refresh_mapping_i32 = None
         row_capture_last_n_i32 = row_plan.row_capture_last_n_i32.to(
             device=device,
             dtype=torch.int32,
@@ -317,6 +670,9 @@ def prepare_capture_forward_side_outputs(
         batch_size=batch_size,
         slot_in_chunk=slot_in_chunk,
         device=device,
+        cache_owner=scratch_cache_owner,
+        validated_mapping=validated_prefill_mapping_i32,
+        cpu_row_truth_validated=cpu_row_truth_validated,
     )
     (
         refresh_capture_row_by_batch_row_i32,
@@ -327,7 +683,11 @@ def prepare_capture_forward_side_outputs(
         batch_size=batch_size,
         slot_in_chunk=slot_in_chunk,
         device=device,
+        cache_owner=scratch_cache_owner,
+        validated_mapping=validated_refresh_mapping_i32,
+        cpu_row_truth_validated=cpu_row_truth_validated,
     )
+
     def _capture_head_stride(out_capture_scores: Optional[torch.Tensor]) -> int:
         if not isinstance(out_capture_scores, torch.Tensor):
             return 0
@@ -361,30 +721,31 @@ def prepare_capture_forward_side_outputs(
         # will write OOB; deferred to device-side CUDA error.
 
     if producer_rows.numel() > 0:
-        if not has_cpu_row_truth and prefill_producer_rows.numel() > 0:
+        if not cpu_row_truth_validated and prefill_producer_rows.numel() > 0:
             active_capture_row_by_batch_row_i32.scatter_(
                 0,
                 prefill_producer_rows,
                 prefill_capture_row_by_batch_row_i32.index_select(0, prefill_producer_rows),
             )
-        if not has_cpu_row_truth and decode_producer_rows.numel() > 0:
+        if not cpu_row_truth_validated and decode_producer_rows.numel() > 0:
             active_capture_row_by_batch_row_i32.scatter_(
                 0,
                 decode_producer_rows,
                 refresh_capture_row_by_batch_row_i32.index_select(0, decode_producer_rows),
             )
-        _validate_phase_capacity_async(
-            name="prefill",
-            phase_rows=prefill_producer_rows,
-            capture_row_by_batch_row_i32=prefill_capture_row_by_batch_row_i32,
-            out_capture_scores=prefill_out_capture_scores,
-        )
-        _validate_phase_capacity_async(
-            name="refresh",
-            phase_rows=decode_producer_rows,
-            capture_row_by_batch_row_i32=refresh_capture_row_by_batch_row_i32,
-            out_capture_scores=refresh_out_capture_scores,
-        )
+        if not cpu_row_truth_validated:
+            _validate_phase_capacity_async(
+                name="prefill",
+                phase_rows=prefill_producer_rows,
+                capture_row_by_batch_row_i32=prefill_capture_row_by_batch_row_i32,
+                out_capture_scores=prefill_out_capture_scores,
+            )
+            _validate_phase_capacity_async(
+                name="refresh",
+                phase_rows=decode_producer_rows,
+                capture_row_by_batch_row_i32=refresh_capture_row_by_batch_row_i32,
+                out_capture_scores=refresh_out_capture_scores,
+            )
 
     # Rev 2: upper bounds from CPU args (caller computes from layout/authority,
     # not GPU tensor max).
@@ -477,6 +838,7 @@ def prepare_capture_forward_side_outputs(
             and tuple(int(v) for v in cached_tensor.shape) == scratch_storage_shape
         ):
             scratch_storage = cached_tensor
+    scratch_cache_hit = scratch_storage is not None
     if scratch_storage is None:
         # The native capture store runs after FA masking and postprocess reads
         # only producer rows within [last_n, effective_kv_len]. Reusing an
@@ -536,6 +898,27 @@ def prepare_capture_forward_side_outputs(
                                     except Exception:
                                         pass
                             del _old
+    if _CAPTURE_SCRATCH_PROBE_LOG:
+        _probe_key_kind = (
+            str(scratch_cache_extra_key[0])
+            if isinstance(scratch_cache_extra_key, tuple)
+            and scratch_cache_extra_key
+            else "default"
+        )
+        log_capture_scratch_probe(
+            source="live",
+            cache_key=scratch_key,
+            cache_hit=bool(scratch_cache_hit),
+            scratch_storage_shape=scratch_storage_shape,
+            scratch_dtype=scratch_dtype,
+            element_size_bytes=int(scratch_storage.element_size()),
+            actual_rows=int(_actual_capture_rows),
+            bucket_rows=int(_alloc_capture_rows),
+            heads=int(num_heads),
+            last_n=int(max_capture_last_n),
+            capture_k=int(max_capture_k),
+            key_kind=_probe_key_kind,
+        )
     _scr_slot = int(ring_scratch_slot) if int(ring_scratch_slot) >= 0 else int(slot_in_chunk)
     if int(scratch_layer_slots) > 0:
         if int(_scr_slot) < 0 or int(_scr_slot) >= int(scratch_layer_slots):

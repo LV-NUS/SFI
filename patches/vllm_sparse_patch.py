@@ -360,6 +360,7 @@ def _prepare_prefill_capture_payload(
     num_heads: int,
     device: torch.device,
     capture_plan: Optional[Dict[int, int]] = None,
+    layout: Optional["StepCaptureLayout"] = None,
 ) -> Optional[
     Tuple[
         torch.Tensor,
@@ -398,6 +399,7 @@ def _prepare_prefill_capture_payload(
         num_heads=num_heads,
         device=device,
         capture_plan=capture_plan,
+        layout=layout,
     )
 
 
@@ -1668,36 +1670,31 @@ class VLLMSparseController(
             # 同一 step 内首层已验证通过，后续层直接返回。
             # batch_size / q_start_loc / logits 覆盖在 step 内不变。
             return step_bound_meta
-        if True:
-            step_authority = self.step_authority
-            if step_authority is None:
-                if not bool(self._step_bound_meta_probe_warned_missing_authority):
-                    _log.warning(
-                        "%s: step_bound_meta probe skipped once (step_authority missing)",
-                        stage,
-                    )
-                    self._step_bound_meta_probe_warned_missing_authority = True
-            else:
-                auth_req_set_hash = step_authority.req_set_hash
-                auth_row_phase_hash = step_authority.row_phase_hash
-                bound_req_set_hash = step_bound_meta.req_set_hash
-                bound_row_phase_hash = step_bound_meta.row_phase_hash
-                if (
-                    bound_req_set_hash != auth_req_set_hash
-                    or bound_row_phase_hash != auth_row_phase_hash
-                ):
-                    raise RuntimeError(
-                        f"{stage}: step_bound_meta probe signature drift "
-                        f"(bound_req_set_hash={bound_req_set_hash} "
-                        f"bound_row_phase_hash={bound_row_phase_hash} "
-                        f"auth_req_set_hash={auth_req_set_hash} "
-                        f"auth_row_phase_hash={auth_row_phase_hash})"
-                    )
-            self._step_bound_meta_probe_checked_epoch = bound_epoch
-            self._step_bound_meta_probe_checked_handle_id = bound_handle_id
-            self._step_bound_meta_probe_checked_handle_generation = (
-                bound_handle_generation
-            )
+        step_authority = self.step_authority
+        authority_probe_validated = step_authority is not None
+        if step_authority is None:
+            if not bool(self._step_bound_meta_probe_warned_missing_authority):
+                _log.warning(
+                    "%s: step_bound_meta probe skipped once (step_authority missing)",
+                    stage,
+                )
+                self._step_bound_meta_probe_warned_missing_authority = True
+        else:
+            auth_req_set_hash = step_authority.req_set_hash
+            auth_row_phase_hash = step_authority.row_phase_hash
+            bound_req_set_hash = step_bound_meta.req_set_hash
+            bound_row_phase_hash = step_bound_meta.row_phase_hash
+            if (
+                bound_req_set_hash != auth_req_set_hash
+                or bound_row_phase_hash != auth_row_phase_hash
+            ):
+                raise RuntimeError(
+                    f"{stage}: step_bound_meta probe signature drift "
+                    f"(bound_req_set_hash={bound_req_set_hash} "
+                    f"bound_row_phase_hash={bound_row_phase_hash} "
+                    f"auth_req_set_hash={auth_req_set_hash} "
+                    f"auth_row_phase_hash={auth_row_phase_hash})"
+                )
         bound_batch_size = step_bound_meta.batch_size
         if bound_batch_size < step_ctx_num_reqs:
             raise RuntimeError(
@@ -1718,6 +1715,14 @@ class VLLMSparseController(
             raise RuntimeError(
                 f"{stage}: step_bound_meta logits_capacity coverage mismatch "
                 f"(rows={len(step_bound_meta.logits_capacity_by_row)} num_reqs={step_ctx_num_reqs})"
+            )
+        # Publish the per-step fast-path identity only after every invariant has
+        # passed.  A failed first probe must remain fail-closed on retries.
+        if authority_probe_validated:
+            self._step_bound_meta_probe_checked_epoch = bound_epoch
+            self._step_bound_meta_probe_checked_handle_id = bound_handle_id
+            self._step_bound_meta_probe_checked_handle_generation = (
+                bound_handle_generation
             )
         return step_bound_meta
 

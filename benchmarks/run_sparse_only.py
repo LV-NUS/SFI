@@ -9,6 +9,11 @@ import sys
 import time
 from pathlib import Path
 
+try:
+    from benchmarks.scheduler_contract import resolve_benchmark_max_num_seqs
+except ModuleNotFoundError:
+    from scheduler_contract import resolve_benchmark_max_num_seqs  # type: ignore[no-redef]
+
 ACTIVE_SM80_GT1_RUNNER = "bench_sm80_mixed_page_one_shot_graph_e2e.py"
 FA3_ROUTE_COUNTER_MMAP_BYTES = 8 * 8
 
@@ -322,6 +327,7 @@ def _decode_run_config(args: argparse.Namespace, *, prompt_count: int) -> dict[s
         "prompt": str(args.prompt),
         "prompt_count": int(prompt_count),
         "batch_size": int(args.batch_size),
+        "max_num_seqs": _effective_max_num_seqs(args),
         "split_context_prompts": bool(args.split_context_prompts),
         "max_new_tokens": int(args.max_new_tokens),
         "mix_max_new_tokens": (
@@ -551,6 +557,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dtype", default="bfloat16", choices=("bfloat16", "float16"))
     parser.add_argument("--prompt", default="benchmarks/needle_prompt_part1.txt")
     parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument(
+        "--max-num-seqs",
+        type=int,
+        default=0,
+        help=(
+            "vLLM scheduler concurrency cap (0 = --batch-size). Benchmark "
+            "parents pass the request batch explicitly so profile-time capture "
+            "buffers are not sized to vLLM's unrelated deployment default."
+        ),
+    )
     parser.add_argument(
         "--split-context-prompts",
         action="store_true",
@@ -782,8 +798,25 @@ def build_parser() -> argparse.ArgumentParser:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if int(args.batch_size) <= 0:
+        parser.error("--batch-size must be > 0")
+    try:
+        _effective_max_num_seqs(args)
+    except ValueError as exc:
+        parser.error(str(exc))
     validate_deferred_bridge_args(parser, args)
     return args
+
+
+def _effective_max_num_seqs(args: argparse.Namespace) -> int:
+    return resolve_benchmark_max_num_seqs(
+        batch_size=int(args.batch_size),
+        configured=int(getattr(args, "max_num_seqs", 0) or 0),
+    )
+
+
+def _scheduler_engine_kwargs(args: argparse.Namespace) -> dict[str, object]:
+    return {"max_num_seqs": _effective_max_num_seqs(args)}
 
 
 def main() -> None:
@@ -1306,6 +1339,7 @@ def main() -> None:
         "compilation_config": compilation_config,
         "disable_cascade_attn": bool(args.disable_cascade_attn),
     }
+    engine_kwargs.update(_scheduler_engine_kwargs(args))
     if int(engine_kwargs["tensor_parallel_size"]) > 1 and (
         os.environ.get("VLLM_SPARSE_FORCE_DISABLE_CUSTOM_AR", "") == "1"
     ):

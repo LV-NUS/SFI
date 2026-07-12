@@ -24,6 +24,7 @@ from benchmarks.sm80_run_pair import (
     build_config_digest,
     validate_shared_route_proof,
 )
+from benchmarks.scheduler_contract import resolve_benchmark_max_num_seqs
 
 
 DEFAULT_OUT_ATOL = 0.0
@@ -194,6 +195,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--cuda-visible-devices", default=os.environ.get("CUDA_VISIBLE_DEVICES", "0"))
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument(
+        "--max-num-seqs",
+        type=int,
+        default=0,
+        help="vLLM scheduler concurrency cap (0 = --batch-size).",
+    )
+    parser.add_argument(
         "--split-context-prompts",
         action="store_true",
         help="Pass each Context: segment as a separate request to the sparse/dense runners.",
@@ -264,6 +271,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--iters must be > 0")
     if args.batch_size <= 0:
         parser.error("--batch-size must be > 0")
+    try:
+        _effective_max_num_seqs(args)
+    except ValueError as exc:
+        parser.error(str(exc))
     if args.timeout_s <= 0:
         parser.error("--timeout-s must be > 0")
     if args.compact_blocks_per_slot <= 0:
@@ -275,6 +286,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if args.prefill_last_n < 0:
         parser.error("--prefill-last-n must be >= 0")
     return args
+
+
+def _effective_max_num_seqs(args: argparse.Namespace) -> int:
+    return resolve_benchmark_max_num_seqs(
+        batch_size=int(args.batch_size),
+        configured=int(getattr(args, "max_num_seqs", 0) or 0),
+    )
 
 
 def record_to_jsonable(record: Phase1FullGraphRecord) -> dict[str, object]:
@@ -362,6 +380,7 @@ def _run_pair_config(
         "prompt": str(args.prompt),
         "output_len": int(args.iters),
         "batch_size": int(args.batch_size),
+        "max_num_seqs": _effective_max_num_seqs(args),
         "full_cuda_graph": True,
         "env": _trace_profile_env(env),
     }
@@ -513,6 +532,8 @@ def _build_smoke_command(
         str(args.prompt),
         "--batch-size",
         str(int(args.batch_size)),
+        "--max-num-seqs",
+        str(_effective_max_num_seqs(args)),
         "--max-new-tokens",
         str(int(args.iters)),
         "--full-cuda-graph",
@@ -566,6 +587,8 @@ def _build_dense_reference_command(
         str(args.prompt),
         "--batch-size",
         str(int(args.batch_size)),
+        "--max-num-seqs",
+        str(_effective_max_num_seqs(args)),
         "--max-new-tokens",
         str(int(args.iters)),
         "--full-cuda-graph",
@@ -1714,6 +1737,11 @@ def _route_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
         if event.get("event")
         == "mixed_page_full_cudagraph_replay_refresh_payload_enqueue"
     ]
+    async_producer_writer_complete_events = [
+        event
+        for event in events
+        if event.get("event") == "async_producer_writer_complete"
+    ]
     refresh_reason_counts: dict[str, int] = {}
     for event in replay_refresh_payload_enqueue_events:
         reason = str(event.get("refresh_reason", "") or "unknown")
@@ -1817,6 +1845,9 @@ def _route_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
                 max(0, _as_int(event.get("refresh_slot_count"), 0))
                 for event in replay_refresh_payload_enqueue_events
             )
+        ),
+        "async_producer_writer_complete_count": len(
+            async_producer_writer_complete_events
         ),
         "refresh_reason_counts": refresh_reason_counts,
         # [INTENTS-SEMANTICS 口径] 世代 enqueue 计数(非 token-time 意图数),

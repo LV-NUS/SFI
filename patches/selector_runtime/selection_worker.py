@@ -29,7 +29,13 @@ from patches.sparse_constants import (
 )
 from patches.selector_runtime.selected_out_ring import SelectedOutRing, SlotStableOverrides
 from patches.sparse_types import SelectorBatchPayload, continuous_producer_enabled
+from utils.selector_pipeline_identity import SELECTOR_PIPELINE_SEMANTIC_VERSION
 import time as _sw_time
+
+
+def _pipeline_pack_order_is_verified(pipeline_fn: object) -> bool:
+    marker = getattr(pipeline_fn, "_sfi_pack_order_canonical_semantic", None)
+    return type(marker) is int and marker == SELECTOR_PIPELINE_SEMANTIC_VERSION
 
 
 def _producer_detail_marker(controller):
@@ -1658,6 +1664,7 @@ def compute_alpha_selection_pipeline_unified_impl(
         and log_f_denoms is None
     )
 
+    pack_order_canonical = False
     if _use_decode_bounds_opt:
         if not _DECODE_BOUNDS_KERNEL_CACHED:
             raise RuntimeError(
@@ -1676,6 +1683,9 @@ def compute_alpha_selection_pipeline_unified_impl(
                 self._cached_pipeline_with_bounds = _pwb
                 _compute_bounds_decode = _cbd
                 _pipeline_with_bounds = _pwb
+            pack_order_canonical = _pipeline_pack_order_is_verified(
+                _pipeline_with_bounds
+            )
 
             # 计算 bounds（使用 CUDA kernel，避免 ATen ops）
             if profile_detail:
@@ -1863,6 +1873,7 @@ def compute_alpha_selection_pipeline_unified_impl(
                 if _ppwb is None:
                     from utils.selector_pipeline_ext import pipeline_pre_denom_topk_with_bounds as _ppwb
                     self._cached_pipeline_pre_denom = _ppwb
+                pack_order_canonical = _pipeline_pack_order_is_verified(_ppwb)
 
                 # [T3-B] pre_denom arm gets the exact logits-arm treatment
                 # (#13 STAGE-0): hoist the two _ensure_* producers above the
@@ -2013,6 +2024,9 @@ def compute_alpha_selection_pipeline_unified_impl(
                 self._cached_pipeline_prefill_with_bounds = _pwb
                 _compute_bounds_prefill = _cbp
                 _pipeline_with_bounds = _pwb
+            pack_order_canonical = _pipeline_pack_order_is_verified(
+                _pipeline_with_bounds
+            )
 
             if profile_detail:
                 bounds_evt0 = torch.cuda.Event(enable_timing=True)
@@ -2126,4 +2140,16 @@ def compute_alpha_selection_pipeline_unified_impl(
 
     if _pd_mark is not None:
         _pd_mark("sel_post")
-    return selected_indices, head_sink, recent_start, kv_len_head, allowed_lengths, profile_events
+    # Exact-semantic unified extension output is already canonical: ascending
+    # valid int32 prefix followed by -1.  The explicit marker lets downstream
+    # skip L1 only for this verified producer; legacy/mocked tuples default
+    # fail-closed to False in _normalize_selection_layers_result.
+    return (
+        selected_indices,
+        head_sink,
+        recent_start,
+        kv_len_head,
+        allowed_lengths,
+        profile_events,
+        pack_order_canonical,
+    )

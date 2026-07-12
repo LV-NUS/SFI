@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import os
 import sys
-from typing import Optional
+from typing import Mapping, Optional
 
 from patches.runtime_contracts import validate_capture_inflight, validate_reduce_group
 
@@ -19,7 +19,9 @@ __all__ = [
     "_FORCE_COMPACT_OFF_CACHED",
     "_RELEASE_ON_IDLE_CACHED",
     "_REBUILD_PTRS_PINNED_CACHED",
+    "_WRITER_TOKEN_TILE_DEFAULT",
     "_WRITER_TOKEN_TILE_CACHED",
+    "resolve_writer_token_tile",
     "_WRITER_INPUT_BTABLE_CHECK_CACHED",
     "_SELECTOR_TRUSTED_SHAPES_CACHED",
     "_SELECTOR_FAST_SIG_CACHED",
@@ -37,6 +39,8 @@ __all__ = [
     "_LITE_SIG_RETURN_ASSERT_CACHED",
     "_DECODE_BOUNDS_KERNEL_CACHED",
     "_CAPTURE_CHUNK",
+    "_CAPTURE_CHUNK_DEFAULT",
+    "resolve_capture_chunk",
     "_CAPTURE_KV_BUCKET_CACHED",
     "_CAPTURE_IN_FLIGHT",
     "_CAPTURE_REDUCE_GROUP",
@@ -131,7 +135,22 @@ _REBUILD_PTRS_PINNED_CACHED = os.environ.get("VLLM_SPARSE_REBUILD_PTRS_PINNED", 
 # 线程仅 16 活跃(12.5%)且 block 数 ×8,microbench(12k 档 L36 B8 H8 k1536)
 # steady 全 skip 0.80→0.24ms、cold 全拷贝 5.97→2.15ms;128=kMaxSharedTileTokens
 # 上限,相1 满活跃。tile 只改并行拆分不改写集合(每 (t,vi) 单写手)=逐位等价。
-_WRITER_TOKEN_TILE_CACHED: int = int(os.environ.get("VLLM_SPARSE_WRITER_TOKEN_TILE", "128") or "0")
+_WRITER_TOKEN_TILE_DEFAULT = 128
+
+
+def resolve_writer_token_tile(environ: Mapping[str, str] | None = None) -> int:
+    """Resolve the writer tile with the runtime's exact legacy-zero semantics."""
+    source = os.environ if environ is None else environ
+    return int(
+        source.get(
+            "VLLM_SPARSE_WRITER_TOKEN_TILE",
+            str(_WRITER_TOKEN_TILE_DEFAULT),
+        )
+        or "0"
+    )
+
+
+_WRITER_TOKEN_TILE_CACHED: int = resolve_writer_token_tile()
 # [WRITER-ENQUEUE-DIET 2026-07-12 ext批] 诊断档 btable 前置断言开关(默认关)。
 # 旧形态=writer 每次 dispatch 热路径 os.environ.get;循 _DYNAMIC_ENV 惯例迁到
 # import 期缓存(pytest 域消费点走 if _DYNAMIC_ENV else CACHED 双臂)。
@@ -210,12 +229,31 @@ _LITE_SIG_RETURN_ASSERT_CACHED = (
 # ---------------------------------------------------------------------------
 # Chunk-batched capture ring (memory + async overlap)
 # ---------------------------------------------------------------------------
-try:
-    _CAPTURE_CHUNK: int = int(os.environ.get("VLLM_SPARSE_CAPTURE_CHUNK", "14") or "14")
-except ValueError:
-    _CAPTURE_CHUNK = 14
-if _CAPTURE_CHUNK <= 0:
-    _CAPTURE_CHUNK = 14
+# [CHUNK18-PROMOTION 2026-07-12] Promoted after a same-GPU six-leg 4B/bs8x12k
+# A/B (+1.0156% all-decode TPS, every pair positive), full c14/c18 route and
+# artifact proof, and a 0.6B golden run with identical hashes/counts and both
+# production gates true. The env remains the explicit rollback/experiment
+# surface; invalid/non-positive values fall back to the proven default.
+_CAPTURE_CHUNK_DEFAULT = 18
+
+
+def resolve_capture_chunk(environ: Mapping[str, str] | None = None) -> int:
+    """Resolve capture chunk, falling back for malformed/non-positive values."""
+    source = os.environ if environ is None else environ
+    try:
+        value = int(
+            source.get(
+                "VLLM_SPARSE_CAPTURE_CHUNK",
+                str(_CAPTURE_CHUNK_DEFAULT),
+            )
+            or str(_CAPTURE_CHUNK_DEFAULT)
+        )
+    except (TypeError, ValueError):
+        return _CAPTURE_CHUNK_DEFAULT
+    return value if value > 0 else _CAPTURE_CHUNK_DEFAULT
+
+
+_CAPTURE_CHUNK: int = resolve_capture_chunk()
 
 try:
     _CAPTURE_KV_BUCKET_CACHED: int = int(os.environ.get("VLLM_SPARSE_CAPTURE_KV_BUCKET", "2048") or "2048")
@@ -421,15 +459,11 @@ _SELECTOR_PIPELINE_WORKSPACE_CACHED = os.environ.get("VLLM_SPARSE_SELECTOR_PIPEL
 # capture 学费已证为地板=SFI_P3_PREWARM_DESIGN_2026-07-11.md §7-§8)。
 # 显式 env=0 仍为完整回退路径(cached+F1 shim+C++ 调用期 shim 三层一致)。
 _SELECTOR_FIXED_SHAPE_TOPK_CACHED = os.environ.get("VLLM_SPARSE_SELECTOR_FIXED_SHAPE_TOPK", "1") == "1"
-# [F1 COHERENCE-SHIM 2026-07-11] the ext prebuilt-reject predicate
-# (utils/selector_pipeline_ext._fixed_shape_topk_required) reads the env LIVE.
-# If the default above ever flips to ON while the operator leaves the env
-# unset, that predicate would still see OFF and ACCEPT a stale prebuilt .so
-# compiled without the fixed-shape kernel: C++ runs OFF semantics while
-# Python widens the topk slice under KBUCKET ON semantics -> pad picks leak
-# into selected_indices. Export the resolved value at import time (same
-# discipline as the FUSE_NMS_CROSS shim in selector_pipeline_ext) so every
-# live-env reader provably agrees with this cached constant; an explicit
+# [F1 COHERENCE-SHIM 2026-07-11] selector_pipeline_ext's C++ dispatch reads
+# this env LIVE, while Python routing uses the cached value above. Export the
+# resolved default at import time so both sides agree. Prebuilt capability is
+# now guarded independently by the extension's exact semantic version, which
+# proves the fixed-shape kernel is present; an explicit
 # operator-set "0"/"1" is always respected.
 if os.environ.get("VLLM_SPARSE_SELECTOR_FIXED_SHAPE_TOPK") is None:
     os.environ["VLLM_SPARSE_SELECTOR_FIXED_SHAPE_TOPK"] = (

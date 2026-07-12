@@ -1488,6 +1488,7 @@ def compute_alpha_selection_batched_impl(
         selected_middle_counts_all,
         selected_token_scores_all,
         detail_events,
+        pack_order_canonical,
     ) = self._compute_alpha_selection_batched_layers(
         capture_scores=capture_scores_stack,
         log_f_denoms=log_f_denoms_stack,
@@ -1519,12 +1520,13 @@ def compute_alpha_selection_batched_impl(
     # 附带根修:gather kernel 前缀消费 persist_len 槽且对 -1 槽打 ordinal
     # fallback——规范化后有效 pick 恒在前缀内,短行 regime 不再出现"有效 pick
     # 落在前缀外被丢/-1 混入前缀吃填充 token"的 run 间可变选集。
-    selected_indices_all, selected_token_scores_all = (
-        canonicalize_selected_indices_pack_order(
-            selected_indices_all,
-            selected_token_scores=selected_token_scores_all,
+    if not bool(pack_order_canonical) or selected_token_scores_all is not None:
+        selected_indices_all, selected_token_scores_all = (
+            canonicalize_selected_indices_pack_order(
+                selected_indices_all,
+                selected_token_scores=selected_token_scores_all,
+            )
         )
-    )
     _evts = _unpack_detail_events(detail_events)
     _none2 = (None, None)
 
@@ -1538,6 +1540,7 @@ def compute_alpha_selection_batched_impl(
         selected_middle_pages=selected_middle_pages_all,
         selected_middle_counts=selected_middle_counts_all,
         selected_token_scores=selected_token_scores_all,
+        pack_order_canonical=True,
         profile_cpu_stack_us=profile_cpu_stack_us,
         profile_cpu_validate_us=profile_cpu_validate_us,
         profile_cpu_key_norms_us=profile_cpu_key_norms_us,

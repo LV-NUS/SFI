@@ -1183,6 +1183,47 @@ class RefreshRebuildMixin:
         setattr(self, total_name, float(getattr(self, total_name, 0.0)) + elapsed)
         setattr(self, max_name, max(float(getattr(self, max_name, 0.0)), elapsed))
 
+    def _record_async_producer_writer_route_evidence(
+        self,
+        pending: "PendingRefreshRebuild",
+    ) -> None:
+        """Emit lightweight writer-invocation proof for verdict-only runs.
+
+        The detailed refresh profiler already counts this boundary, but the
+        speed child intentionally runs without that profiler. Its route trace
+        is already enabled in verdict-only mode, so one event after a
+        successful writer invocation proves that producer work crossed the
+        writer boundary without adding timing events or per-step profiling to
+        the measured path.
+        """
+        if not os.environ.get("VLLM_SPARSE_FA3_ROUTE_TRACE_LOG", ""):
+            return
+        count = int(
+            getattr(self, "_async_producer_writer_route_evidence_count", 0)
+        ) + 1
+        from patches.fa3_native.install import append_fa3_route_trace
+
+        def _pending_int(name: str) -> int:
+            value = getattr(pending, name, None)
+            return -1 if value is None else int(value)
+
+        try:
+            append_fa3_route_trace(
+                {
+                    "event": "async_producer_writer_complete",
+                    "async_producer_writer_complete_count": int(count),
+                    "pending_id": _pending_int("pending_id"),
+                    "target_layer_start": _pending_int("target_layer_start"),
+                    "target_layer_end": _pending_int("target_layer_end"),
+                }
+            )
+        except Exception:
+            # Route tracing is diagnostics. The benchmark still fails closed
+            # because postflight will reject the missing writer evidence, but
+            # a trace I/O error must not invalidate completed producer work.
+            return
+        self._async_producer_writer_route_evidence_count = count
+
     def _record_deadline_async_producer_gpu_event_pair(
         self,
         stage: str,
@@ -3164,6 +3205,7 @@ class RefreshRebuildMixin:
                     pending,
                     pending.result,
                 )
+                self._record_async_producer_writer_route_evidence(pending)
             finally:
                 if profile_enabled:
                     self._record_deadline_async_producer_stage(
@@ -3972,6 +4014,9 @@ class RefreshRebuildMixin:
                             self._run_pending_refresh_rebuild_compact_writer(
                                 pending,
                                 sel,
+                            )
+                            self._record_async_producer_writer_route_evidence(
+                                pending
                             )
                         finally:
                             if (

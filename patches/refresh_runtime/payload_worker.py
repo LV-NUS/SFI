@@ -103,6 +103,79 @@ def _refresh_payload_views_from_layout(
     )
 
 
+def _prefill_payload_layout_matches(
+    *,
+    layout: object,
+    step_context: object,
+    slot_list: Sequence[int],
+    num_heads: int,
+    device: torch.device,
+    kv_needed: int,
+    expected_buf_id: int,
+    chunk_query_lengths: Optional[torch.Tensor],
+) -> bool:
+    """Validate a caller-resolved prefill layout before skipping lookup."""
+
+    if layout is None:
+        return False
+    step_identity = (
+        int(getattr(step_context, "epoch", -1)),
+        int(getattr(step_context, "step_handle_id", -1)),
+        int(getattr(step_context, "step_handle_generation", -1)),
+    )
+    if (
+        int(getattr(layout, "epoch", -1)) != step_identity[0]
+        or int(getattr(layout, "step_handle_id", -1)) != step_identity[1]
+        or int(getattr(layout, "step_handle_generation", -1)) != step_identity[2]
+        or int(getattr(layout, "buf_id", -1)) != int(expected_buf_id)
+        or int(getattr(layout, "num_heads", -1)) != int(num_heads)
+        or int(getattr(layout, "kv_max", -1)) < int(kv_needed)
+        or tuple(int(v) for v in getattr(layout, "slot_list", tuple()))
+        != tuple(int(v) for v in slot_list)
+    ):
+        return False
+    live_lengths_key = getattr(layout, "live_lengths_key", None)
+    if not isinstance(live_lengths_key, tuple) or len(live_lengths_key) < 5:
+        return False
+    if tuple(int(v) for v in live_lengths_key[:3]) != step_identity:
+        return False
+    row_key = getattr(layout, "slot_row_map_key", None)
+    if row_key is None or tuple(int(v) for v in live_lengths_key[4]) != tuple(
+        int(v) for v in row_key
+    ):
+        return False
+    required_tensors = (
+        getattr(layout, "capture_scores", None),
+        getattr(layout, "log_f_denoms", None),
+        getattr(layout, "slot_tensor", None),
+        getattr(layout, "slot_tensor_i32", None),
+        getattr(layout, "row_tensor", None),
+        getattr(layout, "row_tensor_i32", None),
+        getattr(layout, "capture_row_by_batch_row_i32", None),
+        getattr(layout, "seq_lens_batch", None),
+        getattr(layout, "kv_lengths", None),
+        getattr(layout, "kv_len_per_row_i32", None),
+    )
+    if any(
+        not isinstance(tensor, torch.Tensor) or tensor.device != device
+        for tensor in required_tensors
+    ):
+        return False
+    capture_scores = required_tensors[0]
+    if (
+        capture_scores.dim() != 5
+        or int(capture_scores.shape[1]) < len(slot_list)
+        or int(capture_scores.shape[2]) != int(num_heads)
+        or int(capture_scores.shape[-1]) < int(kv_needed)
+    ):
+        return False
+    if chunk_query_lengths is not None and not isinstance(
+        getattr(layout, "chunk_lengths", None), torch.Tensor
+    ):
+        return False
+    return True
+
+
 def prepare_prefill_capture_payload_impl(
     *,
     controller: "VLLMSparseController",
@@ -116,6 +189,7 @@ def prepare_prefill_capture_payload_impl(
     num_heads: int,
     device: torch.device,
     capture_plan: Optional[Dict[int, int]] = None,
+    layout: Optional["StepCaptureLayout"] = None,
 ) -> Optional[
     Tuple[
         torch.Tensor,
@@ -155,23 +229,35 @@ def prepare_prefill_capture_payload_impl(
     global_layer_index = controller.layer_index_by_cache_key.get(cache_key, -1)
     if global_layer_index < 0:
         return None
-    layout = controller._get_step_capture_layout(
-        phase="prefill",
-        state=state,
-        step_context=step_context,
-        global_layer_index=global_layer_index,
-        slot_list=slot_list,
-        seqused_k=seqused_k,
-        num_heads=num_heads,
-        device=device,
-        chunk_query_lengths=chunk_query_lengths,
-        prepared_only=bool(
-            getattr(controller, "_prefill_capture_meta_arena_enabled", False)
-        ),
+    _, expected_buf_id, slot_in_chunk = controller._map_global_layer_to_capture_slot(
+        global_layer_index
     )
+    if not _prefill_payload_layout_matches(
+        layout=layout,
+        step_context=step_context,
+        slot_list=slot_list,
+        num_heads=int(num_heads),
+        device=device,
+        kv_needed=int(plan_max_kv),
+        expected_buf_id=int(expected_buf_id),
+        chunk_query_lengths=chunk_query_lengths,
+    ):
+        layout = controller._get_step_capture_layout(
+            phase="prefill",
+            state=state,
+            step_context=step_context,
+            global_layer_index=global_layer_index,
+            slot_list=slot_list,
+            seqused_k=seqused_k,
+            num_heads=num_heads,
+            device=device,
+            chunk_query_lengths=chunk_query_lengths,
+            prepared_only=bool(
+                getattr(controller, "_prefill_capture_meta_arena_enabled", False)
+            ),
+        )
     if layout is None:
         raise RuntimeError("prefill capture plan set but capture layout missing")
-    _, _, slot_in_chunk = controller._map_global_layer_to_capture_slot(global_layer_index)
     kv_needed = int(plan_max_kv)
     # 性能关键：selector 的 Triton log_s 内部把 K 当作 tl.constexpr（静态展开），
     # 若每步都传不同的 kv_needed，会导致 chunk0 频繁触发新的 K specialization 编译/缓存 miss。

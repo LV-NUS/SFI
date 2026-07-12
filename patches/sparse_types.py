@@ -858,6 +858,10 @@ class StepCaptureLayout:
     # tensor/live lengths/cpu tensors/lease 全部同值重做为纯冗余）。键含
     # chunk_id——chunk2 复用 buf0 时 lease/live lengths 必须重建，跨 chunk 必失效。
     step_memo_token: Optional[Tuple[int, int, int, int]] = None
+    # prepared prefill 的同 step/chunk 跨层复用证明。具体 token 由
+    # capture_layout_worker 私有实现持有；任一权威元数据或 layout 载体替换
+    # 都会 fail-closed 回退 arena bind + 完整校验。
+    prefill_step_layout_memo: Optional[object] = None
     # 正式 active mapping contract：仅覆盖当前 batch 的活动视图，供消费层只读。
     active_capture_row_by_batch_row_i32: Optional[torch.Tensor] = None
     # slot->row 映射快照：用于检测同一 epoch 内的 row 变化并重建 row_tensor/capture_row
@@ -1609,6 +1613,7 @@ class SelectorResult:
     selected_middle_pages: Optional[torch.Tensor] = None
     selected_middle_counts: Optional[torch.Tensor] = None
     selected_token_scores: Optional[torch.Tensor] = None
+    pack_order_canonical: bool = False
     profile_cpu_compute_us: Optional[float] = None
     profile_cpu_post_us: Optional[float] = None
     profile_cpu_stack_us: Optional[float] = None
