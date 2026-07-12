@@ -477,6 +477,92 @@ if os.environ.get("VLLM_NATIVE_FULLGRAPH_REPLAY_CUDA_EVENT_LOG"):
         ) from exc
 
 
+# [K6-FORENSICS 2026-07-12] Replay-counted kineto window (env-gated diagnostic
+# hook, default off — same family as the blocks above). Set
+# VLLM_SPARSE_KINETO_REPLAY_WINDOW_OUT=<chrome_trace.json> to hook
+# torch.cuda.CUDAGraph.replay: at replay #VLLM_SPARSE_KINETO_REPLAY_START
+# (default 150) it enters a CUDA-activity-only torch profiler and
+# VLLM_SPARSE_KINETO_REPLAY_SPAN (default 40) replays later dumps the trace.
+# Purpose: count in-graph prepare launches per decode step (K6 36->1 refit).
+# Observation only; production numbers must come from profiler-free runs.
+if os.environ.get("VLLM_SPARSE_KINETO_REPLAY_WINDOW_OUT"):
+    try:
+        import threading as _sfi_k6_threading
+
+        import torch as _sfi_k6_torch
+        from torch.profiler import (
+            ProfilerActivity as _sfi_k6_PA,
+            profile as _sfi_k6_profile,
+        )
+
+        _sfi_k6_state = {"n": 0, "prof": None, "done": False}
+        _sfi_k6_lock = _sfi_k6_threading.Lock()
+        _sfi_k6_orig_replay = _sfi_k6_torch.cuda.CUDAGraph.replay
+        _sfi_k6_start = int(
+            os.environ.get("VLLM_SPARSE_KINETO_REPLAY_START", "150")
+        )
+        _sfi_k6_span = int(os.environ.get("VLLM_SPARSE_KINETO_REPLAY_SPAN", "40"))
+        _sfi_k6_out = os.environ["VLLM_SPARSE_KINETO_REPLAY_WINDOW_OUT"]
+
+        def _sfi_k6_replay_hook(self, *args, **kwargs):
+            do_start = do_stop = False
+            with _sfi_k6_lock:
+                _sfi_k6_state["n"] += 1
+                n = _sfi_k6_state["n"]
+                if (
+                    n == _sfi_k6_start
+                    and _sfi_k6_state["prof"] is None
+                    and not _sfi_k6_state["done"]
+                ):
+                    do_start = True
+                elif (
+                    _sfi_k6_state["prof"] is not None
+                    and not _sfi_k6_state["done"]
+                    and n >= _sfi_k6_start + _sfi_k6_span
+                ):
+                    do_stop = True
+            if do_start:
+                try:
+                    p = _sfi_k6_profile(activities=[_sfi_k6_PA.CUDA])
+                    p.__enter__()
+                    with _sfi_k6_lock:
+                        _sfi_k6_state["prof"] = p
+                    print(f"[k6-kineto] profiler ON at replay {n}", flush=True)
+                except Exception as exc:
+                    print(f"[k6-kineto] profiler start failed: {exc!r}", flush=True)
+                    with _sfi_k6_lock:
+                        _sfi_k6_state["done"] = True
+            if do_stop:
+                with _sfi_k6_lock:
+                    p = _sfi_k6_state["prof"]
+                    _sfi_k6_state["prof"] = None
+                    _sfi_k6_state["done"] = True
+                try:
+                    p.__exit__(None, None, None)
+                    p.export_chrome_trace(_sfi_k6_out)
+                    print(
+                        f"[k6-kineto] profiler OFF at replay {_sfi_k6_state['n']}, "
+                        f"dumped {_sfi_k6_out}",
+                        flush=True,
+                    )
+                except Exception as exc:
+                    print(f"[k6-kineto] profiler stop failed: {exc!r}", flush=True)
+            return _sfi_k6_orig_replay(self, *args, **kwargs)
+
+        if not getattr(_sfi_k6_torch.cuda.CUDAGraph.replay, "_sfi_k6_kineto", False):
+            _sfi_k6_replay_hook._sfi_k6_kineto = True
+            _sfi_k6_torch.cuda.CUDAGraph.replay = _sfi_k6_replay_hook
+            print(
+                f"[k6-kineto] replay hook armed (start={_sfi_k6_start}, "
+                f"span={_sfi_k6_span})",
+                flush=True,
+            )
+    except Exception as exc:
+        raise SystemExit(
+            f"sitecustomize K6 kineto replay-window hook failed: {exc}"
+        ) from exc
+
+
 # Executor/MQ timing diagnostic.
 # Default off. Enable with VLLM_EXECUTOR_RPC_TIMING_LOG=/path/to/jsonl.
 # This splits MultiprocExecutor.collective_rpc(non_block=True) into host-side

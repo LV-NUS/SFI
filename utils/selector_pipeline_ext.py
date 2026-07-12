@@ -75,6 +75,11 @@ if os.environ.get("VLLM_SPARSE_SELECTOR_FUSE_NMS_CROSS") is None:
 
 
 def _fixed_shape_topk_required() -> bool:
+    # Live env read; coherent with patches.sparse_constants
+    # _SELECTOR_FIXED_SHAPE_TOPK_CACHED via that module's import-time F1 shim
+    # (it exports the resolved default when the operator left the env unset),
+    # so a future constants-side default flip cannot silently accept a stale
+    # prebuilt compiled without the fixed-shape kernel.
     return os.environ.get("VLLM_SPARSE_SELECTOR_FIXED_SHAPE_TOPK", "0") == "1"
 
 

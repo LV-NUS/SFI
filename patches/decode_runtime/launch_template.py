@@ -54,6 +54,41 @@ def _row_changed(prior: Tuple[int, ...], row: int, value: int) -> bool:
     return row >= len(prior) or int(prior[row]) != int(value)
 
 
+def _fresh_descriptor_cpu_mirror(
+    reference: torch.Tensor,
+    *,
+    pin_memory: bool,
+) -> torch.Tensor:
+    """[ARM-WAR-R1-PINNED-INDEPENDENT 2026-07-12] fresh pinned CPU 镜像克隆。
+
+    E1 后向 WAR 根修(组X 案):常驻 pinned 镜像的全量异步 H2D 可能仍未决
+    (整建步 enqueue 深埋在在途 forward 之后,未决窗 ms 级),下一步 delta 的
+    无条件 host 行写若打在同一缓冲=在途 H2D 读到"未来值"。每次 delta 改写
+    前克隆到独立 fresh pinned 分配,旧块由 torch CachingHostAllocator 事件
+    护栏保到未决 H2D 完成,WAR 窗物理消灭。clone 同时保全 CPU 镜像残留语义
+    (delta 只写行 2-5,行 0/1 靠整建残留)。代价=一次尺寸桶分配+≤768B
+    CPU memcpy(µs 级)。
+    """
+    if pin_memory:
+        try:
+            fresh = torch.empty(
+                tuple(reference.shape),
+                device="cpu",
+                dtype=reference.dtype,
+                pin_memory=True,
+            )
+        except RuntimeError:
+            fresh = torch.empty(
+                tuple(reference.shape), device="cpu", dtype=reference.dtype
+            )
+    else:
+        fresh = torch.empty(
+            tuple(reference.shape), device="cpu", dtype=reference.dtype
+        )
+    fresh.copy_(reference)
+    return fresh
+
+
 def compile_launch_template(
     plan: CompactRecentLaunchPlan,
     *,
@@ -85,6 +120,7 @@ def apply_launch_template_row_delta(
     recent_page_count_by_row: Tuple[int, ...],
     update_gpu: bool = True,
     force_gpu_refresh: bool = False,
+    controller: object | None = None,
 ) -> LaunchTemplateUpdateResult:
     plan = template.plan
     batch_size = int(plan.batch_size)
@@ -133,7 +169,13 @@ def apply_launch_template_row_delta(
         or _row_changed(plan.recent_count_cpu, row, recent_count[row])
         for row in range(batch_size)
     )
-    descriptor_cpu = template.descriptor_cpu_i32
+    non_blocking = template.descriptor_gpu_i32.device.type == "cuda"
+    # [ARM-WAR-R1-PINNED-INDEPENDENT 2026-07-12] host 行写打在独立 fresh
+    # 克隆上而非常驻镜像(E1 后向 WAR 根修,机理见 _fresh_descriptor_cpu_mirror)。
+    descriptor_cpu = _fresh_descriptor_cpu_mirror(
+        template.descriptor_cpu_i32,
+        pin_memory=non_blocking,
+    )
     if bool(recent_window_changed):
         for row in range(batch_size):
             descriptor_cpu[2, row] = recent_first[row]
@@ -145,12 +187,24 @@ def apply_launch_template_row_delta(
             descriptor_cpu[4, row] = request_recent_len[row]
             descriptor_cpu[5, row] = launch_effective_k[row]
 
-    non_blocking = template.descriptor_gpu_i32.device.type == "cuda"
     if bool(update_gpu):
         descriptor_row_start = 2 if bool(recent_window_changed) else 4
         template.descriptor_gpu_i32[descriptor_row_start:6, :batch_size].copy_(
             descriptor_cpu[descriptor_row_start:6, :batch_size],
             non_blocking=non_blocking,
+        )
+
+    # 双引用替换:template 镜像与 controller 常驻属性同步指向 fresh,保持
+    # 「controller 属性=活镜像」不变量(metadata_builder 收尾处的模板身份
+    # 三判 launch_template.descriptor_cpu_i32 is descriptor_cpu_i32 依赖它,
+    # 否则每 delta 步强制 recompile 并装回陈旧镜像;取证 dump 的 host 面
+    # 快照也读 controller 属性)。
+    template.descriptor_cpu_i32 = descriptor_cpu
+    if controller is not None:
+        setattr(
+            controller,
+            "_compact_recent_launch_plan_descriptor_cpu_i32",
+            descriptor_cpu,
         )
 
     plan.request_recent_len_cpu = request_recent_len

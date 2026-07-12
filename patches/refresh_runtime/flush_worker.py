@@ -152,7 +152,6 @@ def flush_prefill_batches_impl(
     flush_micro_profile_summary_fn: Callable[[], None],
     refresh_profile_pending_cls: type,
     make_selector_fast_signature_fn: Callable[..., object],
-    rebuild_physical_block_sort_cached: bool,
 ) -> None:
     _CAPTURE_IN_FLIGHT = capture_in_flight
     _CAPTURE_CHUNK = capture_chunk
@@ -173,7 +172,6 @@ def flush_prefill_batches_impl(
             _REFRESH_MICRO_PROFILE_EVERY = 64
     _RefreshProfilePending = refresh_profile_pending_cls
     _make_selector_fast_signature = make_selector_fast_signature_fn
-    _REBUILD_PHYSICAL_BLOCK_SORT_CACHED = rebuild_physical_block_sort_cached
     """Chunk-batched flush.
 
     - per-chunk：prefill/refresh 都以 SelectorBatchPayload 入队；
@@ -902,11 +900,6 @@ def flush_prefill_batches_impl(
                 except Exception:
                     _log.warning("refresh profiling: rebuild_selected_k extraction failed", exc_info=True)
                     prof.rebuild_selected_k = 0
-                try:
-                    prof.rebuild_physical_block_sort_flag = 1 if bool(_REBUILD_PHYSICAL_BLOCK_SORT_CACHED) else 0
-                except Exception:
-                    _log.warning("refresh profiling: rebuild_physical_block_sort_flag extraction failed", exc_info=True)
-                    prof.rebuild_physical_block_sort_flag = 0
                 t_rebuild1_ns = time.perf_counter_ns()
                 prof.refresh_rebuild_cpu_us = (t_rebuild1_ns - t_rebuild0_ns) / 1000.0
                 if _REFRESH_MICRO_PROFILE_CACHED:
@@ -2875,7 +2868,6 @@ def flush_prefill_batches_impl(
                     rebuild_num_kv_heads=int(prof.rebuild_num_kv_heads),
                     rebuild_batch_slots=int(prof.rebuild_batch_slots),
                     capture_kv_len_total=int(prof.capture_kv_len_total),
-                    rebuild_physical_block_sort=int(prof.rebuild_physical_block_sort_flag),
                     writer_pointer_rebuild_count=int(prof.writer_pointer_rebuild_count),
                     writer_pointer_lookup_count=int(prof.writer_pointer_lookup_count),
                     writer_cached_pointer_hit_rate=float(prof.writer_cached_pointer_hit_rate),
@@ -3165,6 +3157,14 @@ def flush_prefill_batches_impl(
                             "_deadline_deferred_selector_wrapper_gap_cpu_us_max",
                             0.0,
                         )
+                    ),
+                    deadline_deferred_producer_detail_us=dict(
+                        getattr(
+                            self,
+                            "_deadline_deferred_producer_detail_us",
+                            None,
+                        )
+                        or {}
                     ),
                     deadline_async_producer_body_count=int(
                         getattr(self, "_deadline_async_producer_body_count", 0)
@@ -3801,7 +3801,6 @@ def flush_prefill_batches_impl(
                     "rebuild_num_kv_heads": int(prof.rebuild_num_kv_heads),
                     "rebuild_batch_slots": int(prof.rebuild_batch_slots),
                     "capture_kv_len_total": int(prof.capture_kv_len_total),
-                    "rebuild_physical_block_sort": int(prof.rebuild_physical_block_sort_flag),
                     "writer_pointer_rebuild_count": int(prof.writer_pointer_rebuild_count),
                     "writer_pointer_lookup_count": int(prof.writer_pointer_lookup_count),
                     "writer_cached_pointer_hit_rate": float(prof.writer_cached_pointer_hit_rate),
@@ -4210,6 +4209,22 @@ def flush_prefill_batches_impl(
                             0.0,
                         )
                     )
+                # [LITE-P0 J3 仪器 2026-07-11] SIG_RETURN 臂命中/降级计数快照
+                # ——J1 红案取证发现 DecodeRuntimeCounters 全族均无遥测通道
+                # ("计数恒 0"实为无此键假象)。record 为 dict,此处直塞与既有
+                # 动态键同型;-1=runtime state 缺席哨兵。
+                _lite_counters = getattr(
+                    getattr(self, "_decode_runtime_state", None), "counters", None
+                )
+                record["lite_sig_return_step_count"] = int(
+                    getattr(_lite_counters, "sig_return_step_count", -1)
+                )
+                record["lite_fallback_count"] = int(
+                    getattr(_lite_counters, "lite_fallback_count", -1)
+                )
+                record["lite_last_fallback_reason"] = str(
+                    getattr(self, "_lite_sig_return_last_fallback_reason", "")
+                )
                 try:
                     payload = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
                 except Exception:

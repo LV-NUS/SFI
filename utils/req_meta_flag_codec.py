@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import torch
-
 REQ_META_FLAG_BASE_MASK = 0xFF
 REQ_META_SINK_SHIFT = 8
 REQ_META_SINK_MAX = (1 << 23) - 1

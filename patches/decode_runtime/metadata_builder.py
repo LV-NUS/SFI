@@ -1120,22 +1120,6 @@ def _decode_runtime_mode_for_controller(controller: object) -> DecodeRuntimeMode
     return DecodeRuntimeMode.FULL_RECOMPILE
 
 
-def _refresh_reuse_decode_data_eligible(controller: object) -> bool:
-    # VLLM_SPARSE_REFRESH_REUSE_DECODE_DATA gate (#2 cut #1). A logf-only refresh
-    # step (FULL_RECOMPILE via logf flip): static guard / batch / q-layout / recent
-    # window are byte-identical to the prior step by classify ordering; only the
-    # compact selection + logf_mask_generation changed. compact_kv_len_max
-    # (=sink_cap+persist_cap, config constant) is invariant and all kernel compact
-    # fields are re-derived from the live state_ref downstream, so reusing
-    # StepDecodeData here is byte-identical. lifecycle-OFF only.
-    state = getattr(controller, "_decode_runtime_state", None)
-    if state is None:
-        return False
-    if _decode_runtime_mode_for_controller(controller) is not DecodeRuntimeMode.FULL_RECOMPILE:
-        return False
-    return str(getattr(state, "last_reason", "")) == "logf_generation_changed"
-
-
 def _can_skip_layer_state_refresh_for_step(
     controller: object,
     *,
@@ -1240,6 +1224,11 @@ def _reset_decode_runtime_full_recompile(controller: object, reason: str) -> Non
         state.last_mode = DecodeRuntimeMode.FULL_RECOMPILE
         state.last_reason = str(reason)
         state.last_applied_step_id = None
+    # [LITE-P0 fail-close #2 2026-07-11] runtime 强制全量 = 批组成/形态可能
+    # 已变(抢占/驱逐/容量),触发前稳态快照随之作废——不清则成陈旧别名源
+    # (审计档 §D-2:同 bs 同 q_lens 的批重组下快照会通过签名比对误 admit)。
+    if getattr(controller, "_lite_pre_trigger_steady_delta", None) is not None:
+        controller._lite_pre_trigger_steady_delta = None
 
 
 def _seed_decode_runtime_state_after_full_recompile(
@@ -3640,6 +3629,8 @@ def _try_apply_same_page_minimal_metadata_update(
             recent_page_count_by_row=predicted_delta.recent_page_count_by_row,
             update_gpu=bool(visible_uses_launch_effective),
             force_gpu_refresh=bool(visible_uses_launch_effective),
+            # [ARM-WAR-R1-PINNED-INDEPENDENT 2026-07-12] fresh 镜像双引用替换。
+            controller=controller,
         )
         if bool(update.requires_recompile):
             controller._decode_runtime_same_page_minimal_miss_reason = (
@@ -3799,6 +3790,21 @@ def _try_run_steady_decode_metadata_fast_path_inner(
     if prefill_rows:
         return _miss("prefill_rows_present")
     if any(bool(v) for v in layer_effective_refresh_by_row[:batch_size]):
+        # [LITE-P0 快照 2026-07-11] 触发步在此早退,不进 classify——runtime
+        # state 的 last_delta 此刻仍是"触发前最后一个稳态 delta"(下一站慢路径
+        # :6242 update_classification 会用触发步 delta 覆盖它)。这是全程唯一
+        # 天然截存窗口:返程步的 SIG_RETURN admit 以此快照为签名基准(q/logf
+        # 逐位翻回比对)。纯引用赋值零成本零行为;快照随每个触发步刷新,批组成
+        # 变化(抢占/驱逐)时 last_delta 的 batch_size 自带甄别。
+        _lite_state = getattr(controller, "_decode_runtime_state", None)
+        if isinstance(_lite_state, DecodeRuntimeState):
+            _lite_last = _lite_state.last_delta
+            if _lite_last is not None and _lite_state.last_mode in (
+                DecodeRuntimeMode.STEADY_DELTA,
+                DecodeRuntimeMode.PAGE_BOUNDARY_DELTA,
+                DecodeRuntimeMode.SIG_RETURN_DELTA,
+            ):
+                controller._lite_pre_trigger_steady_delta = _lite_last
         return _miss("layer_effective_refresh_present")
     if any(int(v) != 0 for v in step_authority.logf_mask_by_row[:batch_size]):
         return _miss("logf_mask_present")
@@ -4011,6 +4017,8 @@ def _try_run_steady_decode_metadata_fast_path_inner(
             recent_page_count_by_row=delta.recent_page_count_by_row,
             update_gpu=True,
             force_gpu_refresh=bool(visible_uses_launch_effective),
+            # [ARM-WAR-R1-PINNED-INDEPENDENT 2026-07-12] fresh 镜像双引用替换。
+            controller=controller,
         )
         if bool(update.requires_recompile):
             _reset_decode_runtime_full_recompile(
@@ -4045,6 +4053,8 @@ def _try_run_steady_decode_metadata_fast_path_inner(
             recent_first_page_by_row=delta.recent_first_page_by_row,
             recent_page_count_by_row=delta.recent_page_count_by_row,
             update_gpu=False,
+            # [ARM-WAR-R1-PINNED-INDEPENDENT 2026-07-12] fresh 镜像双引用替换。
+            controller=controller,
         )
     controller._decode_runtime_template_update_reason = update.reason
     same_page_update_kernel_count = int(
@@ -4247,6 +4257,26 @@ def _try_run_ultra_steady_decode_metadata_fast_path(
         or len(layer_effective_refresh_by_row) < batch_size
     ):
         return _wrapper_miss("ultra_gate:layer_effective_refresh_coverage")
+    # [LITE-P0 刀F 显式化 2026-07-11] 懒兑现的隐式依赖显式化——**只计数不
+    # miss**:翻代 commit 推进 canonical layer 的 compact_meta_epoch,ultra 命
+    # 中臂完全不看 live offset,过期 plan 被继续用=读旧半区(内容完好)的懒兑现
+    # 语义=黄金锚锚定行为。强制 miss 会在"commit 落在稳态区间"的形态(U2 未验)
+    # 下提前 pickup=改变读半区时机=数值面变(翻锚风险),故 P0 仅把该隐式依赖
+    # 变成可观测计数:drift 窗口内的 ultra 命中步数落 `_lite_epoch_drift_hit_
+    # count`(遥测,与懒兑现窗宽对账;若实测恒 0=commit 恰在簇内,P1 升级增量
+    # pickup 臂时强制语义才安全)。零行为改变。
+    _lite_template = getattr(controller, "_compact_recent_launch_template", None)
+    if _lite_template is not None:
+        _lite_keys = getattr(controller, "layer_cache_keys", None)
+        _lite_states = getattr(controller, "layer_states", None)
+        if _lite_keys and isinstance(_lite_states, dict):
+            _lite_canonical = _lite_states.get(_lite_keys[0])
+            if _lite_canonical is not None and int(
+                getattr(_lite_canonical, "compact_meta_epoch", -1)
+            ) != int(getattr(_lite_template, "compact_meta_epoch", -1)):
+                controller._lite_epoch_drift_hit_count = (
+                    int(getattr(controller, "_lite_epoch_drift_hit_count", 0)) + 1
+                )
     return _try_run_steady_decode_metadata_fast_path(
         controller,
         attn_metadata=attn_metadata,
@@ -4474,11 +4504,45 @@ def _resolved_row_ptr_lease_snapshot(
     reserved_manager_block_ids = tuple(int(v) for v in reserved_ids)
     reserved_manager_block_ids_arg: object = reserved_manager_block_ids
     if reserved_manager_block_ids:
-        reserved_tensor = torch.tensor(
-            reserved_manager_block_ids,
-            dtype=torch.int32,
-            device=device,
-        )
+        if device.type == "cuda":
+            # [S1-KC-PIN-STAGING 2026-07-12] 原 torch.tensor(tuple, device=
+            # cuda)=pageable H2D memcpy_and_sync(等当前流排空)。冷路径(lease
+            # 换代才走,S1 探针 2 次/跑)但同栈同害,一并收口。独立 pinned 小
+            # 分配+non_blocking H2D;结果 tensor 常驻 cache 跨步复用,首个消费
+            # 与本 copy 同流=流序保证;WAR 护栏=CachingHostAllocator 事件跟踪。
+            _reserved_len = len(reserved_manager_block_ids)
+            try:
+                _reserved_stage_cpu = torch.empty(
+                    (_reserved_len,),
+                    dtype=torch.int32,
+                    device="cpu",
+                    pin_memory=True,
+                )
+            except RuntimeError:
+                _reserved_stage_cpu = torch.empty(
+                    (_reserved_len,),
+                    dtype=torch.int32,
+                    device="cpu",
+                )
+            _reserved_stage_cpu.copy_(
+                torch.as_tensor(
+                    reserved_manager_block_ids,
+                    dtype=torch.int32,
+                    device="cpu",
+                )
+            )
+            reserved_tensor = torch.empty(
+                (_reserved_len,),
+                dtype=torch.int32,
+                device=device,
+            )
+            reserved_tensor.copy_(_reserved_stage_cpu, non_blocking=True)
+        else:
+            reserved_tensor = torch.tensor(
+                reserved_manager_block_ids,
+                dtype=torch.int32,
+                device=device,
+            )
         reserved_manager_block_ids_arg = reserved_tensor
 
     setattr(
@@ -5757,6 +5821,14 @@ def maybe_build_step_decode_data_from_metadata_impl(
     decode_runtime_adapter_invocation_count = 0
     decode_runtime_steady_delta_d2h_sync_count = 0
     decode_runtime_implicit_sync_count = 0
+    # [ALLOC-COUNT-TRUTH 2026-07-11] 考古 2-10:此计数此前全仓从未自增=假遥测
+    # (Gate C same_page 行"零分配"守门被恒 0 空转成假绿)。现接真值:计数本函数
+    # 体内 torch 构造器语句(empty/zeros/ones/full/tensor/as_tensor/arange)的
+    # 执行次数,含懒建持久缓冲与每步临时;视图/就地/算子临时(.ne/.to/.gt/
+    # index_select)不逐个计数,但每个会分配的支路至少含一个计数点=branch 粒度
+    # 完备。steady/ultra 快路径上报(:4158 附近)保持字面 0=结构性真值:快路径
+    # 体内与其唯一 helper(apply_launch_template_row_delta,纯 setitem+copy_)
+    # 均无构造器语句,已亲证。
     decode_runtime_per_step_allocation_count = 0
     if step_meta is None or step_authority is None:
         self._compact_recent_launch_template = None
@@ -6285,6 +6357,9 @@ def maybe_build_step_decode_data_from_metadata_impl(
                                 update_gpu=_should_update_launch_template_gpu_for_decode_delta(
                                     _decode_runtime_mode
                                 ),
+                                # [ARM-WAR-R1-PINNED-INDEPENDENT 2026-07-12]
+                                # fresh 镜像双引用替换。
+                                controller=self,
                             )
                             self._decode_runtime_template_update_reason = (
                                 _template_update.reason
@@ -6487,6 +6562,7 @@ def maybe_build_step_decode_data_from_metadata_impl(
                 *,
                 init_fill: Optional[int] = None,
             ) -> torch.Tensor:
+                nonlocal decode_runtime_per_step_allocation_count
                 buf = getattr(self, name, None)
                 if (
                     buf is None
@@ -6496,6 +6572,7 @@ def maybe_build_step_decode_data_from_metadata_impl(
                     or buf.numel() < max_batch
                 ):
                     buf = torch.empty((max_batch,), device="cpu", dtype=dtype, pin_memory=True)
+                    decode_runtime_per_step_allocation_count += 1
                     if init_fill is not None:
                         buf.fill_(int(init_fill))
                     setattr(self, name, buf)
@@ -6515,6 +6592,8 @@ def maybe_build_step_decode_data_from_metadata_impl(
                 torch.as_tensor(mask_by_row, dtype=torch.int32).ne(0).to(dtype=torch.int32)
             )
             last_n_cpu_stage.copy_(cap_cpu_stage.gt(0).to(dtype=torch.long))
+            # [ALLOC-COUNT-TRUTH] 三个 as_tensor 每步临时(上方 cap/q_lens/mask)。
+            decode_runtime_per_step_allocation_count += 3
             cap_storage_rebuilt = False
             if (
                 self._decode_logits_cap_i64 is None
@@ -6522,6 +6601,7 @@ def maybe_build_step_decode_data_from_metadata_impl(
                 or self._decode_logits_cap_i64.numel() < max_batch
             ):
                 self._decode_logits_cap_i64 = torch.empty((max_batch,), device=cap_device, dtype=torch.long)
+                decode_runtime_per_step_allocation_count += 1
                 cap_storage_rebuilt = True
             last_n_storage_rebuilt = False
             if (
@@ -6530,6 +6610,7 @@ def maybe_build_step_decode_data_from_metadata_impl(
                 or self._decode_logits_last_n_i64.numel() < max_batch
             ):
                 self._decode_logits_last_n_i64 = torch.empty((max_batch,), device=cap_device, dtype=torch.long)
+                decode_runtime_per_step_allocation_count += 1
                 last_n_storage_rebuilt = True
             device = cap_device
             mask_storage_rebuilt = False
@@ -6539,6 +6620,7 @@ def maybe_build_step_decode_data_from_metadata_impl(
                 or self._decode_log_f_mask_i32.numel() < max_batch
             ):
                 self._decode_log_f_mask_i32 = torch.empty((max_batch,), device=device, dtype=torch.int32)
+                decode_runtime_per_step_allocation_count += 1
                 mask_storage_rebuilt = True
             q_lens_storage_rebuilt = False
             if (
@@ -6547,6 +6629,7 @@ def maybe_build_step_decode_data_from_metadata_impl(
                 or self._decode_q_lens_i32.numel() < max_batch
             ):
                 self._decode_q_lens_i32 = torch.empty((max_batch,), device=device, dtype=torch.int32)
+                decode_runtime_per_step_allocation_count += 1
                 q_lens_storage_rebuilt = True
 
             if (
@@ -6564,6 +6647,8 @@ def maybe_build_step_decode_data_from_metadata_impl(
                     dirty_rows = torch.as_tensor(dirty_rows_tuple, dtype=torch.long, device="cpu")
                 else:
                     dirty_rows = torch.empty((0,), dtype=torch.long, device="cpu")
+            # [ALLOC-COUNT-TRUTH] dirty_rows 每步临时(上方三臂各恰一次构造)。
+            decode_runtime_per_step_allocation_count += 1
 
             if dirty_rows.numel() > 0:
                 cap_rows = dirty_rows.to(device=cap_device, dtype=torch.long, non_blocking=True)
@@ -6910,20 +6995,14 @@ def maybe_build_step_decode_data_from_metadata_impl(
                 _device_identity(device),
             )
         _mark_xlayer_detail("arena_key")
+        # [转正清理 2026-07-11] VLLM_SPARSE_REFRESH_REUSE_DECODE_DATA 残旋钮
+        # 下线(默认 OFF 从未转正,无旋钮纪律):logf-only reuse 臂整删,判据
+        # 恒为 cache_key+spec_key 双同的 verbatim 形态。
         reuse_decode_data = (
             self.step_decode_data is not None
             and self.step_decode_data.cache_key == step_decode_cache_key
             and self._step_decode_spec_key == spec_key
         )
-        if (
-            not reuse_decode_data
-            and os.environ.get("VLLM_SPARSE_REFRESH_REUSE_DECODE_DATA") == "1"
-            and self.step_decode_data is not None
-            and self._step_decode_spec_key == spec_key
-            and _refresh_reuse_decode_data_eligible(self)
-        ):
-            reuse_decode_data = True
-            self._refresh_reuse_dd_hits = int(getattr(self, "_refresh_reuse_dd_hits", 0)) + 1
         reuse_decision = None
         full_decode_reuse_hit = bool(reuse_decode_data)
         _mark_xlayer_detail("reuse_decision")
@@ -7076,6 +7155,7 @@ def maybe_build_step_decode_data_from_metadata_impl(
                 shape: Tuple[int, ...],
                 dtype: torch.dtype,
             ) -> torch.Tensor:
+                nonlocal decode_runtime_per_step_allocation_count
                 buf = getattr(self, name, None)
                 if (
                     buf is None
@@ -7085,6 +7165,7 @@ def maybe_build_step_decode_data_from_metadata_impl(
                     or any(buf.shape[i] < shape[i] for i in range(len(shape)))
                 ):
                     buf = torch.zeros(shape, device=device, dtype=dtype)
+                    decode_runtime_per_step_allocation_count += 1
                     setattr(self, name, buf)
                 return buf
 
@@ -7139,22 +7220,28 @@ def maybe_build_step_decode_data_from_metadata_impl(
                     or self._decode_row_is_compact_i32.numel() < max_batch_size
                 ):
                     self._decode_row_is_compact_i32 = torch.zeros((max_batch_size,), device=device, dtype=torch.int32)
+                    decode_runtime_per_step_allocation_count += 1
                 _mark_xlayer_detail("row_compact_buffer")
                 # 从 row_mode_by_row 就地派生 compact 标记（_ROW_MODE_COMPACT == 1）。
                 # 这里在首个 compact row 进入 graph bridge 时处于热路径，必须用
                 # pinned staging，否则小 tensor H2D 也可能把 first emit 卡成同步尾巴。
-                _compact_staging = self._decode_compact_staging_cpu
-                if _compact_staging is None or _compact_staging.numel() < max_batch_size:
-                    try:
-                        _compact_staging = torch.empty(
-                            (max_batch_size,),
-                            device="cpu",
-                            dtype=torch.int32,
-                            pin_memory=True,
-                        )
-                    except RuntimeError:
-                        _compact_staging = torch.empty((max_batch_size,), device="cpu", dtype=torch.int32)
-                    self._decode_compact_staging_cpu = _compact_staging
+                # [ARM-WAR-R1-PINNED-INDEPENDENT 2026-07-12] E4 根修:staging 由
+                # 常驻单例(_decode_compact_staging_cpu,已退休)改为每次 fill 独立
+                # fresh pinned 分配——单例的「本步 host 复写 ←→ 前一整建步同缓冲
+                # H2D 未决」前向 WAR 窗物理消灭(CachingHostAllocator 事件护栏,
+                # 机理同 compact_recent_launch_plan_builder 同名标记)。need_fill
+                # 仅整建步真,分配频率=整建步频,尺寸桶稳态命中 µs 级。
+                try:
+                    _compact_staging = torch.empty(
+                        (max_batch_size,),
+                        device="cpu",
+                        dtype=torch.int32,
+                        pin_memory=True,
+                    )
+                except RuntimeError:
+                    _compact_staging = torch.empty((max_batch_size,), device="cpu", dtype=torch.int32)
+                # [ALLOC-COUNT-TRUTH][合入注记 07-12] fresh pinned 每 fill +1(整建步频,原单例仅首分配计数)。
+                decode_runtime_per_step_allocation_count += 1
                 for _ci in range(batch_size):
                     _compact_staging[_ci] = 1 if row_mode_by_row[_ci] == int(_ROW_MODE_COMPACT) else 0
                 self._decode_row_is_compact_i32[:batch_size].copy_(
@@ -7268,6 +7355,7 @@ def maybe_build_step_decode_data_from_metadata_impl(
         ):
             cap = _align_up_int(max_batch_size, 256)
             self._decode_dummy_capture_row_by_batch_row_i32 = torch.zeros((cap,), device=device, dtype=torch.int32)
+            decode_runtime_per_step_allocation_count += 1
             self._decode_dummy_capture_row_device = device
             self._decode_dummy_capture_row_cap = cap
         decode_capture_row_buf0_i32 = self._decode_dummy_capture_row_by_batch_row_i32[:batch_size]
@@ -7287,12 +7375,23 @@ def maybe_build_step_decode_data_from_metadata_impl(
                 or self._decode_slot_in_chunk_by_layer_i32.device != device
                 or self._decode_layer_map_num_layers != num_layers
             ):
-                self._decode_buf_id_by_layer_i32 = torch.empty((num_layers,), device=device, dtype=torch.int32)
-                self._decode_slot_in_chunk_by_layer_i32 = torch.empty((num_layers,), device=device, dtype=torch.int32)
-                buf_ids_cpu = [(idx // _CAPTURE_CHUNK) % _CAPTURE_IN_FLIGHT for idx in range(num_layers)]
-                slot_in_chunk_cpu = [idx % _CAPTURE_CHUNK for idx in range(num_layers)]
-                self._decode_buf_id_by_layer_i32.copy_(torch.as_tensor(buf_ids_cpu, dtype=torch.int32))
-                self._decode_slot_in_chunk_by_layer_i32.copy_(torch.as_tensor(slot_in_chunk_cpu, dtype=torch.int32))
+                # [S1-KC-PIN-STAGING 2026-07-12] 原 copy_(as_tensor(CPU list))
+                # =pageable H2D memcpy_and_sync(等当前流排空;冷路径,S1 探针
+                # 各 2 次/跑)。两映射均为 arange 的纯整式,直接 device 上生成
+                # =拷贝整体消灭(下方 _logf_pair arange 先例同型);值与原 CPU
+                # list comprehension 逐位相同(非负整数 floor_divide/mod)。
+                _layer_idx_i32 = torch.arange(
+                    num_layers, device=device, dtype=torch.int32
+                )
+                self._decode_buf_id_by_layer_i32 = (
+                    (_layer_idx_i32 // _CAPTURE_CHUNK) % _CAPTURE_IN_FLIGHT
+                ).contiguous()
+                self._decode_slot_in_chunk_by_layer_i32 = (
+                    _layer_idx_i32 % _CAPTURE_CHUNK
+                ).contiguous()
+                # [ALLOC-COUNT-TRUTH][合入注记 07-12] K-c arange 路径分配账:
+                # 1 arange 临时+2 contiguous 持久(原口径 4=2 empty+2 staging)。
+                decode_runtime_per_step_allocation_count += 3
                 self._decode_layer_map_num_layers = num_layers
 
             # layer_logf_enable：layer-group gating 下只有 active 组的层允许 log_f override。
@@ -7319,6 +7418,8 @@ def maybe_build_step_decode_data_from_metadata_impl(
                     _li = torch.arange(num_layers, device=device, dtype=torch.int32)
                     _even = ((_li & 1) == 0).to(torch.int32).contiguous()
                     _logf_pair = (_even, (1 - _even).contiguous())
+                    # [ALLOC-COUNT-TRUTH] arange 构造(后续 ==/.to/.contiguous 为算子临时)。
+                    decode_runtime_per_step_allocation_count += 1
                     self._decode_layer_logf_enable_pair = _logf_pair
                 self._decode_layer_logf_enable_i32 = _logf_pair[int(active_group) & 1]
             else:
@@ -8536,12 +8637,16 @@ def maybe_build_step_prefill_global_meta_from_metadata_impl(
         or self._decode_slot_in_chunk_by_layer_i32.device != device
         or self._decode_layer_map_num_layers != num_layers
     ):
-        self._decode_buf_id_by_layer_i32 = torch.empty((num_layers,), device=device, dtype=torch.int32)
-        self._decode_slot_in_chunk_by_layer_i32 = torch.empty((num_layers,), device=device, dtype=torch.int32)
-        buf_ids_cpu = [(idx // _CAPTURE_CHUNK) % _CAPTURE_IN_FLIGHT for idx in range(num_layers)]
-        slot_in_chunk_cpu = [idx % _CAPTURE_CHUNK for idx in range(num_layers)]
-        self._decode_buf_id_by_layer_i32.copy_(torch.as_tensor(buf_ids_cpu, dtype=torch.int32))
-        self._decode_slot_in_chunk_by_layer_i32.copy_(torch.as_tensor(slot_in_chunk_cpu, dtype=torch.int32))
+        # [S1-KC-PIN-STAGING 2026-07-12] decode 侧同名映射的孪生件(共享同一对
+        # 属性);同型同修:device arange 直接生成=拷贝整体消灭,值逐位同原
+        # CPU list comprehension。机理注释见 decode 侧(need_decode_out_ptr 块)。
+        _layer_idx_i32 = torch.arange(num_layers, device=device, dtype=torch.int32)
+        self._decode_buf_id_by_layer_i32 = (
+            (_layer_idx_i32 // _CAPTURE_CHUNK) % _CAPTURE_IN_FLIGHT
+        ).contiguous()
+        self._decode_slot_in_chunk_by_layer_i32 = (
+            _layer_idx_i32 % _CAPTURE_CHUNK
+        ).contiguous()
         self._decode_layer_map_num_layers = num_layers
     _mark_detail_phase("buffer_prepare")
 

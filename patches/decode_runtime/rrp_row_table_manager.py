@@ -1076,6 +1076,39 @@ class RrpRowTableManager:
                     non_blocking=True,
                 )
                 return
+            if batch_target.device.type == "cuda":
+                # [S1-KC-PIN-STAGING 2026-07-12] 原 torch.tensor(tuple,
+                # device=cuda)=每次一个 pageable H2D memcpy_and_sync(cudaMemcpy
+                # Async+cudaStreamSynchronize),等当前流全排空=host 领先被排干
+                # (S1 探针定谳:372 次/轮,单个 5-14ms 级,mb.misc 洞前沿主料)。
+                # 改 SEQUSED-STAGING-INDEPENDENT 同款(本函数下方 seqused_k_i32
+                # 分支先例):每次独立 pinned 小分配(bs×4B,CachingHostAllocator
+                # 缓存命中 µs 级)+non_blocking H2D。WAR 护栏=allocator 事件跟踪
+                # (pinned 块 free 后须等 copy_ 记录的 stream 事件完成才复用,
+                # 07-02 pinned staging 铁律满足;零共享单例=零 WAR 窗)。
+                # batch_target[:bs] 连续,pinned→GPU 单 memcpy;值逐位同源。
+                try:
+                    staging_cpu = torch.empty(
+                        (batch_size,),
+                        dtype=torch.int32,
+                        device="cpu",
+                        pin_memory=True,
+                    )
+                except RuntimeError:
+                    staging_cpu = torch.empty(
+                        (batch_size,),
+                        dtype=torch.int32,
+                        device="cpu",
+                    )
+                staging_cpu.copy_(
+                    torch.as_tensor(
+                        row_values,
+                        dtype=torch.int32,
+                        device="cpu",
+                    )
+                )
+                batch_target[:batch_size].copy_(staging_cpu, non_blocking=True)
+                return
             values = torch.tensor(
                 row_values,
                 dtype=torch.int32,

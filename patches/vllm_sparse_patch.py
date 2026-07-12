@@ -146,7 +146,6 @@ from patches.sparse_constants import (
     _FORCE_COMPACT_OFF_CACHED,
     _FORCE_DENSE_CACHED,
     _FREE_SLOT_ID,
-    _REBUILD_PHYSICAL_BLOCK_SORT_CACHED,
     _REFRESH_MICRO_PROFILE_CACHED,
     _RELEASE_ON_IDLE_CACHED,
     _is_free_slot_id,
@@ -1484,6 +1483,21 @@ class VLLMSparseController(
         self._capture_ring_retired_events.clear()
         self._lease_stats["pending"] = 0
 
+        # [TOPK-GRAPH-IDLE-RESET 2026-07-11] idle 清环使 capture arena ptr
+        # 换代——selector topk graphs map 的旧键必死(key 编码 arena/槽容器
+        # data_ptr)。跨轮残留会顶满 population16 触发 clear-all 清库循环
+        # (旧 12 键+新 12 键>16;单轮判速 warmup 轮走 inline 臂 0 捕故未曾
+        # 显形,多轮 repeat/serve 空闲重入形态会)。整组重置=下轮从空 map
+        # 重捕;bypass latch 保留(闩死语义跨 idle 不失效)。防御 sync 同 G4:
+        # idle 时无在飞 replay,排干后再丢 graphs+mempool 引用。
+        _tkg_state = getattr(self, "_selector_topk_graph_state", None)
+        if isinstance(_tkg_state, dict) and not bool(_tkg_state.get("bypass")):
+            try:
+                torch.cuda.current_stream().synchronize()
+            except Exception:
+                pass
+            self._selector_topk_graph_state = None
+
         # 释放 controller 级缓冲
         self._selector_key_norms_all = None
         self._selector_key_norms_shape = None
@@ -1936,7 +1950,6 @@ class VLLMSparseController(
             flush_micro_profile_summary_fn=_flush_micro_profile_summary,
             refresh_profile_pending_cls=_RefreshProfilePending,
             make_selector_fast_signature_fn=_make_selector_fast_signature,
-            rebuild_physical_block_sort_cached=bool(_REBUILD_PHYSICAL_BLOCK_SORT_CACHED),
         )
 
     def allocate_step_handle(
@@ -2215,6 +2228,33 @@ class VLLMSparseController(
             _invalidate_page_sparse_step_cache_truth(state)
             state._slot_row_map_key = None
         tracking.bootstrap_done = False
+        # [A2-RESUME-TICKET-RESET 2026-07-11] resume=从头重算:抢占前的触发
+        # 弹药(pending 票/sentence intent/lease 意图/post_bridge 追赶 due)
+        # 描述的是被逐出的旧 decode 形态,对重算窗一律作废。重算窗内
+        # bootstrap_pending 尚未置位(prefill 重 finalize 才置,flush_worker
+        # 唯二站点),[BOOTSTRAP-MATERIALIZE-GATE]/[INTERVAL-BOOTSTRAP-GATE]
+        # 四层门全部只看 bootstrap_pending=全不设防——残留弹药会把 refresh
+        # 世代物化进"压缩态刚清零+prefill 半途"的行:轻则纵深断言
+        # (_mark_bootstrap_request_ready)/FORCE_NOW 不变量 fail-fast 崩引擎,
+        # 重则消费重算半途 capture(错值窗)。源头根修=清弹药本体而非给门打
+        # 补丁;全部弹药均为可再生派生态(crossing 由 was_short×is_short 重
+        # 检测/句边界由 token 重喂/interval 由时钟重锚/lease 由重 bootstrap
+        # 重建),清除无饿死面。
+        self._clear_request_pending_refresh(
+            request_id=request_id, ready_compact=False
+        )
+        self._clear_request_trigger_intent(request_id=request_id)
+        self._clear_request_lease_rearm(request_id=request_id)
+        tracking.post_bridge_refresh_due_decode_step = -1
+        # interval 时钟重锚:decode_step 单调不回滚(重算窗内冻结在抢占前值),
+        # last_decode_refresh_step 若保留陈旧值,冻结的 delta>=interval 即
+        # "陈旧到点"。置 -1 后:plan 侧 last<0 局部兜底(视为本步已刷)保证
+        # 重锚前不误触发;下一分类步由 step_context_worker 首-decode 锚
+        # (decode_step>=0 ∧ last<0 ⇒ last=decode_step)以当前 token 计数重锚,
+        # 节拍自 resume 点重新起算——与新请求 bootstrap 后的 interval 语义
+        # 一致。scheduled_*/inflight_* 镜像有意**不清**:它们是抢占时刻已在
+        # 飞世代的读侧闸与纵深断言绊线,清除=致盲(该子案取证后另行定谳)。
+        tracking.last_decode_refresh_step = -1
         # [CHUNKED-CAPTURE-ACCUMULATE 2026-07-06] resume=从头重算=捕获窗重新
         # 分片；同长 prompt 不触发 record_prompt_tokens 的 != 归零，跨片累计
         # 必须在此清零，否则 finalize 对账把旧片计入 fail-fast 误伤。
@@ -3677,12 +3717,27 @@ class VLLMSparseController(
         def _refresh_gap_blocked(
             tracking_local: RequestTracking,
             decode_step_local: int,
+            ticket_local: RequestIntentTicket | None = None,
         ) -> bool:
             # [TP-DET-TRIGGER 2026-07-07] 决定论触发挡板:自上次提交(enqueue
             # commit 点推进 last_decode_refresh_step,票面计划步)起
             # min_refresh_gap 步内不触发/不拉入——替代原 inflight(scheduled/
             # GPU-writer 完成时序)挡板。输入全部 TP-rank 一致(step/提交历史),
             # 与用户设计合同同构(任意两次 refresh ≥ min_refresh_gap,跨 reason)。
+            # [BUG-A1 根修 2026-07-11] threshold-crossing 的 FORCE_NOW 票豁免
+            # gap:短态请求的 last_decode_refresh_step 是首 decode 步合成锚
+            # (:727-728)而非真实 refresh,prompt_len∈(threshold-gap, threshold]
+            # 的 crossing 落在合成锚 gap 窗内会被此挡板拦到不物化,而 FORCE_NOW
+            # 不变量(:4766-4780)对"有 FORCE_NOW 票却不在 refresh_reqs"直接
+            # raise=引擎崩(bench 固定长 prompt 打不到,serve 任意长度可命中;
+            # 全局 work ledger 有在飞时 inflight 误真跳过 raise=间歇性)。
+            # crossing 是状态迁移非节拍事件,"任意两次 refresh ≥ gap"合同不被
+            # 违反(其 last 锚不是 refresh);提交后 last 重锚到 crossing 步,
+            # 后续节拍一致。判据仍全 host 决定论(票字段)。
+            if ticket_local is not None and _is_threshold_crossing_force_pending(
+                ticket_local
+            ):
+                return False
             trigger_local = getattr(tracking_local, "trigger", None)
             if trigger_local is not None:
                 gap_local = max(
@@ -3890,7 +3945,16 @@ class VLLMSparseController(
             # bootstrap 首刷(从未有过 compact 内容)没有旧代,必须保留 dense。
             if compact_gen_count() <= 1:
                 return False
-            return bool(tracking_local.bootstrap_done)
+            # [代理硬化 2026-07-11 审计档随手批] bootstrap_done 单独作"有可读
+            # 旧代"的代理是错的:短态 bootstrap 行(prompt<=threshold 直接 done,
+            # 从未有 compact 内容,step_context_worker.py:733-743)done=True 却
+            # 无旧代可读。今天被行路由 compact-ready 门遮蔽无害,按无 fallback
+            # 纪律根修代理本身:_was_short_dense 恒 True 直到 crossing 世代
+            # 提交点(读侧终局,A3 合同钉死)——它为 True 的全窗(短态+crossing
+            # 首刷在飞)恰是"无旧代"的准确范围,提交后翻 False=旧代已可读。
+            return bool(tracking_local.bootstrap_done) and not bool(
+                getattr(tracking_local, "_was_short_dense", False)
+            )
 
         def _pending_rebuild_requires_dense_consume(
             rid_local: str,
@@ -4220,10 +4284,31 @@ class VLLMSparseController(
                     if update_state:
                         self._clear_request_trigger_intent(request_id=rid)
 
+            # [REFRESH-AMNESTY G-2 消费点 2026-07-12] lease_rearm 满足性吸收:
+            # 三载体中唯 lease_rearm 缺"被更晚 refresh 满足"检查(sentence
+            # intent=上方 last>=intent_step 吸收臂;post_bridge due=下方
+            # last>=due 清 due 臂),致 rearm 置位后行已被更晚世代重建时仍会
+            # gap 放行再开 FORCE_NOW 世代=同一需求二次兑现(审查档 §3 G-2/
+            # §5-P2)。判据取严格 <:rearm_step<last ⇔ 置位后 last 又被 commit
+            # 推进过 ⇒ 行必已被该新世代重建,诉求满足 ⇒ 消解不落票;
+            # rearm_step==last 二义(可为 commit 后同 step 作废置位=行未重建),
+            # 不赦保新电平。commit 点大赦(refresh_rebuild_mixin [REFRESH-
+            # AMNESTY])已从源头根绝稳态 stale rearm,本臂覆盖非 commit 路径
+            # 推进 last 的角落(首-decode 锚)并钉死载体满足语义(合同 T14)。
+            # 吸收判定对 update_state 两模式一致跳过落票(决策等价),消解
+            # 写动作仅 update_state 下执行(只读合同)。
+            _lease_rearm_satisfied = (
+                (not workload_plan_replay_active)
+                and tracking.lease_rearm
+                and 0 <= int(tracking.lease_rearm_decode_step) < last_decode_refresh
+            )
+            if _lease_rearm_satisfied:
+                if update_state:
+                    self._clear_request_lease_rearm(request_id=rid)
             # lease 异常恢复意图由 planner 统一落票（单写者）：默认 FORCE_NOW。
             # [TP-DET-TRIGGER] gap 挡板替代 inflight 挡:顺手斩断远端 64k
             # lease_rearm↔interval 拉锯风暴(gap 内不再重复 rearm 提交)。
-            if (not _refresh_gap_blocked(tracking, decode_step)) and tracking.lease_rearm:
+            elif (not _refresh_gap_blocked(tracking, decode_step)) and tracking.lease_rearm:
                 lease_step = tracking.lease_rearm_decode_step
                 if lease_step < 0:
                     lease_step = decode_step
@@ -4298,7 +4383,8 @@ class VLLMSparseController(
             # 清票与 INTERVAL not-ready 保票三态(均读 GPU 完成态,per-rank
             # 异步,TP>1 决策发散根)整段退休。
             if ticket.pending_refresh:
-                if not _refresh_gap_blocked(tracking, decode_step):
+                # [BUG-A1] 传票使 crossing FORCE_NOW 豁免 gap(合成锚陷阱)。
+                if not _refresh_gap_blocked(tracking, decode_step, ticket):
                     req_pending_step = (
                         ticket.pending_decode_step
                         if ticket.pending_decode_step >= 0
@@ -4642,7 +4728,9 @@ class VLLMSparseController(
                 for rid in refresh_set
                 if (
                     not _refresh_gap_blocked(
-                        tracking_by_req[rid], decode_step_by_req.get(rid, -1)
+                        tracking_by_req[rid],
+                        decode_step_by_req.get(rid, -1),
+                        tickets_plan_by_req[rid],
                     )
                 )
                 or (
@@ -4675,7 +4763,9 @@ class VLLMSparseController(
                 and (
                     (
                         not _refresh_gap_blocked(
-                            tracking_by_req[rid], decode_step_by_req.get(rid, -1)
+                            tracking_by_req[rid],
+                            decode_step_by_req.get(rid, -1),
+                            tickets_plan_by_req[rid],
                         )
                     )
                     or (

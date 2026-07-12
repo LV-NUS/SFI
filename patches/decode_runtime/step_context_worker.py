@@ -10,9 +10,10 @@ from patches.step_decode_pipeline import reset_runtime_step_cursor_state
 from patches.step_faults import StepFault
 from patches.request_intent_ticket import PendingPolicy, mark_threshold_crossing
 from patches.prefill_capture_meta_arena import CaptureArenaIntent
-from triton_kernel.req_meta_flag_codec import validate_sink_tokens
+from utils.req_meta_flag_codec import validate_sink_tokens
 from patches.decode_runtime.row_policy import resolve_decode_row_policy
 from patches.refresh_runtime.flush_scheduler import normalize_refresh_slot_list
+from patches.tp_contract import ensure_tp_slot_by_row
 from patches.sparse_utils import (
     _align_up_int,
     _make_decode_plan_version,
@@ -44,8 +45,6 @@ from patches.fa3_native.install import (
 from patches.fa3_native.contracts import TargetSelectedScopeKey
 from patches.fa3_native.snapshot_binding import SelectedScopeKey
 from patches.fa3_native.scope_async import allocate_scope_wait_handle
-
-_PERSISTENT_BATCH_ENABLED = os.environ.get("VLLM_SPARSE_PERSISTENT_BATCH", "0") == "1"
 
 # === VLLM_SPARSE_PSC_BSKIP: steady-step pure-derivation (B) reuse gate ===
 # Skip the 4 pure-derivation B blocks of prepare_step_context_impl on a
@@ -555,16 +554,6 @@ def prepare_step_context_impl(
     max_query_len = max(q_lens) if q_lens else 0
     max_seq_len = max(seq_lens_tuple) if seq_lens_tuple else 0
 
-    # --- Persistent batch: incremental diff tracking (VLLM_SPARSE_PERSISTENT_BATCH=1) ---
-    pb = None
-    if _PERSISTENT_BATCH_ENABLED:
-        pb = getattr(self, '_persistent_batch', None)
-        if pb is None:
-            from patches.persistent_batch import PersistentStepBatch
-            pb = PersistentStepBatch.create(max(128, num_reqs * 2))
-            self._persistent_batch = pb
-        pb.apply_diff(req_ids_tuple, seq_lens_tuple, q_lens)
-
     # async trace：每步输出上一 epoch 的统计（如果启用）。
     # step profile：输出上一 epoch 的统计（如果启用）。
     current_epoch = self.step_context_epoch
@@ -584,10 +573,7 @@ def prepare_step_context_impl(
     self._step_semantic_snapshot = self._build_step_semantic_snapshot()
     # 每步重置 slot debug 采样信息（避免沿用上一步数据）
     # async trace：为新 epoch 重置计数器（如果启用）。
-    req_id_to_index = (
-        pb.export_req_id_to_index() if pb is not None
-        else {rid: idx for idx, rid in enumerate(req_ids_tuple)}
-    )
+    req_id_to_index = {rid: idx for idx, rid in enumerate(req_ids_tuple)}
 
     prompt_len_list: Tuple[int, ...] = (
         tuple(prompt_lengths[:num_reqs])
@@ -867,12 +853,6 @@ def prepare_step_context_impl(
             num_reqs=num_reqs,
         )
         self._step_hash_cache = (req_ids_tuple, has_prefill_row, req_set_hash, row_phase_hash)
-    # Sync derived phase state into persistent batch (enables cross-step caching)
-    if pb is not None:
-        pb.sync_derived_arrays(
-            is_prefill_by_row_list, bootstrap_done_list,
-            has_prefill_row, has_decode_row,
-        )
 
     # 回退判据：当上游不给 prompt/computed 时，基于"近期是否有 prefill enqueue"判断是否可释放。
     if prefill_active is None:
@@ -949,12 +929,13 @@ def prepare_step_context_impl(
             f"step={self.step_context_epoch}"
         )
     slot_map = self.get_step_global_slot_map(req_ids_tuple)
-    if pb is not None:
-        for _i in range(num_reqs):
-            pb.slot_by_row[_i] = int(slot_map.get(req_ids_tuple[_i], -1))
-        slot_by_row = pb.export_slot_by_row()
-    else:
-        slot_by_row = tuple(int(slot_map.get(rid, -1)) for rid in req_ids_tuple)
+    slot_by_row = tuple(int(slot_map.get(rid, -1)) for rid in req_ids_tuple)
+    # [TP-SLOT-CONTRACT 2026-07-11] slot_by_row 跨 rank 逐位一致此前是未校验
+    # 假设(tp_contract 只验 req/prompt/computed)。无 collective 可用(rank0+
+    # broadcast 永久封路),就地钉本 rank 充分条件:覆盖+非负+步内单射;违反=
+    # 槽位账本腐坏(双占/漏配),fail-fast 优于静默跨 rank 发散(错行 GPU plan)。
+    # [合入注记 07-12] 原分支另有 persistent_batch(pb) 路径,该死件已随任务#16 整删,仅存直算路径。
+    ensure_tp_slot_by_row(slot_by_row=slot_by_row, num_reqs=num_reqs)
     # === VLLM_SPARSE_PSC_BSKIP: content-key + steady decision ===
     _psc_full_build = True
     _psc_bskip_use = False
@@ -1048,33 +1029,8 @@ def prepare_step_context_impl(
             needs_logits = logf_producer == _LOGF_PRODUCER_ATTN
             needs_logits_by_row_list.append(needs_logits)
             logits_last_n_by_row_list.append(1 if needs_logits else 0)
-        if pb is not None:
-            for _i in range(num_reqs):
-                pb.row_mode[_i] = row_mode_by_row_list[_i]
-            row_mode_by_row = pb.export_row_mode()
-        else:
-            row_mode_by_row = tuple(row_mode_by_row_list)
+        row_mode_by_row = tuple(row_mode_by_row_list)
         row_mode_signature = row_mode_by_row
-        # [PENDING-FUNNEL-DEBUG 2026-07-09 临时取证探针,破案后拆] authority 终值。
-        _funnel_dbg = os.environ.get("VLLM_SPARSE_PENDING_FUNNEL_DEBUG_LOG", "")
-        if _funnel_dbg:
-            _fd_n = getattr(self, "_funnel_auth_probe_n", 0) + 1
-            self._funnel_auth_probe_n = _fd_n
-            if _fd_n % 16 == 1:
-                try:
-                    with open(_funnel_dbg, "a") as _fd_fh:
-                        _fd_fh.write(
-                            f"auth\trow_mode={tuple(row_mode_by_row_list)}\t"
-                            f"is_prefill={tuple(bool(v) for v in is_prefill_by_row_list)}\t"
-                            f"boot={tuple(bool(v) for v in bootstrap_done_list)}\t"
-                            f"refresh_mask={tuple(bool(v) for v in refresh_row_mask)}\t"
-                            f"force_dense={tuple(bool(v) for v in force_dense_while_inflight_by_row)}\t"
-                            f"short_dense={tuple(bool(getattr(self.request_states.get(_r), '_was_short_dense', False)) for _r in req_ids_tuple)}\t"
-                            f"q_lens={tuple(int(v) for v in q_lens)}\t"
-                            f"epoch={self.step_context_epoch}\n"
-                        )
-                except OSError:
-                    pass
         logf_producer_by_row = tuple(logf_producer_by_row_list)
         needs_logits_by_row = tuple(needs_logits_by_row_list)
         logits_last_n_by_row = tuple(logits_last_n_by_row_list)
@@ -1390,18 +1346,10 @@ def prepare_step_context_impl(
         self.max_batch_size = num_reqs
 
     compact_bootstrap_threshold = self._compact_threshold_tokens()
-    if pb is not None:
-        _sd_list = [
-            compact_bootstrap_threshold > 0 and seq_len > 0 and seq_len <= compact_bootstrap_threshold
-            for seq_len in seq_lens_tuple
-        ]
-        pb.sync_short_dense(_sd_list)
-        short_dense_by_row = pb.export_short_dense()
-    else:
-        short_dense_by_row = tuple(
-            (compact_bootstrap_threshold > 0 and seq_len > 0 and seq_len <= compact_bootstrap_threshold)
-            for seq_len in seq_lens_tuple
-        )
+    short_dense_by_row = tuple(
+        (compact_bootstrap_threshold > 0 and seq_len > 0 and seq_len <= compact_bootstrap_threshold)
+        for seq_len in seq_lens_tuple
+    )
 
     self.step_meta = StepMeta(
         epoch=self.step_context_epoch,
@@ -1415,12 +1363,12 @@ def prepare_step_context_impl(
         sink_tokens=validate_sink_tokens(semantic_snapshot.sink_tokens),
         block_size=block_size,
         compact_bootstrap_threshold=compact_bootstrap_threshold,
-        bootstrap_done_by_row=pb.export_bootstrap_done() if pb is not None else tuple(bootstrap_done_list),
+        bootstrap_done_by_row=tuple(bootstrap_done_list),
         q_lens=q_lens,
-        is_prefill_by_row=pb.export_is_prefill() if pb is not None else tuple(is_prefill_by_row_list),
+        is_prefill_by_row=tuple(is_prefill_by_row_list),
         has_prefill_row=has_prefill_row,
         has_decode_row=has_decode_row,
-        prefill_rows=pb.get_prefill_rows() if pb is not None else tuple(prefill_rows_list),
+        prefill_rows=tuple(prefill_rows_list),
         is_decode_only=is_decode_only,
         has_prefill_by_prompt=bool(has_prefill_by_prompt),
         short_dense_by_row=short_dense_by_row,
@@ -1548,13 +1496,13 @@ def prepare_step_context_impl(
             q_lens_by_row=q_lens,
             context_kv_len_by_row=seq_lens_tuple,
             q_start_loc=q_start_loc,
-            is_prefill_by_row=pb.export_is_prefill() if pb is not None else tuple(is_prefill_by_row_list),
+            is_prefill_by_row=tuple(is_prefill_by_row_list),
             has_prefill_row=has_prefill_row,
             has_decode_row=has_decode_row,
-            prefill_rows=pb.get_prefill_rows() if pb is not None else tuple(prefill_rows_list),
+            prefill_rows=tuple(prefill_rows_list),
             is_decode_only=is_decode_only,
             has_prefill_by_prompt=bool(has_prefill_by_prompt),
-            bootstrap_done_by_row=pb.export_bootstrap_done() if pb is not None else tuple(bootstrap_done_list),
+            bootstrap_done_by_row=tuple(bootstrap_done_list),
             short_dense_by_row=short_dense_by_row,
             slot_by_row=slot_by_row,
             row_mode_by_row=row_mode_by_row,

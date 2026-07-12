@@ -54,6 +54,32 @@ def validate_tp_input_contract(
     return tuple(mapped_indices)
 
 
+def ensure_tp_slot_by_row(
+    *,
+    slot_by_row: Sequence[int],
+    num_reqs: int,
+) -> None:
+    """Pin the local invariants behind the cross-rank slot_by_row assumption.
+
+    TP-DET relies on slot_by_row being BITWISE-identical across ranks, but no
+    in-band collective may verify that (rank0+broadcast is permanently ruled
+    out). This pins the per-rank sufficient conditions instead: row coverage,
+    non-negative slots, and step-level injectivity. Any violation means THIS
+    rank's slot ledger is corrupt (double-assignment / missing assignment --
+    the exact lifecycle-corruption class that surfaces as silent cross-rank
+    divergence and wrong-row GPU plans), so fail fast here.
+    """
+    if len(slot_by_row) < num_reqs:
+        raise _tp_contract_error(
+            f"slot_by_row shorter than batch: slots={len(slot_by_row)} reqs={num_reqs}"
+        )
+    slots = tuple(int(slot_by_row[row]) for row in range(num_reqs))
+    if any(slot < 0 for slot in slots) or len(set(slots)) != num_reqs:
+        raise _tp_contract_error(
+            f"slot_by_row assignment corrupt (negative or duplicate slot): {slots}"
+        )
+
+
 def ensure_tp_prompt_lengths(
     *,
     prompt_lengths: Sequence[int],

@@ -230,7 +230,6 @@ class _RefreshProfilePending:
     rebuild_num_kv_heads: int = 0
     rebuild_batch_slots: int = 0
     capture_kv_len_total: int = 0
-    rebuild_physical_block_sort: int = 0
     writer_pointer_rebuild_count: int = 0
     writer_pointer_lookup_count: int = 0
     writer_cached_pointer_hit_rate: float = -1.0
@@ -305,6 +304,11 @@ class _RefreshProfilePending:
     deadline_deferred_selector_post_cpu_us_max: float = 0.0
     deadline_deferred_selector_wrapper_gap_cpu_us_total: float = 0.0
     deadline_deferred_selector_wrapper_gap_cpu_us_max: float = 0.0
+    # [S7-FORENSIC 2026-07-10] off-loop selector/writer impl 内部 host 分相
+    # dict 载体(键=sel_*/wr_* 段名,值=cpu_us 累计;detail 门关=恒空 dict,零税)。
+    deadline_deferred_producer_detail_us: Dict[str, float] = field(
+        default_factory=dict
+    )
     deadline_async_producer_body_count: int = 0
     deadline_async_producer_body_cpu_us_total: float = 0.0
     deadline_async_producer_body_cpu_us_max: float = 0.0
@@ -514,8 +518,6 @@ class _FlushProfileAccum:
     rebuild_num_kv_heads: int = 0
     rebuild_batch_slots: int = 0
     capture_kv_len_total: int = 0
-    # Gather config
-    rebuild_physical_block_sort_flag: int = 0
     writer_pointer_rebuild_count: int = 0
     writer_pointer_lookup_count: int = 0
     writer_cached_pointer_hit_rate: float = -1.0
@@ -1356,6 +1358,21 @@ def _normalize_prefill_capture_config(config: SparseControllerConfig) -> None:
                 value,
             )
         config.prefill_last_n_query = 0
+    elif value > 16:
+        # [LAST-N-DOMAIN 收窄 2026-07-11] the log_s reduce kernels hard-cap
+        # rows at kLogFPreMaxR=16 (selector_log_s_ext.py kLogFPreMaxR): any
+        # row beyond 16 is SILENTLY dropped from the reduce — configured
+        # last_n > 16 would quietly ignore captured data with no error (same
+        # silent-domain-overflow class as the capture depth-3 case). Fail
+        # fast at config normalization so the bad value never reaches the
+        # kernel; raise (not clamp) per 无 fallback 纪律 — a clamp would
+        # silently change requested semantics.
+        raise ValueError(
+            f"{config.log_prefix} prefill_last_n_query={value} exceeds the "
+            "log_s reduce kernel row cap (kLogFPreMaxR=16); rows beyond 16 "
+            "would be silently dropped. Lower the config or generalize the "
+            "kernel cap first."
+        )
 
 
 # ---------------------------------------------------------------------------

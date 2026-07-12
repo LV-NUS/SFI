@@ -18,6 +18,7 @@ from patches.sparse_constants import (
     _SELECTOR_LOGS_CACHE_R_CACHED,
     _ASYNC_PRODUCER_WRITER_GRAPH_CACHED,  # ASYNC_PRODUCER_WRITER_GRAPH
     _DECODE_BOUNDS_KERNEL_CACHED,
+    _DEFERRED_SELECTOR_PROFILE_DETAIL_CACHED,
     _REBUILD_PTRS_PINNED_CACHED,
     _SELECTOR_SELECTED_INDICES_OUT_CACHED,
     _SELECTOR_PIPELINE_WORKSPACE_CACHED,
@@ -25,8 +26,34 @@ from patches.sparse_constants import (
     _SELECTOR_TOPK_GRAPH_CACHED,  # #13 STAGE-0 captured selector graph (default OFF)
     _WRITER_TOKEN_TILE_CACHED,
 )
-from patches.selector_runtime.selected_out_ring import SelectedOutRing
+from patches.selector_runtime.selected_out_ring import SelectedOutRing, SlotStableOverrides
 from patches.sparse_types import SelectorBatchPayload, continuous_producer_enabled
+import time as _sw_time
+
+
+def _producer_detail_marker(controller):
+    """[S7-FORENSIC 2026-07-10] off-loop selector/writer impl host 分相记账器。
+
+    detail 门(VLLM_SPARSE_DEFERRED_SELECTOR_PROFILE_DETAIL)关=返回 None 零税;
+    开=返回 mark(name) 闭包,dict 载体挂 controller,flush_worker 快照带出
+    refresh_profile.log(deadline_deferred_producer_detail_us)。
+    """
+    if not _DEFERRED_SELECTOR_PROFILE_DETAIL_CACHED:
+        return None
+    detail = getattr(controller, "_deadline_deferred_producer_detail_us", None)
+    if detail is None:
+        detail = {}
+        controller._deadline_deferred_producer_detail_us = detail
+    state = [_sw_time.perf_counter_ns()]
+
+    def _mark(name: str) -> None:
+        now_ns = _sw_time.perf_counter_ns()
+        detail[name] = float(detail.get(name, 0.0) or 0.0) + (
+            now_ns - state[0]
+        ) / 1000.0
+        state[0] = now_ns
+
+    return _mark
 
 # [REBUILD-H2D-STAGING 2026-07-05] rebuild 提交路径的三个小张量原用
 # `torch.tensor(list, device=cuda)` 构造——pageable 源的 H2D 是同步拷贝
@@ -146,6 +173,13 @@ def rebuild_compact_slots_batched_layers_from_selection_impl(
     compact_meta_commit_log: Optional[List[Dict[str, object]]] = None,
 ) -> bool:
     """跨层 fused gather 重建 compact。成功返回 True，失败回退返回 False。"""
+    _pd_mark = _producer_detail_marker(self)
+    if _pd_mark is not None:
+        # [B6 2026-07-11] wr_* 分相键为全调用方累计(bootstrap/prefill/refresh
+        # 同一载体)——per-call 判读除以 writer_count 分母错。加显式调用计数键,
+        # per-call = wr_*/wr_calls 才可信(相对占比不受影响)。
+        _pd_wd = self._deadline_deferred_producer_detail_us
+        _pd_wd["wr_calls"] = float(_pd_wd.get("wr_calls", 0.0) or 0.0) + 1.0
     setattr(self, "_last_writer_kernel_variant", "")
     if defer_compact_meta_publish and compact_meta_commit_log is None:
         raise RuntimeError("deferred compact metadata publish requires commit log")
@@ -693,6 +727,8 @@ def rebuild_compact_slots_batched_layers_from_selection_impl(
         # info[4]=layer_cache_sig：本层签名只算一次，第二遍 per-layer 校验循环复用。
         layer_infos.append((payload, has_rebuild, _row_tensor_layer, reset_slot_commits, layer_cache_sig))
 
+    if _pd_mark is not None:
+        _pd_mark("wr_setup_layers")
     if max_len <= 0:
         return _fail_rebuild_contract("max_len_nonpositive")
     if not any(info[1] for info in layer_infos):  # info[1] = has_rebuild
@@ -899,6 +935,8 @@ def rebuild_compact_slots_batched_layers_from_selection_impl(
         pointer_rebuild_miss |= _miss
     else:
         pointer_rebuild_miss = bool(use_ptr_arrays)
+    if _pd_mark is not None:
+        _pd_mark("wr_ptr_publish")
 
     # CUDA path: the op consumes logical selected_indices + row_tensor +
     # slot_tensor + block_tables and performs block_table lookup internally.
@@ -1116,6 +1154,8 @@ def rebuild_compact_slots_batched_layers_from_selection_impl(
     writer_token_tile_arg = (
         int(writer_token_tile) if int(writer_token_tile) > 0 else int(stride_tokens_ref)
     )
+    if _pd_mark is not None:
+        _pd_mark("wr_stable_copies")
     writer_launch_args = (
         *ptr_gather_args,
         int(writer_token_tile_arg),
@@ -1257,6 +1297,8 @@ def rebuild_compact_slots_batched_layers_from_selection_impl(
         _dispatch_done_evt = torch.cuda.Event()
         self._writer_dispatch_done_evt = _dispatch_done_evt
     _dispatch_done_evt.record(torch.cuda.current_stream())
+    if _pd_mark is not None:
+        _pd_mark("wr_kernel_dispatch")
 
     # 方案 G2 优化：stride_tokens_int 跨层一致，在循环外预计算
     stride_tokens_int = stride_tokens_ref
@@ -1410,6 +1452,8 @@ def rebuild_compact_slots_batched_layers_from_selection_impl(
                         )
             state.bump_compact_meta_epoch()
 
+    if _pd_mark is not None:
+        _pd_mark("wr_meta_commit")
     return True
 
 def compute_alpha_selection_pipeline_unified_impl(
@@ -1466,6 +1510,7 @@ def compute_alpha_selection_pipeline_unified_impl(
     pipeline_evt0: Optional[torch.cuda.Event] = None
     pipeline_evt1: Optional[torch.cuda.Event] = None
 
+    _pd_mark = _producer_detail_marker(self)
     # 记录 seq_full 准备开始时间点
     if profile_detail:
         seq_full_evt0 = torch.cuda.Event(enable_timing=True)
@@ -1507,6 +1552,8 @@ def compute_alpha_selection_pipeline_unified_impl(
         seq_full_evt1 = torch.cuda.Event(enable_timing=True)
         seq_full_evt1.record()
 
+    if _pd_mark is not None:
+        _pd_mark("sel_seq_full")
     # 2. 准备 pipeline 参数（使用缓存避免每次 float() 转换）
     k_head = compact_recent_effective_k_head(
         k_head=int(cfg.k_head or 0),
@@ -1585,6 +1632,8 @@ def compute_alpha_selection_pipeline_unified_impl(
         _nms_win, _soft_alpha, _alpha_cross, _temperature,
     ) = _cfg_cache
 
+    if _pd_mark is not None:
+        _pd_mark("sel_params_cfg")
     # 3. 调用 pipeline
     # 记录 pure_preproc 开始时间点
     if profile_detail:
@@ -1643,6 +1692,8 @@ def compute_alpha_selection_pipeline_unified_impl(
                 bounds_evt1 = torch.cuda.Event(enable_timing=True)
                 bounds_evt1.record()
 
+            if _pd_mark is not None:
+                _pd_mark("sel_bounds")
             # 调用 with_bounds 版本（跳过 C++ 中的 ATen bounds 计算）
             if profile_detail:
                 pipeline_evt0 = torch.cuda.Event(enable_timing=True)
@@ -1674,6 +1725,9 @@ def compute_alpha_selection_pipeline_unified_impl(
                     if _SELECTOR_PIPELINE_WORKSPACE_CACHED
                     else None
                 )
+
+                if _pd_mark is not None:
+                    _pd_mark("sel_ensure")
 
                 def _eager_topk_pipeline():
                     return _pipeline_with_bounds(
@@ -1723,6 +1777,37 @@ def compute_alpha_selection_pipeline_unified_impl(
                     and _sel_ring.run_open
                     and not _sel_ring.current_run_spilled
                 )
+                if _pd_mark is not None:
+                    _pd_g = self._deadline_deferred_producer_detail_us
+                    _pd_g["sel_gate_env_on"] = float(bool(_SELECTOR_TOPK_GRAPH_CACHED))
+                    _gk = (
+                        "sel_gate_ring_true"
+                        if _topk_ring_run
+                        else (
+                            "sel_gate_ring_none"
+                            if _sel_ring is None
+                            else (
+                                "sel_gate_ring_closed"
+                                if not getattr(_sel_ring, "run_open", False)
+                                else "sel_gate_ring_spilled"
+                            )
+                        )
+                    )
+                    _pd_g[_gk] = float(_pd_g.get(_gk, 0.0) or 0.0) + 1.0
+                    _sa = True
+                    for _sa_attr in (
+                        "_selector_selected_indices_out_override",
+                        "_selector_decode_bounds_buffers_override",
+                        "_selector_pipeline_workspace_override",
+                    ):
+                        _sa_ov = getattr(self, _sa_attr, None)
+                        if isinstance(_sa_ov, dict) and not isinstance(
+                            _sa_ov, SlotStableOverrides
+                        ):
+                            _sa = False
+                            break
+                    _sk = "sel_gate_stable_true" if _sa else "sel_gate_stable_false"
+                    _pd_g[_sk] = float(_pd_g.get(_sk, 0.0) or 0.0) + 1.0
                 if _SELECTOR_TOPK_GRAPH_CACHED and _topk_ring_run:
                     # Key on shapes + EVERY consumed/produced data_ptr so a moved
                     # storage or a regime change (override realloc, kbucket
@@ -1795,6 +1880,9 @@ def compute_alpha_selection_pipeline_unified_impl(
                     if _SELECTOR_PIPELINE_WORKSPACE_CACHED
                     else None
                 )
+
+                if _pd_mark is not None:
+                    _pd_mark("sel_ensure")
 
                 def _eager_topk_pipeline_pre_denom():
                     return _ppwb(
@@ -1883,6 +1971,15 @@ def compute_alpha_selection_pipeline_unified_impl(
                     )
                 else:
                     selected_indices = _eager_topk_pipeline_pre_denom()
+            if _pd_mark is not None:
+                _pd_mark("sel_dispatch")
+                _pd_d = self._deadline_deferred_producer_detail_us
+                _pd_d["sel_dispatch_calls"] = float(
+                    _pd_d.get("sel_dispatch_calls", 0.0) or 0.0
+                ) + 1.0
+                _pd_d["sel_graph_replay_count_last"] = float(
+                    getattr(self, "_selector_topk_graph_replay_count", 0)
+                )
             if profile_detail:
                 pipeline_evt1 = torch.cuda.Event(enable_timing=True)
                 pipeline_evt1.record()
@@ -2016,4 +2113,6 @@ def compute_alpha_selection_pipeline_unified_impl(
             "pipeline": (pipeline_evt0, pipeline_evt1),
         }
 
+    if _pd_mark is not None:
+        _pd_mark("sel_post")
     return selected_indices, head_sink, recent_start, kv_len_head, allowed_lengths, profile_events

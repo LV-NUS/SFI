@@ -303,6 +303,13 @@ class RefreshRebuildMixin:
         self._writer_graph_recapture_window: int = 0
         self._writer_graph_recapture_count: int = 0
         self._writer_graph_evict_clear_count: int = 0
+        # [S1-KA1 2026-07-12] dedicated idle stream for writer-graph capture
+        # (lazy-created on the cold capture path). Capturing on refresh_stream
+        # forced a pre-capture refresh_stream.synchronize() that drained the
+        # in-flight selector chain — the bs8x12k steady-state decode hole
+        # (S1 forensics: 3 chunks x 0.5-3.1ms per new geometry key).
+        self._writer_graph_capture_stream_obj: Optional[Any] = None
+        self._writer_graph_capture_stream_device: Optional[torch.device] = None
         self._deadline_async_producer_result_precomputed_count: int = 0
         self._deadline_async_producer_split_release_forced_count: int = 0
         self._deadline_async_producer_split_release_adaptive_count: int = 0
@@ -2166,6 +2173,23 @@ class RefreshRebuildMixin:
             )
         return False
 
+    def _writer_graph_capture_stream(self, *, device: torch.device) -> Any:
+        """[S1-KA1] Dedicated idle stream for writer-graph capture.
+
+        Capture-stream identity is not baked into the graph: capture records
+        only the kernel launch (pointer/scalar launch_args), and ``replay()``
+        launches on the CALLER's current stream (refresh_stream, exactly as
+        before). Lazy-created on the cold capture path only — never touched
+        in steady state (replay/eager). No priority: the stream carries no
+        real GPU work (only pre-capture ready-event waits).
+        """
+        stream = self._writer_graph_capture_stream_obj
+        if stream is None or self._writer_graph_capture_stream_device != device:
+            stream = torch.cuda.Stream(device=device)
+            self._writer_graph_capture_stream_obj = stream
+            self._writer_graph_capture_stream_device = device
+        return stream
+
     def _writer_graph_dispatch_launch(
         self,
         *,
@@ -2367,19 +2391,34 @@ class RefreshRebuildMixin:
                 *launch_args
             )
 
-        # Defects #1,#2: drain ptr ready-events on the capture stream and latch
-        # the skip-wait set so the in-capture ptr lookup does NOT wait_event.
-        self._prepare_rebuild_ptr_ready_events_for_capture(device=device)
+        # [S1-KA1 2026-07-12] capture on a DEDICATED idle stream, NO pre-drain.
+        # 历史链:[ASYNC-CAPTURE 2026-07-07 B-1] 把 ``with torch.cuda.graph``
+        # 的全设备 synchronize+empty_cache(~26ms 全机停顿)收窄为
+        # refresh_stream.synchronize();S1 取证(2026-07-11)定谳该 sync 即
+        # bs8x12k 稳态判速孤洞本体:每新 geometry key 3 chunk 串行
+        # "排空→捕获",每次把 refresh_stream 在飞 selector 链排干
+        # (0.5-3.1ms/chunk)。排空的真实语义逐条核销后=零必要:
+        #  ①capture 是纯 host 记录,begin 后的 launch 不执行 → 上游 selector
+        #    链/输入数据是否就绪与捕获无关(数据正确性由 eager 本步已发射 +
+        #    replay 侧 refresh_stream 流序 + _wait_writer_input_ready 保证);
+        #  ②begin 前已入流的 pending 工作不进图(CUDA stream capture 语义)
+        #    → "误捕 selector 链尾巴"不存在(单 host 线程,链早已全部入流);
+        #  ③捕获合法性唯一硬约束=图内不得 wait 图外 event —— 由下方
+        #    _prepare 建边 + skip-wait latch 保证,与流是否空闲无关;
+        #  ④capture 流身份不烙进图:replay() 在调用方 current stream
+        #    (refresh_stream)上发射,字节与旧形态逐位同。
+        # 专用流上不做 synchronize:ready-event 记录在 refresh_stream 上
+        # selector 链之后,任何 sync 都会透过 wait 边等回整条链(收益归零);
+        # 专用流上只有 wait 边、永无真实工作,pending wait 与 begin 合法共存。
+        # 无需 empty_cache;捕获内容与 with 版逐字节相同。pool 不传=graph
+        # 私有([POOL-PRIVATE] 见上)。
+        capture_stream = self._writer_graph_capture_stream(device=device)
         try:
-            # [ASYNC-CAPTURE 2026-07-07 B-1] 手动 capture_begin/end 替代
-            # ``with torch.cuda.graph(...)``:其 __enter__ 做全设备
-            # torch.cuda.synchronize()+empty_cache()(~26ms 级全机停顿,decode
-            # 主流被迫排空;empty_cache 还把 allocator 缓存段清光,后续两侧分配
-            # 重新 cudaMalloc)。捕获正确性只需捕获流自身空闲——收窄为
-            # refresh_stream.synchronize();无需 empty_cache。捕获内容与 with
-            # 版逐字节相同。pool 不传=graph 私有([POOL-PRIVATE] 见上)。
-            self.refresh_stream.synchronize()
-            with torch.cuda.stream(self.refresh_stream):
+            with torch.cuda.stream(capture_stream):
+                # Defects #1,#2: drain ptr ready-events on the capture stream
+                # (= current stream inside this block) and latch the skip-wait
+                # set so the in-capture ptr lookup does NOT wait_event.
+                self._prepare_rebuild_ptr_ready_events_for_capture(device=device)
                 graph.capture_begin()
                 try:
                     _replay_body()
@@ -4504,6 +4543,44 @@ class RefreshRebuildMixin:
                 == int(PendingReasonCode.COMPACT_THRESHOLD_CROSSED)
             ):
                 tracking._was_short_dense = False
+            # [REFRESH-AMNESTY 2026-07-12] 电平语义大赦(规范:sentence/interval
+            # =同一"需要 refresh"电平的两个信号源,任一 refresh 兑现即统一消解,
+            # 不冲突不堆积;TRIGGER_INTERPLAY_AUDIT_2026-07-12.md §3/§6):本请求
+            # 世代在此提交=电平已兑现,所有**不晚于提交步**的信号载体统一消解;
+            # 晚于提交步的信号=新电平,保留。本点每 refresh 世代每命中请求执行
+            # 一次(判速档 ~0.07-0.09 次/step·请求),纯 host 字段比较+赋值,
+            # plan 每步循环零新增=零热路径开销。crossing FORCE_NOW 票不经此
+            # 消解:ticket 载体走下方 _clear_request_pending_refresh(本请求
+            # 物化才消),且本循环 per-request 作用域=他请求 commit 零触碰。
+            _amnesty_last = int(tracking.last_decode_refresh_step)
+            # ① sentence intent(G-1):plan 侧吸收判据(vllm_sparse_patch
+            #   :4125-4131 last>=intent_step,已提交世代的计划步覆盖不晚于它
+            #   的句边界)原样前移到 commit 点——同判据同阈值零语义差,消掉
+            #   "commit 后等下一 plan 周期才吸收"的 1 步空窗。
+            _amn_intent_step = int(
+                getattr(tracking, "trigger_intent_decode_step", -1)
+            )
+            if 0 <= _amn_intent_step <= _amnesty_last:
+                self._clear_request_trigger_intent(request_id=req_id)
+            # ② lease_rearm(G-2 堆积实锤,审查档 §5-P2):rearm 置位(世代作废
+            #   行需重排)与 scheduled_*/inflight_* 清除同步,其后任何 commit
+            #   必属新世代 ⇒ 本次提交已重建该行,rearm 诉求满足;不清则 gap
+            #   放行后再开 FORCE_NOW 世代=同一需求二次兑现。rearm_step>提交步
+            #   (commit 后新置)不赦,保留新电平。
+            if bool(getattr(tracking, "lease_rearm", False)):
+                _amn_rearm_step = int(
+                    getattr(tracking, "lease_rearm_decode_step", -1)
+                )
+                if _amn_rearm_step <= _amnesty_last:
+                    self._clear_request_lease_rearm(request_id=req_id)
+            # ③ post_bridge due(G-3):plan 侧同判据(:4304-4314 last>=due 只
+            #   清 due)前移;边界窗(due>提交步)按追赶票字面语义保留不赦
+            #   (G-3 放宽为独立拍板件,本刀不动)。
+            _amn_due_step = int(
+                getattr(tracking, "post_bridge_refresh_due_decode_step", -1)
+            )
+            if 0 <= _amn_due_step <= _amnesty_last:
+                tracking.post_bridge_refresh_due_decode_step = -1
             # 票转 consumed:决策面生命周期在提交点闭合(ready_compact=False
             # 不触碰刚写入的 scheduled_*;scheduled 转为读侧/观测语义,其读侧
             # 清除仍在 publish final——读路由允许 per-rank 时序,近似语义)。

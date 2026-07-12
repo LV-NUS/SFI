@@ -714,12 +714,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Set VLLM_SPARSE_WAIT_POLICY (chunk=always wait per buf; split=skip wait when no pending work).",
     )
     parser.add_argument(
-        "--rebuild-physical-block-sort",
-        action="store_true",
-        help="Enable physical block-major reorder of selected_indices for rebuild (VLLM_SPARSE_REBUILD_PHYSICAL_BLOCK_SORT=1). "
-        "Experimental: may introduce slight numeric drift.",
-    )
-    parser.add_argument(
         "--refresh-stream-priority",
         type=int,
         default=None,
@@ -1087,7 +1081,6 @@ def main() -> None:
         stride_tokens_vals = _collect("rebuild_stride_tokens", predicate=refresh_pred)
         selected_k_vals = _collect("rebuild_selected_k", predicate=refresh_pred)
         block_size_vals = _collect("rebuild_block_size", predicate=refresh_pred)
-        physical_sort_vals = _collect("rebuild_physical_block_sort", predicate=refresh_pred)
         overlap_ratio_vals = _collect("refresh_overlap_ratio", predicate=refresh_pred)
         overlap_new_k_vals = _collect("refresh_overlap_new_k", predicate=refresh_pred)
         overlap_old_k_vals = _collect("refresh_overlap_old_k", predicate=refresh_pred)
@@ -1119,8 +1112,6 @@ def main() -> None:
             parts.append(_fmt("selected_k", selected_k_vals, unit="", decimals=0))
         if block_size_vals:
             parts.append(_fmt("block_size", block_size_vals, unit="", decimals=0))
-        if physical_sort_vals:
-            parts.append(_fmt("physical_sort", physical_sort_vals, unit="", decimals=0))
         if overlap_ratio_vals:
             parts.append(_fmt("overlap_ratio", overlap_ratio_vals, unit="", decimals=3))
         if overlap_new_k_vals:
@@ -1247,8 +1238,6 @@ def main() -> None:
         os.environ["VLLM_SPARSE_CAPTURE_KV_BUCKET"] = str(int(args.capture_kv_bucket))
     if str(args.wait_policy).strip():
         os.environ["VLLM_SPARSE_WAIT_POLICY"] = str(args.wait_policy).strip()
-    if bool(getattr(args, "rebuild_physical_block_sort", False)):
-        os.environ["VLLM_SPARSE_REBUILD_PHYSICAL_BLOCK_SORT"] = "1"
     if args.refresh_stream_priority is not None:
         os.environ["VLLM_SPARSE_REFRESH_STREAM_PRIORITY"] = str(int(args.refresh_stream_priority))
     if bool(args.trace_async):

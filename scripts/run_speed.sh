@@ -60,6 +60,13 @@ TP_ARGS=()
 if [[ "${TP}" -gt 1 ]]; then
   TP_ARGS=(--tensor-parallel-size "${TP}")
 fi
+# VERDICT_ONLY=1 skips the diagnostic child (verdict-grade screening: proofs
+# re-source from the speed-child trace; counts readout file becomes
+# ${TAG}_speed_route.jsonl). Default (unset/0) is the unchanged full form.
+VERDICT_ARGS=()
+if [[ "${VERDICT_ONLY:-0}" == "1" ]]; then
+  VERDICT_ARGS=(--verdict-only)
+fi
 
 # --- Sparse KV-budget preflight (warns, never blocks) ------------------------
 # Sparse mode leases compact pages from vLLM's block pool ON TOP of the full
@@ -153,6 +160,7 @@ PYTHONPATH="${SFI_ROOT}" "${PY}" -m benchmarks.bench_sm80_mixed_page_one_shot_gr
   --gpu-mem-util "${UTIL:-0.9}" \
   --model "${MODEL}" --python "${PY}" --fa3-upstream-root "${FA_ROOT}" \
   --cuda-visible-devices "${GPU}" --timeout-s 3600 ${TP_ARGS[@]+"${TP_ARGS[@]}"} \
+  ${VERDICT_ARGS[@]+"${VERDICT_ARGS[@]}"} \
   --skip-dense-reference --outputs-include-text \
   --output "${OUT}/${TAG}.json" \
   --summary-output "${OUT}/${TAG}_summary.json" \

@@ -2118,34 +2118,13 @@ def _resolve_selected_no_capture_row_plan(
     return row_plan
 
 
-def _wrap_bridge_for_war_event(bridge):
-    """WAR gate at source: record the producer-done event on the producer's REAL stream
-    (current_stream() right after the FA4 decode kernel launch) so the cross-step descriptor
-    rewrite can wait_event on it. Idempotent; failures are swallowed."""
-    try:
-        import torch as _bw_torch
-        _fn = getattr(bridge, "mixed_page_attn_varlen_func", None)
-        if _fn is None or getattr(_fn, "_war_wrapped", False):
-            return bridge
-        def _war_wrapped_fn(*_a, **_k):
-            _r = _fn(*_a, **_k)
-            try:
-                import patches.sparse_constants as _bw_sc
-                _sid = _bw_torch.cuda.current_stream().cuda_stream
-                _d = _bw_sc._RRP_GRAPH_DONE_EVTS
-                _e = _d.get(_sid)
-                if _e is None:
-                    _e = _bw_torch.cuda.Event()
-                    _d[_sid] = _e
-                _e.record()
-            except Exception:
-                pass
-            return _r
-        _war_wrapped_fn._war_wrapped = True
-        bridge.mixed_page_attn_varlen_func = _war_wrapped_fn
-    except Exception:
-        pass
-    return bridge
+# [2026-07-12 RRP-DONE-EVTS-RETIRED] _wrap_bridge_for_war_event deleted. Its
+# only job was recording per-stream CUDA events into
+# sparse_constants._RRP_GRAPH_DONE_EVTS after every bridge mixed-page call;
+# a whole-repo audit found ZERO wait_event/query consumers of that dict (the
+# real cross-step WAR fence is the separate _RRP_WAR_FENCE_EVT/_ARMED pair,
+# recorded post-graph and waited in decode_runtime/metadata_builder.py), so
+# the record was pure dead overhead -- and its except-pass swallowed errors.
 
 
 def _resolve_selected_no_capture_bridge(
@@ -2158,7 +2137,7 @@ def _resolve_selected_no_capture_bridge(
 
     from patches.fa3_native.install import load_vendored_flash_attn_bridge
 
-    bridge = _wrap_bridge_for_war_event(load_vendored_flash_attn_bridge())
+    bridge = load_vendored_flash_attn_bridge()
     setattr(controller, "_fa3_selected_no_capture_bridge", bridge)
     return bridge
 
@@ -2172,6 +2151,312 @@ def _expand_layer_descale(
     if scale is None:
         return None
     return scale.expand(descale_shape)
+
+
+_MIXED_PAGE_SM_COUNT_BY_DEVICE: Dict[int, int] = {}
+
+
+def _mixed_page_device_sm_count(device: torch.device) -> int:
+    index = device.index
+    if index is None:
+        index = int(torch.cuda.current_device())
+    count = _MIXED_PAGE_SM_COUNT_BY_DEVICE.get(index)
+    if count is None:
+        count = int(torch.cuda.get_device_properties(index).multi_processor_count)
+        if count <= 0:
+            raise RuntimeError(
+                "mixed-page split gate requires a positive multi_processor_count"
+            )
+        _MIXED_PAGE_SM_COUNT_BY_DEVICE[index] = count
+    return count
+
+
+# [2026-07-11 SPLIT-ROOT Phase1] Host-side scan bound for the split argmin.
+# Mirrors the max_splits=128 cap flash_api.cpp get_num_splits feeds
+# num_splits_heuristic; the host argmin's solution is passed as the launch's
+# explicit num_splits (dynamic cap + sizing), so this also bounds the accum
+# buffer sizing. If the host argmin ever hits this bound the fa3 route trace
+# records clamped_at_scan_cap=True.
+_MIXED_PAGE_SPLIT_ARGMIN_SCAN_CAP = 128
+
+# [2026-07-11 SPLIT-ROOT Phase1] n-block unit for the host-side upper-bound
+# nb. 64 is the smallest d=128 decode kBlockN across the FA3 tile tables (the
+# SM80 non-split arm), NOT a mirrored tile constant: any unit <= the true
+# kBlockN yields nb_upper >= nb_true, which biases the host solution (= the
+# launch's dynamic cap) upward, so the device prepare kernel -- which
+# recomputes the argmin per replay from the template-exact kBlockN and live
+# resolved seqused -- is maximally unlikely to be clamped by the cap. The unit
+# only shapes the conservative capture-time bound, never the executed split
+# count. tests/test_split_makespan_argmin_parity.py pins the cap-dominance
+# property over the tile family.
+_MIXED_PAGE_SPLIT_ARGMIN_NB_UNIT = 64
+
+
+def _mixed_page_split_makespan_argmin(
+    total_ctas_single_split: int,
+    num_sm: int,
+    num_n_blocks_single: int,
+    num_n_blocks_split: int,
+    num_splits_static: int,
+) -> int:
+    """[2026-07-11 SPLIT-ROOT Phase1] Discrete makespan argmin.
+
+    T(1) = ceil(G/P) * (nb_single + 1);
+    T(s>=2) = ceil(G*s/P) * (ceil(nb_split/s) + 1).
+    The "+1" is a per-wave fixed cost of one virtual block (launch ramp +
+    tail per wave; dimensionless structural constant, not a machine
+    constant) -- without it the model over-favoured deep-wave splits on
+    mid-G tiers (measured: bs4xsel8k s=10 ran +8.9% vs legacy s=3).
+    Multi-wave domain bounded at waves(s) <= max(waves(1), 3): S0-a falsified
+    the single-wave cap (multi-wave splits win on saturated tiers) and
+    validated the model order up to 3 waves; deeper waves stay outside the
+    solution domain until an S0-b experiment extends it (experiment-domain
+    bound). s <= num_splits_static, ties to the smallest s. Literal twin of
+    split_makespan_argmin() in the vendored hopper/flash_prepare_scheduler.cu
+    -- same T(s), same domain, same tie-break.
+    tests/test_split_makespan_argmin_parity.py extracts both bodies and pins
+    them point-identical over a G x P x nb_single x nb_split x s_ub grid; edit
+    both together.
+    """
+    # Wave-level enumeration, literally the device kernel's loop shape (the
+    # naive per-s scan costs 2 software int-divides per s on GPU and measured
+    # +2.7us on the prepare kernel; within a wave level w the makespan
+    # w*ceil(nb/s) is non-increasing in s, so only each level's largest
+    # admissible s matters and the smallest-s tie resolves to
+    # max(s_lo, ceil(nb/q))). Point-identical to the naive scan by
+    # tests/test_split_makespan_argmin_parity.py's oracle grid.
+    max_validated_waves = 3  # S0-a validated wave depth
+    waves_one = (total_ctas_single_split + num_sm - 1) // num_sm
+    waves_cap = max(waves_one, max_validated_waves)
+    best_s = 1
+    best_t = waves_one * (num_n_blocks_single + 1)
+    s_scan_max = min(num_splits_static, num_n_blocks_split)
+    if s_scan_max >= 2:
+        w_first = (2 * total_ctas_single_split + num_sm - 1) // num_sm
+        s_lo = 2
+        w = w_first
+        while w <= waves_cap and s_lo <= s_scan_max:
+            s_hi = (w * num_sm) // total_ctas_single_split
+            if s_hi > s_scan_max:
+                s_hi = s_scan_max
+            if s_hi < s_lo:
+                w += 1
+                continue  # empty level after clamping
+            q = (num_n_blocks_split + s_hi - 1) // s_hi
+            t = w * (q + 1)
+            if t < best_t:
+                s_star = (num_n_blocks_split + q - 1) // q if q > 0 else s_lo
+                if s_star < s_lo:
+                    s_star = s_lo
+                best_t = t
+                best_s = s_star
+            s_lo = s_hi + 1
+            w += 1
+    return best_s
+
+
+def _mixed_page_split_domain_cap(
+    total_ctas_single_split: int,
+    num_sm: int,
+    num_n_blocks_upper: int,
+) -> int:
+    """[2026-07-11 SPLIT-ROOT Phase1] Algebraic upper bound of the argmin's
+    solution DOMAIN: waves(s) <= max(waves(1), 3) and s <= nb together give
+    s <= floor(max(ceil(G/P), 3) * P / G) and s <= nb_upper. This bound is
+    TILE-INDEPENDENT (the wave domain does not involve kBlockN, and every
+    real tile's nb is <= the 64-token-unit upper bound), so passing it as the
+    launch's explicit num_splits (= dynamic cap + sizing) provably admits the
+    device prepare kernel's per-replay argmin under any tile calibre -- the
+    cap-dominance the same-formula design needs. A host-side ARGMIN solution
+    cannot serve as the cap: multi-wave tie structures make the solution
+    non-monotonic in nb (a coarser nb can solve a SMALLER s than a real
+    tile's), which would clamp the device solution.
+    """
+    max_validated_waves = 3  # S0-a validated wave depth (same as the argmin)
+    waves_one = (total_ctas_single_split + num_sm - 1) // num_sm
+    waves_cap = max(waves_one, max_validated_waves)
+    domain_cap = (waves_cap * num_sm) // total_ctas_single_split
+    return max(1, min(_MIXED_PAGE_SPLIT_ARGMIN_SCAN_CAP, num_n_blocks_upper, domain_cap))
+
+
+# [2026-07-12 K6-SCHED-MD-SINGLE-SOURCE] Per-device arch-major memo, sibling of
+# _MIXED_PAGE_SM_COUNT_BY_DEVICE (compute capability is a hardware constant per
+# device index; no env knob).
+_MIXED_PAGE_ARCH_MAJOR_BY_DEVICE: Dict[int, int] = {}
+
+
+def _mixed_page_device_arch_major(device: torch.device) -> int:
+    index = device.index
+    if index is None:
+        index = int(torch.cuda.current_device())
+    major = _MIXED_PAGE_ARCH_MAJOR_BY_DEVICE.get(index)
+    if major is None:
+        major = int(torch.cuda.get_device_properties(index).major)
+        if major <= 0:
+            raise RuntimeError(
+                "mixed-page scheduler-metadata gate requires a positive device arch major"
+            )
+        _MIXED_PAGE_ARCH_MAJOR_BY_DEVICE[index] = major
+    return major
+
+
+# [2026-07-12 K6-SCHED-MD-SINGLE-SOURCE] Key under which the shared
+# scheduler-metadata entry lives inside the per-dummy-run context dict
+# (controller._vllm_dummy_run_context). The dict is created fresh for every
+# _dummy_run call and cleared in its finally block, so entry lifetime ==
+# one profile/warmup/capture run BY CONSTRUCTION -- cross-run reuse is
+# structurally impossible (the "done_for_identity_token" defensive pattern,
+# realized as host-object lifetime instead of a new epoch counter).
+_MIXED_PAGE_PROFILE_SHARED_SCHED_MD_KEY = "k6_profile_shared_scheduler_metadata"
+
+
+def _mixed_page_profile_shared_scheduler_metadata(
+    *,
+    bridge: object,
+    device: torch.device,
+    batch_size: int,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    num_heads: int,
+    num_heads_k: int,
+    headdim: int,
+    headdim_v: int,
+    qkv_dtype: torch.dtype,
+    seqused_k: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    page_size: int,
+    causal: bool,
+    window_size: Tuple[int, int],
+    has_softcap: bool,
+    num_splits_cap: int,
+) -> torch.Tensor | None:
+    """[2026-07-12 K6-SCHED-MD-SINGLE-SOURCE] One prepare launch per profile/
+    capture run instead of one per layer (36x -> 1x on the speed-tier form).
+
+    Mechanism: the first attention layer of a dummy run calls the vendored
+    get_scheduler_metadata (flash_api.cpp:838-999) -- the structural twin of
+    the main mha_fwd path's metadata block (:1392-1458): same
+    scheduler_needs_semaphore / use_dynamic_split / vector-count /
+    metadata_size arithmetic, and it launches prepare_varlen_num_blocks once
+    on the CURRENT stream (captured into the CUDA graph when capturing). The
+    remaining 35 layers pass the returned tensor as scheduler_metadata, which
+    flips params.skip_scheduler_metadata_computation (flash_api.cpp:1420) so
+    the launch template's prepare launch (flash_fwd_launch_template.h:409
+    guard: `!skip_scheduler_metadata_computation`) is skipped. At replay the
+    single in-graph prepare still re-solves the makespan argmin against the
+    live seqused buffer every step (<= the domain cap), so per-replay split
+    adaptivity is fully preserved -- this is a launch-count diet, not a
+    semantics freeze.
+
+    Layer-order safety (audited, R2 material-B): the prepare kernel zeroes the
+    tile-count semaphore (flash_prepare_scheduler.cu:224) and every split>1
+    layer's combine kernel self-resets it (flash_fwd_combine_kernel.h:427-430,
+    args wire params.tile_count_semaphore as semaphore_to_reset); layers run
+    serially on one stream, so each layer observes semaphore==0 exactly as if
+    it had run its own prepare. The three prepare-produced batch vectors are
+    pure functions of (seqused, geometry) shared by all 36 layers
+    (layer-invariance), and are read-only to the attention/combine kernels.
+
+    Shape safety is fail-fast by construction: the launch passes the SAME
+    num_splits (the split-domain cap) and geometry to both this metadata
+    producer and the mha_fwd consumer, and C++ CHECK_SHAPE(scheduler_metadata,
+    metadata_size) at flash_api.cpp:1424 rejects any size mismatch (the
+    2026-07-01 rejection was two call sites hand-computing DIFFERENT calibres;
+    a single producer consumed under the same calibre is immune).
+
+    Scope (Phase1, design verdict): SM8x only -- the caller gates on device
+    arch major < 9. On SM90 a splits==1 launch with a passed metadata walks
+    the per-call semaphore memset arm (flash_api.cpp:1662-1664) and the
+    prepare kernel runs with PDL there; both are unmeasured on this route, so
+    SM90 keeps the legacy per-layer prepare (returns None -> unchanged path).
+    Returns None (legacy path, one prepare per layer) when no per-dummy-run
+    host dict exists; profile-route calls outside a dummy run have no safe
+    step-identity carrier, and correctness there is the legacy behaviour.
+    """
+    controller = _get_global_controller()
+    dummy_context = (
+        getattr(controller, "_vllm_dummy_run_context", None)
+        if controller is not None
+        else None
+    )
+    if not isinstance(dummy_context, dict):
+        return None
+    # prepare reads these buffers by POINTER inside the (captured) kernel; a
+    # non-contiguous input would make the python wrapper's maybe_contiguous
+    # clone them and freeze replay adaptivity. Refuse to produce a bad value.
+    if not seqused_k.is_contiguous():
+        raise RuntimeError(
+            "K6 shared scheduler_metadata requires contiguous seqused_k"
+        )
+    if not cu_seqlens_q.is_contiguous():
+        raise RuntimeError(
+            "K6 shared scheduler_metadata requires contiguous cu_seqlens_q"
+        )
+    device_index = device.index
+    if device_index is None:
+        device_index = int(torch.cuda.current_device())
+    # The capturing flag separates the warmup (eager) and capture phases that
+    # share one dummy-run dict: a warmup-phase tensor lives in the ordinary
+    # allocator pool and must NEVER be baked into a graph, and vice versa.
+    key = (
+        bool(torch.cuda.is_current_stream_capturing()),
+        int(device_index),
+        int(batch_size),
+        int(max_seqlen_q),
+        int(max_seqlen_k),
+        int(num_heads),
+        int(num_heads_k),
+        int(headdim),
+        int(headdim_v),
+        str(qkv_dtype),
+        int(seqused_k.data_ptr()),
+        int(cu_seqlens_q.data_ptr()),
+        int(page_size),
+        bool(causal),
+        (int(window_size[0]), int(window_size[1])),
+        bool(has_softcap),
+        int(num_splits_cap),
+    )
+    entry = dummy_context.get(_MIXED_PAGE_PROFILE_SHARED_SCHED_MD_KEY)
+    if (
+        isinstance(entry, tuple)
+        and len(entry) == 2
+        and entry[0] == key
+        and isinstance(entry[1], torch.Tensor)
+    ):
+        return entry[1]
+    get_scheduler_metadata = getattr(bridge, "get_scheduler_metadata", None)
+    if not callable(get_scheduler_metadata):
+        raise RuntimeError(
+            "K6 shared scheduler_metadata requires bridge.get_scheduler_metadata"
+        )
+    metadata = get_scheduler_metadata(
+        batch_size,
+        max_seqlen_q,
+        max_seqlen_k,
+        num_heads,
+        num_heads_k,
+        headdim,
+        seqused_k,
+        qkv_dtype=qkv_dtype,
+        headdim_v=headdim_v,
+        cu_seqlens_q=cu_seqlens_q,
+        page_size=page_size,
+        causal=causal,
+        window_size=(int(window_size[0]), int(window_size[1])),
+        has_softcap=bool(has_softcap),
+        num_splits=int(num_splits_cap),
+        pack_gqa=None,
+        sm_margin=0,
+        prefill_active_worklist=False,
+    )
+    if not isinstance(metadata, torch.Tensor):
+        raise RuntimeError(
+            "K6 shared scheduler_metadata: vendored get_scheduler_metadata "
+            "did not return a tensor"
+        )
+    dummy_context[_MIXED_PAGE_PROFILE_SHARED_SCHED_MD_KEY] = (key, metadata)
+    return metadata
 
 
 def _run_profile_resolved_row_ptr_mixed_forward(
@@ -2290,9 +2575,113 @@ def _run_profile_resolved_row_ptr_mixed_forward(
     sliding_window = getattr(self, "sliding_window", None)
     window_size = list(sliding_window) if sliding_window is not None else None
 
+    # [2026-07-11 SPLIT-ROOT Phase1] Static instance selection by the same
+    # discrete makespan argmin the vendored prepare kernel now runs for mixed
+    # rows: T(1) = ceil(G/P)*nb_single, T(s>=2) = ceil(G*s/P)*ceil(nb_split/s),
+    # full wave domain (S0-a falsified the single-wave cap: bs8xsel4k s=3 runs
+    # -15.6% across 2 waves, bs8xsel12k s=5 -27.3% across 3), ties to the
+    # smallest s (design verdict SFI_KIND4_NEXT_OPT_DIRECTIONS_2026-07-11 par.1
+    # + S0-a addendum; supersedes the [2026-07-11 K1] half-SM gate -- the
+    # machine constant is gone, the arithmetic stays).
+    # Cap semantics (the launched value is the DOMAIN upper bound, not a host
+    # argmin solution -- two designs died to real counterexamples: a host
+    # argmin solution as the cap is non-monotonic in nb under multi-wave ties
+    # and can clamp the device solution; a host argmin==1 instance gate under
+    # the 64-token calibre mis-pins forms whose device tile still profits
+    # from splits, e.g. H100 bs16 x h_k8 mid-sel):
+    # - cap > 1  -> pass it as the launch's EXPLICIT num_splits: under
+    #   use_dynamic_split (b <= 992 && splits > 1) it is a dynamic CAP +
+    #   sizing bound, not a pinned count -- the in-graph prepare kernel
+    #   solves the same argmin per replay against the live resolved seqused
+    #   and the template-exact kBlockN, PROVABLY <= this cap (the bound is
+    #   tile-independent, see _mixed_page_split_domain_cap; flash_api.cpp
+    #   guard now admits explicit >1 for ResolvedRowPtr; S0-a measured the
+    #   cap semantics on the native form). Rows the device argmin resolves to
+    #   1 run one split on the split instance (numerically exact; the
+    #   epsilon vs the non-split instance only exists on degenerate short-sel
+    #   forms).
+    # - cap == 1 -> only when the solution domain itself collapses
+    #   (max_seqlen_k <= one 64-token block, or G > 1.5*P super-saturation):
+    #   the non-split kernel instance, prepare early-outs, bit-identical to
+    #   the retired-K1 pin1 arm by construction.
+    # G = batch_size*num_kv_heads: this capture-time launch is the decode form
+    # (one m-block per row under PackGQA); for profile-step calls with
+    # max_seqlen_q > 1 this undercounts G, which only lowers the cap the
+    # profile step runs under (never affects capture anchors).
+    # nb upper bound: max_seqlen_k (native >= resolved) in units of the
+    # smallest decode kBlockN (see _MIXED_PAGE_SPLIT_ARGMIN_NB_UNIT), so every
+    # real tile's n-block count is <= it.
+    # This function runs only during FULL-cudagraph capture, so the decision
+    # freezes per (batch bucket, h_k, device); accum/semaphore buffers allocate
+    # inside capture into the capture pool with sizes fixed by the frozen cap.
+    # Split-combine reassociates fp32 -> low bits move wherever the executed
+    # split count changes (allclose level; e2e speed-tier hash anchors are
+    # expected to move and must be re-pinned with a pin1 control leg).
+    mixed_page_argmin_nb_ub = (
+        int(max_seqlen_k) + _MIXED_PAGE_SPLIT_ARGMIN_NB_UNIT - 1
+    ) // _MIXED_PAGE_SPLIT_ARGMIN_NB_UNIT
+    _mixed_page_g = batch_size * num_kv_heads
+    _mixed_page_p = _mixed_page_device_sm_count(q_arg.device)
+    # host argmin: observability only (route trace) -- what the model would
+    # solve on the capture-time upper bounds; the executed split count is the
+    # device prepare kernel's per-replay solution under the cap below.
+    mixed_page_host_split_argmin = _mixed_page_split_makespan_argmin(
+        _mixed_page_g,
+        _mixed_page_p,
+        mixed_page_argmin_nb_ub,
+        mixed_page_argmin_nb_ub,
+        _MIXED_PAGE_SPLIT_ARGMIN_SCAN_CAP,
+    )
+    mixed_page_split_cap = _mixed_page_split_domain_cap(
+        _mixed_page_g, _mixed_page_p, mixed_page_argmin_nb_ub
+    )
+
     from patches.fa3_native.install import load_vendored_flash_attn_bridge
 
-    bridge = _wrap_bridge_for_war_event(load_vendored_flash_attn_bridge())
+    bridge = load_vendored_flash_attn_bridge()
+    mixed_page_causal = bool(getattr(attn_metadata, "causal", True))
+    mixed_page_softcap = float(getattr(self, "logits_soft_cap", 0.0) or 0.0)
+    mixed_page_window_tuple = (
+        (int(window_size[0]), int(window_size[1]))
+        if window_size is not None
+        else (-1, -1)
+    )
+    # [2026-07-12 K6-SCHED-MD-SINGLE-SOURCE] One prepare per run instead of one
+    # per layer. The first layer of a dummy run produces the metadata via the
+    # vendored get_scheduler_metadata (single prepare launch, captured into the
+    # graph when capturing); the other 35 layers pass the same tensor so the C++
+    # side skips its per-call prepare launch (flash_api.cpp:1420 +
+    # flash_fwd_launch_template.h:409). Every argument below is the SAME local
+    # the launch's common_kwargs uses -- one calibre, one producer, and the C++
+    # CHECK_SHAPE(scheduler_metadata, metadata_size) (flash_api.cpp:1424) hard-
+    # rejects any residual size drift (constructive fix for the 2026-07-01
+    # two-hand-computed-calibres rejection). SM8x-only Phase1 gate: on SM90 the
+    # splits==1 + passed-metadata combination walks a per-call semaphore memset
+    # arm (flash_api.cpp:1662-1664, unmeasured there) -> keep legacy per-layer
+    # prepare (shared metadata stays None, byte-identical old path).
+    mixed_page_shared_scheduler_metadata = None
+    if _mixed_page_device_arch_major(q_arg.device) < 9:
+        mixed_page_shared_scheduler_metadata = (
+            _mixed_page_profile_shared_scheduler_metadata(
+                bridge=bridge,
+                device=q_arg.device,
+                batch_size=batch_size,
+                max_seqlen_q=int(max_seqlen_q),
+                max_seqlen_k=int(max_seqlen_k),
+                num_heads=int(q_arg.shape[1]),
+                num_heads_k=int(num_kv_heads),
+                headdim=int(q_arg.shape[2]),
+                headdim_v=int(value_cache.shape[-1]),
+                qkv_dtype=q_arg.dtype,
+                seqused_k=seqused_k,
+                cu_seqlens_q=cu_seqlens_q,
+                page_size=int(key_cache.shape[1]),
+                causal=mixed_page_causal,
+                window_size=mixed_page_window_tuple,
+                has_softcap=mixed_page_softcap > 0.0,
+                num_splits_cap=int(mixed_page_split_cap),
+            )
+        )
     common_kwargs = {
         "q": q_arg,
         "k": key_cache,
@@ -2303,28 +2692,35 @@ def _run_profile_resolved_row_ptr_mixed_forward(
         "seqused_k": seqused_k,
         "max_seqlen_k": max_seqlen_k,
         "softmax_scale": getattr(self, "scale", None),
-        "causal": bool(getattr(attn_metadata, "causal", True)),
+        "causal": mixed_page_causal,
         "window_size": window_size,
         "block_table": block_table,
-        "softcap": float(getattr(self, "logits_soft_cap", 0.0) or 0.0),
-        # [2026-07-01] Paired with the single-split pin below: kind4's SingleTileVarlenScheduler
-        # needs no split scheduler metadata. vLLM precomputes scheduler_metadata sized for
-        # max_num_splits=32; under num_splits=1 the C++ CHECK_SHAPE(scheduler_metadata,
-        # metadata_size) at flash_api.cpp:2413 would reject it. Passing None makes C++ size
-        # tile_count_semaphore for single-split itself (flash_api.cpp:2418, .has_value()==false).
-        "scheduler_metadata": None,
+        "softcap": mixed_page_softcap,
+        # [2026-07-01, kept under 2026-07-11 SPLIT-ROOT; scoped by 2026-07-12
+        # K6] None used to be the only correct value here: vLLM's own
+        # precomputed scheduler_metadata is sized for max_num_splits=32 and the
+        # C++ CHECK_SHAPE (flash_api.cpp:1424) rejects any foreign calibre.
+        # K6 does NOT resurrect that path -- the shared tensor above is
+        # produced by the vendored twin under the exact launch calibre (same
+        # num_splits cap, same geometry, same live seqused buffer), so the
+        # in-graph prepare (now launched once per run by the metadata
+        # producer instead of once per layer) keeps re-solving per-batch
+        # dynamic splits <= cap at every replay. None (SM90 / no dummy-run
+        # host) preserves the legacy per-layer prepare byte-for-byte.
+        "scheduler_metadata": mixed_page_shared_scheduler_metadata,
         "q_descale": _expand_layer_descale(layer, "_q_scale", descale_shape),
         "k_descale": _expand_layer_descale(layer, "_k_scale", descale_shape),
         "v_descale": _expand_layer_descale(layer, "_v_scale", descale_shape),
-        # [2026-07-01] kind4/RRP is contractually single-split: SingleTileVarlenScheduler
-        # structurally excludes split-KV, and sparse-compact eff_k is short enough that
-        # native's own num_splits heuristic also resolves to 1. vLLM full-cudagraph's
-        # AttentionConfig.flash_attn_max_num_splits_for_cuda_graph (=32 on this build) is a
-        # capture-time upper bound meant for the Native split path; stock vLLM NEVER sets it
-        # (this getattr was written assuming it stays 0). Pinning single-split here restores
-        # that design assumption so guard + capacity_tokens(=8192) sizing stay self-consistent.
-        # Native split path is unaffected (different call site). No graph change, no extra work.
-        "num_splits": 1,
+        # [2026-07-11 SPLIT-ROOT Phase1] The split-domain cap, passed as the
+        # launch's explicit num_splits = dynamic cap + sizing bound (see the
+        # argmin comment above; ==1 pins the non-split instance, >1 selects
+        # the split instance with in-graph prepare refinement <= cap). The
+        # 2026-07-01 "contractually single-split / SingleTileVarlenScheduler"
+        # note that used to pin 1 here stays superseded: varlen+split walks
+        # VarlenDynamicPersistentTileScheduler on SM80 and SM90, and kind4
+        # split is measured green (verdict §1b + Step0 sanitizer + S0-a).
+        # Native split path is unaffected (different call site).
+        "num_splits": int(mixed_page_split_cap),
         "s_aux": getattr(self, "sinks", None),
         "cp_world_size": int(getattr(attn_metadata, "cp_world_size", 1) or 1),
         "cp_rank": int(getattr(attn_metadata, "cp_rank", 0) or 0),
@@ -2378,6 +2774,30 @@ def _run_profile_resolved_row_ptr_mixed_forward(
                     "max_seqlen_q": int(max_seqlen_q),
                     "max_seqlen_k": int(max_seqlen_k),
                     "num_splits": int(common_kwargs["num_splits"]),
+                    # [2026-07-11 SPLIT-ROOT Phase1] host argmin observability:
+                    # the capture-time solution, the domain cap actually
+                    # launched (num_splits above), inputs, and whether the 128
+                    # scan cap clamped the solution (device-side clamp probing
+                    # is the FLASH_SPLIT_ARGMIN_CLAMP_DEBUG rebuild of the
+                    # prepare TU).
+                    "host_split_argmin": int(mixed_page_host_split_argmin),
+                    "host_split_cap": int(mixed_page_split_cap),
+                    "host_split_argmin_nb_ub": int(mixed_page_argmin_nb_ub),
+                    # [2026-07-12 K6] shared scheduler_metadata observability:
+                    # non-None => this layer consumes the run-shared tensor
+                    # (prepare launched once per run, not per layer).
+                    "k6_shared_scheduler_metadata": bool(
+                        mixed_page_shared_scheduler_metadata is not None
+                    ),
+                    "k6_scheduler_metadata_numel": (
+                        int(mixed_page_shared_scheduler_metadata.numel())
+                        if mixed_page_shared_scheduler_metadata is not None
+                        else -1
+                    ),
+                    "host_split_argmin_clamped_at_scan_cap": bool(
+                        mixed_page_host_split_argmin
+                        == _MIXED_PAGE_SPLIT_ARGMIN_SCAN_CAP
+                    ),
                     "num_kv_heads": int(num_kv_heads),
                     "graph_replay_carriers": bool(
                         common_kwargs["graph_replay_carriers"]
@@ -9313,21 +9733,8 @@ def _patch_cuda_graph_wrapper_for_sparse_cudagraph() -> None:
                     try:
                         return original_call(self, *args, **kwargs)
                     finally:
-                        # ROOT WAR fix: the eager decode's FA4 producer just ran here on this
-                        # branch's stream; record its done-event so the next step's rewrite can
-                        # wait on it (this path early-returns before the post-graph fence).
-                        try:
-                            import torch as _eg_torch
-                            import patches.sparse_constants as _eg_sc
-                            _eg_sid = _eg_torch.cuda.current_stream().cuda_stream
-                            _eg_d = _eg_sc._RRP_GRAPH_DONE_EVTS
-                            _eg_e = _eg_d.get(_eg_sid)
-                            if _eg_e is None:
-                                _eg_e = _eg_torch.cuda.Event()
-                                _eg_d[_eg_sid] = _eg_e
-                            _eg_e.record()
-                        except Exception:
-                            pass
+                        # [2026-07-12 RRP-DONE-EVTS-RETIRED] per-call done-event
+                        # record deleted: zero wait/query consumers repo-wide.
                         if refresh_enabled or release_pending:
                             _release_refresh_producer_after_decode_if_pending(
                                 controller
@@ -9384,21 +9791,9 @@ def _patch_cuda_graph_wrapper_for_sparse_cudagraph() -> None:
             if refresh_enabled or release_pending:
                 _release_refresh_producer_after_decode_if_pending(controller)
         _evt_bisect_mark("post_replay", controller)
-        # GPU-side WAR gate: record an event on the launch stream AFTER the decode graph,
-        # so the next step's descriptor rewrite can wait on it (build stream wait_event),
-        # ordering the rewrite strictly after the prior graph's FA4 producer reads. No CPU block.
-        try:
-            import torch as _ge_torch
-            import patches.sparse_constants as _ge_sc
-            _ge_sid = _ge_torch.cuda.current_stream().cuda_stream
-            _ge_d = _ge_sc._RRP_GRAPH_DONE_EVTS
-            _ge_e = _ge_d.get(_ge_sid)
-            if _ge_e is None:
-                _ge_e = _ge_torch.cuda.Event()
-                _ge_d[_ge_sid] = _ge_e
-            _ge_e.record()
-        except Exception:
-            pass
+        # [2026-07-12 RRP-DONE-EVTS-RETIRED] post-replay done-event record
+        # deleted: _RRP_GRAPH_DONE_EVTS had zero wait/query consumers repo-wide;
+        # the REAL cross-step ordering is the GRAPH-WAR FENCE right below.
         # GRAPH-WAR FENCE (event, GPU-side, no CPU block): record an event on the launch
         # stream S right AFTER the graph replay. The racer (FA4 producer descriptor reads)
         # is on S -- proven: a stream-scoped wait on S fixes it -- so same-stream ordering
@@ -9985,21 +10380,8 @@ def _patch_gpu_ubatch_wrapper_for_sparse_cudagraph() -> None:
                     try:
                         return original_call(self, *args, **kwargs)
                     finally:
-                        # ROOT WAR fix: the eager decode's FA4 producer just ran here on this
-                        # branch's stream; record its done-event so the next step's rewrite can
-                        # wait on it (this path early-returns before the post-graph fence).
-                        try:
-                            import torch as _eg_torch
-                            import patches.sparse_constants as _eg_sc
-                            _eg_sid = _eg_torch.cuda.current_stream().cuda_stream
-                            _eg_d = _eg_sc._RRP_GRAPH_DONE_EVTS
-                            _eg_e = _eg_d.get(_eg_sid)
-                            if _eg_e is None:
-                                _eg_e = _eg_torch.cuda.Event()
-                                _eg_d[_eg_sid] = _eg_e
-                            _eg_e.record()
-                        except Exception:
-                            pass
+                        # [2026-07-12 RRP-DONE-EVTS-RETIRED] per-call done-event
+                        # record deleted: zero wait/query consumers repo-wide.
                         if refresh_enabled or release_pending:
                             _release_refresh_producer_after_decode_if_pending(
                                 controller
@@ -11850,7 +12232,7 @@ def _run_capture_only_mixed_forward(
     alpha_log_f = float(getattr(semantic_snapshot, "alpha_log_f"))
     if not math.isfinite(alpha_log_f):
         raise ValueError(f"Invalid alpha_log_f from snapshot: {alpha_log_f}")
-    bridge = _wrap_bridge_for_war_event(load_vendored_flash_attn_bridge())
+    bridge = load_vendored_flash_attn_bridge()
     original_seq_lens = getattr(attn_metadata, "seq_lens")
     original_max_seq_len = getattr(attn_metadata, "max_seq_len", None)
     original_scheduler_metadata = getattr(attn_metadata, "scheduler_metadata", None)
@@ -12765,7 +13147,7 @@ def install_fa4_dense_fallback_gateway(bridge: object | None = None) -> dict[str
     if bridge is None:
         from patches.fa3_native.install import load_vendored_flash_attn_bridge
 
-        bridge = _wrap_bridge_for_war_event(load_vendored_flash_attn_bridge())
+        bridge = load_vendored_flash_attn_bridge()
     try:
         from vllm.v1.attention.backends import fa_utils
         from vllm.v1.attention.backends import flash_attn as v1_flash_attn
@@ -12858,7 +13240,7 @@ def _patch_flash_attention_forward_and_helpers() -> None:
         unwrap_dense_original_flash_attention_forward,
     )
 
-    bridge = _wrap_bridge_for_war_event(load_vendored_flash_attn_bridge())
+    bridge = load_vendored_flash_attn_bridge()
     native_get_flash_attn_version = build_vendored_get_flash_attn_version(bridge)
     impl_cls = getattr(v1_flash_attn, "FlashAttentionImpl", None)
     if impl_cls is None:

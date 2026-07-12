@@ -5,7 +5,6 @@ OWNS:
   - _init_selector_compute_state(): selector compute state initialization
   - _get_positions_i32 / _get_positions_i64 / _get_window_idx_i32 / _get_tail_offsets(): cached index tensors
   - _get_row_index_tensor / _get_cached_logits_patch_i32(): cached helper tensors
-  - _reorder_selected_indices_physical_block_major(): block-major reorder for compact copy
   - _ensure_selector_key_norms_buffer / _ensure_selector_capture_scores_buffer: per-layer buffer pools
   - _ensure_selector_log_f_denoms_buffer / _ensure_selector_kv_lengths_buffer: per-layer buffer pools
   - _ensure_log_f_workspace(): scratch workspace for log-f computation
@@ -38,12 +37,7 @@ from typing import (
 
 import torch
 
-from hybrid_selectors.alpha_fair_selector import (
-    AlphaFairSelectorConfig,
-    apply_cross_head_mutex_bounds,
-    compute_alpha_scores_batched_layers_triton_logf_bounds,
-    compute_alpha_scores_batched_layers_triton_logf_pre_denom_bounds,
-)
+from hybrid_selectors.alpha_fair_selector import AlphaFairSelectorConfig
 from patches.selector_runtime.batched_selection import (
     compute_alpha_selection_batched_impl,
 )
@@ -68,7 +62,6 @@ from patches.sparse_types import (
 )
 from patches.sparse_constants import (
     _DECODE_BOUNDS_KERNEL_CACHED,
-    _REBUILD_PHYSICAL_BLOCK_SORT_CACHED,
     _SELECTOR_CPP_PREPROC_CACHED,
     _SELECTOR_CPP_STACK_CACHED,
     _SELECTOR_FAST_SIG_CACHED,
@@ -76,7 +69,6 @@ from patches.sparse_constants import (
     _SELECTOR_KEY_NORMS_CACHE_CAP_CACHED,
     _SELECTOR_PIPELINE_UNIFIED_CACHED,
     _SELECTOR_TRUSTED_SHAPES_CACHED,
-    _selector_graph_lru_enabled,
     _is_free_slot_id,
     should_skip_page_sparse_state,
 )
@@ -315,7 +307,9 @@ class SelectorComputeMixin:
         self._step_logits_ready_input_signature: Optional[Tuple[object, ...]] = None
         self._step_logits_ready_bound_signature: Optional[Tuple[object, ...]] = None
         self._decode_row_is_compact_i32: Optional[torch.Tensor] = None  # [max_batch], int32
-        self._decode_compact_staging_cpu: Optional[torch.Tensor] = None  # [max_batch], int32, CPU
+        # [ARM-WAR-R1-PINNED-INDEPENDENT 2026-07-12] _decode_compact_staging_cpu
+        # 常驻单例已退休:xlayer staging 改每次 fill 独立 fresh pinned 分配
+        # (E4 WAR 根修,见 metadata_builder xlayer need_fill 填充段同名标记)。
         self._decode_seqused_k_i32: Optional[torch.Tensor] = None  # [max_batch], int32
         self._decode_cu_seqlens_q_i32: Optional[torch.Tensor] = None  # [max_batch+1], int32
         self.step_prefill_plan_epoch: int = -1
@@ -412,70 +406,11 @@ class SelectorComputeMixin:
         )
 
 
-    @staticmethod
-    def _compute_selected_indices_physical_block_major_order(
-        *,
-        selected_indices: torch.Tensor,
-        block_table: torch.Tensor,
-        row_tensor_i32: torch.Tensor,
-        block_size: int,
-    ) -> Optional[torch.Tensor]:
-        if selected_indices.numel() == 0:
-            return None
-        if selected_indices.dim() != 4:
-            return None
-        if block_size <= 0:
-            return None
-        if block_table.numel() == 0 or block_table.dim() != 2:
-            return None
-        if block_table.dtype != torch.int32:
-            return None
-        if row_tensor_i32.numel() == 0:
-            return None
-
-        device = selected_indices.device
-        if block_table.device != device:
-            return None
-
-        layers, batch, _, k = selected_indices.shape
-        max_rows = int(block_table.shape[0])
-        if max_rows <= 0:
-            return None
-        cols = int(block_table.shape[1])
-        if cols <= 0:
-            return None
-        if row_tensor_i32.device != device:
-            row_tensor_i32 = row_tensor_i32.to(device=device)
-        if row_tensor_i32.dtype != torch.int32:
-            row_tensor_i32 = row_tensor_i32.to(dtype=torch.int32)
-        if int(row_tensor_i32.numel()) < int(batch):
-            return None
-        row_tensor_i32 = row_tensor_i32[:batch]
-
-        row_valid = (row_tensor_i32 >= 0) & (row_tensor_i32 < max_rows)
-        rows_safe = row_tensor_i32.clamp(min=0, max=max(0, max_rows - 1)).to(dtype=torch.long)
-        bt_rows = block_table.index_select(0, rows_safe)
-        bt_rows_exp = bt_rows.unsqueeze(0).expand(int(layers), -1, -1)
-
-        sel = selected_indices
-        valid = sel >= 0
-        pos_safe = sel.clamp(min=0).to(dtype=torch.int64)
-        block_idx = torch.div(pos_safe, int(block_size), rounding_mode="floor")
-        block_idx = block_idx.clamp(min=0, max=max(0, cols - 1)).to(dtype=torch.int64)
-
-        block_idx_flat = block_idx.reshape(int(layers), int(batch), -1)
-        phys_flat = bt_rows_exp.gather(2, block_idx_flat)
-        phys = phys_flat.reshape(int(layers), int(batch), -1, int(k)).to(dtype=torch.int64)
-
-        offset = torch.remainder(pos_safe, int(block_size))
-        key = phys * int(block_size) + offset
-
-        invalid = (~valid) | (phys < 0)
-        if not bool(row_valid.all()):
-            invalid = invalid | (~row_valid.view(1, int(batch), 1, 1))
-        key_sentinel = (1 << 62)
-        key = key.masked_fill(invalid, int(key_sentinel))
-        return torch.argsort(key, dim=-1)
+    # NOTE: _compute_selected_indices_physical_block_major_order(物理槽位键
+    # 重排实验,VLLM_SPARSE_REBUILD_PHYSICAL_BLOCK_SORT 门控)已删除——被
+    # [SELECTOR-PACK-ORDER-DETERMINISM 2026-07-11] 的无条件逻辑 index 升序
+    # 规范化取代(batched_selection.canonicalize_selected_indices_pack_order):
+    # 物理键依赖 allocator 状态,非"输入序列的纯函数",不满足决定论锚要求。
 
     def _get_cached_logits_patch_i32(
         self,
@@ -1765,9 +1700,11 @@ class SelectorComputeMixin:
         cross-stream ordering, and the slot is never reused before its pending
         is terminal — so the graph is safe there (out/bounds/ws ptrs are part
         of the graph key -> per-slot graphs). Bare per-run dicts (ring spill /
-        escape env / replay-refresh private helper) still bypass. Ring spill
-        runs are additionally excluded at the dispatch site via
-        ptr_rebuild_miss (transient ptrs must never be captured).
+        escape env / replay-refresh private helper) still bypass. [F2 对齐]
+        Ring spill runs are additionally excluded at the dispatch CALL SITES
+        (selection_worker `_topk_ring_run` gate includes `not
+        current_run_spilled` -> plain eager; ptr_rebuild_miss is NOT passed
+        there — transient ptrs never reach capture either way).
         """
         for attr in (
             "_selector_selected_indices_out_override",
@@ -1804,6 +1741,28 @@ class SelectorComputeMixin:
             )
         return False
 
+    def _selector_topk_graph_bypass_latch(self) -> None:
+        """[G4 2026-07-11] Latch permanent bypass, draining the current stream
+        BEFORE dropping the state dict: a replay of a *different* key may still
+        be in flight on this stream, and dropping the last references to the
+        graphs+mempool lets the pool's blocks be freed and reused by other
+        streams while that replay still writes them (theoretical UAF). All
+        latch arms are cold (replay/capture failure, thrash verdict) so the
+        sync costs nothing in steady state. The sync itself is guarded: on a
+        sticky CUDA context error it would raise too, but the latch must still
+        land so the dispatcher keeps falling back to eager.
+        """
+        import torch as _torch
+
+        try:
+            _torch.cuda.current_stream().synchronize()
+        except Exception:
+            _log.warning(
+                "selector topk graph: bypass-latch stream sync failed",
+                exc_info=True,
+            )
+        self._selector_topk_graph_state = {"bypass": True}
+
     def _selector_topk_graph_dispatch(
         self,
         *,
@@ -1836,16 +1795,10 @@ class SelectorComputeMixin:
         graphs = state.get("graphs") if isinstance(state, dict) else None
         entry = graphs.get(key) if isinstance(graphs, dict) else None
         # Hot path: key hit and a captured graph exists -> replay only.
+        # ([转正清理 2026-07-11] GRAPH_LRU 旋钮下线:MRU touch 分支随删,
+        # eviction 恒为 clear-all+thrash 联判——population16 后合法稳态
+        # key 全集 12<16,清库臂本身罕至。)
         if entry is not None and not ptr_rebuild_miss:
-            if _selector_graph_lru_enabled() and isinstance(graphs, dict):
-                # Mark this key most-recently-used (move to the end of the
-                # insertion ordering via pop+reinsert, which works on a plain
-                # dict) so the LRU eviction at capture time does not drop a
-                # still-hot shape.
-                try:
-                    graphs[key] = graphs.pop(key)
-                except KeyError:
-                    pass
             try:
                 entry["graph"].replay()
                 # Real replay counter (graph-agnostic): proof the captured graph
@@ -1860,25 +1813,42 @@ class SelectorComputeMixin:
                     "selector topk graph replay failed; bypassing capture",
                     exc_info=True,
                 )
-                self._selector_topk_graph_state = {"bypass": True}
+                self._selector_topk_graph_bypass_latch()
                 return eager_fn()
         # Cold / new-key / ptr-rebuild step: run eager NOW (also the recapture
         # step). Only (re)capture when no pointer rebuild happened this step.
-        result = eager_fn()
+        # [C'-FORENSIC 2026-07-11] cold-arm eager vs capture 段分解仪器(detail
+        # 门下零税)。capdet_tk 定谳:cold eager per=474µs / capture 段 per=
+        # 2788µs;defer-capture(B')两发 603.0/603.2 vs 原位 604.1-605.5=
+        # 零收益偏负已回退——原位 capture 的 2.8ms 被兑现窗背压吸收(hide
+        # 客观性),挪 step-prep 反而显性化。仪器留档供复查。
+        _pd_det = getattr(self, "_deadline_deferred_producer_detail_us", None)
+        if _pd_det is not None:
+            import time as _time
+
+            _t0 = _time.perf_counter_ns()
+            result = eager_fn()
+            _t1 = _time.perf_counter_ns()
+            _pd_det["sel_cold_eager_us"] = float(
+                _pd_det.get("sel_cold_eager_us", 0.0) or 0.0
+            ) + (_t1 - _t0) / 1000.0
+            _pd_det["sel_cold_eager_calls"] = float(
+                _pd_det.get("sel_cold_eager_calls", 0.0) or 0.0
+            ) + 1.0
+        else:
+            result = eager_fn()
         if ptr_rebuild_miss:
             if isinstance(graphs, dict):
                 graphs.pop(key, None)
             return result
         try:
-            self._capture_selector_topk_graph(
-                eager_fn=eager_fn, key=key, prewarm_result=result
-            )
+            self._capture_selector_topk_graph(eager_fn=eager_fn, key=key)
         except Exception:
             _log.warning(
                 "selector topk graph capture failed; bypassing capture",
                 exc_info=True,
             )
-            self._selector_topk_graph_state = {"bypass": True}
+            self._selector_topk_graph_bypass_latch()
         return result
 
     def _capture_selector_topk_graph(
@@ -1886,14 +1856,16 @@ class SelectorComputeMixin:
         *,
         eager_fn,
         key,
-        prewarm_result,
     ) -> None:
         """Capture the eager selector closure into a per-key CUDA graph.
 
         The closure is a pure function of its (now data_ptr-stable) launch
         inputs, so the captured graph replays byte-identical output into the
-        stable selected_indices_out buffer. The captured ``result`` view is what
-        replay returns. Never nests inside the outer decode capture.
+        stable selected_indices_out buffer. The captured ``result`` view is
+        what replay returns ([转正清理 2026-07-11] the old prewarm_result
+        argument was dead — the cached result has always been the
+        capture-mode rerun's return). Never nests inside the outer decode
+        capture.
         """
         import torch as _torch
 
@@ -1924,8 +1896,40 @@ class SelectorComputeMixin:
             nonlocal captured_result
             captured_result = eager_fn()
 
-        with _torch.cuda.graph(graph, pool=mempool, stream=stream):
-            _body()
+        # [P5-LIGHT-CAPTURE 2026-07-10] 绕 torch.cuda.graph CM 的全设备
+        # synchronize+empty_cache(torch 2.10 graphs.py:244/254)——深忙态单次
+        # capture 45-55ms(≈排干当时 GPU 积压)→<1ms(65-80×,可行性实验判定
+        # 在案:正确性 24 组逐位对/pool 隔离/深忙不误捕/replay 零内存增长)。
+        # 自负责三项:①专用流上下文(默认流 capture_begin 直接 raise)②try/
+        # finally capture_end(缺了=全进程卡 capturing 态)③闭包卫生(eager_fn
+        # 无 host 标量物化,生产捕获已实证)。capture_error_mode=thread_local
+        # =审查判定书 G3(消 TP>1 NCCL watchdog×global 捕获模式竞态)。失败
+        # 毒化(pool/RNG 卡捕获态)为 torch 2.10 固有且 CM 同样中招,处置照旧
+        # =外层 except→bypass latch(fail-open 回 eager)。
+        # [C'-FORENSIC 2026-07-11] capture 段整程计时(begin..end 含记录重放
+        # +实例化;detail 门下零税)——与 dispatch 冷臂 sel_cold_eager_us 一起
+        # 分解冷 key 峰。
+        _pd_det = getattr(self, "_deadline_deferred_producer_detail_us", None)
+        _cap_t0 = 0
+        if _pd_det is not None:
+            import time as _time
+
+            _cap_t0 = _time.perf_counter_ns()
+        with _torch.cuda.stream(stream):
+            graph.capture_begin(pool=mempool, capture_error_mode="thread_local")
+            try:
+                _body()
+            finally:
+                graph.capture_end()
+        if _pd_det is not None:
+            import time as _time
+
+            _pd_det["sel_capture_us"] = float(
+                _pd_det.get("sel_capture_us", 0.0) or 0.0
+            ) + (_time.perf_counter_ns() - _cap_t0) / 1000.0
+            _pd_det["sel_capture_calls"] = float(
+                _pd_det.get("sel_capture_calls", 0.0) or 0.0
+            ) + 1.0
         key_t = tuple(int(v) for v in key)
         if not isinstance(state, dict) or not isinstance(state.get("graphs"), dict):
             state = {"graphs": {}, "mempool": mempool, "bypass": False}
@@ -1935,24 +1939,17 @@ class SelectorComputeMixin:
         # Defensive bound: beyond a plausible shape population the keys are
         # churning; drop the stale set (keep the just-captured graph) and let the
         # thrash detector adjudicate a bypass.
-        if len(graphs_map) >= 8 and key_t not in graphs_map:
+        # [TOPK-GRAPH-POPULATION-16 2026-07-10] 8→16:off-loop 生产 key 全集实测
+        # =12(3 ring 槽×2 capture buf×2 层组形状),8 装不下→每逢新 key 清库循环
+        # (tk3on 轮 capture=17 实证);16 覆盖全集留余量,合法稳态永不触发此臂。
+        if len(graphs_map) >= 16 and key_t not in graphs_map:
             # [SELECTED-OUT-RING v2] 清库=population 溢出的 churn 实证,计数
             # 供 thrash 联判(合法稳态 key 族有界,永不触发此臂)。
+            # ([转正清理 2026-07-11] GRAPH_LRU 旋钮下线,eviction 恒 clear-all。)
             self._selector_topk_graph_window_clear_count = (
                 int(getattr(self, "_selector_topk_graph_window_clear_count", 0)) + 1
             )
-            if _selector_graph_lru_enabled():
-                # Single-entry LRU: evict only the least-recently-used key
-                # (the oldest in the map's insertion ordering, kept fresh by
-                # the replay-hit touch below) and keep the other 7 warm graphs.
-                try:
-                    _lru_victim = next(iter(graphs_map))
-                except StopIteration:
-                    _lru_victim = None
-                if _lru_victim is not None:
-                    graphs_map.pop(_lru_victim, None)
-            else:
-                graphs_map.clear()
+            graphs_map.clear()
         graphs_map[key_t] = {
             "graph": graph,
             "result": captured_result,
@@ -1972,7 +1969,7 @@ class SelectorComputeMixin:
             except OSError:
                 pass
         if self._selector_topk_graph_record_recapture():
-            self._selector_topk_graph_state = {"bypass": True}
+            self._selector_topk_graph_bypass_latch()
 
     def _get_selector_layer_index_tensor(
         self,
@@ -2775,494 +2772,6 @@ class SelectorComputeMixin:
                     f"root_cause={exc!r}"
                 ) from exc
 
-        # 方案 I 优化：批量创建 profile events，减少重复条件检查
-        # 扩展到10个event: 原有6个 + 4个细粒度计时(seq_full_0/1, pure_preproc_0/1)
-        _profile_evts = self._create_profile_events_batch(10, device, profile_detail)
-        preproc_evt0, preproc_evt1, log_s_evt0, log_s_evt1, topk_evt0, topk_evt1 = _profile_evts[:6]
-        seq_full_evt0, seq_full_evt1, pure_preproc_evt0, pure_preproc_evt1 = _profile_evts[6:10]
-
-        self._record_event_safe(preproc_evt0, device)
-
-        # 方案 B 优化：提前转为 int32，避免后续多次 dtype 转换
-        # 方案 D 优化：预处理在 C++ 薄封装中完成（保持语义不变），减少 Python 发射开销
-        semantic_snapshot = self._get_step_semantic_snapshot()
-        sink_cfg = int(semantic_snapshot.sink_tokens)
-        recent_cfg = int(semantic_snapshot.recent_tokens)
-
-        # 细粒度计时：seq_full准备开始
-        self._record_event_safe(seq_full_evt0, device)
-        seq_full: Optional[torch.Tensor] = None
-        if block_size > 0 and recent_cfg > 0:
-            if (
-                seq_lens_full is not None
-                and isinstance(seq_lens_full, torch.Tensor)
-                and seq_lens_full.numel() >= batch_size
-            ):
-                seq_full = seq_lens_full[:batch_size]
-                if seq_full.device != device:
-                    seq_full = seq_full.to(device=device)
-                if seq_full.dtype != torch.int32:
-                    seq_full = seq_full.to(dtype=torch.int32)
-                seq_full = seq_full.view(1, batch_size, 1).expand(layers, batch_size, num_kv_heads)
-            elif seq_lens_tensor_cpu is not None and seq_lens_tensor_cpu.numel() >= batch_size:
-                # 方案 A 优化：复用预创建的 seq_lens_tensor，只需 to(device)
-                # 方案 B：改用 int32
-                seq_full = (
-                    seq_lens_tensor_cpu[:batch_size]
-                    .to(device=device, dtype=torch.int32)
-                    .view(1, batch_size, 1)
-                    .expand(layers, batch_size, num_kv_heads)
-                )
-            elif seq_lens_cpu is not None and len(seq_lens_cpu) >= batch_size:
-                seq_full = torch.tensor(
-                    [max(0, int(seq_lens_cpu[i])) for i in range(batch_size)],
-                    device=device,
-                    dtype=torch.int32,
-                ).view(1, batch_size, 1).expand(layers, batch_size, num_kv_heads)
-
-        # 细粒度计时：seq_full准备结束
-        self._record_event_safe(seq_full_evt1, device)
-
-        kv_lengths_by_kv_i32: torch.Tensor
-        kv_len_head: torch.Tensor
-        head_sink: torch.Tensor
-        recent_start: torch.Tensor
-        allowed_lengths: torch.Tensor
-        row_lo: torch.Tensor
-        row_hi: torch.Tensor
-        use_cpp_preproc = _compute_use_cpp_preproc(selection_mode=selection_mode)
-
-        # 细粒度计时：纯preproc_bounds计算开始
-        self._record_event_safe(pure_preproc_evt0, device)
-
-        preproc_out = None
-        if use_cpp_preproc:
-            _ext = _get_selector_batch_ext()
-            if _ext is not None:
-                try:
-                    preproc_out = _ext.preproc_bounds(
-                        kv_lengths=kv_lengths,
-                        num_kv_heads=num_kv_heads,
-                        num_queries_per_kv=num_queries_per_kv,
-                        kv_len_total=kv_len_total,
-                        sink_cfg=sink_cfg,
-                        recent_cfg=recent_cfg,
-                        block_size=block_size,
-                        window=window,
-                        seq_full=seq_full,
-                    )
-                except Exception:
-                    _log.warning("C++ preproc_bounds failed", exc_info=True)
-                    raise
-        if preproc_out is not None and isinstance(preproc_out, tuple) and len(preproc_out) == 7:
-            (
-                kv_lengths_by_kv_i32,
-                kv_len_head,
-                head_sink,
-                recent_start,
-                allowed_lengths,
-                row_lo,
-                row_hi,
-            ) = preproc_out
-        elif use_cpp_preproc:
-            raise RuntimeError(
-                "selector cpp preproc is enabled but unavailable"
-            )
-        else:
-            kv_lengths_by_kv = kv_lengths.reshape(layers, batch_size, num_kv_heads, num_queries_per_kv)
-            kv_lengths_by_kv_i32 = kv_lengths_by_kv.to(dtype=torch.int32)
-            kv_len_head = kv_lengths_by_kv_i32.max(dim=3).values.clamp(max=kv_len_total)
-
-            head_sink = torch.clamp(kv_len_head, max=max(0, sink_cfg))
-
-            # recent_start：必须基于“真实 seq_len”（而不是 capture K 上限）计算，否则当 capture 已裁掉 recent
-            # 时会发生“重复扣 recent”的静默错误（把 [recent_start-256, recent_start) 也当作 recent 丢弃）。
-            #
-            # - seq_lens_cpu 来自 StepContext（CPU），不触发 DtoH，同一 batch 内跨层一致；
-            # - 最终 recent_start 仍需 clamp 到 kv_len_total（capture 的 K 维上限）。
-            # 方案 B：recent_start 也保持 int32
-            if block_size > 0 and recent_cfg > 0:
-                if seq_full is not None:
-                    cap_full = torch.clamp(seq_full, max=int(recent_cfg))
-                    rs_full = ((seq_full - cap_full) // int(block_size)) * int(block_size)
-                    rs_full = torch.clamp(rs_full, min=0, max=int(kv_len_total))
-                    recent_start = rs_full
-                else:
-                    cap = torch.clamp(kv_len_head, max=int(recent_cfg))
-                    recent_start = ((kv_len_head - cap) // int(block_size)) * int(block_size)
-                    recent_start = torch.clamp(recent_start, min=0, max=int(kv_len_total))
-            else:
-                recent_start = kv_len_head.new_zeros(kv_len_head.shape)
-
-            allowed_lengths = torch.clamp(recent_start - head_sink, min=0)
-
-            # bounds：不物化 [L,B,Hkv,Q,W,K] 的 allowed_mask（巨量显存 + 带宽），而是为每个 row
-            # 提供允许的区间 [row_lo, row_hi)。这里 row 表示 (query, window_pos) 的笛卡尔积。
-            #
-            # 旧语义：allowed_mask = length & stair & ~(sink|over|recent)
-            # 由于 sink/recent 是“永远保留”，selector 只在 middle 段 [sink, recent_start) 里挑 token；
-            # 该有效域天然是连续区间，可用 bounds 精确表达。
-            #
-            # 方案 B：head_sink/kv_len_head/recent_start 已是 int32，无需转换
-            # row_lo/hi: [L,B,Hkv,Q,W]（int32）
-            row_lo = head_sink.unsqueeze(-1).unsqueeze(-1).expand(
-                layers, batch_size, num_kv_heads, num_queries_per_kv, window
-            )
-
-            # row_hi 由以下约束取 min：
-            # - per query kv_len（kv_lengths_by_kv_i32）
-            # - stair 上界（kv_len_head - tail_offset）
-            # - recent_start（排除 recent 段）
-            # 最后 clamp 到 [0, kv_len_total]
-            kv_len_q = kv_lengths_by_kv_i32.unsqueeze(-1).expand(
-                layers, batch_size, num_kv_heads, num_queries_per_kv, window
-            )
-            row_hi = kv_len_q
-            if window > 0:
-                # 使用缓存的常量 tensor，避免每次 refresh 重新分配
-                tail_offsets = self._get_tail_offsets(window=window, device=device)
-                hi_stair = kv_len_head.unsqueeze(-1).unsqueeze(-1) - tail_offsets
-                hi_stair = hi_stair.expand(layers, batch_size, num_kv_heads, num_queries_per_kv, window)
-                row_hi = torch.minimum(row_hi, hi_stair)
-            row_hi = torch.minimum(
-                row_hi,
-                recent_start.unsqueeze(-1).unsqueeze(-1).expand(
-                    layers, batch_size, num_kv_heads, num_queries_per_kv, window
-                ),
-            )
-            row_hi = torch.clamp(row_hi, min=0, max=int(kv_len_total))
-
-        # 细粒度计时：纯preproc_bounds计算结束（覆盖C++和Python两个路径）
-        self._record_event_safe(pure_preproc_evt1, device)
-
-        positions_token = self._get_positions_i32(kv_len=kv_len_total, device=device)
-
-        scores_kv = capture_scores.reshape(
-            layers, batch_size, num_kv_heads, num_queries_per_kv, window, kv_len_total
-        )
-
-        # 方案 I 优化：使用辅助方法记录 event
-        # preproc 计时覆盖：kv_len_head/head_sink/recent_start/row_lo/row_hi 等张量算子
-        self._record_event_safe(preproc_evt1, device)
-        self._record_event_safe(log_s_evt0, device)
-
-        log_s_detail_events: Optional[
-            Dict[str, Tuple[Optional[torch.cuda.Event], Optional[torch.cuda.Event]]]
-        ] = None
-        log_s_adjusted, log_s_detail_events = self._compute_alpha_log_s_batched_layers(
-            scores_kv=scores_kv,
-            log_f_denoms=log_f_denoms,
-            row_lo=row_lo,
-            row_hi=row_hi,
-            token_lo=head_sink,
-            token_hi=recent_start,
-            key_norms_full=key_norms_full,
-            positions_token=positions_token,
-            apply_cross_head=True,
-            profile_detail=bool(profile_detail),
-        )
-        self._record_event_safe(log_s_evt1, device)
-        self._record_event_safe(topk_evt0, device)
-
-        selected_middle_pages = None
-        selected_middle_counts = None
-        selected_token_scores = None
-        if selection_mode == "token_topk":
-            k_head_cfg = compact_recent_effective_k_head(
-                k_head=int(self.config.alpha_fair.k_head or 0),
-                sink_tokens=int(sink_cfg),
-                attn_mode=str(getattr(self.config, "attn_mode", "compact_recent")),
-            )
-            selected_indices_batch, selected_token_scores = self._select_alpha_topk_batched_with_scores(
-                log_s_adjusted=log_s_adjusted,
-                head_sink=head_sink,
-                recent_start=recent_start,
-                kv_len_head=kv_len_head,
-                positions_token=positions_token,
-                k_head_cfg=k_head_cfg,
-                slice_start=topk_slice_start,
-                slice_end=topk_slice_end,
-            )
-        else:
-            raise ValueError(f"unsupported alpha selection_mode: {selection_mode}")
-        self._record_event_safe(topk_evt1, device)
-
-        profile_events: Optional[Dict[str, Tuple[Optional[torch.cuda.Event], Optional[torch.cuda.Event]]]] = None
-        if profile_detail:
-            profile_events = {
-                "preproc": (preproc_evt0, preproc_evt1),
-                "seq_full": (seq_full_evt0, seq_full_evt1),
-                "pure_preproc": (pure_preproc_evt0, pure_preproc_evt1),
-                "log_s": (log_s_evt0, log_s_evt1),
-                "log_s_triton": (None, None),
-                "log_s_mask": (None, None),
-                "log_s_cross": (None, None),
-                "topk": (topk_evt0, topk_evt1),
-            }
-            if log_s_detail_events is not None:
-                for key in ("log_s_triton", "log_s_mask", "log_s_cross"):
-                    pair = log_s_detail_events.get(key)
-                    if isinstance(pair, tuple) and len(pair) == 2:
-                        profile_events[key] = pair
-        result = (
-            selected_indices_batch,
-            head_sink,
-            recent_start,
-            kv_len_head,
-            allowed_lengths,
-            selected_middle_pages,
-            selected_middle_counts,
-            selected_token_scores,
-            profile_events,
-        )
-        if bool(return_selected_token_scores):
-            return result
-        return (
-            result[0],
-            result[1],
-            result[2],
-            result[3],
-            result[4],
-            result[5],
-            result[6],
-            result[8],
-        )
-
-    def _compute_alpha_log_s_batched_layers(
-        self,
-        *,
-        scores_kv: torch.Tensor,
-        log_f_denoms: Optional[torch.Tensor],
-        row_lo: torch.Tensor,
-        row_hi: torch.Tensor,
-        token_lo: torch.Tensor,
-        token_hi: torch.Tensor,
-        key_norms_full: torch.Tensor,
-        positions_token: torch.Tensor,
-        apply_cross_head: bool = True,
-        profile_detail: bool = False,
-    ) -> Tuple[
-        torch.Tensor,
-        Optional[Dict[str, Tuple[Optional[torch.cuda.Event], Optional[torch.cuda.Event]]]],
-    ]:
-        """Selector 阶段 A：计算 log_s（含 cross-head mutex），保持语义与旧路径一致。"""
-        if self.config is None or self.config.alpha_fair is None:
-            raise RuntimeError("alpha selector requires config.alpha_fair")
-
-        log_s_batch: Optional[torch.Tensor] = None
-        device = scores_kv.device
-        # 方案 I 优化：批量创建 profile events
-        _log_s_evts = self._create_profile_events_batch(6, device, profile_detail)
-        log_s_triton_evt0, log_s_triton_evt1, log_s_mask_evt0, log_s_mask_evt1, log_s_cross_evt0, log_s_cross_evt1 = _log_s_evts
-
-        row_dim = int(scores_kv.shape[3]) * int(scores_kv.shape[4])
-        if log_s_batch is None:
-            if not scores_kv.is_cuda:
-                raise RuntimeError("alpha selector requires CUDA tensors (torch fallback removed)")
-            if row_dim > 128:
-                raise RuntimeError(
-                    "legacy selector log_s path only supports rows<=128; "
-                    "no fallback is available"
-                )
-
-            # 方案 I 优化：使用辅助方法记录 event
-            self._record_event_safe(log_s_triton_evt0, device)
-            if log_f_denoms is None:
-                log_s_batch, _ = compute_alpha_scores_batched_layers_triton_logf_bounds(
-                    scores_kv,
-                    row_lo,
-                    row_hi,
-                    key_norms_full,
-                    positions_token,
-                    self.config.alpha_fair,
-                    return_mean_probs=False,
-                )
-            else:
-                # last_n>1：kernel 输出 log_f_pre + denom_f（按 query head）。
-                # 这里使用 denom 在 Triton 内恢复每行 log_probs，并完成 rows→log_f 聚合，避免：
-                # - torch.log_softmax 回退
-                # - 物化大张量 (log_probs = log_f_pre - denom)
-                if log_f_denoms.dim() != 3:
-                    raise ValueError("log_f_denoms must be [L, B, Hq]")
-                layers, batch, num_kv_heads, num_queries_per_kv, window, _ = scores_kv.shape
-                if window != 1:
-                    raise RuntimeError("log_f_pre+denom path requires window==1")
-                if log_f_denoms.shape != (layers, batch, num_kv_heads * num_queries_per_kv):
-                    raise ValueError("log_f_denoms shape mismatch with scores_kv heads")
-                denoms_rows = log_f_denoms.reshape(layers, batch, num_kv_heads, num_queries_per_kv, 1)
-                log_s_batch, _ = compute_alpha_scores_batched_layers_triton_logf_pre_denom_bounds(
-                    scores_kv,
-                    denoms_rows,
-                    row_lo,
-                    row_hi,
-                    key_norms_full,
-                    positions_token,
-                    self.config.alpha_fair,
-                    return_mean_probs=False,
-                )
-            self._record_event_safe(log_s_triton_evt1, device)
-
-        layers, batch_size, num_kv_heads, kv_len_total = log_s_batch.shape
-        # token_lo/token_hi：用于 cross-head mutex 的有效域裁剪。
-        # 方案 I 优化：使用辅助方法记录 event
-        log_s_adjusted = log_s_batch
-        if apply_cross_head:
-            self._record_event_safe(log_s_mask_evt0, device)
-            flat_log_s = log_s_batch.reshape(layers * batch_size, num_kv_heads, kv_len_total)
-            flat_lo = token_lo.reshape(layers * batch_size, num_kv_heads)
-            if flat_lo.device != device:
-                flat_lo = flat_lo.to(device=device)
-            if flat_lo.dtype != torch.int32:
-                flat_lo = flat_lo.to(dtype=torch.int32)
-            flat_hi = token_hi.reshape(layers * batch_size, num_kv_heads)
-            if flat_hi.device != device:
-                flat_hi = flat_hi.to(device=device)
-            if flat_hi.dtype != torch.int32:
-                flat_hi = flat_hi.to(dtype=torch.int32)
-            self._record_event_safe(log_s_mask_evt1, device)
-            self._record_event_safe(log_s_cross_evt0, device)
-            log_s_adjusted = apply_cross_head_mutex_bounds(
-                flat_log_s,
-                flat_lo,
-                flat_hi,
-                self.config.alpha_fair.cross_head_alpha,
-                self.config.alpha_fair.cross_head_temperature,
-                self.config.alpha_fair.nms_window,
-                self.config.alpha_fair.cross_head_power,
-            ).reshape(layers, batch_size, num_kv_heads, kv_len_total)
-            self._record_event_safe(log_s_cross_evt1, device)
-
-        profile_events: Optional[Dict[str, Tuple[Optional[torch.cuda.Event], Optional[torch.cuda.Event]]]] = None
-        if profile_detail:
-            profile_events = {
-                "log_s_triton": (log_s_triton_evt0, log_s_triton_evt1),
-                "log_s_mask": (log_s_mask_evt0, log_s_mask_evt1),
-                "log_s_cross": (log_s_cross_evt0, log_s_cross_evt1),
-            }
-        return log_s_adjusted, profile_events
-
-    def _select_alpha_topk_batched(
-        self,
-        *,
-        log_s_adjusted: torch.Tensor,
-        head_sink: torch.Tensor,
-        recent_start: torch.Tensor,
-        kv_len_head: torch.Tensor,
-        positions_token: torch.Tensor,
-        k_head_cfg: int,
-        slice_start: Optional[int] = None,
-        slice_end: Optional[int] = None,
-    ) -> torch.Tensor:
-        """Selector 阶段 B：从 log_s 中选择 top-k indices（保持旧逻辑）。"""
-        topk_idx, _ = self._select_alpha_topk_batched_with_scores(
-            log_s_adjusted=log_s_adjusted,
-            head_sink=head_sink,
-            recent_start=recent_start,
-            kv_len_head=kv_len_head,
-            positions_token=positions_token,
-            k_head_cfg=k_head_cfg,
-            slice_start=slice_start,
-            slice_end=slice_end,
-        )
-        return topk_idx
-
-    def _select_alpha_topk_batched_with_scores(
-        self,
-        *,
-        log_s_adjusted: torch.Tensor,
-        head_sink: torch.Tensor,
-        recent_start: torch.Tensor,
-        kv_len_head: torch.Tensor,
-        positions_token: torch.Tensor,
-        k_head_cfg: int,
-        slice_start: Optional[int] = None,
-        slice_end: Optional[int] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Selector 阶段 B：选择 top-k indices，并保留对应 score。"""
-        layers, batch_size, num_kv_heads, kv_len_total = log_s_adjusted.shape
-        device = log_s_adjusted.device
-        if k_head_cfg <= 0:
-            empty_idx = torch.full((layers, batch_size, num_kv_heads, 1), -1, dtype=torch.int32, device=device)
-            empty_scores = torch.full(
-                (layers, batch_size, num_kv_heads, 1),
-                float("-inf"),
-                dtype=log_s_adjusted.dtype,
-                device=device,
-            )
-            return empty_idx, empty_scores
-
-        use_slice = False
-        start = 0
-        end = kv_len_total
-        if slice_start is not None and slice_end is not None:
-            start = max(0, int(slice_start))
-            end = min(int(slice_end), int(kv_len_total))
-            if end > start:
-                use_slice = True
-
-        # 方案 C 优化：使用 sorted=True 替代后处理 sort
-        # sorted=True 会自动将有效值降序排列，-inf 值排到尾部，节省约 400us
-        if use_slice:
-            scores = log_s_adjusted[..., start:end]
-            topk_shift = int(start)
-        else:
-            scores = log_s_adjusted
-            topk_shift = 0
-        scores_len = int(scores.shape[-1]) if scores.ndim > 0 else 0
-        if scores_len <= 0:
-            topk_idx = torch.full(
-                (layers, batch_size, num_kv_heads, int(k_head_cfg)),
-                -1,
-                dtype=torch.int32,
-                device=device,
-            )
-            topk_vals = torch.full(
-                (layers, batch_size, num_kv_heads, int(k_head_cfg)),
-                float("-inf"),
-                dtype=log_s_adjusted.dtype,
-                device=device,
-            )
-            return topk_idx, topk_vals
-        k_eff = min(int(k_head_cfg), int(scores_len))
-        topk_vals, topk_idx = torch.topk(
-            scores,
-            k_eff,
-            dim=-1,
-            largest=True,
-            sorted=True,  # 方案 C：直接排序
-        )
-        if topk_shift:
-            topk_idx = topk_idx + int(topk_shift)
-        if k_eff < int(k_head_cfg):
-            pad = torch.full(
-                (layers, batch_size, num_kv_heads, int(k_head_cfg) - int(k_eff)),
-                -1,
-                dtype=topk_idx.dtype,
-                device=device,
-            )
-            topk_idx = torch.cat([topk_idx, pad], dim=-1)
-            padv = torch.full_like(pad, float("-inf"), dtype=topk_vals.dtype)
-            topk_vals = torch.cat([topk_vals, padv], dim=-1)
-        # 方案 E 优化：先转 int32 再 masked_fill（减少 ~50us）
-        # 重要：后续 fused rebuild / CUDA writer 仅需 int32 token index
-        if topk_idx.dtype != torch.int32:
-            topk_idx = topk_idx.to(dtype=torch.int32)
-        # 将 -inf 对应的 index 标记为 -1（sorted=True 已保证 -inf 在尾部）
-        invalid = ~torch.isfinite(topk_vals)
-        topk_idx = topk_idx.masked_fill(invalid, -1)
-        # 方案 C：由于 sorted=True 已经把有效值排在前面、-inf 排在尾部，
-        # 无需再用 sentinel sort 重排
-        valid_counts = (topk_idx >= 0).sum(dim=-1)
-        min_valid = valid_counts.min(dim=2).values
-        k_index_template = torch.arange(int(k_head_cfg), device=device, dtype=min_valid.dtype)
-        keep_mask = (
-            k_index_template.view(1, 1, 1, -1)
-            < min_valid.unsqueeze(-1).unsqueeze(-1)
-        )
-        topk_idx = topk_idx.masked_fill(~keep_mask, -1)
-        topk_vals = topk_vals.masked_fill(~keep_mask, float("-inf"))
-        return topk_idx, topk_vals
-
     def _compute_alpha_selection_batched(
         self,
         payloads: Sequence[SelectorBatchPayload],
@@ -3278,7 +2787,6 @@ class SelectorComputeMixin:
             align_up_int_fn=_align_up_int,
             selector_cpp_stack_cached=bool(_SELECTOR_CPP_STACK_CACHED),
             get_selector_batch_ext_fn=_get_selector_batch_ext,
-            rebuild_physical_block_sort_cached=bool(_REBUILD_PHYSICAL_BLOCK_SORT_CACHED),
             selector_kbucket_cached=bool(_SELECTOR_KBUCKET_CACHED),
         )
 

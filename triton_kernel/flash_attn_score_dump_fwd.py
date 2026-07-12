@@ -14,7 +14,7 @@ import torch
 import triton
 import triton.language as tl
 
-from triton_kernel.req_meta_flag_codec import REQ_META_SINK_SHIFT, validate_sink_tokens
+from utils.req_meta_flag_codec import REQ_META_SINK_SHIFT, validate_sink_tokens
 
 REQ_META_SINK_SHIFT_CONST = tl.constexpr(REQ_META_SINK_SHIFT)
 

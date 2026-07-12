@@ -737,6 +737,25 @@ class WaitDeciderMixin:
         tracking: object,
         epoch: int = -1,
     ) -> None:
+        # [BOOTSTRAP-MATERIALIZE-GATE 纵深断言 2026-07-10] ready 全层 commit
+        # 前,该请求不得有在飞 refresh 世代(chunk 分轮 commit 与本 commit 交错
+        # =层间 read_gen 错开=[DUAL-GEN-LAYER-PARITY] 崩)。planner 咽喉门保证
+        # bridge 窗内票一律不 materialize ⇒ scheduled_* 恒 -1(scheduled 仅在
+        # payload enqueue 成功的 commit 路径写入);此处 fail-fast 把门破/交错
+        # 在源头暴露,替代 parity 守卫的下游兜捕。调用点全部经
+        # bootstrap_pending=True 门(ready 后不重复 commit),无误炸面。
+        _sched_ctrl = int(getattr(tracking, "scheduled_refresh_ctrl_step", -1))
+        _sched_decode = int(getattr(tracking, "scheduled_decode_refresh_step", -1))
+        if _sched_ctrl >= 0 or _sched_decode >= 0:
+            raise RuntimeError(
+                "[BOOTSTRAP-MATERIALIZE-GATE] bootstrap ready commit while a "
+                f"refresh generation is in flight for req={rid!r} "
+                f"(scheduled_refresh_ctrl_step={_sched_ctrl}, "
+                f"scheduled_decode_refresh_step={_sched_decode}): chunk-round "
+                "commits would interleave with the bootstrap full-layer commit "
+                "(dual-gen layer parity risk); the planner materialize gate "
+                "must hold tickets of bootstrap_pending requests"
+            )
         ready_state = getattr(tracking, "producer_ready_state", None)
         commit_log = getattr(ready_state, "compact_meta_commit_log", None)
         if commit_log:

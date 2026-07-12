@@ -257,6 +257,52 @@ def _bucket_topk_slice_end(slice_start: int, slice_end: int, kv_len_total: int) 
     return end
 
 
+def canonicalize_selected_indices_pack_order(
+    selected_indices: torch.Tensor,
+    *,
+    selected_token_scores: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """[SELECTOR-PACK-ORDER-DETERMINISM 2026-07-11] canonical pack order.
+
+    选中集合(最后一维)按逻辑 token index 升序规范化,-1(空槽)移尾:
+      * 选集不变(纯 permutation),仅序规范——输出是选中"集合"的纯函数,
+        与生产者(ATen topk sorted=false)的实现定义输出序无关;
+      * 有效 pick 的 index 键逐行唯一(topk 不重复取列)⇒有效区全序,排序
+        稳定性不影响有效区结果;-1 槽(value-sentinel/短窗 pad)统一移尾,
+        stable=True 使整个 permutation 也是输入的确定函数;
+      * 键与分数无关——不扰动选择语义,只规范 writer 的 pack 序。
+    selected_token_scores(若有)随同一 permutation 对齐(live unified 路径
+    恒为 None,分支保留给任何未来分数生产者)。
+    """
+    if not isinstance(selected_indices, torch.Tensor) or selected_indices.numel() == 0:
+        return selected_indices, selected_token_scores
+    if selected_indices.dim() != 4:
+        raise ValueError(
+            "selected_indices must be [L,B,H,k] for pack-order canonicalization; "
+            f"got dim={int(selected_indices.dim())}"
+        )
+    if int(selected_indices.shape[-1]) <= 1:
+        return selected_indices, selected_token_scores
+    # 空槽 sentinel:取 dtype 上界(逻辑 token index 远小于 int32/int64 上界,
+    # 有效值不可能与 sentinel 冲突),升序后自然落尾。
+    empty_key = torch.iinfo(selected_indices.dtype).max
+    sort_keys = selected_indices.masked_fill(selected_indices < 0, empty_key)
+    if selected_token_scores is None:
+        # 快路径:键即值,直接 sort 免 argsort+gather。
+        sorted_keys = torch.sort(sort_keys, dim=-1, stable=True).values
+        return sorted_keys.masked_fill_(sorted_keys == empty_key, -1), None
+    if selected_token_scores.shape != selected_indices.shape:
+        raise ValueError(
+            "selected_token_scores shape must match selected_indices "
+            "for pack-order canonicalization"
+        )
+    order = torch.argsort(sort_keys, dim=-1, stable=True)
+    return (
+        selected_indices.gather(-1, order),
+        selected_token_scores.gather(-1, order),
+    )
+
+
 def compute_alpha_selection_batched_impl(
     self: Any,
     payloads: Any,
@@ -266,13 +312,11 @@ def compute_alpha_selection_batched_impl(
     align_up_int_fn: Callable[[int, int], int],
     selector_cpp_stack_cached: bool,
     get_selector_batch_ext_fn: Callable[[], object],
-    rebuild_physical_block_sort_cached: bool,
     selector_kbucket_cached: bool = False,
 ):
     _align_up_int = align_up_int_fn
     _SELECTOR_CPP_STACK_CACHED = bool(selector_cpp_stack_cached)
     _get_selector_batch_ext = get_selector_batch_ext_fn
-    _REBUILD_PHYSICAL_BLOCK_SORT_CACHED = bool(rebuild_physical_block_sort_cached)
     if not payloads:
         return None
     if self.config is None or self.config.alpha_fair is None:
@@ -1464,46 +1508,23 @@ def compute_alpha_selection_batched_impl(
     if profile_detail and t_select0_ns is not None:
         profile_cpu_select_us = (time.perf_counter_ns() - t_select0_ns) / 1000.0
 
-    # 可选：按 physical block-major 重排 selected_indices（不改变 token 集合，仅更换顺序）。
-    # 该优化仅用于性能实验：可能带来轻微数值漂移（attention 归约顺序变化）。
-    physical_sort = bool(_REBUILD_PHYSICAL_BLOCK_SORT_CACHED)
-    if physical_sort and phase == "decode":
-        try:
-            if block_table_ref is not None and block_size_ref is not None and int(block_size_ref) > 0:
-                # [DETERMINISTIC-SLOT-SOURCE 2026-07-03] row 恒从 row_list 构造
-                # (payload 的 row_tensor(_i32) 是复用 buffer live 视图,错峰下
-                # 被覆写;此处喂 block_table 行查表做重排键)。
-                rt_i32 = None
-                if row_list_ref is not None and len(row_list_ref) == batch_size:
-                    rt_i32 = cached_sequence_to_device(
-                        row_list_ref,
-                        device=device,
-                        dtype=torch.int32,
-                        cache_name=f"selector_physical_row_i32{selector_layer_span_cache_suffix}",
-                        cache_owner=self,
-                        reuse_unchanged=True,
-                    )
-                if rt_i32 is not None:
-                    reorder_order = self._compute_selected_indices_physical_block_major_order(
-                        selected_indices=selected_indices_all,
-                        block_table=block_table_ref,
-                        row_tensor_i32=rt_i32,
-                        block_size=int(block_size_ref),
-                    )
-                    if reorder_order is not None:
-                        if (
-                            selected_token_scores_all is not None
-                            and selected_token_scores_all.shape != selected_indices_all.shape
-                        ):
-                            raise ValueError(
-                                "selected_token_scores shape must match selected_indices for physical reorder"
-                            )
-                        selected_indices_all = selected_indices_all.gather(-1, reorder_order)
-                        if selected_token_scores_all is not None:
-                            selected_token_scores_all = selected_token_scores_all.gather(-1, reorder_order)
-        except Exception:
-            _log.warning("physical_block_major reorder failed", exc_info=True)
-            raise
+    # [SELECTOR-PACK-ORDER-DETERMINISM 2026-07-11] 换锚件:pack 序无条件规范化
+    # (全 phase,无旋钮)。上游 ATen topk(sorted=false) 的输出序是实现定义的
+    # (CUDA multi-block 竞争序 run 间可变),而 writer 链按此序 pack compact 页
+    # → FA 按行序做非结合 fp 累加 → logits 低位 run 间漂移。此处把选中集合按
+    # 逻辑 token index 升序、-1(空槽)移尾规范化:选集不变,pack 序变为选中
+    # 集合的纯函数(与 topk 输出序/物理块分配均无关)。取代原
+    # VLLM_SPARSE_REBUILD_PHYSICAL_BLOCK_SORT 实验旋钮(物理槽位键依赖
+    # allocator 状态,非"输入序列的纯函数";其 argsort/gather 骨架在此保留)。
+    # 附带根修:gather kernel 前缀消费 persist_len 槽且对 -1 槽打 ordinal
+    # fallback——规范化后有效 pick 恒在前缀内,短行 regime 不再出现"有效 pick
+    # 落在前缀外被丢/-1 混入前缀吃填充 token"的 run 间可变选集。
+    selected_indices_all, selected_token_scores_all = (
+        canonicalize_selected_indices_pack_order(
+            selected_indices_all,
+            selected_token_scores=selected_token_scores_all,
+        )
+    )
     _evts = _unpack_detail_events(detail_events)
     _none2 = (None, None)
 

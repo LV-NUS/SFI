@@ -9,8 +9,9 @@ SFI's CUDA fast path is implemented as a patch set on top of
 | **FA3 patch** | `sfi_fa3_sm80_sm90.patch` — mixed-page / compact-KV forward, dual-source paged KV, resolved-row-ptr routing, score capture; targets **SM80** (Ampere) and **SM90** (Hopper) |
 | **FA4 patch** | `sfi_fa4_sm100_cute.patch` — the same compact-KV design ported to the FA4 CuTe-DSL kernels, plus the shared dispatch-layer validation/guards in `vllm_flash_attn/flash_attn_interface.py`; targets **SM100** (Blackwell); applies **on top of** the FA3 patch |
 
-Both patches were generated with `git diff --binary` against the base commit
-and verified to apply cleanly (`git apply --check`) in that exact order:
+Both patches were generated with `git diff --binary` against the base commit.
+The FA3 patch is verified to apply cleanly (`git apply --check`) on the base
+commit:
 
 ```bash
 git clone https://github.com/vllm-project/flash-attention.git
@@ -18,8 +19,18 @@ cd flash-attention
 git checkout f5bc33cfc02c744d24a2e9d50e6db656de40611c
 git submodule update --init csrc/cutlass
 git apply /path/to/SFI/kernel_patches/sfi_fa3_sm80_sm90.patch
-git apply /path/to/SFI/kernel_patches/sfi_fa4_sm100_cute.patch   # SM100 only
+git apply /path/to/SFI/kernel_patches/sfi_fa4_sm100_cute.patch   # SM100 only — see note below
 ```
+
+> **SM100 note (2026-07-12):** `sfi_fa3_sm80_sm90.patch` was refreshed with a
+> large SM80/SM90 kernel batch plus a dispatch-layer ABI extension (trailing
+> optional `softmax_lse_out` op arg). `sfi_fa4_sm100_cute.patch` was generated
+> against the previous FA3 form and two of its
+> `vllm_flash_attn/flash_attn_interface.py` hunks no longer apply on top of the
+> refreshed FA3 patch (the six `flash_attn/cute/*` hunks and the two guard
+> hunks still apply). SM80/SM90 users are unaffected. SM100 users should stay
+> on the previous release tag until the FA4 patch is rebased in an upcoming
+> SM100 window.
 
 `scripts/setup_flash_attention.sh` automates exactly this plus the build.
 

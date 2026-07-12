@@ -378,6 +378,38 @@ def build_compact_recent_launch_plan(
         batch_size=batch_size,
         device=device,
     )
+    # [ARM-WAR-R1-PINNED-INDEPENDENT 2026-07-12] E1/E2/E3 根修(组X 案定谳:
+    # 时序敏感结构性异步缺边)。controller 常驻 pinned 单例 descriptor/offset
+    # 存在「异步 H2D 未决 ←→ 相邻步 host 复写」WAR 族:cudaMemcpyAsync 读源
+    # 发生在 GPU 执行时刻而非 enqueue 时刻,host 领先窗内对同一 pinned 源的
+    # 复写会让在途 H2D 读到"未来值"。改为每次整建独立 fresh pinned 分配并
+    # 替换常驻引用:torch CachingHostAllocator 在 pinned 块释放时按使用流
+    # record event、复用前查询完成——旧块在其未决 H2D 完成前不会被发回,
+    # WAR 窗物理消灭。零事件零 sync 零旋钮;分配走尺寸桶稳态命中(µs 级),
+    # memcpy ≤2KB。先例=rrp_row_table_manager [SEQUSED-STAGING-INDEPENDENT
+    # 2026-07-07](同族第六处)。host_plan(pageable、无 H2D)不在族内。
+    # 形状合同不变:(6,capacity)/(capacity,) 同 _ensure_cached_plan_buffers。
+    pin_memory = str(device.type) == "cuda"
+    descriptor_cpu_storage = _new_cpu_tensor(
+        tuple(descriptor_cpu_storage.shape),
+        dtype=torch.int32,
+        pin_memory=pin_memory,
+    )
+    offset_cpu_storage = _new_cpu_tensor(
+        tuple(offset_cpu_storage.shape),
+        dtype=torch.int64,
+        pin_memory=pin_memory,
+    )
+    setattr(
+        controller,
+        "_compact_recent_launch_plan_descriptor_cpu_i32",
+        descriptor_cpu_storage,
+    )
+    setattr(
+        controller,
+        "_compact_recent_launch_plan_offset_cpu_i64",
+        offset_cpu_storage,
+    )
     descriptor_cpu = descriptor_cpu_storage[:, :batch_size]
     host_plan_i32 = host_cpu_storage[:batch_size, :]
     compact_offset_cpu = offset_cpu_storage[:batch_size]

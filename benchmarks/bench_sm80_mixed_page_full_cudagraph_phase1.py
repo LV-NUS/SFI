@@ -7,6 +7,7 @@ import os
 import signal
 import subprocess
 import sys
+from collections import Counter
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -757,10 +758,34 @@ def _semantic_output_diffs(
     return diffs
 
 
+class _RouteTraceEvents(list):
+    """route trace 事件列表载体:附带解析诊断(坏行数/来源路径)。
+
+    [ROUTE-TRACE-PID-NORM 2026-07-11] list 子类=对既有消费者完全透明
+    (迭代/len/切片/拼接/json 序列化均为 list 语义);仅 _route_summary 的
+    pid 归一读取附加属性,用于把多进程 O_APPEND 长行撕裂的坏行数量转成
+    组间一致性断言的容忍上界(撕裂丢行才可解释组间小差异)。
+    """
+
+    __slots__ = ("bad_line_count", "source_path")
+
+    def __init__(
+        self,
+        events: list[dict[str, Any]] | tuple[dict[str, Any], ...] = (),
+        *,
+        bad_line_count: int = 0,
+        source_path: str = "",
+    ) -> None:
+        super().__init__(events)
+        self.bad_line_count = int(bad_line_count)
+        self.source_path = str(source_path)
+
+
 def _read_trace_events(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
-        return []
+        return _RouteTraceEvents((), bad_line_count=0, source_path=str(path))
     events: list[dict[str, Any]] = []
+    bad_line_count = 0
     with path.open("r", encoding="utf-8") as handle:
         for raw in handle:
             raw = raw.strip()
@@ -769,14 +794,172 @@ def _read_trace_events(path: Path) -> list[dict[str, Any]]:
             try:
                 payload = json.loads(raw)
             except Exception:
+                # 多进程 O_APPEND 撕裂/截断行:保持旧行为跳过,但如实计数,
+                # 供 pid 归一把组间差异归因到撕裂(而非静默吞掉)。
+                bad_line_count += 1
                 continue
             if isinstance(payload, dict):
                 events.append(payload)
-    return events
+            else:
+                bad_line_count += 1
+    return _RouteTraceEvents(
+        events,
+        bad_line_count=bad_line_count,
+        source_path=str(path),
+    )
 
 
 def _read_jsonl_events(path: Path) -> list[dict[str, Any]]:
     return _read_trace_events(path)
+
+
+def _refresh_reason_key(reason: str) -> str:
+    """refresh_reason 归桶(sentence/interval;period 系归 interval)。"""
+    if "sentence" in reason:
+        return "sentence"
+    if "interval" in reason:
+        return "interval"
+    if "period" in reason:
+        return "interval"
+    return reason
+
+
+_ROUTE_TRACE_ENQUEUE_EVENT = "mixed_page_full_cudagraph_replay_refresh_payload_enqueue"
+
+
+def _route_trace_event_pid(event: dict[str, Any]) -> int | None:
+    pid = event.get("pid")
+    if isinstance(pid, bool) or not isinstance(pid, int):
+        return None
+    return int(pid)
+
+
+def _route_trace_event_signature_key(event: dict[str, Any]) -> tuple[str, str, str]:
+    """组间一致性签名键:事件名+callable+(enqueue 事件的 reason 桶)。
+
+    只比"事件种类计数"不比事件内容——各 rank 的时间戳/环计数等字段天然
+    不同,但 SPMD 无 rank 门下事件种类与次数必须逐组一致。reason 桶纳入
+    签名,保证 counts 判读(sentence/interval)所依赖的分布也被一致性
+    断言覆盖。
+    """
+    name = str(event.get("event", "") or "")
+    callable_name = str(event.get("callable", "") or "")
+    reason_key = ""
+    if name == _ROUTE_TRACE_ENQUEUE_EVENT:
+        reason_key = _refresh_reason_key(
+            str(event.get("refresh_reason", "") or "unknown")
+        )
+    return (name, callable_name, reason_key)
+
+
+def _normalize_route_trace_events_by_pid(
+    events: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """[ROUTE-TRACE-PID-NORM 2026-07-11] TP>1 多进程 8× 计数通胀的读侧根修。
+
+    TP>1 时每个 EngineCore worker 进程都把同一 refresh 世代事件 append 进
+    同一份 route trace(发射点无 rank 门,patch_installer/_fa3_route_trace_
+    enabled),逐行累加=一切 route 计数 ×TP 通胀(远端实证 replay_refresh
+    16376/8=2047≈decode 步数)。本函数把聚合语义收回单 controller 口径:
+
+    - 无 pid 事件(bench_measure_marker 等驱动进程直写 marker,不经
+      append_fa3_route_trace)原位直通,不参与分组;
+    - ≤1 个 pid 组=TP1 形态:原对象原样返回(本地判速/黄金/counts 判据链
+      逐位不变的硬合同);
+    - ≥2 个 pid 组:先断言组间"事件种类×次数"签名一致,再取首现 pid 组为
+      计数源(单 controller 口径);组间不一致仅当可归因于 O_APPEND 长行
+      撕裂(spread ≤ 2×坏行数,一条撕裂行至多毁两条事件)时容忍并告警、
+      改取事件最全的组,否则 fail-loud 抛错——绝不静默平均。
+    """
+    bad_line_count = max(0, int(getattr(events, "bad_line_count", 0) or 0))
+    source_path = str(getattr(events, "source_path", "") or "")
+    groups: dict[int, list[dict[str, Any]]] = {}
+    pidless_count = 0
+    for event in events:
+        pid = _route_trace_event_pid(event)
+        if pid is None:
+            pidless_count += 1
+            continue
+        groups.setdefault(pid, []).append(event)
+    diag: dict[str, Any] = {
+        "route_trace_pid_count": len(groups),
+        "route_trace_pidless_event_count": int(pidless_count),
+        "route_trace_bad_line_count": int(bad_line_count),
+        "route_trace_pid_consistency": "single",
+        "route_trace_canonical_pid": next(iter(groups), -1),
+        "route_trace_pid_group_spread": 0,
+        "route_trace_dedup_dropped_event_count": 0,
+    }
+    if len(groups) <= 1:
+        return events, diag
+    signatures: dict[int, Counter] = {
+        pid: Counter(_route_trace_event_signature_key(event) for event in group)
+        for pid, group in groups.items()
+    }
+    pids_in_order = list(groups)
+    first_signature = signatures[pids_in_order[0]]
+    if all(signatures[pid] == first_signature for pid in pids_in_order[1:]):
+        canonical_pid = pids_in_order[0]
+        consistency = "consistent"
+        spread = 0
+    else:
+        signature_keys: set[tuple[str, str, str]] = set()
+        for signature in signatures.values():
+            signature_keys.update(signature)
+        spread = sum(
+            max(signatures[pid].get(key, 0) for pid in pids_in_order)
+            - min(signatures[pid].get(key, 0) for pid in pids_in_order)
+            for key in signature_keys
+        )
+        divergent_rows = []
+        for key in sorted(signature_keys):
+            per_pid = {pid: signatures[pid].get(key, 0) for pid in pids_in_order}
+            if len(set(per_pid.values())) > 1:
+                divergent_rows.append(f"{key}: {per_pid}")
+        if spread > 2 * bad_line_count:
+            detail = "\n  ".join(divergent_rows[:12])
+            raise RuntimeError(
+                "[ROUTE-TRACE-PID-NORM] 多进程 route trace 组间事件计数不一致,"
+                f"且超出撕裂容忍上界(spread={spread} > 2×bad_line_count="
+                f"{2 * bad_line_count}):workers 逻辑发散或 trace 被外部污染,"
+                "判读中止(fail-loud,拒绝静默平均)。"
+                f" source={source_path or '<unknown>'}"
+                f" pids={pids_in_order}"
+                f" totals={ {pid: sum(signatures[pid].values()) for pid in pids_in_order} }\n"
+                f"  发散键(最多 12 条):\n  {detail}"
+            )
+        canonical_pid = max(pids_in_order, key=lambda pid: len(groups[pid]))
+        consistency = "torn_tolerated"
+        print(
+            "[ROUTE-TRACE-PID-NORM][WARN] 组间计数差异已归因 O_APPEND 撕裂"
+            f"(spread={spread} ≤ 2×bad_line_count={2 * bad_line_count}),"
+            f"取事件最全组 pid={canonical_pid} 为计数源。"
+            f" source={source_path or '<unknown>'}"
+            f" 发散键:{'; '.join(divergent_rows[:4])}",
+            file=sys.stderr,
+        )
+    normalized = [
+        event
+        for event in events
+        if (_route_trace_event_pid(event) is None)
+        or (_route_trace_event_pid(event) == canonical_pid)
+    ]
+    diag.update(
+        {
+            "route_trace_pid_consistency": consistency,
+            "route_trace_canonical_pid": int(canonical_pid),
+            "route_trace_pid_group_spread": int(spread),
+            "route_trace_dedup_dropped_event_count": len(events) - len(normalized),
+        }
+    )
+    return (
+        _RouteTraceEvents(
+            normalized,
+            bad_line_count=bad_line_count,
+            source_path=source_path,
+        ),
+        diag,
+    )
 
 
 def _row_mode_distribution(events: list[dict[str, Any]]) -> dict[str, int]:
@@ -1484,6 +1667,10 @@ def _rrp_visible_source_proof_summary(events: list[dict[str, Any]]) -> dict[str,
     }
 
 def _route_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
+    # [ROUTE-TRACE-PID-NORM 2026-07-11] 聚合唯一咽喉:TP>1 多进程重复 append
+    # 的读侧归一(单 controller 口径)。TP1(≤1 pid 组)原对象直通=下游全部
+    # 既有字段逐位不变;诊断键 route_trace_* 纯增量。
+    events, route_trace_pid_diag = _normalize_route_trace_events_by_pid(events)
     wrapper_events = [
         event
         for event in events
@@ -1530,14 +1717,7 @@ def _route_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
     refresh_reason_counts: dict[str, int] = {}
     for event in replay_refresh_payload_enqueue_events:
         reason = str(event.get("refresh_reason", "") or "unknown")
-        if "sentence" in reason:
-            reason_key = "sentence"
-        elif "interval" in reason:
-            reason_key = "interval"
-        elif "period" in reason:
-            reason_key = "interval"
-        else:
-            reason_key = reason
+        reason_key = _refresh_reason_key(reason)
         refresh_reason_counts[reason_key] = refresh_reason_counts.get(reason_key, 0) + max(
             1,
             _as_int(event.get("refresh_intent_req_count"), 1),
@@ -1639,6 +1819,8 @@ def _route_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
             )
         ),
         "refresh_reason_counts": refresh_reason_counts,
+        # [INTENTS-SEMANTICS 口径] 世代 enqueue 计数(非 token-time 意图数),
+        # 详见 one_shot_graph_e2e 同名字段注记。
         "interval_trigger_intents": int(refresh_reason_counts.get("interval", 0)),
         "sentence_trigger_intents": int(sentence_trigger_intents),
         "graph_route_family_mismatch_count": len(
@@ -1659,6 +1841,9 @@ def _route_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
         **_arena_trace_summary(events),
         **deferred_bridge,
         **rrp_visible_source_proof,
+        # [ROUTE-TRACE-PID-NORM] pid 归一诊断(纯增量键;TP1 恒
+        # pid_count≤1/consistency=single/spread=0)。
+        **route_trace_pid_diag,
     }
 
 

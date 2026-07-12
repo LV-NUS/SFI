@@ -42,6 +42,7 @@ from benchmarks.bench_sm80_mixed_page_full_cudagraph_phase1 import (
     _read_json,
     _read_trace_events,
     _resolve_fa3_so_path,
+    _RouteTraceEvents,
     _route_summary,
     _route_proof_payload,
     _run_pair_config,
@@ -394,6 +395,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--verdict-only",
+        action="store_true",
+        help=(
+            "[VERDICT-ONLY 2026-07-11] Skip the diagnostic child; route/"
+            "producer proofs re-source from the speed child route trace "
+            "(+hook profile). Verdict-grade correctness screening; tps is "
+            "directional only (trace observer tax uncalibrated)."
+        ),
+    )
+    parser.add_argument(
         "--chat-template",
         action="store_true",
         help="Render prompts through the model chat template in sparse/dense runners.",
@@ -658,6 +669,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--workload-plan-mode replay requires --workload-plan-replay")
     if args.workload_plan_mode in {"record", "replay"} and args.mode != "sparse":
         parser.error("workload plan record/replay is only supported in --mode sparse")
+    if bool(args.verdict_only) and args.mode != "sparse":
+        parser.error("--verdict-only is only supported in --mode sparse")
+    if bool(args.verdict_only) and args.workload_plan_mode != "natural":
+        parser.error(
+            "--verdict-only cannot be combined with workload plan "
+            "record/replay: the plan event source would move to the "
+            "speed-child trace, which is uncalibrated; run the full "
+            "two-child form for record/replay"
+        )
     return args
 
 
@@ -1345,6 +1365,12 @@ def _copy_sparse_metadata_profile_env_for_diagnostic(env: dict[str, str]) -> Non
         # (pending_group_enqueue_* 键随 stage_profile 进 hook_profile;名字含
         # PROFILE 命中 gate-D 通配清洗,须显式回填诊断 child)。
         "VLLM_SPARSE_REPLAY_REFRESH_ENQUEUE_PROFILE_DETAIL",
+        # [S7-FORENSIC 2026-07-10] off-loop selector 组装 12 分量 host 分相
+        # (deadline_deferred_selector_* 计数族;同上须回填,env 关=count 恒 0)。
+        "VLLM_SPARSE_DEFERRED_SELECTOR_PROFILE_DETAIL",
+        # [S7-FORENSIC 2026-07-10] off-loop body 内 GPU 事件段时长
+        # (deadline_async_producer_*@gpu 族;同上须回填)。
+        "VLLM_SPARSE_ASYNC_PRODUCER_GPU_PROFILE",
     ):
         value = os.environ.get(key, "").strip()
         if value:
@@ -3078,17 +3104,35 @@ def _run_gate_d_mode(args: argparse.Namespace) -> int:
         one_shot_timeline_path.write_text("", encoding="utf-8")
     speed_route_trace_path = (
         _default_gate_d_speed_route_path(output_path)
-        if _env_truthy_value(os.environ.get(SPEED_CHILD_ROUTE_TRACE_ENV))
+        if (
+            _env_truthy_value(os.environ.get(SPEED_CHILD_ROUTE_TRACE_ENV))
+            or bool(args.verdict_only)
+        )
         else None
     )
     if speed_route_trace_path is not None:
         speed_route_trace_path.parent.mkdir(parents=True, exist_ok=True)
         speed_route_trace_path.write_text("", encoding="utf-8")
+    full_cudagraph_hook_profile_path = (
+        Path(args.full_cudagraph_hook_profile_output)
+        if args.full_cudagraph_hook_profile_output
+        else _default_full_cudagraph_hook_profile_path(output_path)
+    )
     speed_env = _build_gate_d_sparse_env(
         args,
         route_trace_path=speed_route_trace_path,
         one_shot_timeline_path=one_shot_timeline_path,
     )
+    if args.verdict_only:
+        # [VERDICT-ONLY 2026-07-11] The diagnostic child is skipped, so the
+        # speed child carries the hook profile (second source of
+        # async_producer_writer_count for the producer gate). Truncate
+        # before spawn so a stale file cannot leak into the readers.
+        full_cudagraph_hook_profile_path.parent.mkdir(parents=True, exist_ok=True)
+        full_cudagraph_hook_profile_path.write_text("", encoding="utf-8")
+        speed_env["VLLM_SPARSE_FULL_CUDAGRAPH_HOOK_PROFILE_LOG"] = str(
+            full_cudagraph_hook_profile_path
+        )
     gpu_before = _gpu_snapshot("pre", cuda_visible_devices=str(args.cuda_visible_devices))
     selector_prewarm_result = _prewarm_gt1_selector_extensions(
         args,
@@ -3147,56 +3191,65 @@ def _run_gate_d_mode(args: argparse.Namespace) -> int:
         if args.refresh_profile_output
         else _default_refresh_profile_path(output_path)
     )
-    full_cudagraph_hook_profile_path = (
-        Path(args.full_cudagraph_hook_profile_output)
-        if args.full_cudagraph_hook_profile_output
-        else _default_full_cudagraph_hook_profile_path(output_path)
-    )
     diag_metrics_path = _default_gate_d_metrics_path(output_path, suffix="_diag")
     diag_outputs_path = _default_gate_d_outputs_path(output_path, suffix="_diag")
     route_trace_path.write_text("", encoding="utf-8")
     refresh_profile_path.parent.mkdir(parents=True, exist_ok=True)
-    full_cudagraph_hook_profile_path.parent.mkdir(parents=True, exist_ok=True)
-    full_cudagraph_hook_profile_path.write_text("", encoding="utf-8")
-    diag_command = _build_phase2_command(
-        args,
-        metrics_path=diag_metrics_path,
-        refresh_profile_path=refresh_profile_path,
-        outputs_path=diag_outputs_path,
-    )
-    diagnostic_env = _build_gate_d_sparse_env(
-        args,
-        route_trace_path=route_trace_path,
-        one_shot_timeline_path=one_shot_timeline_path,
-    )
-    diagnostic_env["VLLM_SPARSE_FULL_CUDAGRAPH_HOOK_PROFILE_LOG"] = str(
-        full_cudagraph_hook_profile_path
-    )
-    _copy_refresh_micro_profile_env_for_diagnostic(diagnostic_env)
-    _copy_selector_profile_env_for_diagnostic(diagnostic_env)
-    # [GATE-D-SPEED-ENV-PURITY 2026-07-10] 自 _build_gate_d_sparse_env 移入的
-    # diagnostic-only 回填(speed child 不再泄入 profile env)。
-    _copy_mixed_page_kernel_profile_env_for_diagnostic(diagnostic_env)
-    _copy_sparse_metadata_profile_env_for_diagnostic(diagnostic_env)
-    _copy_torch_profiler_env_for_diagnostic(diagnostic_env)
-    _copy_step_profile_env_for_diagnostic(diagnostic_env)
-    if args.selector_pipeline_cpu_profile_output:
-        diagnostic_env["VLLM_SPARSE_PIPELINE_CPU_PROFILE"] = "1"
-        diagnostic_env["VLLM_SPARSE_PIPELINE_CPU_PROFILE_LOG"] = str(
-            Path(args.selector_pipeline_cpu_profile_output)
+    diagnostic_env: dict[str, str] | None = None
+    diag_result: Phase1CommandResult | None = None
+    selector_pipeline_cpu_profile_path: Path | None = None
+    if args.verdict_only:
+        # [VERDICT-ONLY 2026-07-11] Skip the diagnostic child. The route
+        # trace was already truncated above; additionally truncate the
+        # refresh profile this run will NOT regenerate so a stale file from
+        # a previous full-form run under the same TAG cannot leak into
+        # _read_refresh_profile or the manual counts readout. Manual counts
+        # readout file in this mode is ``${TAG}_speed_route.jsonl``.
+        refresh_profile_path.write_text("", encoding="utf-8")
+    else:
+        full_cudagraph_hook_profile_path.parent.mkdir(parents=True, exist_ok=True)
+        full_cudagraph_hook_profile_path.write_text("", encoding="utf-8")
+        diag_command = _build_phase2_command(
+            args,
+            metrics_path=diag_metrics_path,
+            refresh_profile_path=refresh_profile_path,
+            outputs_path=diag_outputs_path,
         )
-    selector_pipeline_cpu_profile_path = _selector_pipeline_cpu_profile_path(
-        diagnostic_env,
-        output_path,
-    )
-    if selector_pipeline_cpu_profile_path is not None:
-        selector_pipeline_cpu_profile_path.parent.mkdir(parents=True, exist_ok=True)
-        selector_pipeline_cpu_profile_path.write_text("", encoding="utf-8")
-    diag_result = _run_command(
-        diag_command,
-        env=diagnostic_env,
-        timeout_s=int(args.timeout_s),
-    )
+        diagnostic_env = _build_gate_d_sparse_env(
+            args,
+            route_trace_path=route_trace_path,
+            one_shot_timeline_path=one_shot_timeline_path,
+        )
+        diagnostic_env["VLLM_SPARSE_FULL_CUDAGRAPH_HOOK_PROFILE_LOG"] = str(
+            full_cudagraph_hook_profile_path
+        )
+        _copy_refresh_micro_profile_env_for_diagnostic(diagnostic_env)
+        _copy_selector_profile_env_for_diagnostic(diagnostic_env)
+        # [GATE-D-SPEED-ENV-PURITY 2026-07-10] 自 _build_gate_d_sparse_env 移入的
+        # diagnostic-only 回填(speed child 不再泄入 profile env)。
+        _copy_mixed_page_kernel_profile_env_for_diagnostic(diagnostic_env)
+        _copy_sparse_metadata_profile_env_for_diagnostic(diagnostic_env)
+        _copy_torch_profiler_env_for_diagnostic(diagnostic_env)
+        _copy_step_profile_env_for_diagnostic(diagnostic_env)
+        if args.selector_pipeline_cpu_profile_output:
+            diagnostic_env["VLLM_SPARSE_PIPELINE_CPU_PROFILE"] = "1"
+            diagnostic_env["VLLM_SPARSE_PIPELINE_CPU_PROFILE_LOG"] = str(
+                Path(args.selector_pipeline_cpu_profile_output)
+            )
+        selector_pipeline_cpu_profile_path = _selector_pipeline_cpu_profile_path(
+            diagnostic_env,
+            output_path,
+        )
+        if selector_pipeline_cpu_profile_path is not None:
+            selector_pipeline_cpu_profile_path.parent.mkdir(
+                parents=True, exist_ok=True
+            )
+            selector_pipeline_cpu_profile_path.write_text("", encoding="utf-8")
+        diag_result = _run_command(
+            diag_command,
+            env=diagnostic_env,
+            timeout_s=int(args.timeout_s),
+        )
     reference_result: Phase1CommandResult | None = None
     reference_semantic_diffs: list[dict[str, Any]] = []
     reference_semantic_match: bool | None = None
@@ -3246,18 +3299,29 @@ def _run_gate_d_mode(args: argparse.Namespace) -> int:
         args.skip_dense_reference
     )
     gpu_after = _gpu_snapshot("post", cuda_visible_devices=str(args.cuda_visible_devices))
-    route_summary = _route_summary(_read_trace_events(route_trace_path))
+    # [VERDICT-ONLY 2026-07-11] Single-variable proof re-sourcing: in
+    # verdict-only mode the route/producer proofs read the speed-child trace
+    # (the diagnostic child did not run); default mode keeps the diagnostic
+    # trace, byte-for-byte.
+    effective_route_trace_path = (
+        speed_route_trace_path
+        if (args.verdict_only and speed_route_trace_path is not None)
+        else route_trace_path
+    )
+    route_summary = _route_summary(_read_trace_events(effective_route_trace_path))
     speed_route_summary = (
         _route_summary(_read_trace_events(speed_route_trace_path))
         if speed_route_trace_path is not None
         else {}
     )
-    measurement_trace_events = _read_measurement_trace_events(route_trace_path)
+    measurement_trace_events = _read_measurement_trace_events(
+        effective_route_trace_path
+    )
     producer_route_summary = _route_summary(measurement_trace_events)
     route_proof_result = validate_shared_route_proof(
         _route_proof_payload(
             route_summary=route_summary,
-            env=diagnostic_env,
+            env=(diagnostic_env if diagnostic_env is not None else speed_env),
             fa3_so_sha256=fa3_so_sha256,
         )
     )
@@ -3331,10 +3395,16 @@ def _run_gate_d_mode(args: argparse.Namespace) -> int:
         str(speed_route_trace_path) if speed_route_trace_path is not None else ""
     )
     payload["speed_child_route_summary"] = speed_route_summary
+    payload["verdict_only"] = bool(args.verdict_only)
+    payload["route_summary_source"] = (
+        "speed_child_route_trace"
+        if args.verdict_only
+        else "diagnostic_child_route_trace"
+    )
     payload.update(
         _workload_plan_payload(
             args,
-            route_trace_path=route_trace_path,
+            route_trace_path=effective_route_trace_path,
             measurement_trace_events=measurement_trace_events,
         )
     )
@@ -3448,8 +3518,13 @@ def _run_gate_d_mode(args: argparse.Namespace) -> int:
     ok = (
         speed_result.returncode == 0
         and not speed_result.timed_out
-        and diag_result.returncode == 0
-        and not diag_result.timed_out
+        # [VERDICT-ONLY 2026-07-11] diag_result is None only in verdict-only
+        # mode (diagnostic child skipped); the default form keeps the exact
+        # original two-condition check via the or-branch.
+        and (
+            diag_result is None
+            or (diag_result.returncode == 0 and not diag_result.timed_out)
+        )
         and route_proof_result.passed
         and bool(payload.get("speed_child_route_proof_passed", False))
         # [2026-07-01] producer_graph_roi retired from the exit gate: its counter
@@ -3584,7 +3659,8 @@ def _read_measurement_trace_events(path: Path) -> list[dict[str, Any]]:
     in_measurement = False
     saw_begin = False
     saw_end = False
-    for event in _read_trace_events(path):
+    source_events = _read_trace_events(path)
+    for event in source_events:
         if event.get("event") == "bench_measure_marker":
             phase = str(event.get("phase", "") or "")
             if phase == "measure_begin":
@@ -3599,9 +3675,17 @@ def _read_measurement_trace_events(path: Path) -> list[dict[str, Any]]:
             continue
         if in_measurement:
             records.append(event)
+    # [ROUTE-TRACE-PID-NORM] 保留坏行数载体:测量窗切片内的撕裂丢行数
+    # ≤ 全文件坏行数,作为 _route_summary pid 归一的容忍上界(TP1 单
+    # pid 直通,行为不变)。
+    bad_line_count = int(getattr(source_events, "bad_line_count", 0) or 0)
     if not (saw_begin and saw_end):
-        return []
-    return records
+        records = []
+    return _RouteTraceEvents(
+        records,
+        bad_line_count=bad_line_count,
+        source_path=f"{path}#measurement_window",
+    )
 
 
 def _read_jsonl_records(path: Path) -> list[dict[str, Any]]:

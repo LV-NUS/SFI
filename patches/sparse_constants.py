@@ -20,7 +20,6 @@ __all__ = [
     "_RELEASE_ON_IDLE_CACHED",
     "_REBUILD_PTRS_PINNED_CACHED",
     "_WRITER_TOKEN_TILE_CACHED",
-    "_REBUILD_PHYSICAL_BLOCK_SORT_CACHED",
     "_SELECTOR_TRUSTED_SHAPES_CACHED",
     "_SELECTOR_FAST_SIG_CACHED",
     "_SELECTOR_CPP_PREPROC_CACHED",
@@ -33,10 +32,9 @@ __all__ = [
     "_PAGE_ADD_INCREMENTAL_CACHED",
     "_SAME_PAGE_MINIMAL_UPDATE_CACHED",
     "_SAME_PAGE_READY_EVENT_ONLY_CACHED",
-    "_PROBE_CACHEKEY_CACHED",
     "_SAME_PAGE_MINIMAL_ASSERT_CACHED",
+    "_LITE_SIG_RETURN_ASSERT_CACHED",
     "_DECODE_BOUNDS_KERNEL_CACHED",
-    "_LOGF_OUT_FP32_CACHED",
     "_CAPTURE_CHUNK",
     "_CAPTURE_KV_BUCKET_CACHED",
     "_CAPTURE_IN_FLIGHT",
@@ -61,7 +59,6 @@ __all__ = [
     "_STEP_PROFILE_DETAIL_CACHED",
     "_STEP_PROFILE_EVERY_CACHED",
     "_STEP_PROFILE_LOG_CACHED",
-    "_VALIDATE_COMPACT_META_CACHED",
     "_SELECTOR_FIXED_K_CACHED",
     "_SELECTOR_SELECTED_INDICES_OUT_CACHED",
     "_SELECTOR_PIPELINE_WORKSPACE_CACHED",
@@ -69,8 +66,6 @@ __all__ = [
     "_SELECTOR_KBUCKET_CACHED",
     "_SELECTOR_KEY_NORMS_CACHE_CAP_CACHED",
     "_SELECTOR_TOPK_GRAPH_CACHED",
-    "_SELECTOR_GRAPH_LRU_CACHED",
-    "_selector_graph_lru_enabled",
     "_SELECTED_OUT_RING_CACHED",
     "_SELECTED_OUT_RING_SLOTS_CACHED",
     "_selected_out_ring_enabled",
@@ -140,9 +135,10 @@ _WRITER_TOKEN_TILE_CACHED: int = int(os.environ.get("VLLM_SPARSE_WRITER_TOKEN_TI
 # ---------------------------------------------------------------------------
 # Selector / rebuild experiment switches
 # ---------------------------------------------------------------------------
-_REBUILD_PHYSICAL_BLOCK_SORT_CACHED = (
-    os.environ.get("VLLM_SPARSE_REBUILD_PHYSICAL_BLOCK_SORT", "0") == "1"
-)
+# NOTE: VLLM_SPARSE_REBUILD_PHYSICAL_BLOCK_SORT(物理块序重排实验旋钮)已删除:
+# [SELECTOR-PACK-ORDER-DETERMINISM 2026-07-11] 起 pack 序在
+# batched_selection.canonicalize_selected_indices_pack_order 中无条件按逻辑
+# token index 升序规范化(无旋钮默认落地,换锚件)。
 _SELECTOR_TRUSTED_SHAPES_CACHED = os.environ.get("VLLM_SPARSE_SELECTOR_TRUSTED_SHAPES", "1") == "1"
 # Upper bound on distinct key_norms_all GPU buffers retained at once. Each is
 # [layers, batch, kv_heads, align_up(kv_len+1,4096)] fp16 = multi-GiB at long
@@ -194,17 +190,15 @@ _SAME_PAGE_MINIMAL_UPDATE_CACHED = (
 _SAME_PAGE_READY_EVENT_ONLY_CACHED = (
     os.environ.get("VLLM_SPARSE_SAME_PAGE_READY_EVENT_ONLY", "1") == "1"
 )
-_PROBE_CACHEKEY_CACHED = (
-    os.environ.get("VLLM_PROBE_CACHEKEY") == "1"
-)
 _SAME_PAGE_MINIMAL_ASSERT_CACHED = (
     os.environ.get("VLLM_SPARSE_SAME_PAGE_MINIMAL_ASSERT") == "1"
 )
-
-# ---------------------------------------------------------------------------
-# log_f capture output dtype control
-# ---------------------------------------------------------------------------
-_LOGF_OUT_FP32_CACHED = os.environ.get("VLLM_SPARSE_LOGF_OUT_FP32", "0") == "1"
+# [LITE-P0] SIG_RETURN 臂影子对拍(诊断仪器非兜底,默认关):臂命中时对拍外推
+# delta vs _collect_decode_delta_packet_from_launch_plan 全量真值逐字段,不等
+# 即 raise(bring-up 期用;判据绿后关闭,fail-close 由 admit 链承载)。
+_LITE_SIG_RETURN_ASSERT_CACHED = (
+    os.environ.get("VLLM_SPARSE_LITE_SIG_RETURN_ASSERT") == "1"
+)
 
 # ---------------------------------------------------------------------------
 # Chunk-batched capture ring (memory + async overlap)
@@ -233,17 +227,34 @@ _CAPTURE_IN_FLIGHT = validate_capture_inflight(_CAPTURE_IN_FLIGHT)
 # G in {1,2,4} => reduce every G layers into a (G*_CAPTURE_IN_FLIGHT)-slot raw RING,
 #   draining last_n=16 -> window=1 into the (unchanged) chunk-deep p_f tape. Raw staging
 #   becomes chunk-INDEPENDENT (bounded by G*_CAPTURE_IN_FLIGHT slots). Requires
-#   _CAPTURE_CHUNK % G == 0; otherwise falls back to 0 (OFF, fail-safe).
-# Default 0 until the A/B gate passes; flip to 1 to ship G=1 ON.
+#   _CAPTURE_CHUNK % G == 0.
+# [REDUCE-GROUP-DOMAIN 收窄 2026-07-11] 三个静默降 0 口子全部改 raise(域扫描
+# A2):打错字/超域/CHUNK 不整除原先静默落 G=0——而 G=0 的 chunk-deep scratch
+# 路径在 patch_installer [RING-AUDIT 2026-07-03] 注释里自认"串行调度假设
+# load-bearing"(deferred producer 并发 prefill 无事件护栏),静默切入=无人知晓
+# 地踩进有前提的路径;且 CHUNK=18 实验(新方向 #11)配 G=4 时 18%4!=0 恰会中招。
+# 与同文件 SPLIT_* env 的 raise 风格对齐(fail-fast,坏值不再产生);G=0 仍可
+# 显式配置(诊断档)。
 # ---------------------------------------------------------------------------
 try:
     _CAPTURE_REDUCE_GROUP: int = int(os.environ.get("VLLM_SPARSE_CAPTURE_REDUCE_GROUP", "1") or "1")
-except ValueError:
-    _CAPTURE_REDUCE_GROUP = 0
+except ValueError as _rg_exc:
+    raise ValueError(
+        "VLLM_SPARSE_CAPTURE_REDUCE_GROUP must be an integer in (0, 1, 2, 4); "
+        f"got {os.environ.get('VLLM_SPARSE_CAPTURE_REDUCE_GROUP')!r}"
+    ) from _rg_exc
 if _CAPTURE_REDUCE_GROUP not in (0, 1, 2, 4):
-    _CAPTURE_REDUCE_GROUP = 0
+    raise ValueError(
+        f"VLLM_SPARSE_CAPTURE_REDUCE_GROUP={_CAPTURE_REDUCE_GROUP} unsupported; "
+        "allowed=(0, 1, 2, 4)"
+    )
 if _CAPTURE_REDUCE_GROUP > 0 and (_CAPTURE_CHUNK % _CAPTURE_REDUCE_GROUP) != 0:
-    _CAPTURE_REDUCE_GROUP = 0
+    raise ValueError(
+        f"VLLM_SPARSE_CAPTURE_REDUCE_GROUP={_CAPTURE_REDUCE_GROUP} does not divide "
+        f"_CAPTURE_CHUNK={_CAPTURE_CHUNK}; the per-G raw ring requires "
+        "_CAPTURE_CHUNK % G == 0 (set a dividing G, or G=0 for the explicit "
+        "chunk-deep diagnostic mode)"
+    )
 
 # ---------------------------------------------------------------------------
 # Refresh stream management
@@ -393,47 +404,63 @@ _STEP_PROFILE_EVERY_CACHED = int(os.environ.get("VLLM_SPARSE_STEP_PROFILE_EVERY"
 _STEP_PROFILE_LOG_CACHED = os.environ.get(
     "VLLM_SPARSE_STEP_PROFILE_LOG", "/tmp/vllm_sparse_step_profile.log"
 )
-_VALIDATE_COMPACT_META_CACHED = os.environ.get("VLLM_SPARSE_VALIDATE_COMPACT_META", "0") == "1"
 _SELECTOR_FIXED_K_CACHED = os.environ.get("VLLM_SPARSE_SELECTOR_FIXED_K", "1") == "1"
 _SELECTOR_SELECTED_INDICES_OUT_CACHED = os.environ.get("VLLM_SPARSE_SELECTOR_SELECTED_INDICES_OUT", "1") == "1"
 _SELECTOR_PIPELINE_WORKSPACE_CACHED = os.environ.get("VLLM_SPARSE_SELECTOR_PIPELINE_WORKSPACE_RUNTIME", "1") == "1"
-# fa4_selector_fixed_shape_topk: #13 breaker (a) fixed-shape topk gate (default OFF).
-_SELECTOR_FIXED_SHAPE_TOPK_CACHED = os.environ.get("VLLM_SPARSE_SELECTOR_FIXED_SHAPE_TOPK", "0") == "1"
-# fa4_selector_kbucket: #13 breaker (c) K-bucket gate (default OFF). Rounds the
-# per-refresh narrow topk slice width UP to 256 so the topk-scan domain is
-# shape-stable across refreshes (capture prerequisite). GATE-COUPLING: effective
-# ONLY when the fixed-shape topk gate is also ON, because only the fixed-shape
-# value-sentinel post_topk maps the extra (out-of-window) pad picks to -1; the
-# OFF path would leak them into selected_indices.
+# fa4_selector_fixed_shape_topk: #13 breaker (a) fixed-shape topk gate.
+# [三 env 转正 2026-07-11] default ON (was OFF)。判据链在案:正确性两档全绿
+# (黄金锚 MATCH tk3_golden/bprime_golden+判速 8-hash 多轮 MATCH+counts 逐位
+# =基线)+性能=判速中性+长跑 512 领先 +0.31%(615.7 vs 613.8,graph 稳态纯赚,
+# capture 学费已证为地板=SFI_P3_PREWARM_DESIGN_2026-07-11.md §7-§8)。
+# 显式 env=0 仍为完整回退路径(cached+F1 shim+C++ 调用期 shim 三层一致)。
+_SELECTOR_FIXED_SHAPE_TOPK_CACHED = os.environ.get("VLLM_SPARSE_SELECTOR_FIXED_SHAPE_TOPK", "1") == "1"
+# [F1 COHERENCE-SHIM 2026-07-11] the ext prebuilt-reject predicate
+# (utils/selector_pipeline_ext._fixed_shape_topk_required) reads the env LIVE.
+# If the default above ever flips to ON while the operator leaves the env
+# unset, that predicate would still see OFF and ACCEPT a stale prebuilt .so
+# compiled without the fixed-shape kernel: C++ runs OFF semantics while
+# Python widens the topk slice under KBUCKET ON semantics -> pad picks leak
+# into selected_indices. Export the resolved value at import time (same
+# discipline as the FUSE_NMS_CROSS shim in selector_pipeline_ext) so every
+# live-env reader provably agrees with this cached constant; an explicit
+# operator-set "0"/"1" is always respected.
+if os.environ.get("VLLM_SPARSE_SELECTOR_FIXED_SHAPE_TOPK") is None:
+    os.environ["VLLM_SPARSE_SELECTOR_FIXED_SHAPE_TOPK"] = (
+        "1" if _SELECTOR_FIXED_SHAPE_TOPK_CACHED else "0"
+    )
+# fa4_selector_kbucket: #13 breaker (c) K-bucket gate ([三 env 转正 2026-07-11]
+# default ON, was OFF). Rounds the per-refresh narrow topk slice width UP to
+# 256 so the topk-scan domain is shape-stable across refreshes (capture
+# prerequisite). GATE-COUPLING: effective ONLY when the fixed-shape topk gate
+# is also ON, because only the fixed-shape value-sentinel post_topk maps the
+# extra (out-of-window) pad picks to -1; the OFF path would leak them into
+# selected_indices.
 _SELECTOR_KBUCKET_CACHED = (
-    os.environ.get("VLLM_SPARSE_SELECTOR_KBUCKET", "0") == "1"
+    os.environ.get("VLLM_SPARSE_SELECTOR_KBUCKET", "1") == "1"
     and _SELECTOR_FIXED_SHAPE_TOPK_CACHED
 )
 # fa4_selector_topk_graph: #13 STAGE-0 captured-selector-graph consumer
-# (#13a fixed-shape-topk + #13c K-bucket). Default OFF. Capture/replay the
-# decode-branch selector pipeline (_pipeline_with_bounds) into a CUDA graph on
-# the SYNCHRONOUS refresh path where the 4 _ensure_selector_* buffers are
-# shape-keyed and data_ptr-stable. GATE-COUPLING: the captured graph can only
-# hit when EVERY consumed/produced buffer is stable AND the topk-scan domain is
-# shape-stable, so the flag is effective ONLY when fixed-shape topk, the
-# K-bucket, the stable selected_indices_out buffer, and the stable pipeline
-# workspaces are ALL on. Any of them OFF => a fresh allocation / changing scan
-# domain per refresh => the graph key never hits, so we force the flag False
-# and the runtime keeps the verbatim eager call (byte-identical to HEAD).
+# (#13a fixed-shape-topk + #13c K-bucket). [三 env 转正 2026-07-11] default ON
+# (was OFF). Capture/replay the decode-branch selector pipeline
+# (_pipeline_with_bounds) into a CUDA graph on the SYNCHRONOUS refresh path
+# where the 4 _ensure_selector_* buffers are shape-keyed and data_ptr-stable.
+# GATE-COUPLING: the captured graph can only hit when EVERY consumed/produced
+# buffer is stable AND the topk-scan domain is shape-stable, so the flag is
+# effective ONLY when fixed-shape topk, the K-bucket, the stable
+# selected_indices_out buffer, and the stable pipeline workspaces are ALL on.
+# Any of them OFF => a fresh allocation / changing scan domain per refresh =>
+# the graph key never hits, so we force the flag False and the runtime keeps
+# the verbatim eager call (byte-identical to the pre-graph path).
 _SELECTOR_TOPK_GRAPH_CACHED = (
-    os.environ.get("VLLM_SPARSE_SELECTOR_TOPK_GRAPH", "0") == "1"
+    os.environ.get("VLLM_SPARSE_SELECTOR_TOPK_GRAPH", "1") == "1"
     and _SELECTOR_FIXED_SHAPE_TOPK_CACHED
     and _SELECTOR_KBUCKET_CACHED
     and _SELECTOR_SELECTED_INDICES_OUT_CACHED
     and _SELECTOR_PIPELINE_WORKSPACE_CACHED
 )
-# SELECTOR_GRAPH_LRU (default OFF == HEAD): when ON, the captured-graph eviction
-# policy switches from clear-all (drop all 8 graphs on a new key beyond the
-# bound) to single-entry LRU (evict only the least-recently-used entry, keep the
-# other 7). Default "0" keeps the verbatim clear-all behaviour bit-identical.
-_SELECTOR_GRAPH_LRU_CACHED = (
-    os.environ.get("VLLM_SPARSE_SELECTOR_GRAPH_LRU", "0") == "1"
-)
+# [转正清理 2026-07-11] SELECTOR_GRAPH_LRU 旋钮下线(默认 OFF 从未转正;
+# population16 后合法稳态 key 全集 12<16 上限,清库臂本身罕至,LRU 分支
+# =死码。eviction 恒为 clear-all+thrash 联判)。
 # [SELECTED-OUT-RING 2026-07-09] pending-path selected_indices_out stable ring
 # (default ON). Replaces [SELECTED-PRIVATE-OUT 2026-07-07]'s per-run fresh
 # allocation with a bounded ring of data_ptr-stable buffers guarded by per-slot
@@ -466,18 +493,13 @@ def _selected_out_ring_enabled() -> bool:
 
 
 def _selected_out_ring_slots() -> int:
+    # [B2 双默认对齐 2026-07-11] 动态臂默认曾是 "4" vs 缓存臂 "3"——pytest 验证
+    # 的是生产永不使用、且顶在 thrash 边界注释警告值上的 4 槽形态。统一 "3"。
     if _DYNAMIC_ENV:
-        return int(os.environ.get("VLLM_SPARSE_SELECTED_OUT_RING_SLOTS", "4") or "4")
+        return int(os.environ.get("VLLM_SPARSE_SELECTED_OUT_RING_SLOTS", "3") or "3")
     return _SELECTED_OUT_RING_SLOTS_CACHED
 
 
-def _selector_graph_lru_enabled() -> bool:
-    """Whether captured-graph eviction uses single-entry LRU (default False ==
-    HEAD clear-all). Dynamic/cached convention: live env read under
-    ``_DYNAMIC_ENV`` (e.g. pytest), else the import-time cached bool."""
-    if _DYNAMIC_ENV:
-        return os.environ.get("VLLM_SPARSE_SELECTOR_GRAPH_LRU", "0") == "1"
-    return _SELECTOR_GRAPH_LRU_CACHED
 # ASYNC_PRODUCER_WRITER_GRAPH (task #9): capture the single fused compact WRITER launch into a
 # CUDA graph and replay it on steady refresh steps (host-dispatch cut).
 _ASYNC_PRODUCER_WRITER_GRAPH_CACHED = os.environ.get("VLLM_SPARSE_ASYNC_PRODUCER_WRITER_GRAPH", "1") == "1"
@@ -557,9 +579,11 @@ def should_skip_page_sparse_state(attn_mode: str) -> bool:
 # ---------------------------------------------------------------------------
 _ROW_MODE_DENSE = 0
 _ROW_MODE_COMPACT = 1
-_PP_STEP = [0]  # ping-pong per-step tick (incremented at the post-graph point)
-_RRP_GRAPH_DONE_EVT = [None]  # CUDA event: prior decode graph retired (WAR gate)
-_RRP_GRAPH_DONE_EVTS = {}  # {stream_id: CUDA event} per-stream WAR gate
+# [2026-07-12 RRP-DONE-EVTS-RETIRED] _RRP_GRAPH_DONE_EVT / _RRP_GRAPH_DONE_EVTS
+# deleted: repo-wide audit found record-only writers (patch_installer) and the
+# singular variant fully unused -- zero wait_event/query consumers. The live
+# cross-step WAR mechanism is the fence pair below.
+# [2026-07-12 任务#16 合入注记] _PP_STEP 同批删除(僵尸批审计死件,合入时现树零消费者复核通过)。
 
 # Cross-step WAR fence (decode FULL cudagraph reads vs next-step RRP descriptor
 # overwrite). Shared between the post-graph RECORD (patch_installer) and the next

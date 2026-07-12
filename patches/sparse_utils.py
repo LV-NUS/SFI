@@ -17,7 +17,6 @@ _log = logging.getLogger(__name__)
 
 from patches.sparse_constants import (
     _DYNAMIC_ENV,
-    _PROBE_CACHEKEY_CACHED,
     _ROW_MODE_COMPACT,
     _ROW_MODE_DENSE,
     _ROW_MODE_LOG_F_PREFILL,
@@ -269,27 +268,6 @@ def _make_step_decode_cache_key(
         if isinstance(row_mode_by_row, tuple) and len(row_mode_by_row) == batch_size
         else tuple(int(row_mode_by_row[row]) for row in range(batch_size))
     )
-    if (
-        os.environ.get("VLLM_PROBE_CACHEKEY") == "1"
-        if _DYNAMIC_ENV
-        else _PROBE_CACHEKEY_CACHED
-    ):
-        try:
-            _h = lambda _x: hash(repr(_x))
-            with open("/tmp/cachekey_probe.jsonl", "a", encoding="utf-8") as _f:
-                _f.write(__import__("json").dumps({
-                    "e": int(getattr(step_authority, "epoch", -1)),
-                    "req": _h(step_authority.req_ids),
-                    "slot": _h(slot_signature),
-                    "mode": _h(row_mode_signature),
-                    "boot": _h(step_authority.bootstrap_done_by_row),
-                    "sdense": _h(step_authority.short_dense_by_row),
-                    "lck": _h(tuple(layer_cache_keys)),
-                    "clg": int(compact_layout_generation),
-                    "refresh": _h(refresh_row_signature),
-                }) + "\n")
-        except Exception:
-            pass
     return (
         step_authority.req_ids,
         slot_signature,

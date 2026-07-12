@@ -8,6 +8,12 @@ class DecodeRuntimeMode(str, Enum):
     PAGE_BOUNDARY_DELTA = "page_boundary_delta"
     REFRESH_COMMIT = "refresh_commit"
     FULL_RECOMPILE = "full_recompile"
+    # [LITE-P0 2026-07-11] signature-return arm: the step after a trigger
+    # (capture) step whose q/logf signatures flip BACK to the pre-trigger
+    # steady regime while the value plane is a pure token-advance. Admitted
+    # outside classify (which compares against the TRIGGER delta and would
+    # see q/logf changed); recorded via DecodeRuntimeState.apply_sig_return.
+    SIG_RETURN_DELTA = "sig_return_delta"
 
 
 def _int_value(value: Any) -> int:
@@ -125,6 +131,10 @@ class DecodeRuntimeCounters:
     per_step_allocation_count: int = 0
     carrier_update_kernel_count: int = 0
     predicted_same_page_step_count: int = 0
+    # [LITE-P0] signature-return arm hits / fail-close falls (reason strings
+    # carry the lite_fallback: prefix into decode_runtime_reason).
+    sig_return_step_count: int = 0
+    lite_fallback_count: int = 0
 
 
 @dataclass(slots=True)
@@ -164,6 +174,29 @@ class DecodeRuntimeState:
             self.counters.refresh_commit_step_count += 1
         elif mode is DecodeRuntimeMode.FULL_RECOMPILE:
             self.counters.full_recompile_count += 1
+        elif mode is DecodeRuntimeMode.SIG_RETURN_DELTA:
+            self.counters.sig_return_step_count += 1
+
+    def apply_sig_return(
+        self,
+        current_guard: DecodeStaticGuard,
+        current_delta: DecodeDeltaPacket,
+    ) -> None:
+        """[LITE-P0] Record a SIG_RETURN_DELTA step OUTSIDE classify.
+
+        The signature-return arm proves (before calling this) that the step
+        is a pure signature flip-back to the pre-trigger steady regime with a
+        value plane rebuilt from ground truth. classify itself would compare
+        against the TRIGGER delta (q/logf changed) and land FULL_RECOMPILE,
+        so the arm advances the state manually. The NEXT step's classify then
+        compares against THIS delta and lands STEADY_DELTA naturally.
+        """
+        self.active_guard = current_guard
+        self.last_delta = current_delta
+        self.last_mode = DecodeRuntimeMode.SIG_RETURN_DELTA
+        self.last_reason = "sig_return_steady_resume"
+        self.last_applied_step_id = current_delta.step_id
+        self._increment_counter(DecodeRuntimeMode.SIG_RETURN_DELTA)
 
 
 def classify_decode_runtime_mode(
@@ -222,6 +255,135 @@ def _page_aligned_recent_first_visible(
     first_page = start_token // page_i
     visible_tokens = max(0, real_i - start_token)
     return first_page, visible_tokens
+
+
+def extrapolate_sig_return_delta(
+    *,
+    pre_trigger_delta: DecodeDeltaPacket | None,
+    trigger_delta: DecodeDeltaPacket | None,
+    step_id: int,
+    page_size: int,
+    q_lens_by_row: Any,
+    logf_mask_generation: Any,
+    pending_refresh_state: str,
+    real_kv_len_by_row: Any,
+    row_dynamic_signature: Any = tuple(),
+    recent_tokens: int = -1,
+) -> tuple[DecodeDeltaPacket | None, str]:
+    """[LITE-P0 fail-close #3] Two-step cluster extrapolation for the
+    signature-return arm — the dedicated entry predict_same_page_delta cannot
+    serve (its nonconsecutive_step guard is correct for its caller and MUST
+    NOT be bypassed).
+
+    Reconstructs the return step's value plane from the PRE-TRIGGER steady
+    packet using invariants only (no per-step guesses): the true advance is
+    ``real_now - real_pre`` where real_pre is recovered from the carried
+    packet via real = first_page*page_size + visible (same invariant predict
+    uses) and real_now comes from the caller's step_authority truth. The
+    recent window is then RE-DERIVED for real_now; if the first logical page
+    advanced anywhere inside the cluster the row slid a page boundary and we
+    refuse (the full path's PBD handling must run — a carried-forward stale
+    first page would hide the slide exactly like the p12 bug this mirrors).
+
+    Refuses (None, reason) on ANY doubt: missing packets, non-2-step cluster,
+    batch drift, q/logf not flipped back to the steady signature, refresh
+    pending, implausible advance, window reconstruction mismatch, or a
+    boundary slide inside the cluster.
+    """
+    if pre_trigger_delta is None or trigger_delta is None:
+        return None, "uninitialized"
+    # Strict 2-step cluster shape: steady(t0) -> trigger(t0+1) -> return(t0+2).
+    if int(trigger_delta.step_id) != int(pre_trigger_delta.step_id) + 1:
+        return None, "nonconsecutive_cluster"
+    if int(step_id) != int(trigger_delta.step_id) + 1:
+        return None, "nonconsecutive_cluster"
+    page_size_i = int(page_size)
+    if page_size_i <= 0:
+        return None, "invalid_page_size"
+    batch_size = int(pre_trigger_delta.batch_size)
+    if int(trigger_delta.batch_size) != batch_size:
+        return None, "batch_size_changed"
+    q_lens = _int_tuple(q_lens_by_row)
+    if len(q_lens) != batch_size or q_lens != pre_trigger_delta.q_lens_by_row:
+        return None, "q_layout_changed"
+    if any(int(q) <= 0 for q in q_lens):
+        return None, "q_layout_changed"
+    logf_signature = _int_tuple(logf_mask_generation)
+    if (
+        len(logf_signature) != batch_size
+        or logf_signature != pre_trigger_delta.logf_mask_generation
+    ):
+        return None, "logf_generation_changed"
+    refresh_state = _str_value(pending_refresh_state)
+    if refresh_state not in ("nil", "empty"):
+        return None, "pending_refresh_not_steady"
+    real_now_tuple = _int_tuple(real_kv_len_by_row)
+    if len(real_now_tuple) != batch_size:
+        return None, "real_kv_len_coverage"
+    recent_tokens_i = int(recent_tokens)
+    if recent_tokens_i <= 0:
+        return None, "invalid_recent_window"
+
+    next_request_recent_len: list[int] = []
+    next_launch_effective_k: list[int] = []
+    next_row_effective_k: list[int] = []
+    for row in range(batch_size):
+        prev_first = int(pre_trigger_delta.recent_first_page_by_row[row])
+        prev_visible = int(pre_trigger_delta.request_recent_len_by_row[row])
+        recent_count = int(pre_trigger_delta.recent_page_count_by_row[row])
+        if recent_count < 0:
+            return None, "invalid_recent_window"
+        prev_real = prev_first * page_size_i + prev_visible
+        # Rows the steady packet did NOT place on the page-aligned window path
+        # (dense/recent_cap branch) cannot be reconstructed — refuse rather
+        # than guess (mirrors predict's reconstruction-agreement guard).
+        recon_first, recon_visible = _page_aligned_recent_first_visible(
+            prev_real, page_size_i, recent_tokens_i
+        )
+        if recon_first != prev_first or recon_visible != prev_visible:
+            return None, "window_reconstruction_mismatch"
+        real_now = int(real_now_tuple[row])
+        advance = real_now - prev_real
+        # Sanity: a 2-step cluster advances each row by exactly the tokens
+        # generated across trigger+return (1/step in this runtime's decode;
+        # allow a small bound rather than hard-coding 2 so gt1 query layouts
+        # stay admissible, but refuse implausible jumps).
+        if advance < 1 or advance > 4:
+            return None, "implausible_advance"
+        new_first, new_visible = _page_aligned_recent_first_visible(
+            real_now, page_size_i, recent_tokens_i
+        )
+        if new_first != prev_first:
+            # Boundary slid somewhere inside the cluster: the carried first
+            # page is stale — full path (PBD) must handle this step.
+            return None, "page_boundary_in_cluster"
+        if new_visible > recent_count * page_size_i:
+            return None, "page_boundary_countdown_expired"
+        next_request_recent_len.append(new_visible)
+        next_launch_effective_k.append(
+            int(pre_trigger_delta.launch_effective_k_by_row[row])
+            + (new_visible - prev_visible)
+        )
+        next_row_effective_k.append(
+            int(pre_trigger_delta.row_effective_k_by_row[row]) + advance
+        )
+
+    return (
+        DecodeDeltaPacket(
+            step_id=int(step_id),
+            batch_size=batch_size,
+            row_effective_k_by_row=tuple(next_row_effective_k),
+            request_recent_len_by_row=tuple(next_request_recent_len),
+            launch_effective_k_by_row=tuple(next_launch_effective_k),
+            recent_first_page_by_row=pre_trigger_delta.recent_first_page_by_row,
+            recent_page_count_by_row=pre_trigger_delta.recent_page_count_by_row,
+            q_lens_by_row=q_lens,
+            logf_mask_generation=logf_signature,
+            pending_refresh_state=refresh_state,
+            row_dynamic_signature=tuple(row_dynamic_signature),
+        ),
+        "sig_return_extrapolated",
+    )
 
 
 def predict_same_page_delta(

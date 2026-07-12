@@ -245,9 +245,45 @@ def apply_arena_writes_from_descriptors(
     _seqused_effective_k_seq = derived.get("effective_k_seq")
     if _seqused_effective_k_seq is not None:
         _seqused_batch_size = int(arena.batch_size)
-        _seqused_re = arena.batch_seqused_k_i32.new_tensor(
-            _seqused_effective_k_seq
-        )
+        _seqused_dev = arena.batch_seqused_k_i32.device
+        if _seqused_dev.type == "cuda":
+            # [S1-KC-PIN-STAGING 2026-07-12] 原 new_tensor(list)=每次一个
+            # pageable H2D memcpy_and_sync(等当前流全排空;S1 探针定谳:
+            # 204 次/轮经 bind_production_row_table C++ 快路,mb.misc 洞
+            # 前沿主料之二)。改独立 pinned 小分配+non_blocking H2D 进独立
+            # GPU staging(SEQUSED-STAGING-INDEPENDENT 同款;WAR 护栏=
+            # CachingHostAllocator 事件跟踪,零共享单例零 WAR 窗)。下游两个
+            # D2D copy 形态不变,_seqused_re dtype/shape/值逐位同 new_tensor。
+            try:
+                _seqused_stage_cpu = torch.empty(
+                    (_seqused_batch_size,),
+                    dtype=torch.int32,
+                    device="cpu",
+                    pin_memory=True,
+                )
+            except RuntimeError:
+                _seqused_stage_cpu = torch.empty(
+                    (_seqused_batch_size,),
+                    dtype=torch.int32,
+                    device="cpu",
+                )
+            _seqused_stage_cpu.copy_(
+                torch.as_tensor(
+                    _seqused_effective_k_seq,
+                    dtype=torch.int32,
+                    device="cpu",
+                )
+            )
+            _seqused_re = torch.empty(
+                (_seqused_batch_size,),
+                dtype=torch.int32,
+                device=_seqused_dev,
+            )
+            _seqused_re.copy_(_seqused_stage_cpu, non_blocking=True)
+        else:
+            _seqused_re = arena.batch_seqused_k_i32.new_tensor(
+                _seqused_effective_k_seq
+            )
         arena.batch_seqused_k_i32.copy_(_seqused_re, non_blocking=True)
         arena.seqused_k_i32.view(_seqused_batch_size, num_kv_heads).copy_(
             _seqused_re.reshape(_seqused_batch_size, 1).expand(

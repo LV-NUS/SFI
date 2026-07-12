@@ -3,13 +3,20 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Tuple
 
-# [RING-DEPTH-3 2026-07-08] depth 3 admitted for the refresh-pipeline dwell
-# cut (per-generation 3-chunk cadence no longer forces buf reuse inside one
-# generation). Consumers are fully parameterized on _CAPTURE_IN_FLIGHT (ring
-# mixin, wait ledger, meta arena); memory account: capture scratch reserve
-# projects ~1.75 GiB per buf. Default stays 2 — flip via
-# VLLM_SPARSE_CAPTURE_IN_FLIGHT=3 after the speed A/B on the target card.
-_SUPPORTED_CAPTURE_IN_FLIGHT: Tuple[int, ...] = (1, 2, 3)
+# [RING-DEPTH-3 收窄 2026-07-11] depth 3 was admitted 2026-07-08 on the claim
+# "consumers are fully parameterized on _CAPTURE_IN_FLIGHT" — code archaeology
+# proved that claim FALSE at the pack-kernel layer: the out_ptr fast path
+# routes capture buffers with a BINARY tl.where(buf_id == 0, buf0, buf1)
+# (triton_kernel/flash_attn_score_dump_fwd.py, decode + prefill arms) and the
+# pack call sites bake exactly TWO scores base pointers. Under depth 3 every
+# buf_id == 2 layer group would silently write into ring[1] while chunk1 is
+# still in flight — cross-generation capture corruption with NO error (wrong
+# top-k, quality rot). Contract narrowed to what the kernel actually
+# implements so the bad value can never be produced (fail-fast at env
+# validation, 无 fallback 纪律). Re-admit 3 ONLY after the kernel's buf
+# routing is generalized to an indexed base-pointer array and a depth-3
+# golden-anchor run passes.
+_SUPPORTED_CAPTURE_IN_FLIGHT: Tuple[int, ...] = (1, 2)
 
 
 def validate_capture_inflight(value: int) -> int:

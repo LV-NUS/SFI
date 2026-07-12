@@ -897,7 +897,6 @@ class ProfileMixin:
             "rebuild_num_kv_heads": int(pending.rebuild_num_kv_heads or 0),
             "rebuild_batch_slots": int(pending.rebuild_batch_slots or 0),
             "capture_kv_len_total": int(pending.capture_kv_len_total or 0),
-            "rebuild_physical_block_sort": int(pending.rebuild_physical_block_sort or 0),
             "writer_pointer_rebuild_count": int(
                 pending.writer_pointer_rebuild_count or 0
             ),
@@ -1086,6 +1085,12 @@ class ProfileMixin:
             "deadline_deferred_selector_wrapper_gap_cpu_us_max": float(
                 pending.deadline_deferred_selector_wrapper_gap_cpu_us_max
             ),
+            "deadline_deferred_producer_detail_us": {
+                str(k): float(v)
+                for k, v in (
+                    pending.deadline_deferred_producer_detail_us or {}
+                ).items()
+            },
             "deadline_async_producer_body_count": int(
                 pending.deadline_async_producer_body_count or 0
             ),

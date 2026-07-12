@@ -26,8 +26,11 @@ _selector_topk_graph_stable_active 看到裸 dict 恒 bypass。
    换代臂:容器内 buffer 换代由 ensure 的 override 分支过 UAF 守卫。
 
 容量不足(全部槽 busy)=spill:begin_run 返回"未接管",resolver 走旧行为
-原路(off-loop 外层新鲜 dict 私有化+retention 原样生效),graph 由 dispatch
-以 current_run_spilled→ptr_rebuild_miss 拒捕。显式计数,非静默兜底。
+原路(off-loop 外层新鲜 dict 私有化+retention 原样生效)。[F2 对齐] spill
+run 的拒捕由两个 dispatch 调用臂的门(selection_worker `_topk_ring_run`
+含 `not current_run_spilled`)直接走 else-eager 实现——ptr_rebuild_miss
+参数并未在这两臂传入(行为等价:spill 一样不捕不 replay)。显式计数,
+非静默兜底。
 
 线程形态:pending selector run 的解析在主流 drain 与 refresh_stream off-loop
 两上下文交替、不并发(R4 守卫注释同源结论);begin_run 的 run-open 断言是
