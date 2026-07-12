@@ -38,6 +38,7 @@ from typing import (
 import torch
 
 from hybrid_selectors.alpha_fair_selector import AlphaFairSelectorConfig
+from patches.cpu_gpu_staging import _record_stage_h2d_evt, _wait_stage_h2d_evt
 from patches.selector_runtime.batched_selection import (
     compute_alpha_selection_batched_impl,
 )
@@ -2355,6 +2356,12 @@ class SelectorComputeMixin:
                 device=device,
             )
 
+        _wait_stage_h2d_evt(
+            stage_cache=None,
+            cache_owner=self,
+            key="_decode_logits_stage_h2d_evt",
+        )
+
         def _ensure_stage(name: str) -> torch.Tensor:
             stage = getattr(self, name, None)
             if (
@@ -2382,6 +2389,12 @@ class SelectorComputeMixin:
         self._decode_logits_cap_i64[:num_reqs].copy_(
             cap_stage[:num_reqs],
             non_blocking=True,
+        )
+        _record_stage_h2d_evt(
+            stage_cache=None,
+            cache_owner=self,
+            key="_decode_logits_stage_h2d_evt",
+            device=device,
         )
         if step_context.step_authority is not None and step_context.step_authority.epoch == step_context.epoch:
             step_context.step_authority = step_context.step_authority.with_logits(

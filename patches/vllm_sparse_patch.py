@@ -164,6 +164,16 @@ from patches.controller_mixins import (
     WaitDeciderMixin,
 )
 
+_REFRESH_REASON_CANONICAL_PRIORITY = (
+    int(PendingReasonCode.SENTENCE),
+    int(PendingReasonCode.COMPACT_THRESHOLD_CROSSED),
+    int(PendingReasonCode.LEASE_REARM),
+    int(PendingReasonCode.COMPACT_NOT_READY),
+    int(PendingReasonCode.TRIGGER),
+    int(PendingReasonCode.REFRESH),
+    int(PendingReasonCode.INTERVAL),
+)
+
 try:
     from vllm.logger import init_logger
     _log = init_logger(__name__)
@@ -3714,6 +3724,84 @@ class VLLMSparseController(
             # short 阶段仅放行 crossing 的 FORCE_NOW refresh。
             return not _is_threshold_crossing_force_pending(ticket_local)
 
+        def _request_min_refresh_gap(tracking_local: RequestTracking) -> int:
+            trigger_local = getattr(tracking_local, "trigger", None)
+            if trigger_local is not None:
+                return max(
+                    0,
+                    int(
+                        getattr(
+                            trigger_local.config,
+                            "min_refresh_gap",
+                            DEFAULT_MIN_REFRESH_GAP,
+                        )
+                        or 0
+                    ),
+                )
+            # refresh-on(纯 interval)形态 trigger 缺席:挡板不可失效,
+            # fallback 全局默认(lease/coalesce 线依赖它防重复提交)。
+            return DEFAULT_MIN_REFRESH_GAP
+
+        def _request_last_decode_refresh_step(
+            tracking_local: RequestTracking,
+        ) -> int:
+            value_local = getattr(tracking_local, "last_decode_refresh_step", -1)
+            return -1 if value_local is None else int(value_local)
+
+        def _refresh_join_floor_blocked(
+            tracking_local: RequestTracking,
+            decode_step_local: int,
+        ) -> bool:
+            # [GAP-THROTTLE-GENERATIONAL 2026-07-12 P1-B] 拉入方向(搭已开
+            # 世代的班车)的防荒谬密度小地板=gap//2。规范(审查档 §4/§5-P1
+            # 方向 B,用户拍板):min_refresh_gap 节流对象=**独立开销世代**
+            # (任意两次独立开销世代 ≥ gap),搭车共享既有世代的固定成本
+            # (selector/writer 链墙+launch),不计独立开销 ⇒ 不受全额 gap
+            # 节流。mingap48 取证:全额 gap 拒载搭车者(边际成本≈0)→班车
+            # nreq 7→3 塌缩→被拒者各开全价"专车"→step 世代 34→46(+35%)
+            # =速度 −1.9% 的编队拆解相变;字面 per-request 间隔与合同目的
+            # (成本节流)在拉入方向互相打架。地板语义:上次提交距今 <gap//2
+            # 的请求 KV 增量过小,重刷无增益纯耗 writer 行带宽,仍拒;搭车
+            # commit 重锚 last ⇒ 下次 interval 到点顺延整周期=单请求过密
+            # 风险由 interval 时钟天然兜底。输入全 host 决定论量
+            # ([TP-DET-TRIGGER] 合同保持);地板由既有 min_refresh_gap 派生,
+            # 零新增旋钮。
+            floor_local = _request_min_refresh_gap(tracking_local) // 2
+            if floor_local <= 0 or decode_step_local < 0:
+                return False
+            last_local = _request_last_decode_refresh_step(tracking_local)
+            if last_local < 0:
+                return False
+            return (decode_step_local - last_local) < floor_local
+
+        def _is_fresh_interval_share_ticket(
+            tracking_local: RequestTracking,
+            ticket_local: RequestIntentTicket,
+        ) -> bool:
+            # [GAP-THROTTLE-GENERATIONAL] 班车共享票判据:INTERVAL+
+            # COALESCEABLE 且票面新于上次提交(pending_decode_step>last)。
+            # 三个下游 gap 复审点(残票臂/终审/物化)对这类票按拉入地板而非
+            # 全额 gap 复审——否则拉入点放行的搭车票当步即被终审剥离,或
+            # 空转步 defer 后被残票臂扣押成"独奏"残票,节流阀上移失效。
+            # 判据面论证:①ride-along/coalesce 搭车票=INTERVAL+COALESCEABLE
+            # +票面=当前步>last,恰命中;②interval 自触发票在生产域
+            # (interval≥gap)创建即 delta≥interval≥gap,降档不改行为
+            # (gap>interval 无护栏降级区节奏由 gap 地板变为 max(interval,
+            # gap//2) 地板=有意决策,该区审查档 §8 明示无合同);③A2 型残留
+            # 票(resume 重锚后 last≥票面)不新鲜 ⇒ 仍走全额 gap 纵深防线;
+            # ④FORCE_NOW 票(含 crossing/sentence 升格)不命中 ⇒ FORCE_NOW
+            # 不变量协议("落 FORCE_NOW 票必在 gap 放行点")零触碰。
+            if not ticket_local.pending_refresh:
+                return False
+            if int(ticket_local.pending_reason_code) != int(
+                PendingReasonCode.INTERVAL
+            ):
+                return False
+            if int(ticket_local.pending_policy) != int(PendingPolicy.COALESCEABLE):
+                return False
+            last_local = _request_last_decode_refresh_step(tracking_local)
+            return int(ticket_local.pending_decode_step) > last_local
+
         def _refresh_gap_blocked(
             tracking_local: RequestTracking,
             decode_step_local: int,
@@ -3722,8 +3810,11 @@ class VLLMSparseController(
             # [TP-DET-TRIGGER 2026-07-07] 决定论触发挡板:自上次提交(enqueue
             # commit 点推进 last_decode_refresh_step,票面计划步)起
             # min_refresh_gap 步内不触发/不拉入——替代原 inflight(scheduled/
-            # GPU-writer 完成时序)挡板。输入全部 TP-rank 一致(step/提交历史),
-            # 与用户设计合同同构(任意两次 refresh ≥ min_refresh_gap,跨 reason)。
+            # GPU-writer 完成时序)挡板。输入全部 TP-rank 一致(step/提交历史)。
+            # [GAP-THROTTLE-GENERATIONAL 2026-07-12 P1-B] 合同重述:任意两次
+            # **独立开销世代** ≥ min_refresh_gap(跨 reason);搭车共享既有
+            # 世代不计独立开销,按 gap//2 拉入地板复审(见
+            # _is_fresh_interval_share_ticket 判据面论证)。
             # [BUG-A1 根修 2026-07-11] threshold-crossing 的 FORCE_NOW 票豁免
             # gap:短态请求的 last_decode_refresh_step 是首 decode 步合成锚
             # (:727-728)而非真实 refresh,prompt_len∈(threshold-gap, threshold]
@@ -3738,28 +3829,21 @@ class VLLMSparseController(
                 ticket_local
             ):
                 return False
-            trigger_local = getattr(tracking_local, "trigger", None)
-            if trigger_local is not None:
-                gap_local = max(
-                    0,
-                    int(
-                        getattr(
-                            trigger_local.config,
-                            "min_refresh_gap",
-                            DEFAULT_MIN_REFRESH_GAP,
-                        )
-                        or 0
-                    ),
+            # [GAP-THROTTLE-GENERATIONAL] 班车共享票=拉入地板复审(非全额
+            # gap):覆盖三个传票复审点——[BUG-A1] 残票臂(空转步 defer 的
+            # 搭车票下步随班车整体放行,编队不因 defer 拆解)+refresh_set
+            # 终审+物化候选过滤,与拉入点准入同一语义。非新鲜票(A2 型残留)
+            # /非 INTERVAL/非 COALESCEABLE 照旧全额 gap。
+            if ticket_local is not None and _is_fresh_interval_share_ticket(
+                tracking_local, ticket_local
+            ):
+                return _refresh_join_floor_blocked(
+                    tracking_local, decode_step_local
                 )
-            else:
-                # refresh-on(纯 interval)形态 trigger 缺席:挡板不可失效,
-                # fallback 全局默认(lease/coalesce 线依赖它防重复提交)。
-                gap_local = DEFAULT_MIN_REFRESH_GAP
+            gap_local = _request_min_refresh_gap(tracking_local)
             if gap_local <= 0 or decode_step_local < 0:
                 return False
-            last_local = int(
-                getattr(tracking_local, "last_decode_refresh_step", -1) or -1
-            )
+            last_local = _request_last_decode_refresh_step(tracking_local)
             if last_local < 0:
                 return False
             return (decode_step_local - last_local) < gap_local
@@ -4539,12 +4623,19 @@ class VLLMSparseController(
                 # [BOOTSTRAP-MATERIALIZE-GATE] 咽喉统一兜底(全 reason)。
                 if bool(getattr(tracking, "bootstrap_pending", False)):
                     continue
-                # [TP-DET-TRIGGER] inflight 过滤 → 决定论 gap 过滤。
-                # [JOIN-CLOCK-UNIFY 2026-07-10] gap 挡板与票面统一走
+                # [JOIN-CLOCK-UNIFY 2026-07-10] 挡板与票面统一走
                 # decode_step_by_req 快照口径(主循环对全部 rid 无条件建档,
                 # 与 tracking.decode_step 同源等值;决定论合同单一口径)。
+                # [GAP-THROTTLE-GENERATIONAL 2026-07-12 P1-B] gap 节流阀上移
+                # 世代级(审查档 §4/§5-P1 方向 B 规范直译):本步已有世代开出
+                # (班车,开销已由通过全额 gap/spacing 前置的开车者支付)⇒
+                # 无票健康请求一律可搭,拉入侧只留 gap//2 防荒谬密度地板。
+                # 原全额 gap 一票否决=节流阀装错对象(mingap48 编队拆解相变
+                # 取证:班车 [7,8,7,8]→[3,3,3,3],被拒者以 spacing 地板节奏
+                # 独奏,interval 饿死,step 世代 +35%);bootstrap/short-dense/
+                # decode<0 三健康闸原样保留。
                 decode_step = decode_step_by_req.get(rid, -1)
-                if _refresh_gap_blocked(tracking, decode_step):
+                if _refresh_join_floor_blocked(tracking, decode_step):
                     continue
                 if _is_short_dense_blocked(rid):
                     continue
@@ -4578,6 +4669,36 @@ class VLLMSparseController(
                         + ride_along_joined
                     )
 
+        # The compatibility policy "off" still supports mixed coalesce buses.
+        # Treat each bus as a ticket set so its semantic shape and reported
+        # reason do not depend on request iteration order; strong tickets
+        # conservatively dominate INTERVAL's half-gap join.
+        materialized_ticket_shapes: Set[Tuple[int, int]] = set()
+        if interval_merge_policy == "off":
+            materialized_ticket_shapes = {
+                (
+                    int(tickets_plan_by_req[rid].pending_reason_code),
+                    int(tickets_plan_by_req[rid].pending_policy),
+                )
+                for rid in refresh_set
+                if rid in tickets_plan_by_req
+                and bool(tickets_plan_by_req[rid].pending_refresh)
+                and int(tickets_plan_by_req[rid].pending_reason_code)
+                != int(PendingReasonCode.NONE)
+            }
+        materialized_reason_codes = {
+            reason_code for reason_code, _policy in materialized_ticket_shapes
+        }
+        if materialized_reason_codes:
+            pending_reason_code = next(
+                (
+                    code
+                    for code in _REFRESH_REASON_CANONICAL_PRIORITY
+                    if code in materialized_reason_codes
+                ),
+                int(PendingReasonCode.TRIGGER),
+            )
+
         self._current_decode_step_by_req_epoch = int(self.step_context_epoch)
         self._current_decode_step_by_req = dict(decode_step_by_req)
 
@@ -4610,11 +4731,39 @@ class VLLMSparseController(
                         target = decode_step
             if target is None:
                 target = -1
+            # [GAP-THROTTLE-GENERATIONAL 2026-07-12 P1-B] coalesce 拉入=
+            # ride-along 同型改法(审查档 §5-P1"coalesce :4571 同型"):仅
+            # interval 形班车(reason=INTERVAL 或 interval-only 场景)降为
+            # gap//2 拉入地板——搭车票落 INTERVAL+COALESCEABLE,下游复审
+            # 同语义放行。sentence/lease 形班车保持全额 gap:该路径可产
+            # FORCE_NOW 票(近靶 post_bridge 助手自带全额 gap 前置)或回填
+            # SENTENCE 票(下步残票臂自动升格 FORCE_NOW),降档会制造"gap 窗
+            # 内 FORCE_NOW 票"击穿不变量协议(A1 同型崩链),不动。
+            if interval_merge_policy == "off":
+                _coalesce_bus_interval_shaped = bool(
+                    materialized_ticket_shapes
+                ) and all(
+                    reason_code == int(PendingReasonCode.INTERVAL)
+                    and policy == int(PendingPolicy.COALESCEABLE)
+                    for reason_code, policy in materialized_ticket_shapes
+                )
+            else:
+                _coalesce_bus_interval_shaped = (
+                    pending_reason_code is not None
+                    and int(pending_reason_code) == int(PendingReasonCode.INTERVAL)
+                ) or (
+                    pending_reason_code is None and interval_reason_code is not None
+                )
             for rid in request_ids:
                 if rid in refresh_set:
                     continue
                 # [TP-DET-TRIGGER] inflight 过滤 → 决定论 gap 过滤。
-                if _refresh_gap_blocked(
+                if _coalesce_bus_interval_shaped:
+                    if _refresh_join_floor_blocked(
+                        tracking_by_req[rid], decode_step_by_req.get(rid, -1)
+                    ):
+                        continue
+                elif _refresh_gap_blocked(
                     tracking_by_req[rid], decode_step_by_req.get(rid, -1)
                 ):
                     continue

@@ -971,6 +971,7 @@ class ResolvedRowPtrArena:
     # [LIVE-PAGES-PINNED-ASYNC 2026-07-08] publish_live_rows pinned staging
     # ring + persistent GPU staging (slots-declared for the same reason).
     _live_pages_pinned_ring: object = field(default=None, init=False, repr=False)
+    _live_pages_pinned_ring_events: object = field(default=None, init=False, repr=False)
     _live_pages_pinned_ring_idx: int = field(default=0, init=False, repr=False)
     _live_pages_staging_gpu: object = field(default=None, init=False, repr=False)
     # [ARENA-AFFINE-DEVICE-RETIRED 2026-07-03] The #12 v6 affine-clean
@@ -1518,6 +1519,7 @@ class ResolvedRowPtrArena:
                 for _ in range(depth)
             ]
             self._live_pages_pinned_ring = ring
+            self._live_pages_pinned_ring_events = [None] * depth
             self._live_pages_pinned_ring_idx = 0
             self._live_pages_staging_gpu = torch.full(
                 (rows_cap, max_pages),
@@ -1525,7 +1527,18 @@ class ResolvedRowPtrArena:
                 dtype=torch.int32,
                 device=self.row_table_i32.device,
             )
+        events = getattr(self, "_live_pages_pinned_ring_events", None)
+        if not isinstance(events, list) or len(events) != len(ring):
+            # A live ring without completion events can only come from an
+            # in-process code reload. Drain once before adopting the guarded
+            # representation; otherwise an old slot may still feed an H2D.
+            torch.cuda.current_stream(self.row_table_i32.device).synchronize()
+            events = [None] * len(ring)
+            self._live_pages_pinned_ring_events = events
         idx = int(getattr(self, "_live_pages_pinned_ring_idx", 0))
+        evt = events[idx]
+        if evt is not None and not evt.query():
+            evt.synchronize()
         pinned = ring[idx]
         self._live_pages_pinned_ring_idx = (idx + 1) % len(ring)
         staging = self._live_pages_staging_gpu
@@ -1547,6 +1560,11 @@ class ResolvedRowPtrArena:
             counts.append(page_count)
         n = len(dirty)
         staging[:n].copy_(pinned[:n], non_blocking=True)
+        if self.row_table_i32.device.type == "cuda":
+            if evt is None:
+                evt = torch.cuda.Event(enable_timing=False)
+            evt.record(torch.cuda.current_stream(device=self.row_table_i32.device))
+            events[idx] = evt
         for i, batch_row in enumerate(dirty):
             page_count = counts[i]
             row_start = batch_row * self.num_kv_heads

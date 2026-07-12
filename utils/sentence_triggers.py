@@ -65,9 +65,15 @@ class RefreshTriggerState:
 
 
 # [TP-DET-TRIGGER 2026-07-07] planner 决定论挡板与 token-time trigger 共用的
-# 全局 min_gap 默认(用户设计合同:任意两次 refresh ≥ min_refresh_gap,跨
-# reason)。trigger 缺席时(refresh-on 纯 interval 形态)planner 侧 fallback
-# 到此值,保证挡板不因 sentence 关闭而失效。
+# 全局 min_gap 默认。trigger 缺席时(refresh-on 纯 interval 形态)planner 侧
+# fallback 到此值,保证挡板不因 sentence 关闭而失效。
+# [GAP-THROTTLE-GENERATIONAL 2026-07-12 P1-B 合同重述] 用户设计合同:任意
+# 两次**独立开销世代** ≥ min_refresh_gap(跨 reason)。合同目的=防单请求
+# 被过密 refresh 的固定成本爆发(世代链墙+launch);搭既有世代班车共享固定
+# 成本,不计独立开销,拉入侧只按 gap//2 防荒谬密度地板准入(planner 侧
+# [GAP-THROTTLE-GENERATIONAL],mingap48 编队拆解相变根修;审查档
+# TRIGGER_INTERPLAY_AUDIT_2026-07-12.md §4)。触发/落票方向(sentence
+# spacing/lease/post_bridge/interval 自触发)仍受全额 gap/spacing 节流。
 # [MIN-GAP-24 2026-07-07 用户拍板] 16→24:句触发过密意义不大,per-req 触发
 # 均值控制在 16-32 token/世代(4B 实测 gap=16 时 18-26,提到 24 把均值推入
 # 区间上半,直接降 refresh 频率=速度回收的显式口径旋钮,不靠隐式状态机)。

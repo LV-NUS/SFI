@@ -1309,13 +1309,16 @@ class RefreshRebuildMixin:
         pending: "PendingRefreshRebuild",
     ) -> Tuple[int, int, int, int]:
         missing = 1 << 60
-        deadline_handle_id = int(getattr(pending, "deadline_handle_id", -1) or -1)
-        deadline_epoch = int(getattr(pending, "deadline_epoch", -1) or -1)
-        target_layer_start = int(
-            getattr(pending, "target_layer_start", -1) or -1
-        )
-        ready_epoch = int(getattr(pending, "ready_epoch", -1) or -1)
-        pending_id = int(getattr(pending, "pending_id", -1) or -1)
+
+        def _int_attr_preserve_zero(name: str) -> int:
+            value = getattr(pending, name, None)
+            return -1 if value is None else int(value)
+
+        deadline_handle_id = _int_attr_preserve_zero("deadline_handle_id")
+        deadline_epoch = _int_attr_preserve_zero("deadline_epoch")
+        target_layer_start = _int_attr_preserve_zero("target_layer_start")
+        ready_epoch = _int_attr_preserve_zero("ready_epoch")
+        pending_id = _int_attr_preserve_zero("pending_id")
         deadline = deadline_handle_id if deadline_handle_id > 0 else deadline_epoch
         if deadline < 0:
             deadline = missing

@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from typing import Optional
 
 import torch
@@ -22,6 +23,7 @@ from utils.ext_toolchain import configure_jit_toolchain_or_raise
 
 _MODULE: Optional[torch.nn.Module] = None
 _LOAD_ERROR: Optional[Exception] = None
+_SELECTOR_PIPELINE_SEMANTIC_VERSION = 2026071201
 
 
 def _should_enable() -> bool:
@@ -84,6 +86,14 @@ def _fixed_shape_topk_required() -> bool:
 
 
 def _module_satisfies_runtime_requirements(module: torch.nn.Module) -> bool:
+    semantic_version = getattr(module, "selector_pipeline_semantic_version", None)
+    if not callable(semantic_version):
+        return False
+    try:
+        if int(semantic_version()) != _SELECTOR_PIPELINE_SEMANTIC_VERSION:
+            return False
+    except Exception:
+        return False
     if _workspace_required() and not (
         hasattr(module, "selector_pipeline_logits_topk_with_bounds_workspace")
         and hasattr(module, "selector_pipeline_pre_denom_topk_with_bounds_workspace")
@@ -124,29 +134,13 @@ def _load_ext(*, force: bool = False) -> Optional[torch.nn.Module]:
     if not force:
         prebuilt = load_prebuilt_extension("selector_pipeline_ext")
         if prebuilt is not None:
-            if (
-                (
-                    not _workspace_required()
-                    or (
-                        hasattr(prebuilt, "selector_pipeline_logits_topk_with_bounds_workspace")
-                        and hasattr(prebuilt, "selector_pipeline_pre_denom_topk_with_bounds_workspace")
-                    )
-                )
-                and (
-                    not _selected_indices_out_required()
-                    or (
-                        hasattr(prebuilt, "selector_pipeline_logits_topk_with_bounds_out")
-                        and hasattr(prebuilt, "selector_pipeline_pre_denom_topk_with_bounds_out")
-                        and hasattr(prebuilt, "selector_pipeline_logits_topk_with_bounds_workspace_out")
-                        and hasattr(prebuilt, "selector_pipeline_pre_denom_topk_with_bounds_workspace_out")
-                    )
-                )
-            ):
-                if (
-                    not _fixed_shape_topk_required()
-                ):
-                    _MODULE = prebuilt
-                    return _MODULE
+            if _module_satisfies_runtime_requirements(
+                prebuilt
+            ) and not _fixed_shape_topk_required():
+                _MODULE = prebuilt
+                return _MODULE
+            if sys.modules.get("selector_pipeline_ext") is prebuilt:
+                sys.modules.pop("selector_pipeline_ext", None)
 
     cpp_source = r"""
 #include <torch/extension.h>
@@ -814,7 +808,13 @@ std::vector<torch::Tensor> selector_pipeline_pre_denom_topk_with_bounds_workspac
     torch::Tensor workspace_b,
     torch::Tensor selected_indices_out);
 
+int64_t selector_pipeline_semantic_version() {
+    return 2026071201;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("selector_pipeline_semantic_version", &selector_pipeline_semantic_version,
+          "Selector pipeline internal semantic version");
     m.def("selector_pipeline_logits_topk", &selector_pipeline_logits_topk,
           "Selector pipeline (logits path) -> topk (CUDA)");
     m.def("selector_pipeline_pre_denom_topk", &selector_pipeline_pre_denom_topk,
@@ -2568,6 +2568,50 @@ __global__ void post_topk_fixed_shape_i64_to_i32_out_kernel(
     }
 }
 
+// [POST-TOPK-TIE-DETERMINISM L2 2026-07-12] Deterministic top-k MEMBERSHIP.
+// ATen topk(sorted=false) leaves the MEMBERSHIP at the k-th-value tie-band
+// implementation-defined (CUDA multi-block atomic race): when the k-th largest
+// score tau is duplicated across more columns than the boundary slots it is
+// allotted, WHICH tau-valued columns fill the last slots varies run-to-run ->
+// the selected SET drifts -> compact-page contents drift -> FA fp accumulation
+// drifts -> logits low-bit drift -> near-tie greedy flip. This resolves the tie
+// WITHOUT perturbing scores (score-zero-perturbation): tau is a bitwise copy of
+// an input value, so the gt/eq compares below are exact, never epsilon-shifted.
+// Two stages: (1) find the tie-band via tau = k-th largest; (2) adjudicate ONLY
+// inside the tie-band by ascending logical column index. Columns strictly above
+// tau are always kept unchanged; the remaining boundary slots are filled by the
+// SMALLEST-index tau-valued columns. Non-tie rows are BYTE-identical in set to
+// plain topk. Returns {indices_i64 [..,k] ascending, values_f32 [..,k] aligned}
+// so the downstream value-sentinel kernels/host ops stay byte-unchanged.
+static std::pair<torch::Tensor, torch::Tensor> post_topk_deterministic(
+    const torch::Tensor& scores, int64_t k) {
+    const int64_t W = scores.size(-1);
+    if (k <= 0) {
+        auto empty_i = scores.slice(-1, 0, 0).to(torch::kLong).contiguous();
+        auto empty_v = scores.slice(-1, 0, 0).contiguous();
+        return {empty_i, empty_v};
+    }
+    // Stage 1 (locate the tie-band): tau = k-th largest value. topk VALUES are
+    // exact bit-copies of the inputs, so the eq/gt compares are exact.
+    auto s1_vals = std::get<0>(scores.topk(k, -1, /*largest=*/true, /*sorted=*/false));
+    auto tau = std::get<0>(s1_vals.min(-1, /*keepdim=*/true));            // [..,1]
+    // Stage 2 (adjudicate ONLY within the tie-band, by ascending index):
+    auto gt = scores.gt(tau);                                            // strictly-in
+    auto eq = scores.eq(tau);                                            // tie-band
+    auto need = gt.sum(-1, /*keepdim=*/true).neg().add_(k);             // k - (#>tau); >=1
+    auto rank = eq.to(torch::kLong).cumsum(-1);                          // 1-based index-order rank
+    auto sel = gt.logical_or(eq.logical_and(rank.le(need)));            // exactly k trues / row
+    // Compact to ascending selected indices. Selected keys are the DISTINCT
+    // column indices (< W); unselected columns map to the sentinel W, so the
+    // k-boundary of this compaction topk is strictly tie-free -> deterministic
+    // regardless of its own (sorted) tie policy; sorted=true yields ascending.
+    auto col = torch::arange(W, scores.options().dtype(torch::kLong));   // [W]
+    auto key = torch::where(sel, col, torch::full_like(col, W));         // [..,W]
+    auto idx = std::get<0>(key.topk(k, -1, /*largest=*/false, /*sorted=*/true)).contiguous();
+    auto vals = scores.gather(-1, idx).contiguous();
+    return {idx, vals};
+}
+
 torch::Tensor post_topk(
     torch::Tensor log_s,
     int64_t k_head,
@@ -2609,9 +2653,11 @@ torch::Tensor post_topk(
                 pad_shape, MIN_VAL, fs_scores.options());
             fs_scores = torch::cat({fs_scores.contiguous(), pad_tensor}, -1);
         }
-        auto fs_res = fs_scores.topk(k_head, -1, true, false);
-        auto fs_vals = std::get<0>(fs_res).contiguous();
-        auto fs_idx = std::get<1>(fs_res).contiguous();
+        // [POST-TOPK-TIE-DETERMINISM L2] deterministic membership (fixed-shape arm)
+        // replaces topk(sorted=false); byte-identical set on non-tie rows.
+        auto fs_det = post_topk_deterministic(fs_scores, k_head);
+        auto fs_vals = fs_det.second.contiguous();
+        auto fs_idx = fs_det.first.contiguous();
         int64_t fs_rows = log_s.size(0) * log_s.size(1) * log_s.size(2);
         if (selected_indices_out_opt.has_value()) {
             auto out = selected_indices_out_opt.value();
@@ -2664,9 +2710,11 @@ torch::Tensor post_topk(
     }
     int64_t slice_len = range_valid ? (end - start) : K;
     int64_t k_eff = k_head < slice_len ? k_head : slice_len;
-    auto topk_res = scores.topk(k_eff, -1, true, false);
-    auto topk_vals_f32 = std::get<0>(topk_res).contiguous();
-    auto topk_i64 = std::get<1>(topk_res).contiguous();
+    // [POST-TOPK-TIE-DETERMINISM L2] deterministic membership (variable arm)
+    // replaces topk(sorted=false); byte-identical set on non-tie rows.
+    auto topk_det = post_topk_deterministic(scores, k_eff);
+    auto topk_vals_f32 = topk_det.second.contiguous();
+    auto topk_i64 = topk_det.first.contiguous();
     if (selected_indices_out_opt.has_value()) {
         auto out = selected_indices_out_opt.value();
         TORCH_CHECK(out.defined(), "selected_indices_out must be defined");

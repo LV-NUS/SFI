@@ -44,6 +44,7 @@ _RRP_READY_EVENT_GENERATION_ATTR = "mixed_page_resolver_replay_ready_event_gener
 _RRP_READY_EVENT_STREAM_ATTR = "mixed_page_resolver_replay_ready_event_stream"
 
 from patches.runtime_deps import require_runtime_dep
+from patches.cpu_gpu_staging import _record_stage_h2d_evt, _wait_stage_h2d_evt
 from patches.layer_state import _stable_slot_signature64
 from patches.refresh_runtime.post_kernel_worker import (
     build_step_cache_invariants,
@@ -8526,6 +8527,12 @@ def maybe_build_step_prefill_global_meta_from_metadata_impl(
         or self._prefill_last_n_i32 is None
         or self._prefill_cap_i32 is None
     ):
+        _wait_stage_h2d_evt(
+            stage_cache=None,
+            cache_owner=self,
+            key="_prefill_i32_stage_h2d_evt",
+        )
+
         def _ensure_prefill_cpu_stage(name: str) -> torch.Tensor:
             buf = getattr(self, name, None)
             if (
@@ -8578,6 +8585,12 @@ def maybe_build_step_prefill_global_meta_from_metadata_impl(
             self._prefill_cap_i32 = torch.empty((max_batch_size,), device=device, dtype=torch.int32)
         self._prefill_last_n_i32[:batch_size].copy_(last_n_cpu_stage, non_blocking=True)
         self._prefill_cap_i32[:batch_size].copy_(cap_cpu_stage, non_blocking=True)
+        _record_stage_h2d_evt(
+            stage_cache=None,
+            cache_owner=self,
+            key="_prefill_i32_stage_h2d_evt",
+            device=device,
+        )
         if batch_size < max_batch_size:
             self._prefill_last_n_i32[batch_size:max_batch_size].zero_()
             self._prefill_cap_i32[batch_size:max_batch_size].zero_()
