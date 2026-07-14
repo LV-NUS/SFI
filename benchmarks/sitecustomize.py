@@ -10,6 +10,11 @@ and applies a small compatibility shim for the benchmark entrypoints.
 """
 
 import os
+import sys
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(__file__))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 if os.environ.get("VLLM_IGNORE_DUPLICATE_TRANSFORMERS_CONFIGS", "1") == "1":
     try:
@@ -26,4 +31,3 @@ if os.environ.get("VLLM_IGNORE_DUPLICATE_TRANSFORMERS_CONFIGS", "1") == "1":
         AutoConfig.register = _safe_register  # type: ignore[assignment]
     except Exception:
         pass
-

@@ -457,18 +457,19 @@ _SELECTOR_PIPELINE_WORKSPACE_CACHED = os.environ.get("VLLM_SPARSE_SELECTOR_PIPEL
 # (黄金锚 MATCH tk3_golden/bprime_golden+判速 8-hash 多轮 MATCH+counts 逐位
 # =基线)+性能=判速中性+长跑 512 领先 +0.31%(615.7 vs 613.8,graph 稳态纯赚,
 # capture 学费已证为地板=SFI_P3_PREWARM_DESIGN_2026-07-11.md §7-§8)。
-# 显式 env=0 仍为完整回退路径(cached+F1 shim+C++ 调用期 shim 三层一致)。
-_SELECTOR_FIXED_SHAPE_TOPK_CACHED = os.environ.get("VLLM_SPARSE_SELECTOR_FIXED_SHAPE_TOPK", "1") == "1"
-# [F1 COHERENCE-SHIM 2026-07-11] selector_pipeline_ext's C++ dispatch reads
-# this env LIVE, while Python routing uses the cached value above. Export the
-# resolved default at import time so both sides agree. Prebuilt capability is
-# now guarded independently by the extension's exact semantic version, which
-# proves the fixed-shape kernel is present; an explicit
-# operator-set "0"/"1" is always respected.
-if os.environ.get("VLLM_SPARSE_SELECTOR_FIXED_SHAPE_TOPK") is None:
-    os.environ["VLLM_SPARSE_SELECTOR_FIXED_SHAPE_TOPK"] = (
-        "1" if _SELECTOR_FIXED_SHAPE_TOPK_CACHED else "0"
+# 显式 env=0 仍为完整回退路径；配置只在此处读取一次，随后作为显式参数
+# 贯穿 Python/pybind/CUDA，避免并发调用通过进程全局环境变量串扰。旧 C++
+# dispatch 对非 0/1 值会 fail-fast；边界迁到 Python 后仍保留该严格语义，
+# 不能把拼写错误静默解释成关闭。
+_SELECTOR_FIXED_SHAPE_TOPK_RAW = os.environ.get(
+    "VLLM_SPARSE_SELECTOR_FIXED_SHAPE_TOPK", "1"
+)
+if _SELECTOR_FIXED_SHAPE_TOPK_RAW not in ("0", "1"):
+    raise ValueError(
+        "VLLM_SPARSE_SELECTOR_FIXED_SHAPE_TOPK must be '0' or '1', got "
+        f"{_SELECTOR_FIXED_SHAPE_TOPK_RAW!r}"
     )
+_SELECTOR_FIXED_SHAPE_TOPK_CACHED = _SELECTOR_FIXED_SHAPE_TOPK_RAW == "1"
 # fa4_selector_kbucket: #13 breaker (c) K-bucket gate ([三 env 转正 2026-07-11]
 # default ON, was OFF). Rounds the per-refresh narrow topk slice width UP to
 # 256 so the topk-scan domain is shape-stable across refreshes (capture
@@ -620,17 +621,6 @@ def should_skip_page_sparse_state(attn_mode: str) -> bool:
 # ---------------------------------------------------------------------------
 _ROW_MODE_DENSE = 0
 _ROW_MODE_COMPACT = 1
-# [2026-07-12 RRP-DONE-EVTS-RETIRED] _RRP_GRAPH_DONE_EVT / _RRP_GRAPH_DONE_EVTS
-# deleted: repo-wide audit found record-only writers (patch_installer) and the
-# singular variant fully unused -- zero wait_event/query consumers. The live
-# cross-step WAR mechanism is the fence pair below.
-# [2026-07-12 任务#16 合入注记] _PP_STEP 同批删除(僵尸批审计死件,合入时现树零消费者复核通过)。
-
-# Cross-step WAR fence (decode FULL cudagraph reads vs next-step RRP descriptor
-# overwrite). Shared between the post-graph RECORD (patch_installer) and the next
-# step's data-build WAIT (metadata_builder) so they need no common object identity.
-_RRP_WAR_FENCE_EVT = [None]     # latest CUDA event recorded after a decode FULL graph
-_RRP_WAR_FENCE_ARMED = [False]  # armed only in the bootstrap window
 _ROW_MODE_LOG_F_PREFILL = 2
 _ROW_MODE_LOG_F_REFRESH = 3
 

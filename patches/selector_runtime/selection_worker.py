@@ -1832,8 +1832,8 @@ def compute_alpha_selection_pipeline_unified_impl(
                 if _SELECTOR_TOPK_GRAPH_CACHED and _topk_ring_run:
                     # Key on shapes + EVERY consumed/produced data_ptr so a moved
                     # storage or a regime change (override realloc, kbucket
-                    # clamp-fallback, slice pad, env-flip changing the scan
-                    # domain) misses the cache and falls to verbatim eager.
+                    # clamp-fallback, slice pad, or explicit fixed-shape mode
+                    # changing the scan domain) misses and falls to eager.
                     def _dp(t):
                         try:
                             return int(t.data_ptr()) if t is not None else 0
@@ -1851,6 +1851,7 @@ def compute_alpha_selection_pipeline_unified_impl(
                         int(kv_len_total),
                         int(slice_start),
                         int(slice_end),
+                        bool(_SELECTOR_FIXED_SHAPE_TOPK_CACHED),
                         _dp(capture_scores),
                         _dp(row_lo),
                         _dp(row_hi),
@@ -1954,7 +1955,7 @@ def compute_alpha_selection_pipeline_unified_impl(
                 if _SELECTOR_TOPK_GRAPH_CACHED and _topk_ring_run:
                     # Same key discipline as the logits arm: shapes + EVERY
                     # consumed/produced data_ptr. One extra field vs the
-                    # 18-field logits key — log_f_denoms' ptr — which also
+                    # 19-field logits key — log_f_denoms' ptr — which also
                     # structurally separates pre_denom graphs from logits
                     # graphs in the shared cache (different tuple arity never
                     # compares equal).
@@ -1975,6 +1976,7 @@ def compute_alpha_selection_pipeline_unified_impl(
                         int(kv_len_total),
                         int(slice_start),
                         int(slice_end),
+                        bool(_SELECTOR_FIXED_SHAPE_TOPK_CACHED),
                         _dp(capture_scores),
                         _dp(log_f_denoms),
                         _dp(row_lo),
@@ -2100,6 +2102,7 @@ def compute_alpha_selection_pipeline_unified_impl(
                     if _SELECTOR_SELECTED_INDICES_OUT_CACHED
                     else None
                 ),
+                fixed_shape_topk=_SELECTOR_FIXED_SHAPE_TOPK_CACHED,
             )
             if profile_detail:
                 pipeline_evt1 = torch.cuda.Event(enable_timing=True)

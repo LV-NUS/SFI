@@ -25,8 +25,8 @@ REQUIRED_SUMMARY_FIELDS = (
 )
 
 
-def _extension_provenance() -> dict[str, str]:
-    package_dir = UPSTREAM_FA3_ROOT / "vllm_flash_attn"
+def _extension_provenance(upstream_root: Path) -> dict[str, str]:
+    package_dir = upstream_root / "vllm_flash_attn"
     matches = sorted([*package_dir.glob("_vllm_fa3_C*.so"), *package_dir.glob("_vllm_fa3_C*.pyd")])
     if not matches:
         raise RuntimeError("missing _vllm_fa3_C extension")
@@ -51,6 +51,13 @@ def _parse(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--outputs-include-text", action="store_true", default=True)
     parser.add_argument("--model", required=True)
     parser.add_argument("--python", required=True)
+    parser.add_argument("--fa3-upstream-root", default=str(UPSTREAM_FA3_ROOT))
+    parser.add_argument("--cuda-visible-devices", default="0")
+    parser.add_argument("--route-trace-output", default="")
+    parser.add_argument("--run-nonce", default="")
+    parser.add_argument("--max-new-tokens", type=int, default=128)
+    parser.add_argument("--prefill-last-n", type=int, default=2)
+    parser.add_argument("--max-model-len", type=int, default=0)
     parser.add_argument("--timeout-s", type=int, default=600)
     args = parser.parse_args(sys.argv[1:] if argv is None else argv)
     if args.mode != "sparse":
@@ -61,6 +68,12 @@ def _parse(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--full-cuda-graph is required for the FA3 SM90 gate")
     if not bool(args.outputs_include_text):
         parser.error("--outputs-include-text is required for the FA3 SM90 gate")
+    if args.max_new_tokens <= 0:
+        parser.error("--max-new-tokens must be positive")
+    if args.prefill_last_n <= 0:
+        parser.error("--prefill-last-n must be positive")
+    if args.max_model_len < 0:
+        parser.error("--max-model-len must be non-negative")
     return args
 
 
@@ -88,9 +101,23 @@ def _run_sm80_structural_runner(args: argparse.Namespace) -> None:
         str(args.model),
         "--python",
         str(args.python),
+        "--fa3-upstream-root",
+        str(args.fa3_upstream_root),
+        "--cuda-visible-devices",
+        str(args.cuda_visible_devices),
+        "--run-nonce",
+        str(args.run_nonce),
+        "--max-new-tokens",
+        str(args.max_new_tokens),
+        "--prefill-last-n",
+        str(args.prefill_last_n),
         "--timeout-s",
         str(args.timeout_s),
     ]
+    if args.route_trace_output:
+        forwarded.extend(["--route-trace-output", str(args.route_trace_output)])
+    if args.max_model_len > 0:
+        forwarded.extend(["--max-model-len", str(args.max_model_len)])
     old_argv = sys.argv
     try:
         sys.argv = forwarded
@@ -258,7 +285,8 @@ def main(argv: list[str] | None = None) -> int:
 
     os.environ["VLLM_FLASH_ATTN_VERSION"] = "3"
     os.environ["FA3_SM90_MIXED_PAGE_E2E_GATE"] = "1"
-    provenance = _extension_provenance()
+    upstream_root = Path(args.fa3_upstream_root).expanduser().resolve()
+    provenance = _extension_provenance(upstream_root)
     _run_sm80_structural_runner(args)
 
     summary = _normalize_route_fields(_load_summary(str(args.summary_output)))

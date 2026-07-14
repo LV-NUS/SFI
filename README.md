@@ -1,480 +1,781 @@
 <div align="center">
 
-<br>
-
 # Slow-Fast Inference (SFI)
 
 **Training-Free Inference Acceleration via Within-Sentence Support Stability**
 
-<br>
-
 <a href="https://arxiv.org/abs/2603.12038"><img src="https://img.shields.io/badge/arXiv-2603.12038-b31b1b?style=for-the-badge&logo=arxiv&logoColor=white" alt="Paper"></a>&nbsp;&nbsp;
 <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-blue?style=for-the-badge" alt="License"></a>&nbsp;&nbsp;
 <a href="https://github.com/vllm-project/vllm"><img src="https://img.shields.io/badge/vLLM-v1_engine-blueviolet?style=for-the-badge" alt="vLLM"></a>&nbsp;&nbsp;
-<a href="https://github.com/vllm-project/flash-attention"><img src="https://img.shields.io/badge/FlashAttention-3_%2F_4-76B900?style=for-the-badge&logo=nvidia&logoColor=white" alt="FlashAttention"></a>&nbsp;&nbsp;
-<a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/Python-%E2%89%A53.10-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python"></a>
+<a href="https://github.com/vllm-project/flash-attention"><img src="https://img.shields.io/badge/Kernel-FA3%20%2F%20FA4-76B900?style=for-the-badge&logo=nvidia&logoColor=white" alt="FlashAttention 3 and 4"></a>
 
 <br><br>
 
 <a href="#quick-start">Quick Start</a>&ensp;&middot;&ensp;
-<a href="#overview">Overview</a>&ensp;&middot;&ensp;
-<a href="#supported-hardware">Hardware</a>&ensp;&middot;&ensp;
+<a href="#release-scope">Release Scope</a>&ensp;&middot;&ensp;
 <a href="#installation">Installation</a>&ensp;&middot;&ensp;
-<a href="#testing--benchmarking">Testing</a>&ensp;&middot;&ensp;
-<a href="#adapting-to-your-machine">Your Machine</a>&ensp;&middot;&ensp;
-<a href="#results">Results</a>&ensp;&middot;&ensp;
+<a href="#configuration">Configuration</a>&ensp;&middot;&ensp;
+<a href="#testing-and-benchmarking">Testing</a>&ensp;&middot;&ensp;
+<a href="#troubleshooting">Troubleshooting</a>&ensp;&middot;&ensp;
 <a href="#citation">Citation</a>
 
 <br><br>
 
 <img src="assets/motivation_v5.png" width="72%" alt="SFI teaser" />
 
-<br><br>
-
-**⚡ This is the `cuda-kernel` branch — SFI on natively patched FlashAttention-3/4 CUDA kernels,<br>with full-CUDA-graph decode and fully asynchronous sparse-memory maintenance.**
-
-<br>
-
 </div>
 
 > [!IMPORTANT]
-> **Which branch do I want?**
->
-> | Branch | Kernel backend | Best for |
-> |:--|:--|:--|
-> | **`cuda-kernel`** (this) | patched FlashAttention‑3 / FlashAttention‑4 CUDA kernels, full CUDA graph | maximum performance on A100 / H100 / B200 |
-> | [`triton-kernel`](https://github.com/LV-NUS/SFI/tree/triton-kernel) | Triton kernels | portability, quick experimentation |
-
-<br>
+> This public CUDA release ships the current sparse runtime and its generated
+> FA3/FA4 patch stack. The supported validation path is the one documented in
+> this README: prepare the architecture-matched kernel, pass the fresh one-shot
+> output/route gate, run official LongBench for quality, and use matched
+> sparse/dense pairs for speed.
 
 ## Quick Start
 
-Four commands from zero to a verified, benchmarked install. Every script
-prints an explicit **PASS / FAIL verdict** — nothing needs eyeballing.
+The same absolute Python interpreter must own PyTorch, vLLM, the FA3 build or
+FA4 JIT, and all helper extensions. Replace the paths below.
 
 ```bash
-# 1. Clone this branch
-git clone -b cuda-kernel https://github.com/LV-NUS/SFI.git && cd SFI
+git clone -b cuda-kernel https://github.com/LV-NUS/SFI.git
+cd SFI
 
-# 2. Build the patched FlashAttention kernels
-#    (clones the pinned upstream, applies kernel_patches/, builds ~25-40 min)
-bash scripts/setup_flash_attention.sh              # A100/H100 (FA3)
-#   bash scripts/setup_flash_attention.sh --with-fa4    # B200 (adds FA4 CuTe)
+export PYTHON="/absolute/path/to/environment/bin/python"
+export MODEL="/absolute/path/to/qwen3-model"
+export GPU="0"
+test -x "${PYTHON}"
+export PATH="$(dirname "${PYTHON}"):${PATH}"
+"${PYTHON}" -c 'import torch, vllm; assert torch.cuda.is_available(); print(torch.__version__)'
 
-# 3. Verify end-to-end (production gate: kernel-route proof + producer + lifecycle)
-bash scripts/run_one_shot.sh 0 /path/to/any-qwen3-model
-#    expected tail:  gate_passed=True producer_gate_passed=True decode_tps=...
-#                    ONE-SHOT PASS
+# Auto-detect SM80/SM90/SM100 on the selected GPU and prepare FA3 or FA4.
+PYTHON="${PYTHON}" bash scripts/setup_flash_attention.sh --arch auto --gpu "${GPU}"
 
-# 4. Measure throughput on a pre-tuned tier (exclusive GPU!)
-bash scripts/run_speed.sh 0 /path/to/model bs8x12k sparse   # SFI
-bash scripts/run_speed.sh 0 /path/to/model bs8x12k dense    # your local baseline
-#    expected tail:  decode_tps=...  SPEED RUN OK
+# SM100 only: install CuTe and dependencies from the pinned local metadata.
+SFI_CC="$(CUDA_VISIBLE_DEVICES="${GPU}" "${PYTHON}" -c 'import torch; print("%d.%d" % torch.cuda.get_device_capability(0))')"
+if [[ "${SFI_CC}" == "10.0" ]]; then
+  CUTE_SPEC="${PWD}/third_party_upstreams/vllm-project-flash-attention/flash_attn/cute"
+  if "${PYTHON}" -c 'import torch, sys; sys.exit(0 if str(torch.version.cuda).startswith("13.") else 1)'; then
+    CUTE_SPEC="${CUTE_SPEC}[cu13]"
+  fi
+  "${PYTHON}" -m pip install "${CUTE_SPEC}"
+fi
+
+# Fresh output/infra/route run: unique artifact tag and fresh helper cache.
+RUN_ID="sfi_$(date +%Y%m%d_%H%M%S)"
+PYTHON="${PYTHON}" TORCH_EXTENSIONS_DIR="${PWD}/tmp/torch_extensions/${RUN_ID}" MML=16384 bash scripts/run_one_shot.sh "${GPU}" "${MODEL}" "oneshot_${RUN_ID}"
+
+# Paired throughput measurement on the same exclusive GPU and preset.
+PYTHON="${PYTHON}" bash scripts/run_speed.sh "${GPU}" "${MODEL}" bs8x12k sparse "pair_sparse_${RUN_ID}"
+PYTHON="${PYTHON}" bash scripts/run_speed.sh "${GPU}" "${MODEL}" bs8x12k dense  "pair_dense_${RUN_ID}"
 ```
 
-> [!TIP]
-> Online serving and LongBench evaluation are two more one-liners — see
-> [Testing & Benchmarking](#testing--benchmarking). Detailed install matters
-> (prerequisites, env vars, memory budgeting, troubleshooting) live in
-> **[docs/INSTALL.md](docs/INSTALL.md)**.
+The one-shot run must end with:
 
-<br>
+```text
+child_returncode=0 gate_passed=True production_gate_passed=True producer_gate_passed=True route_proof_passed=True speed_child_route_proof_passed=True decode_tps=...
+ONE-SHOT PASS
+```
+
+The speed runs must end with `SPEED RUN OK`. Compare the two fresh summary
+files under `out/`; do not compare results from different models, context
+shapes, GPU occupancy, or software environments.
+
+### Three independent validation terms
+
+Public validation is intentionally split into three user-facing terms. A
+target is accepted only when all applicable terms pass; an HTTP 200 response,
+one throughput number, or a dense fallback is not sufficient.
+
+| Term | Entrypoint | Accepted result | What it proves |
+|:--|:--|:--|:--|
+| One-shot output | `scripts/run_one_shot.sh` | `ONE-SHOT PASS` | Complete output plus producer, lifecycle, backend and real sparse-route evidence on the fixed long workload; it is not the LongBench quality score |
+| LongBench quality | `scripts/serve_sparse.sh` then `scripts/run_longbench_v2.sh` | `PASS: official LongBench v2 sparse liveness, completeness and scoring` plus `result.txt` | Official 503-sample score, complete responses, and fresh sparse producer/compact-read evidence in server mode |
+| Paired speed | two `scripts/run_speed.sh` runs | `SPEED RUN OK` for both dense and sparse | Same-workload end-to-end throughput with output, route and fallback gates; use alternating pairs for a claim |
+
+The detailed commands are independent: use [one-shot](#1-fresh-one-shot-output-and-sparse-route-gate),
+[paired speed](#2-paired-speed-gate), or [LongBench](#5-longbench-v2-external-evaluation).
+One-shot always exercises the fixed long sparse preset. The LongBench runner
+automatically sends a long sparse smoke request and rejects the run unless it
+observes fresh producer publication and compact-read activity before scoring.
 
 ## Overview
 
-> *Do not pay the cost of full-history attention at every step when the model's useful support has not meaningfully changed.*
+SFI accelerates long-context autoregressive decoding by separating attention
+into two paths:
 
-**Slow-Fast Inference (SFI)** accelerates long-context autoregressive decoding by exploiting the observation that **attention support often evolves more slowly than token generation**. Within a sentence or short coherent span, the set of critical tokens tends to remain stable rather than changing abruptly at every step.
+| | Fast step | Slow step |
+|:--|:--|:--|
+| Work | Attend to compact sparse memory | Run dense full attention |
+| Timing | Most decode steps | Sentence boundaries or refresh deadlines |
+| Purpose | Reuse stable support | Refresh the selected support |
 
-Based on this, SFI decouples decoding into two paths:
+A training-free selector turns dense-attention evidence from slow steps into
+compact KV state for later fast steps. The CUDA release adds:
 
-| | Fast Step | Slow Step |
-|:---:|:---|:---|
-| **What** | Attend to compact sparse memory | Run dense full attention |
-| **When** | Most steps (cheap) | Sentence boundaries / refresh budget (occasional) |
-| **Why** | Support hasn't changed | Time to refresh the sparse support |
-
-A training-free **Selector** converts dense-attention evidence from slow steps into reusable sparse memory for subsequent fast steps. SFI requires **no retraining** and works with existing checkpoints.
-
-**What the CUDA kernel edition adds** over the algorithm itself:
-
-- **Native kernels** — the fast path runs a patched FlashAttention forward
-  that reads a *compact, memory-coalesced KV segment* plus in-place recent
-  tokens (mixed-page dual-source attention), not a masked dense kernel.
-- **Full-CUDA-graph decode** — every decode step replays one captured graph;
-  sparse bookkeeping never breaks graph capture.
-- **Fully asynchronous slow path** — refresh attention, selection, and
-  compact-KV rebuild run on side streams/workers and overlap decoding;
-  outputs are deterministic functions of each step's submitted state
-  (event-ordered, race-audited).
-- **Deterministic by construction** — repeated runs produce identical
-  token streams; the one-shot gate checks this class of invariants.
-
-<details>
-<summary>&ensp;<b>Method &amp; system design</b></summary>
-
-<br>
+- native FA3 and FA4 mixed-page, dual-source attention paths;
+- full-CUDA-graph decode;
+- asynchronous refresh, selection, and compact-KV maintenance;
+- route, producer, lifecycle, and output gates in the supplied runners.
 
 <div align="center">
 <img src="assets/method_new4.png" width="72%" alt="SFI method overview" />
 </div>
 
-<br>
+## Release Scope
 
-1. **Fast path** — most steps attend only to a managed sparse state: **sink tokens** + **selected tokens** (compact segment) + **recent tokens** (in place)
-2. **Slow path** — at sentence boundaries or when the refresh budget is exhausted, a dense refresh step runs full attention
-3. **Selector update** — dense-attention evidence is converted into the sparse support for the next fast-step segment, asynchronously
-
-<div align="center">
-<img src="assets/infra_system.png" width="72%" alt="SFI system design" />
-</div>
-
-</details>
-
-<details>
-<summary>&ensp;<b>Demo</b></summary>
-
-<br>
-
-<div align="center">
-
-https://github.com/user-attachments/assets/2b4277f9-72ee-4ff2-bf4d-442bb58a1ba9
-
-</div>
-
-</details>
-
-<br>
-
-## Supported Hardware
-
-| GPU | Arch | Kernel | Build artifact | Status |
+| GPU class | Architecture | Kernel | Current evidence | Status |
 |:--|:--:|:--|:--|:--|
-| A100-class Ampere | SM80 | **FA3** (C++/CUTLASS) | prebuilt `.so` | ✅ fully validated end-to-end (correctness gate, determinism, throughput) |
-| H100 / H800 Hopper | SM90 | **FA3** (C++/CUTLASS) | prebuilt `.so` | ✅ kernel port complete, compile- and resource-verified |
-| B200 Blackwell | SM100 | **FA4** (CuTe DSL) | runtime JIT | ✅ supported — throughput-validated on B200; CuTe kernel patch + benchmarks included |
+| NVIDIA A100-class | SM80 | patched FA3 | end-to-end correctness, route proof, determinism and throughput | **Validated** |
+| NVIDIA H100/H800-class | SM90 | patched FA3 | patch application, compilation and kernel resource checks | **Build-level support; run the local gates before use** |
+| NVIDIA B200-class | SM100 | FA4 CuTe | rebased overlay, sequential patch proof and CuTe fake-JIT contracts | **Packaged; run the target-hardware one-shot gate** |
 
-Architecture selection is two values: `setup_flash_attention.sh` auto-detects
-the build-time `TORCH_CUDA_ARCH_LIST`, and the run scripts default the
-run-time `VLLM_FLASH_ATTN_VERSION` to `3` (set `4` on SM100). See
-[Adapting to your machine](#adapting-to-your-machine).
+SM90 and SM100 are not advertised as target-hardware performance-validated
+until the one-shot and paired benchmark gates pass on the user's Hopper or
+Blackwell machine. The entrypoints still select the correct kernel family
+automatically and fail closed on architecture mismatches.
 
-<br>
+### Patch provenance
+
+The public patch stack contains:
+
+- `kernel_patches/sfi_fa3_sm80_sm90.patch`: shared wrapper plus FA3
+  SM80/SM90 implementation;
+- `kernel_patches/sfi_fa4_sm100_cute.patch`: a CuTe-only SM100 overlay,
+  applied after the FA3 patch.
+
+Both are generated release artifacts and checked against their canonical
+source trees. Public users should apply them through
+`scripts/setup_flash_attention.sh`; do not hand-edit or reconstruct them from
+another checkout.
+
+The setup script:
+
+1. clones the pinned vLLM FlashAttention upstream;
+2. applies FA3 for SM80/SM90, or FA3 followed by FA4 for SM100;
+3. initializes CUTLASS;
+4. builds `vllm_flash_attn/_vllm_fa3_C*.so` for SM80/SM90, while SM100 keeps
+   the patched CuTe sources for runtime JIT.
+
+SFI does not modify the installed vLLM or flash-attention packages. The
+patched clone is loaded at process startup through
+`VLLM_SPARSE_FA3_UPSTREAM_ROOT`.
 
 ## Installation
 
-The short version (details, prerequisites, and every env var:
-**[docs/INSTALL.md](docs/INSTALL.md)**):
+### Prerequisites
 
-1. **Clone** this branch (`git clone -b cuda-kernel ...`).
-2. **Build kernels**: `bash scripts/setup_flash_attention.sh`
-   — clones [vllm-project/flash-attention](https://github.com/vllm-project/flash-attention)
-   at the pinned base commit, applies
-   [`kernel_patches/`](kernel_patches/README.md), builds
-   `_vllm_fa3_C*.so` in-tree (~25–40 min). FA4/SM100 kernels are Python and
-   JIT-compile at runtime instead.
-3. **Verify**: `bash scripts/run_one_shot.sh 0 <model>` → `ONE-SHOT PASS`.
+| Dependency | Requirement |
+|:--|:--|
+| Python | 3.10 or newer; use one executable absolute path throughout |
+| PyTorch | CUDA build compatible with the installed driver/toolkit |
+| vLLM | `0.19.x` v1 engine; SFI fails closed on incompatible private-API drift |
+| CUDA toolkit | toolkit supported by the chosen PyTorch/vLLM build and target architecture, with `nvcc` available |
+| Build tools | `git`, `cmake`, `ninja`, and a supported host compiler |
+| Model | current automated release gates target Qwen3-family checkpoints |
 
-<details>
-<summary>&ensp;<b>How SFI integrates into vLLM</b>&ensp;<sub>runtime patching — no vLLM source modification</sub></summary>
+PyTorch, the CUDA toolkit, the NVIDIA driver, and the target GPU architecture
+must be mutually compatible. Because SFI patches vLLM v1 private interfaces,
+the supplied preflight and one-shot gates are authoritative: any unsupported
+API or binary-ABI drift must fail before a benchmark or server is accepted.
 
-<br>
-
-```
-Python process start
-      │
-      ▼
-┌──────────────────────────────┐   PYTHONPATH includes the SFI root, so Python
-│       sitecustomize.py       │   auto-imports this in every process —
-└──────────────┬───────────────┘   including vLLM's spawned workers
-               │  VLLM_SPARSE_FA3_UPSTREAM_ROOT set?
-               ▼
-┌──────────────────────────────┐   loads the patched flash-attention clone and
-│  patches/fa3_native/install  │   bridges its kernels into vLLM's flash-attn
-└──────────────┬───────────────┘   interface: FA3 → prebuilt _vllm_fa3_C*.so,
-               │                    FA4 → CuTe DSL kernels (JIT, cached)
-               │  VLLM_SPARSE_CONTROLLER_JSON set?
-               ▼
-┌──────────────────────────────┐   monkey-patches vLLM's attention entry point
-│   patches/patch_installer    │   and the v1 model-runner step hooks
-└──────────────┬───────────────┘   (_prepare_inputs / _dummy_run /
-               │                    _update_states); creates the controller
-               ▼
-┌──────────────────────────────┐   per step: fast path (compact KV, one CUDA
-│    VLLMSparseController      │   graph replay) or slow path (dense refresh +
-└──────────────────────────────┘   async selector / compact-KV rebuild)
-```
-
-Each stage is gated by its own env var: without
-`VLLM_SPARSE_CONTROLLER_JSON` the sparse controller never installs and vLLM
-runs its normal dense path (still on the patched FlashAttention build when
-the kernel bridge is active); without both, the process is vanilla vLLM.
-
-</details>
-
-<details>
-<summary>&ensp;<b>Repository structure</b></summary>
-
-```
-SFI/  (branch: cuda-kernel)
-├── kernel_patches/                  # ★ FlashAttention kernel patches + apply/build guide
-│   ├── sfi_fa3_sm80_sm90.patch      #   FA3: mixed-page dual-source compact-KV forward
-│   └── sfi_fa4_sm100_cute.patch     #   FA4 CuTe (SM100), stacks on the FA3 patch
-├── patches/                         # ★ SFI runtime (~80k lines): controller, dispatch,
-│   ├── patch_installer.py           #   route authority, deterministic async workers
-│   ├── vllm_sparse_patch.py
-│   ├── fa3_native/                  #   vendored-kernel bridge + install
-│   ├── decode_runtime/  refresh_runtime/  selector_runtime/  fa_sparse_runtime/
-│   └── controller_mixins/
-├── scripts/
-│   ├── setup_flash_attention.sh     #   clone + patch + build kernels
-│   ├── run_one_shot.sh              #   correctness gate (PASS/FAIL)
-│   ├── run_speed.sh                 #   throughput tiers (pre-tuned recipes)
-│   ├── serve_sparse.sh              #   OpenAI-compatible server with SFI
-│   ├── run_longbench_v2.sh          #   LongBench v2 against the server
-│   └── make_context_corpus.py       #   benchmark corpus generator
-├── benchmarks/                      # offline runners, e2e/kernel benches, corpora
-├── utils/                           # JIT CUDA helper extensions (selector/bounds)
-├── hybrid_selectors/                # alpha-fair selector
-├── triton_kernel/                   # selector-side Triton kernels
-├── sitecustomize.py                 # auto-injection entry point
-└── docs/INSTALL.md                  # detailed install / config / troubleshooting
-```
-
-</details>
-
-<br>
-
-## Testing & Benchmarking
-
-Three test axes, one script each. All scripts are self-judging (exit code +
-printed verdict) and write their artifacts under `out/`.
-
-### 1&ensp;·&ensp;Correctness — one-shot gated e2e
+Create an isolated user environment if one is not already available. The
+following installs the supported vLLM line and build helpers; choose a
+CUDA-enabled vLLM/PyTorch wheel compatible with the target system when the
+default package index is not appropriate:
 
 ```bash
-bash scripts/run_one_shot.sh <GPU> <MODEL>                      # production gate
-bash scripts/run_one_shot.sh <GPU> <MODEL> tag --with-reference # + dense compare
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip setuptools wheel
+python -m pip install "vllm>=0.19,<0.20" ninja cmake
+export PYTHON="$(python -c 'import os, sys; print(os.path.realpath(sys.executable))')"
 ```
 
-Runs the production pipeline (full-CUDA-graph decode, async bootstrap +
-refresh, selector) on a built-in 2×long-context preset. The gate verifies:
-child exit, **kernel route proof** (`route=mixed_page_attn_varlen_func` in the
-trace — the sparse kernel really ran), producer contract, output health, and
-lifecycle invariants. **Expect `ONE-SHOT PASS`.**
+SM100 additionally requires a driver/toolkit stack that supports `sm_100a`.
+After setup creates the patched checkout, install its CuTe package from the
+pinned local metadata as shown in the next section. That metadata currently
+requires `nvidia-cutlass-dsl>=4.4.2` together with the matching CuTe runtime
+dependencies. The one-shot and server preflights reject a target that cannot
+provide that path.
 
-`--with-reference` additionally runs a dense pass and prints an answer-level
-sparse-vs-dense comparison for inspection. The comparator is strict
-(boxed-answer, else normalized full text), so chain-of-thought outputs rarely
-match verbatim even when the answers agree — it informs, it doesn't gate.
-
-### 2&ensp;·&ensp;Speed — pre-tuned throughput tiers
+Before building, verify the environment:
 
 ```bash
-bash scripts/run_speed.sh <GPU> <MODEL> bs8x12k sparse
-bash scripts/run_speed.sh <GPU> <MODEL> bs8x12k dense     # same-tier baseline
+export PYTHON="/absolute/path/to/environment/bin/python"
+export PATH="$(dirname "${PYTHON}"):${PATH}"
+export CUDA_HOME="/absolute/path/to/cuda"
+export PATH="${CUDA_HOME}/bin:${PATH}"
+
+"${PYTHON}" - <<'PY'
+import shutil
+import torch
+import vllm
+
+assert torch.cuda.is_available(), "PyTorch cannot see CUDA"
+assert shutil.which("nvcc"), "nvcc is not on PATH"
+print("torch:", torch.__version__)
+print("cuda:", torch.version.cuda)
+print("gpu:", torch.cuda.get_device_name(0))
+print("capability:", torch.cuda.get_device_capability(0))
+print("vllm:", vllm.__version__)
+PY
 ```
 
-| Tier | batch × context | KV pool | `--max-model-len` |
+### Prepare the architecture-matched kernel
+
+Use the selected GPU as the source of truth:
+
+```bash
+export PYTHON="/absolute/path/to/environment/bin/python"
+export PATH="$(dirname "${PYTHON}"):${PATH}"
+export CUDA_HOME="/absolute/path/to/cuda"
+export PATH="${CUDA_HOME}/bin:${PATH}"
+export GPU="0"
+
+PYTHON="${PYTHON}" NVCC_THREADS=4 MAX_JOBS=8 \
+  bash scripts/setup_flash_attention.sh --arch auto --gpu "${GPU}"
+```
+
+`--arch auto` maps compute capability 8.0 to SM80/FA3, 9.0 to SM90/FA3,
+and 10.0 to SM100/FA4. An explicit `--arch sm80`, `sm90`, or `sm100` is
+available for controlled automation; when `--gpu` is also supplied, a
+mismatch fails closed.
+
+SM80/SM90 setup applies the FA3 patch and builds
+`vllm_flash_attn/_vllm_fa3_C*.so`. SM100 setup applies the shared FA3 patch
+and then the FA4 CuTe overlay; it prepares runtime-JIT sources and therefore
+does not require an FA3 shared object. Every path emits
+`sfi_flash_attention_build_provenance.json` in the patched checkout.
+
+To inspect the patch application manually, reproduce the same source order
+against the pinned upstream base printed by the setup script:
+
+```bash
+export SFI_ROOT="${PWD}"
+export FA_ROOT="${SFI_ROOT}/third_party_upstreams/manual-flash-attention"
+export BASE_COMMIT="f5bc33cfc02c744d24a2e9d50e6db656de40611c"
+
+git clone https://github.com/vllm-project/flash-attention.git "${FA_ROOT}"
+git -C "${FA_ROOT}" checkout --detach "${BASE_COMMIT}"
+git -C "${FA_ROOT}" apply --check "${SFI_ROOT}/kernel_patches/sfi_fa3_sm80_sm90.patch"
+git -C "${FA_ROOT}" apply --index "${SFI_ROOT}/kernel_patches/sfi_fa3_sm80_sm90.patch"
+git -C "${FA_ROOT}" submodule update --init csrc/cutlass
+```
+
+For an SM100 source-replay audit, apply the CuTe overlay after FA3:
+
+```bash
+git -C "${FA_ROOT}" apply --check "${SFI_ROOT}/kernel_patches/sfi_fa4_sm100_cute.patch"
+git -C "${FA_ROOT}" apply --index "${SFI_ROOT}/kernel_patches/sfi_fa4_sm100_cute.patch"
+```
+
+These manual commands are inspection-only: they do not emit the build
+provenance required by the supplied one-shot, speed, server, or LongBench
+runners. For every executable validation or deployment, use
+`scripts/setup_flash_attention.sh` and point the runner at that setup-generated
+target. The runner rejects a hand-built or stale target before launching a
+workload.
+
+The first one-shot run also compiles small selector/bounds CUDA extensions.
+Their cache must be writable and must never be shared across incompatible
+Python, PyTorch, CUDA, or GPU-architecture environments. The supplied runners
+derive ABI- and semantic-version-partitioned caches automatically.
+
+### Runtime injection
+
+Python imports `sitecustomize.py` when the repository root is on
+`PYTHONPATH`. The installation chain is:
+
+```text
+sitecustomize.py
+  -> patches/fa3_native/install.py
+     -> load the architecture-matched patched clone and bridge it into vLLM
+  -> patches/patch_installer.py
+     -> install the sparse controller and v1 runner hooks
+  -> VLLMSparseController
+     -> select dense-refresh or compact sparse attention for each step
+```
+
+The supplied offline runners configure this chain. For manual integration,
+the critical identities are:
+
+| Variable | Required value or meaning |
+|:--|:--|
+| `PYTHON` | absolute executable used for every parent and child process |
+| `PYTHONPATH` | contains the SFI repository root |
+| `VLLM_SPARSE_FA3_UPSTREAM_ROOT` | patched FlashAttention clone; the compatibility name is used for both FA3 and FA4 |
+| `VLLM_ATTENTION_BACKEND` | exactly `FLASH_ATTN_VLLM_V1` |
+| `VLLM_FLASH_ATTN_VERSION` | `3` for SM80/SM90; `4` for SM100 |
+| `SFI_CUDA_ARCH` | detected or explicit `sm80`, `sm90`, or `sm100` |
+| `SFI_ATTENTION_KERNEL` | `fa3-native` for SM80/SM90; `fa4-cute` for SM100 |
+| `VLLM_SPARSE_CONTROLLER_JSON` | enables and configures the controller |
+| `VLLM_WORKER_MULTIPROC_METHOD` | `spawn` |
+| `TORCH_EXTENSIONS_DIR` | ABI-partitioned writable helper-extension cache |
+| `VLLM_KV_CACHE_MEMORY_BYTES` | explicit per-GPU KV pool size when benchmarking |
+
+If `VLLM_SPARSE_CONTROLLER_JSON` is absent, the sparse controller is not
+installed. If the patched FlashAttention root is also absent, execution is
+normal vLLM.
+
+## Configuration
+
+The runners generate controller JSON automatically. This representative
+quality configuration documents the public contract:
+
+```json
+{
+  "enabled": true,
+  "attn_mode": "compact_recent",
+  "compact_page_residency_enabled": true,
+  "max_live_sparse_slots": 8,
+  "compact_blocks_per_slot": 259,
+  "k_min": 32,
+  "k_max": null,
+  "sink": 4,
+  "recent": 256,
+  "refresh_interval": 96,
+  "refresh_coalesce_window": 0,
+  "alpha_fair": {"k_head": 4096},
+  "prefill_last_n_query": 2,
+  "one_shot_bootstrap_only": true,
+  "continuous_producer_enabled": true,
+  "trigger": {
+    "refresh_interval": 96,
+    "enable_sentence_triggers": true,
+    "min_refresh_gap": 24,
+    "sentence_cooldown": 2
+  }
+}
+```
+
+| Field | Meaning |
+|:--|:--|
+| `alpha_fair.k_head` | selected tokens per KV head; 4096 favors quality, while 1536–2048 favors speed |
+| `max_live_sparse_slots` | maximum simultaneous sparse requests; match real concurrency |
+| `compact_blocks_per_slot` | 16-token compact pages reserved per slot |
+| `sink` / `recent` | always-retained prefix and trailing tokens |
+| `refresh_interval` | maximum decode steps between dense refreshes |
+| `trigger.enable_sentence_triggers` | additionally refresh at sentence boundaries |
+| `prefill_last_n_query` | trailing prompt rows used for bootstrap selection |
+| `one_shot_bootstrap_only` and `continuous_producer_enabled` | bootstrap once, then maintain sparse state asynchronously |
+
+The current compact runtime aligns retained tokens to a 112-token tile. The
+allocation must satisfy:
+
+```text
+required_blocks = ceil(align_up(sink + k_head, 112) / 16)
+compact_blocks_per_slot >= required_blocks
+```
+
+For `sink=4` and `k_head=4096`, the minimum is 259 blocks. Configuration
+validation rejects undersized or unknown fields.
+
+### GPU memory budgeting
+
+SFI state, CUDA-graph capture buffers, and selector workspaces live outside
+vLLM's KV-pool budget. Plan memory as:
+
+```text
+model weights + VLLM_KV_CACHE_MEMORY_BYTES + SFI/JIT/capture headroom < VRAM
+```
+
+The sparse KV pool must hold both full-history KV and the compact-page lease.
+With dual-generation compact state enabled:
+
+```text
+compact_lease_bytes =
+    slots * blocks_per_slot * 16 * kv_bytes_per_token * 2
+
+capacity_tokens_per_request =
+    (KVB - compact_lease_bytes) / (kv_bytes_per_token * batch)
+
+capacity_tokens_per_request > context_tokens + max_new_tokens
+```
+
+`KVB` is per GPU. For tensor parallelism, use the per-rank
+`kv_bytes_per_token` after KV-head sharding. An undersized pool can make the
+scheduler serialize requests and recompute prefill, roughly doubling decode
+steps without an immediate OOM. `run_speed.sh` checks this before launch.
+
+The speed runner's default `KV_TOKEN_BYTES=147456/TP` is specific to the
+current Qwen3-4B BF16 shape. For another model, set the per-rank value before
+benchmarking:
+
+```text
+KV_TOKEN_BYTES = layers * KV_heads_per_rank * head_dim * 2(K+V) * dtype_bytes
+```
+
+For example, export `KV_TOKEN_BYTES` explicitly when KV heads do not shard
+evenly across `TP`. A wrong value can either reject a valid shape or allow a
+shape that later serializes.
+
+Use these controls in order:
+
+1. set `MML` to the real prompt-plus-generation requirement;
+2. pin `KVB` rather than relying on utilization-based auto-sizing;
+3. set slots to actual concurrency;
+4. choose the smallest valid blocks-per-slot for the selected `k_head`;
+5. leave additional headroom for JIT compilation and CUDA graph capture.
+
+## Testing and Benchmarking
+
+### 1. Fresh one-shot output and sparse-route gate
+
+```bash
+export PYTHON="/absolute/path/to/environment/bin/python"
+export MODEL="/absolute/path/to/qwen3-model"
+RUN_ID="oneshot_$(date +%Y%m%d_%H%M%S)"
+
+PYTHON="${PYTHON}" TORCH_EXTENSIONS_DIR="${PWD}/tmp/torch_extensions/${RUN_ID}" MML=16384 bash scripts/run_one_shot.sh 0 "${MODEL}" "oneshot_${RUN_ID}"
+```
+
+This infrastructure gate verifies fresh child completion, mixed-page kernel routing,
+producer activity, sparse lifecycle invariants, output health, and summary
+freshness. SM90 always enables its dense reference because the Hopper
+correctness gate is reference-backed. On SM80/SM100, optional dense output
+inspection is available with a fourth `--with-reference` argument:
+
+```bash
+PYTHON="${PYTHON}" MML=16384 bash scripts/run_one_shot.sh 0 "${MODEL}" "oneshot_reference_${RUN_ID}" --with-reference
+```
+
+The `bs2long-cap128` preset intentionally uses the tracked
+`benchmarks/needle_prompt_two_parts.txt` calibration fixture. Its two requests
+preserve the previously validated 11,262/7,456-token workload and 128-token
+decode cap. Do not replace the prompt, output length, or sparse trigger
+parameters when comparing a change with the established one-shot result.
+
+The textual comparator is intentionally strict; a semantic text difference is
+informational, while route, producer, lifecycle, and process failures remain
+hard failures. Treat the official LongBench score, not one-shot textual parity,
+as the public quality result.
+
+### 2. Paired speed gate
+
+```bash
+export PYTHON="/absolute/path/to/environment/bin/python"
+export MODEL="/absolute/path/to/qwen3-model"
+PAIR_ID="pair_$(date +%Y%m%d_%H%M%S)"
+
+PYTHON="${PYTHON}" bash scripts/run_speed.sh 0 "${MODEL}" bs8x12k sparse "${PAIR_ID}_sparse"
+PYTHON="${PYTHON}" bash scripts/run_speed.sh 0 "${MODEL}" bs8x12k dense  "${PAIR_ID}_dense"
+```
+
+The built-in tiers are A100-40GB starting points:
+
+| Tier | Batch × context | KV pool | Max model length |
 |:--|:--:|:--:|:--:|
 | `bs8x12k` | 8 × 12k | 18 GiB | 16384 |
 | `bs8x16k` | 8 × 16k | 22 GiB | 20480 |
 | `bs4x24k` | 4 × 24k | 16 GiB | 28672 |
 | `bs2x30k` | 2 × 30k | 16 GiB | 36864 |
 
-In sparse mode the KV pool must hold the **full KV plus the compact-page
-lease**: `KVB ≥ batch × (ctx + max_new) × KV-bytes/token + slots ×
-blocks/slot × 16 × KV-bytes/token`. An undersized pool doesn't crash — the
-vLLM scheduler silently serializes the batch and throughput roughly halves;
-`run_speed.sh` preflights this and warns.
+Each run creates or reuses a tokenizer-bound, content-addressed corpus with
+exactly `BS × CTX` tokens derived from the tracked fixed calibration source.
+The source hash, tokenizer fingerprint, and corpus hash are part of the
+artifact identity. Dense/sparse comparisons must use the same generated corpus
+and all other workload parameters; changing the corpus starts a new baseline.
 
-Any tier scales via env overrides (`BS CTX KVB MML CORPUS`), and the corpus is
-generated automatically (tokenizer-measured `Context:` segments; see
-`scripts/make_context_corpus.py`). Judge by the printed `decode_tps`, full
-decode length, refresh counts, zero fallbacks — the script checks all of this.
-**Throughput requires an exclusive idle GPU.**
+On SM90/SM100, another model, or a GPU with different memory capacity, treat
+the tier only as a workload shape and override `BS`, `CTX`, `KVB`, `MML`,
+`MAX_NEW`, and `KV_TOKEN_BYTES` for the target. The runner detects the
+architecture and selects FA3 or FA4, but it does not infer a safe memory
+budget for an unfamiliar model or GPU.
 
-The script also prints `all_decode_tps` — throughput over the steady window
-that starts once **every** request has finished its chunked prefill. On
-long-context / large-batch tiers the head of the decode window interleaves
-with prefill of the later requests (both modes pay it equally; at 8 × 32k it
-is ~80% of wall time), which dilutes `decode_tps` toward 1×. `decode_tps`
-stays honest about end-to-end latency; `all_decode_tps` is the fair
-steady-state decode comparison.
+Only compare runs that use:
 
-Reference decode throughput measured with these exact scripts — one
-A100-40GB, Qwen3-4B, `max_new=256`, `k_head=1536`, sparse and dense
-paired on the same tree and day:
+- the same model, exact corpus, batch, context, generation length, and KV pool;
+- the same code, architecture-matched kernel identity, interpreter, selector
+  cache identity, and GPU set;
+- an exclusive idle GPU with no overlapping process;
+- complete outputs, expected decode length, route proof, and zero unexpected
+  fallback.
 
-| batch × context | **SFI** (tok/s) | dense (tok/s) | speedup |
-|:--:|:--:|:--:|:--:|
-| 8 × 12k | **256.1** | 170.5 | **1.50×** |
-| 8 × 16k | **187.7** | 127.7 | **1.47×** |
-| 4 × 24k | **116.8** | 80.9 | **1.44×** |
-| 2 × 30k | **95.1** | 64.1 | **1.48×** |
-| 1 × 64k | **73.2** | 59.0 | 1.24× |
-| 1 × 96k | **67.3** | 46.9 | **1.43×** |
+Use at least three alternating sparse/dense pairs for a performance claim.
+`decode_tps` is the end-to-end decode-window metric.
+`all_decode_tps` isolates the window after every request has completed
+chunked prefill; report both rather than selecting the more favorable one.
 
-On this small model / single 40 GB card, decode time is weight-bandwidth-heavy
-and the attention share is modest — these ratios are the *floor* of what SFI
-delivers. The speedup grows with the attention share of the step (larger
-batches × longer contexts, larger-KV models): kernel-level gains at low
-retention reach ~10× (table in [Results](#results)), and the paper's 128K
-end-to-end runs reach up to 14×.
+### 3. Tensor parallelism
 
-**Multi-GPU (tensor parallel).** `TP=N` plus a GPU list runs any tier across
-multiple cards — including contexts that don't fit a single card's memory
-(e.g. 2 × 128k on two 40 GB cards):
+The speed runner accepts `TP=N` and a comma-separated GPU list. The number
+of listed GPUs must equal `TP`, and `KVB` remains per GPU:
 
 ```bash
-TP=2 BS=2 CTX=128000 KVB=20401094656 MML=132096 \
-  bash scripts/run_speed.sh "0,1" <MODEL> bs2x30k sparse   # KVB is per GPU
+export PYTHON="/absolute/path/to/environment/bin/python"
+export MODEL="/absolute/path/to/qwen3-model"
+
+PYTHON="${PYTHON}" TP=2 BS=2 CTX=128000 KVB=20401094656 MML=132096 bash scripts/run_speed.sh "0,1" "${MODEL}" bs2x30k sparse "tp2_sparse"
+
+PYTHON="${PYTHON}" TP=2 BS=2 CTX=128000 KVB=20401094656 MML=132096 bash scripts/run_speed.sh "0,1" "${MODEL}" bs2x30k dense "tp2_dense"
 ```
 
-The runner applies the required TP engine settings automatically; see
-[docs/INSTALL.md](docs/INSTALL.md#adapting-to-your-machine) for details.
+The runner probes topology and avoids vLLM custom all-reduce on unsupported
+PCIe-only layouts. NVLink availability, collective overhead, and per-rank KV
+capacity can dominate TP results; treat TP as a separate paired validation,
+not as evidence inherited from a single-GPU run.
 
-### 3&ensp;·&ensp;Quality — LongBench over an SFI server
+The exact SM80 TP8 remote gate is a single self-contained sparse invocation.
+It runs the adjacent observer-free dense reference internally, requires an
+exact clean release identity and model configuration, and rejects incomplete
+rank-local route, lifecycle, output, or custom-all-reduce evidence:
 
 ```bash
-# terminal 1: serve with quality settings (k_head=4096)
-K_HEAD=4096 MML=65536 bash scripts/serve_sparse.sh <GPU> <MODEL> 8000
+export SFI_EXPECTED_GIT_COMMIT="$(git rev-parse HEAD)"
+export SFI_EXPECTED_MODEL_CONFIG_SHA256="$(sha256sum "${MODEL}/config.json" | awk '{print $1}')"
+export VLLM_SPARSE_FA3_UPSTREAM_ROOT="${PWD}/third_party_upstreams/vllm-project-flash-attention"
+export TORCH_EXTENSIONS_DIR="${PWD}/tmp/torch_extensions/tp8_${SFI_EXPECTED_GIT_COMMIT}"
+unset PYTORCH_ALLOC_CONF PYTORCH_CUDA_ALLOC_CONF
 
-# terminal 2: official LongBench v2 harness against the server
-LONGBENCH_ROOT=/path/to/LongBench bash scripts/run_longbench_v2.sh <MODEL_NAME> 4
+PYTHON="${PYTHON}" TP=8 bash scripts/run_speed.sh \
+  "0,1,2,3,4,5,6,7" "${MODEL}" tp8x64k sparse \
+  "tp8_exact_${SFI_EXPECTED_GIT_COMMIT:0:12}"
 ```
 
-`serve_sparse.sh` is also the production serving entry point: it assembles the
-controller JSON and the full env chain, and starts an OpenAI-compatible
-`vllm serve` with full CUDA graph. Proof that the sparse path is live:
-`/tmp/vllm_sparse_site.log` (patch install) and
-`VLLM_SPARSE_FA3_ROUTE_TRACE_LOG` (per-step kernel routing). Paper-setting
-quality results are in [Results](#results).
+The run is accepted only when `scripts/check_run_speed_summary.py` prints
+`SPEED RUN OK`. This is the remote target-hardware gate; the public release
+does not claim TP8 acceleration before that exact run passes.
 
-<br>
+### 4. Sparse serving
 
-## Adapting to Your Machine
+After setup and the one-shot gate, start the fail-closed OpenAI-compatible
+server in a dedicated shell:
 
-Everything machine-specific reduces to four decisions
-(full guide: [docs/INSTALL.md](docs/INSTALL.md#adapting-to-your-machine)):
+```bash
+export PYTHON="/absolute/path/to/environment/bin/python"
+export MODEL="/absolute/path/to/qwen3-model"
+export GPU="0"
 
-| Decision | How |
+PYTHON="${PYTHON}" HOST=127.0.0.1 MML=32768 SLOTS=8 \
+  bash scripts/serve_sparse.sh "${GPU}" "${MODEL}" 8000
+```
+
+The launcher enumerates every selected rank, requires one homogeneous exact
+SM80/SM90/SM100 capability, binds the corresponding FA3/FA4 kernel, makes
+`--max-num-seqs` equal to sparse slots, includes that size in CUDA-graph
+capture, partitions helper caches by ABI and selector semantics, and writes a
+PID-bound manifest plus fresh route/liveness artifacts under
+`tmp/serve_runs/`. It refuses an occupied address rather than killing an
+unrelated process.
+
+The default bind is loopback-only and may use the documented local test key.
+To expose the server on another interface, set an explicit non-loopback
+`HOST` and a strong `API_KEY`; the launcher rejects the default key outside
+loopback:
+
+```bash
+PYTHON="${PYTHON}" HOST=0.0.0.0 API_KEY="replace-with-a-strong-secret" \
+  bash scripts/serve_sparse.sh "${GPU}" "${MODEL}" 8000
+```
+
+For an API reachability check, call the endpoint from another shell:
+
+```bash
+export MODEL="/absolute/path/to/qwen3-model"
+
+curl -sS http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Authorization: Bearer token-abc123' \
+  -H 'Content-Type: application/json' \
+  -d "{\"model\":\"${MODEL}\",\"messages\":[{\"role\":\"user\",\"content\":\"Summarize the supplied context.\"}],\"temperature\":0,\"max_tokens\":128}"
+```
+
+The request model must match an ID returned by `/v1/models`; when a local
+path is served, that ID is normally the same path. This deliberately short
+request checks only API reachability and is not expected to cross the sparse
+threshold. The LongBench command below automatically sends the long smoke and
+checks fresh manifest-bound sparse activity before the official evaluation;
+users do not need to tune a prompt or lower a trigger threshold to prove the
+server path.
+
+### 5. LongBench v2 external evaluation
+
+SFI does not vendor the complete LongBench evaluation dataset or harness.
+The tracked calibration fixtures used by one-shot/speed are regression inputs,
+not an embedded LongBench evaluation. `scripts/run_longbench_v2.sh` binds the
+official [THUDM/LongBench](https://github.com/THUDM/LongBench) prediction and
+scoring workflow to a live SFI sparse server and its route evidence.
+
+First prepare a separate official checkout and a lightweight client
+environment. Keeping the client separate prevents its dependency choices from
+changing the SFI server environment:
+
+```bash
+export PYTHON="/absolute/path/to/sfi-server-environment/bin/python"
+export LONGBENCH_ROOT="/absolute/path/to/LongBench"
+git clone https://github.com/THUDM/LongBench.git "${LONGBENCH_ROOT}"
+
+"${PYTHON}" -m venv --system-site-packages \
+  "${LONGBENCH_ROOT}/.venv-sfi-client"
+export LONGBENCH_PYTHON="${LONGBENCH_ROOT}/.venv-sfi-client/bin/python"
+"${LONGBENCH_PYTHON}" -m pip install --upgrade pip
+"${LONGBENCH_PYTHON}" -m pip install datasets openai transformers tiktoken tqdm
+git -C "${LONGBENCH_ROOT}" rev-parse HEAD
+```
+
+Do not install the external checkout's requirements into the SFI server
+environment. The client only needs the packages imported by the official
+prediction script; the server continues to use the supported vLLM stack.
+
+Add one model alias to the official `config/model2path.json` and
+`config/model2maxlen.json`. The mapped path must be the same absolute model
+path served by SFI. This example uses a 120,000-token LongBench input budget
+under a 131,072-token server limit:
+
+```bash
+export MODEL="/absolute/path/to/qwen3-model"
+export MODEL_NAME="Qwen3-local"
+export LONGBENCH_MAXLEN="120000"
+
+"${LONGBENCH_PYTHON}" - \
+  "${LONGBENCH_ROOT}" "${MODEL_NAME}" "${MODEL}" "${LONGBENCH_MAXLEN}" <<'PY'
+import json
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1]).resolve(strict=True)
+name = sys.argv[2]
+model = str(pathlib.Path(sys.argv[3]).resolve(strict=True))
+maxlen = int(sys.argv[4])
+for filename, value in (
+    ("model2path.json", model),
+    ("model2maxlen.json", maxlen),
+):
+    path = root / "config" / filename
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data[name] = value
+    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+PY
+```
+
+The official `pred.py` defaults currently target
+`http://127.0.0.1:8000/v1` with the local key `token-abc123`, which matches the
+default SFI launcher below. If you intentionally change the host, port, or
+key, update `URL` and `API_KEY` in the external `pred.py` as described by the
+official LongBench README; the SFI experiment shell checks the values before
+running and does not edit the external checkout.
+
+Stop any earlier short-context server, then start SFI with sufficient model
+length and KV capacity. Reduce `SLOTS` if the target cannot hold this context,
+but keep it at least as large as the requested LongBench concurrency:
+
+```bash
+export PYTHON="/absolute/path/to/sfi-server-environment/bin/python"
+export MODEL="/absolute/path/to/qwen3-model"
+
+PYTHON="${PYTHON}" HOST=127.0.0.1 MML=131072 SLOTS=1 \
+  bash scripts/serve_sparse.sh "0" "${MODEL}" 8000
+```
+
+Run the external harness from a second shell:
+
+```bash
+export PYTHON="/absolute/path/to/sfi-server-environment/bin/python"
+export LONGBENCH_ROOT="/absolute/path/to/LongBench"
+export LONGBENCH_PYTHON="${LONGBENCH_ROOT}/.venv-sfi-client/bin/python"
+export MODEL_NAME="Qwen3-local"
+
+PYTHON="${PYTHON}" LONGBENCH_ROOT="${LONGBENCH_ROOT}" \
+  LONGBENCH_PYTHON="${LONGBENCH_PYTHON}" \
+  bash scripts/run_longbench_v2.sh "${MODEL_NAME}" 1 8000
+```
+
+The shell verifies the live server PID, command, controller, model/MML,
+authentication, all TP ranks, architecture, and FA3/FA4 family. It performs a
+long sparse smoke and a fresh producer/compact-read liveness check, invokes
+the external official `pred.py`, checks a second liveness delta, requires 503
+unique non-empty responses, and runs the external official `result.py` in an
+isolated result directory. Artifacts include the external Git revision,
+configuration hashes, server identity, predictions, liveness logs, and
+official score output under `tmp/longbench_v2_runs/`. The final lines print
+the exact `score=.../result.txt` and `score_summary=.../score_summary.json`
+paths. SFI independently recomputes Overall/Easy/Hard/Short/Medium/Long from
+the 503 prediction rows and rejects a malformed or mismatched official score.
+
+Start with `SLOTS=1` and `N_PROC=1`; increase both only after the KV budget and
+target-hardware gate prove that the longer concurrent workload fits.
+`N_PROC` must not exceed server `SLOTS`. The configured LongBench maximum plus
+generation and chat-template overhead must fit `MML`; changing the truncation
+length, prompt, sampling, model, upstream revision, dataset state, or scorer
+changes the experiment and must be reported. The upstream client does not pin
+a dataset revision, so the recorded Git/source hashes alone are not a dataset
+snapshot. For a dense comparison, use the same official checkout, config,
+model, sampling, and dataset state against a dense vLLM server, store it in a
+separate result directory, and follow the official scoring instructions. Never
+accept a sparse quality result when either liveness gate or output completeness
+fails.
+
+## Repository Layout
+
+```text
+SFI/
+├── kernel_patches/
+│   ├── sfi_fa3_sm80_sm90.patch    # generated shared/FA3 patch
+│   └── sfi_fa4_sm100_cute.patch   # generated SM100 CuTe overlay
+├── patches/                        # runtime controller and FA3/FA4 bridge
+├── scripts/
+│   ├── setup_flash_attention.sh    # detect, clone, apply, build/JIT-ready
+│   ├── run_one_shot.sh             # correctness and route gate
+│   ├── run_speed.sh                # paired performance runner
+│   ├── check_tp8_arm_teardown.py    # post-arm worker/GPU lifecycle gate
+│   ├── serve_sparse.sh              # fail-closed sparse API server
+│   ├── run_longbench_v2.sh          # external LongBench + sparse-route gate
+│   └── check_sparse_liveness.py    # server sparse-activity judge
+├── benchmarks/                     # offline end-to-end and kernel runners
+├── utils/                          # selector/bounds CUDA extensions
+├── hybrid_selectors/               # training-free selector
+├── triton_kernel/                  # selector-side helpers, not attention backend
+├── sitecustomize.py                # process-start injection
+└── assets/
+```
+
+## Troubleshooting
+
+| Symptom | Cause and action |
 |:--|:--|
-| **Which kernel** | your GPU arch: SM80/SM90 → FA3 (`VLLM_FLASH_ATTN_VERSION=3`), SM100 → FA4 (`=4`). Build-time arch (`TORCH_CUDA_ARCH_LIST`) is auto-detected by the setup script |
-| **CUDA toolkit** | point `CUDA_HOME` at any local ≥ 12.0 toolkit before building (≥ 12.8 for Blackwell) |
-| **Memory budget** | size `--max-model-len` to your real need; on shared GPUs or big models **pin the KV pool** with `VLLM_KV_CACHE_MEMORY_BYTES` — SFI's runtime state (~2–3 GB at 8 slots) lives *outside* vLLM's `gpu-memory-utilization` accounting |
-| **Quality vs speed** | one dial: `k_head` (4096 for evals ↔ 1536–2048 for throughput); keep `compact_blocks_per_slot ≥ k_head/16` and `slots = your batch` |
-
-Failure signatures (GPU stolen by a neighbor, expected harness exit 2 in
-free-corpus mode, corpus segment contract, ...) are tabulated in
-[docs/INSTALL.md → Troubleshooting](docs/INSTALL.md#troubleshooting).
-
-<br>
+| `PYTHON env required` or wrong extension ABI | export one executable absolute `PYTHON`; do not mix environments or reuse a cache built by another ABI |
+| setup fails before compilation or JIT preparation | verify the selected GPU, `CUDA_HOME`, `nvcc --version`, host compiler, `ninja`, PyTorch CUDA visibility, and writable build paths |
+| no `_vllm_fa3_C*.so` after SM80/SM90 setup | the FA3 build did not complete; rerun setup and do not launch until the shared object exists |
+| SM100 setup has no `_vllm_fa3_C*.so` | expected: SM100 uses the patched FA4 CuTe runtime-JIT source; require the one-shot/FA4 preflight instead |
+| helper-extension JIT fails | ensure `ninja` exists and `TORCH_EXTENSIONS_DIR` is writable and ABI-isolated |
+| architecture mismatch or heterogeneous TP | every selected rank must have exact homogeneous CC 8.0, 9.0, or 10.0; make explicit `SFI_CUDA_ARCH` match it |
+| no mixed-page route proof | verify repository root in `PYTHONPATH`, the patched FlashAttention root, backend `FLASH_ATTN_VLLM_V1`, FA version 3/4 for the target, and valid controller JSON |
+| server rejects non-loopback bind | export a non-default `API_KEY`; the documented test key is accepted only on loopback |
+| LongBench checkout/client error | clone the official THUDM repository, use an absolute `LONGBENCH_ROOT`, and install client packages in `LONGBENCH_PYTHON` rather than changing the SFI server environment |
+| LongBench URL, key, model, or max-length mismatch | make external `pred.py` and both official config maps match the live server; keep configured input plus generation/template headroom within `MML` |
+| engine-start OOM | lower `MML`, explicitly reduce `KVB`, reduce batch/slots, and reserve JIT/CUDA-graph headroom |
+| decode steps are about 2× expected | KV pool cannot hold full KV plus compact dual-generation lease; raise `KVB` or reduce context, generation length, batch, or blocks |
+| throughput is unstable or unexpectedly low | reserve an exclusive GPU, check clocks/power, repeat alternating pairs, and reject runs with incomplete outputs or fallback |
+| TP worker fails in custom all-reduce | verify topology and do not force custom all-reduce on an unsupported PCIe-only configuration |
+| stale artifacts appear to pass | use unique tags and timestamped artifact paths; require summaries and liveness files newer than run start |
 
 ## Results
 
-Paper results (algorithm-level, Triton backend; the CUDA edition above is the
-same algorithm on faster kernels):
-
-SFI achieves **1.6–14.4× end-to-end decode speedup** while **preserving quality close to dense full attention** across long-context and long-CoT workloads.
-
-<details>
-<summary>&ensp;<b>End-to-end throughput</b></summary>
-
-<br>
+The paper reports 1.6–14.4× end-to-end decode acceleration across its
+long-context workloads while preserving quality close to dense full
+attention. Those paper numbers are algorithm-level results; they are not a
+substitute for the paired release benchmark on the user's hardware.
 
 <div align="center">
-<img src="assets/speed.png" width="72%" alt="SFI throughput" />
+<img src="assets/speed.png" width="72%" alt="SFI throughput results" />
 </div>
 
-<br>
-
-Representative speedups at 128K context: &ensp; **Qwen3-4B** 14.36× &ensp;·&ensp; **Qwen3-30B-A3B** 11.98× &ensp;·&ensp; **Qwen3-235B-A22B** 13.49×
-
-</details>
-
-<details>
-<summary>&ensp;<b>Kernel-level speedup</b>&ensp;<sub>KV length 16K · batch=16 · bf16</sub></summary>
-
-<br>
-
-| Retention (%) | 1.6 | 6.3 | 12.5 | 25.0 | 37.5 | 50.0 | 75.0 | 98.4 | 100 |
-|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| **Speedup** | **10.67×** | **9.56×** | **7.15×** | **3.96×** | **2.75×** | **2.10×** | **1.43×** | 1.10× | 1.00× |
-
-</details>
-
-<details>
-<summary>&ensp;<b>LongBench-V1 quality</b>&ensp;<sub>17 tasks · 3 model scales</sub></summary>
-
-<br>
-
-| Category | Task | 4B Slow | 4B **SFI** | 30B-A3B Slow | 30B-A3B **SFI** | 235B-A22B Slow | 235B-A22B **SFI** |
-|:---|:---|:---:|:---:|:---:|:---:|:---:|:---:|
-| *Single-Doc QA* | Qasper | 40.60 | **44.20** | 38.96 | **42.14** | **45.77** | 44.67 |
-| | MultiFieldQA-en | 46.56 | **49.31** | 50.32 | **53.22** | **51.21** | 50.92 |
-| | MultiFieldQA-zh | 61.21 | **63.81** | 63.42 | **66.00** | **67.08** | 66.37 |
-| *Multi-Doc QA* | HotpotQA | 55.34 | **59.00** | 61.68 | **63.37** | 67.13 | **67.65** |
-| | 2WikiMQA | 42.02 | **44.50** | 54.68 | **55.98** | 64.14 | **65.31** |
-| | MuSiQue | 24.79 | **25.76** | **32.22** | 31.95 | 42.86 | **43.44** |
-| | DuReader | 21.85 | **23.77** | 21.40 | **23.44** | **25.38** | 24.58 |
-| *Summarization* | GovReport | 27.87 | **29.72** | 29.40 | **30.18** | **31.68** | 31.28 |
-| | QMSum | 22.11 | **22.21** | 21.66 | **21.92** | **22.81** | 22.72 |
-| | MultiNews | **24.06** | 24.04 | **23.52** | 23.46 | **23.46** | 23.33 |
-| *Few-Shot* | TREC | 73.00 | **75.00** | 77.50 | **78.50** | **77.50** | **77.50** |
-| | TriviaQA | 85.29 | **85.62** | **91.56** | 91.06 | 91.86 | **92.10** |
-| | SAMSum | 39.12 | **39.99** | 39.12 | **39.72** | 41.09 | **41.30** |
-| | LSHT | 30.25 | **37.75** | 42.50 | **47.25** | 51.00 | **52.00** |
-| *Synthetic & Code* | PassageRet-en | **100.0** | **100.0** | **100.0** | **100.0** | **100.0** | **100.0** |
-| | LCC | **4.48** | 4.32 | 24.82 | **25.13** | **61.32** | 61.10 |
-| | RepoBench-P | 5.17 | **5.28** | 24.76 | **24.92** | 62.56 | **63.18** |
-| **Average** | | 41.40 | **43.19** | 46.91 | **48.13** | 54.52 | **54.56** |
-
-SFI matches or improves full-KV decoding on most subsets, with the clearest average gains at 4B (+1.8) and 30B-A3B (+1.2).
-
-</details>
-
-<details>
-<summary>&ensp;<b>LongBench-V2 quality</b></summary>
-
-<br>
-
-| Model | Method | Overall | Easy | Hard | Short | Medium | Long |
-|:---|:---|:---:|:---:|:---:|:---:|:---:|:---:|
-| Qwen3-4B | Slow | 34.2 | 37.5 | 32.2 | **35.0** | 33.5 | **34.3** |
-| | **SFI** | **34.8** | **38.5** | **32.5** | **35.0** | **34.9** | **34.3** |
-| Qwen3-30B-A3B | Slow | **35.1** | **36.0** | **34.6** | **38.5** | **32.8** | **28.6** |
-| | **SFI** | **35.1** | **36.0** | **34.6** | **38.5** | **32.8** | **28.6** |
-| Qwen3-235B-A22B | Slow | **46.0** | **50.0** | **43.7** | **48.0** | **44.1** | 47.6 |
-| | **SFI** | **46.0** | **50.0** | **43.7** | 47.5 | **44.1** | **52.4** |
-
-</details>
-
-<details>
-<summary>&ensp;<b>Long-CoT reasoning</b>&ensp;<sub>GPQA &amp; MMLU</sub></summary>
-
-<br>
-
-| Model | GPQA Slow | GPQA **SFI** | MMLU Slow | MMLU **SFI** |
-|:---|:---:|:---:|:---:|:---:|
-| Qwen3-4B-Thinking | **64.14** | 63.70 | **63.00** | **63.00** |
-| Qwen3-30B-A3B-Thinking | 69.70 | **71.21** | **70.90** | 70.60 |
-| Qwen3-235B-A22B-Thinking | **80.80** | **80.80** | 90.09 | **90.30** |
-
-</details>
-
-<br>
+For the public CUDA release, use the emitted one-shot and paired-speed
+artifacts as the deployment verdict. Performance depends on model shape,
+context length, batch size, sparse retention, memory capacity, and GPU
+topology.
 
 ## Roadmap
 
-- [x] SFI framework with vLLM + Triton kernel (`triton-kernel` branch)
-- [x] **FlashAttention-3 CUDA kernel backend — SM80 / SM90 (this branch)**
-- [x] **FlashAttention-4 CuTe kernel backend — SM100 (this branch)**
-- [x] SM100/B200 kernel throughput validation (measured on B200)
-- [x] **Multi-GPU tensor-parallel sparse decode (validated end-to-end at 2 × 128k)**
+- [x] FA3 native sparse attention path for SM80
+- [x] SM80 end-to-end correctness and throughput gates
+- [x] SM90 patch application, compilation, and resource checks
+- [x] FA4/SM100 overlay rebase and sequential FA3→FA4 patch proof
+- [x] architecture-adaptive setup, one-shot, sparse serving, and external LongBench gate
+- [ ] SM90 target-hardware end-to-end validation
+- [ ] SM100 target-hardware end-to-end and paired performance validation
+- [ ] TP8 server/LongBench target-hardware validation
 - [ ] SGLang backend support
-
-<br>
 
 ## Citation
 
@@ -491,4 +792,5 @@ SFI matches or improves full-KV decoding on most subsets, with the clearest aver
 
 ## Contact
 
-For questions, please open an [issue](https://github.com/LV-NUS/SFI/issues) or email [xyxie@pku.edu.cn](mailto:xyxie@pku.edu.cn).
+For questions, open an [issue](https://github.com/LV-NUS/SFI/issues) or email
+[xyxie@pku.edu.cn](mailto:xyxie@pku.edu.cn).

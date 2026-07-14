@@ -165,6 +165,12 @@ _UBATCH_WRAPPER_PATCHED: bool = False
 _ORIGINAL_UBATCH_WRAPPER_CALL = None
 _CUDAGRAPH_WRAPPER_PATCHED: bool = False
 _ORIGINAL_CUDAGRAPH_WRAPPER_CALL = None
+_MODEL_FORWARD_REFRESH_OWNER_PATCHED: bool = False
+_ORIGINAL_MODEL_FORWARD_FOR_REFRESH_OWNER = None
+_MODEL_FORWARD_REFRESH_READY_ATTR = (
+    "_mixed_page_model_forward_refresh_generation_ready"
+)
+_MODEL_FORWARD_REFRESH_ACTIVE_ATTR = "_mixed_page_model_forward_refresh_owner_active"
 _SERIALIZED_CONFIG_ENV = "VLLM_SPARSE_CONTROLLER_JSON"
 # [EVT-BISECT 2026-07-07] 4B illegal 归因量具:每步两枚事件(drain 后/replay 后)
 # 非阻塞 query 夹逼 sticky error 的毒源段。默认关=零开销;开=每步 2 次
@@ -253,15 +259,18 @@ _FULL_CUDAGRAPH_REPLAY_CUDA_EVENT_LOG_CACHED = os.environ.get(
     "VLLM_SPARSE_FULL_CUDAGRAPH_REPLAY_CUDA_EVENT_LOG",
     "",
 )
-_FULL_CUDAGRAPH_REPLAY_WRAPPER_ABLATE_EXTRA_CACHED = os.environ.get(
+_RETIRED_FULL_CUDAGRAPH_WRAPPER_ENVS = (
     "VLLM_SPARSE_FULL_CUDAGRAPH_REPLAY_WRAPPER_ABLATE_EXTRA",
-    "0",
-)
-_FULL_CUDAGRAPH_REPLAY_WRAPPER_ABLATE_HIT_LOG_CACHED = os.environ.get(
     "VLLM_SPARSE_FULL_CUDAGRAPH_REPLAY_WRAPPER_ABLATE_HIT_LOG",
-    "",
 )
-_FULL_CUDAGRAPH_REPLAY_WRAPPER_ABLATE_HIT_LOG_REGISTERED = False
+for _retired_env_name in _RETIRED_FULL_CUDAGRAPH_WRAPPER_ENVS:
+    _retired_env_value = str(os.environ.get(_retired_env_name, "") or "").strip()
+    if _retired_env_value not in {"", "0"}:
+        raise RuntimeError(
+            "E_SFI_RETIRED_FULL_CUDAGRAPH_WRAPPER_ENV: "
+            f"{_retired_env_name} is retired because it bypassed the RRP "
+            "replay/writer ownership handshake"
+        )
 _FULL_CUDAGRAPH_REPLAY_CUDA_EVENT_ROWS: List[dict] = []
 _FULL_CUDAGRAPH_REPLAY_CUDA_EVENT_PATH = ""
 _FULL_CUDAGRAPH_REPLAY_CUDA_EVENT_REGISTERED = False
@@ -342,144 +351,6 @@ def _bootstrap_bridge_graph_policy() -> str:
         "VLLM_SPARSE_BOOTSTRAP_BRIDGE_GRAPH_POLICY",
         _BOOTSTRAP_BRIDGE_GRAPH_POLICY_CACHED,
     ).strip()
-
-
-def _full_cudagraph_replay_wrapper_ablate_hit_log(refresh_enabled: bool) -> str:
-    if not refresh_enabled:
-        return ""
-    return _cached_or_dynamic_env(
-        "VLLM_SPARSE_FULL_CUDAGRAPH_REPLAY_WRAPPER_ABLATE_HIT_LOG",
-        _FULL_CUDAGRAPH_REPLAY_WRAPPER_ABLATE_HIT_LOG_CACHED,
-    )
-
-
-def _flush_full_cudagraph_replay_wrapper_ablate_hit_log() -> None:
-    path = _full_cudagraph_replay_wrapper_ablate_hit_log(True)
-    if not path:
-        return
-    try:
-        controller = _GLOBAL_CONTROLLER
-        steady_hit_count = int(
-            getattr(
-                controller,
-                "_mixed_page_full_cudagraph_wrapper_steady_fast_path_hit_count",
-                0,
-            )
-            or 0
-        )
-        ablation_hit_count = int(
-            getattr(
-                controller,
-                "_mixed_page_full_cudagraph_wrapper_ablation_hit_count",
-                0,
-            )
-            or 0
-        )
-        payload = {
-            "event": "mixed_page_full_cudagraph_wrapper_ablation_hits",
-            "pid": int(os.getpid()),
-            "hit_count": int(steady_hit_count),
-            "steady_fast_path_hit_count": int(steady_hit_count),
-            "ablation_hit_count": int(ablation_hit_count),
-        }
-        parent = os.path.dirname(path)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        with open(path, "a", encoding="utf-8") as handle:
-            json.dump(payload, handle, sort_keys=True)
-            handle.write("\n")
-    except Exception:
-        pass
-
-
-def _ensure_full_cudagraph_replay_wrapper_ablate_hit_log_registered(
-    refresh_enabled: bool,
-) -> None:
-    global _FULL_CUDAGRAPH_REPLAY_WRAPPER_ABLATE_HIT_LOG_REGISTERED
-    if _FULL_CUDAGRAPH_REPLAY_WRAPPER_ABLATE_HIT_LOG_REGISTERED:
-        return
-    if not _full_cudagraph_replay_wrapper_ablate_hit_log(refresh_enabled):
-        return
-    atexit.register(_flush_full_cudagraph_replay_wrapper_ablate_hit_log)
-    _FULL_CUDAGRAPH_REPLAY_WRAPPER_ABLATE_HIT_LOG_REGISTERED = True
-
-
-def _full_cudagraph_replay_wrapper_ablate_extra_enabled(refresh_enabled: bool) -> bool:
-    if not refresh_enabled:
-        return False
-    return (
-        _cached_or_dynamic_env(
-            "VLLM_SPARSE_FULL_CUDAGRAPH_REPLAY_WRAPPER_ABLATE_EXTRA",
-            _FULL_CUDAGRAPH_REPLAY_WRAPPER_ABLATE_EXTRA_CACHED,
-            "0",
-        )
-        == "1"
-    )
-
-
-def _full_cudagraph_replay_wrapper_steady_fast_path_ready(
-    *,
-    controller: object,
-    state: dict[str, object],
-) -> bool:
-    if bool(getattr(controller, "_refresh_producer_stream_release_pending", False)):
-        return False
-    if _full_cudagraph_replay_step_has_refresh_row(controller):
-        return False
-    pending = getattr(controller, "_pending_refresh_rebuilds", None)
-    if pending:
-        return False
-    flags_obj = getattr(controller, "_buf_pending_work_flags", ())
-    if isinstance(flags_obj, (list, tuple)):
-        for value in flags_obj:
-            if int(value) != 0:
-                return False
-    async_enabled = getattr(controller, "_async_refresh_enabled", None)
-    if callable(async_enabled) and bool(async_enabled()):
-        step_ctx = getattr(controller, "step_context", None)
-        epoch = int(
-            getattr(
-                controller,
-                "step_context_epoch",
-                getattr(step_ctx, "epoch", -1),
-            )
-        )
-        blockers = getattr(controller, "_pending_work_blockers", None)
-        if callable(blockers) and bool(blockers(epoch=epoch)):
-            return False
-    if bool(
-        getattr(controller, "_one_shot_group_ready_full_graph_wait_required", False)
-    ):
-        return False
-    # [RAW-FENCE 2026-07-02] During the war transient (dirty carrier switchover
-    # steps) the slow path must run so the RAW fence above can order the replay
-    # after the refresh-stream gather writes. Sticky flag clears after 4 clean
-    # steps -> zero steady-state cost.
-    if bool(getattr(controller, "_rrp_war_active", False)):
-        return False
-    return bool(state)
-
-
-def _full_cudagraph_replay_wrapper_ablate_extra_ready(
-    *,
-    controller: object,
-    state: dict[str, object],
-) -> bool:
-    return _full_cudagraph_replay_wrapper_steady_fast_path_ready(
-        controller=controller,
-        state=state,
-    )
-
-
-def _bump_controller_int_attr(controller: object, name: str) -> None:
-    try:
-        setattr(
-            controller,
-            name,
-            int(getattr(controller, name, 0) or 0) + 1,
-        )
-    except Exception:
-        pass
 
 
 def _get_v1_flash_attn_modules():
@@ -1574,7 +1445,7 @@ def _compact_recent_support_error(
         and int(window_size_right) == -1
         and float(softcap) == 0.0
         and int(cp_world_size) == 1
-        and 0 <= int(num_splits) <= 256
+        and 0 <= int(num_splits) <= 255
         and q_v is None
         and s_aux is None
         and q_descale is None
@@ -1756,8 +1627,14 @@ def _build_step_ticket(
     req_ids: List[str],
     num_scheduled_tokens: Dict[str, int],
     finished_req_ids: set,
-    scheduler_output: object,
+    dispatch_token: int,
 ) -> StepTicket:
+    dispatch_token = int(dispatch_token)
+    if dispatch_token <= 0:
+        raise RuntimeError(
+            "E_STEP_DISPATCH_TOKEN: _prepare_inputs requires a positive "
+            "worker dispatch token"
+        )
     req_ids_tuple = tuple(str(rid) for rid in req_ids)
     scheduled_tuple = tuple(int(num_scheduled_tokens.get(rid, 0)) for rid in req_ids_tuple)
     finished_tuple = tuple(
@@ -1772,7 +1649,6 @@ def _build_step_ticket(
     source_signature = int(
         hash((req_ids_tuple, scheduled_tuple, finished_tuple)) & 0x7FFFFFFFFFFFFFFF
     )
-    scheduler_token = int(id(scheduler_output))
     target_epoch = int(getattr(controller, "step_context_epoch", 0)) + 1
     cached_snapshot = getattr(controller, "_active_step_snapshot", None)
     cached_ticket = getattr(controller, "_active_step_ticket", None)
@@ -1780,14 +1656,15 @@ def _build_step_ticket(
         getattr(controller, "_active_step_source_signature", -1)
     )
     if cached_snapshot is not None and cached_ticket is not None:
-        cached_scheduler_token = int(getattr(cached_ticket, "scheduler_token", -1))
+        cached_dispatch_token = int(getattr(cached_ticket, "dispatch_token", -1))
         cached_epoch = int(getattr(cached_snapshot, "step_epoch", -1))
         if (
             cached_epoch > 0
-            and cached_scheduler_token == scheduler_token
+            and cached_dispatch_token == dispatch_token
             and cached_source_signature == source_signature
         ):
-            # 同一 scheduler_output 复入：复用已分配 target_epoch，避免伪“下一步”漂移。
+            # 同一 execute_model dispatch 内复入：复用已分配
+            # target_epoch。对象地址不是稳定身份，不得参与判定。
             target_epoch = int(cached_epoch)
     return StepTicket(
         target_epoch=target_epoch,
@@ -1795,14 +1672,18 @@ def _build_step_ticket(
         scheduled_signature=int(hash(scheduled_tuple) & 0x7FFFFFFFFFFFFFFF),
         finished_signature=int(hash(finished_tuple) & 0x7FFFFFFFFFFFFFFF),
         source_signature=source_signature,
-        scheduler_token=scheduler_token,
+        dispatch_token=dispatch_token,
     )
+
+
 _PREPARE_PATCHED: bool = False
 _ORIGINAL_PREPARE_INPUTS = None
 _DUMMY_RUN_PATCHED: bool = False
 _ORIGINAL_DUMMY_RUN = None
 _UPDATE_STATES_PATCHED: bool = False
 _ORIGINAL_UPDATE_STATES = None
+_INSTALLED_UPDATE_STATES_WRAPPER = None
+SPARSE_UPDATE_STATES_PREDECESSOR_ABI = "sfi_sparse_update_states_predecessor/v1"
 _FLASH_METADATA_PATCHED: bool = False
 _ORIGINAL_FLASH_METADATA_BUILD = None
 _REQUEST_PATCHED: bool = False
@@ -2118,15 +1999,6 @@ def _resolve_selected_no_capture_row_plan(
     return row_plan
 
 
-# [2026-07-12 RRP-DONE-EVTS-RETIRED] _wrap_bridge_for_war_event deleted. Its
-# only job was recording per-stream CUDA events into
-# sparse_constants._RRP_GRAPH_DONE_EVTS after every bridge mixed-page call;
-# a whole-repo audit found ZERO wait_event/query consumers of that dict (the
-# real cross-step WAR fence is the separate _RRP_WAR_FENCE_EVT/_ARMED pair,
-# recorded post-graph and waited in decode_runtime/metadata_builder.py), so
-# the record was pure dead overhead -- and its except-pass swallowed errors.
-
-
 def _resolve_selected_no_capture_bridge(
     *,
     controller: object,
@@ -2218,6 +2090,8 @@ def _mixed_page_split_makespan_argmin(
     them point-identical over a G x P x nb_single x nb_split x s_ub grid; edit
     both together.
     """
+    if total_ctas_single_split <= 0:
+        return 1
     # Wave-level enumeration, literally the device kernel's loop shape (the
     # naive per-s scan costs 2 software int-divides per s on GPU and measured
     # +2.7us on the prepare kernel; within a wave level w the makespan
@@ -2322,13 +2196,14 @@ def _mixed_page_profile_shared_scheduler_metadata(
     headdim: int,
     headdim_v: int,
     qkv_dtype: torch.dtype,
-    seqused_k: torch.Tensor,
+    scheduler_seqused_k: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
     page_size: int,
     causal: bool,
     window_size: Tuple[int, int],
     has_softcap: bool,
     num_splits_cap: int,
+    page_resolver_kind: int,
 ) -> torch.Tensor | None:
     """[2026-07-12 K6-SCHED-MD-SINGLE-SOURCE] One prepare launch per profile/
     capture run instead of one per layer (36x -> 1x on the speed-tier form).
@@ -2344,9 +2219,10 @@ def _mixed_page_profile_shared_scheduler_metadata(
     the launch template's prepare launch (flash_fwd_launch_template.h:409
     guard: `!skip_scheduler_metadata_computation`) is skipped. At replay the
     single in-graph prepare still re-solves the makespan argmin against the
-    live seqused buffer every step (<= the domain cap), so per-replay split
-    adaptivity is fully preserved -- this is a launch-count diet, not a
-    semantics freeze.
+    canonical graph-live resolved-length carrier every step (<= the domain
+    cap). The producer and RRP consumer are required to read the same pointer;
+    this is both a launch-count diet and a single-source scheduling contract,
+    not a semantics freeze.
 
     Layer-order safety (audited, R2 material-B): the prepare kernel zeroes the
     tile-count semaphore (flash_prepare_scheduler.cu:224) and every split>1
@@ -2354,13 +2230,15 @@ def _mixed_page_profile_shared_scheduler_metadata(
     args wire params.tile_count_semaphore as semaphore_to_reset); layers run
     serially on one stream, so each layer observes semaphore==0 exactly as if
     it had run its own prepare. The three prepare-produced batch vectors are
-    pure functions of (seqused, geometry) shared by all 36 layers
-    (layer-invariance), and are read-only to the attention/combine kernels.
+    pure functions of (resolved visible length, geometry) shared by all 36
+    layers (layer-invariance), and are read-only to the attention/combine
+    kernels.
 
-    Shape safety is fail-fast by construction: the launch passes the SAME
-    num_splits (the split-domain cap) and geometry to both this metadata
-    producer and the mha_fwd consumer, and C++ CHECK_SHAPE(scheduler_metadata,
-    metadata_size) at flash_api.cpp:1424 rejects any size mismatch (the
+    Shape and policy safety are fail-fast by construction: the launch passes
+    the SAME num_splits (the split-domain cap), geometry, and resolver kind to
+    both this metadata producer and the mha_fwd consumer. C++
+    CHECK_SHAPE(scheduler_metadata, metadata_size) at flash_api.cpp:1424
+    rejects any size mismatch (the
     2026-07-01 rejection was two call sites hand-computing DIFFERENT calibres;
     a single producer consumed under the same calibre is immune).
 
@@ -2381,26 +2259,83 @@ def _mixed_page_profile_shared_scheduler_metadata(
     )
     if not isinstance(dummy_context, dict):
         return None
-    # prepare reads these buffers by POINTER inside the (captured) kernel; a
-    # non-contiguous input would make the python wrapper's maybe_contiguous
-    # clone them and freeze replay adaptivity. Refuse to produce a bad value.
-    if not seqused_k.is_contiguous():
+    # prepare reads these buffers by POINTER inside the captured kernel. The
+    # scheduler carrier is deliberately batch-row only: Phase1 metadata owns
+    # one dynamic split decision per batch, so silently accepting a per-head
+    # carrier would make the producer and consumer disagree about its layout.
+    if not isinstance(scheduler_seqused_k, torch.Tensor):
         raise RuntimeError(
-            "K6 shared scheduler_metadata requires contiguous seqused_k"
+            "K6 shared scheduler_metadata requires tensor scheduler_seqused_k"
+        )
+    if scheduler_seqused_k.dtype != torch.int32:
+        raise RuntimeError(
+            "K6 shared scheduler_metadata scheduler_seqused_k must have dtype "
+            "torch.int32"
+        )
+    if scheduler_seqused_k.device != device:
+        raise RuntimeError(
+            "K6 shared scheduler_metadata scheduler_seqused_k device must "
+            "match launch device"
+        )
+    if scheduler_seqused_k.dim() != 1 or int(
+        scheduler_seqused_k.numel()
+    ) != int(batch_size):
+        raise RuntimeError(
+            "K6 shared scheduler_metadata scheduler_seqused_k must provide "
+            "one int32 entry per batch row"
+        )
+    if not scheduler_seqused_k.is_contiguous():
+        raise RuntimeError(
+            "K6 shared scheduler_metadata requires contiguous scheduler_seqused_k"
+        )
+    if cu_seqlens_q.dtype != torch.int32:
+        raise RuntimeError(
+            "K6 shared scheduler_metadata cu_seqlens_q must have dtype torch.int32"
+        )
+    if cu_seqlens_q.device != device:
+        raise RuntimeError(
+            "K6 shared scheduler_metadata cu_seqlens_q device must match "
+            "launch device"
+        )
+    if cu_seqlens_q.dim() != 1 or int(cu_seqlens_q.numel()) != int(
+        batch_size
+    ) + 1:
+        raise RuntimeError(
+            "K6 shared scheduler_metadata cu_seqlens_q must provide batch_size + 1 entries"
         )
     if not cu_seqlens_q.is_contiguous():
         raise RuntimeError(
             "K6 shared scheduler_metadata requires contiguous cu_seqlens_q"
         )
-    device_index = device.index
-    if device_index is None:
-        device_index = int(torch.cuda.current_device())
+    page_resolver_kind = int(page_resolver_kind)
+    if page_resolver_kind not in (0, 4):
+        raise RuntimeError(
+            "K6 shared scheduler_metadata page_resolver_kind must be "
+            f"0 (Native) or 4 (ResolvedRowPtr); got {page_resolver_kind}"
+        )
+    # Cache identity belongs to the graph-live buffers, not to the ambient
+    # CUDA thread state.  Querying current_device() here is both redundant
+    # after the exact device checks above and unsafe for CPU contract/fake
+    # bridges (and for multi-device workers whose current device can drift).
+    # A real CUDA tensor always carries its concrete ordinal; index-less
+    # devices such as CPU use -1 while device_type keeps the key unambiguous.
+    carrier_device = scheduler_seqused_k.device
+    device_index = carrier_device.index
+    device_identity = (
+        str(carrier_device.type),
+        -1 if device_index is None else int(device_index),
+    )
+    stream_is_capturing = (
+        bool(torch.cuda.is_current_stream_capturing())
+        if carrier_device.type == "cuda"
+        else False
+    )
     # The capturing flag separates the warmup (eager) and capture phases that
     # share one dummy-run dict: a warmup-phase tensor lives in the ordinary
     # allocator pool and must NEVER be baked into a graph, and vice versa.
     key = (
-        bool(torch.cuda.is_current_stream_capturing()),
-        int(device_index),
+        stream_is_capturing,
+        device_identity,
         int(batch_size),
         int(max_seqlen_q),
         int(max_seqlen_k),
@@ -2409,13 +2344,14 @@ def _mixed_page_profile_shared_scheduler_metadata(
         int(headdim),
         int(headdim_v),
         str(qkv_dtype),
-        int(seqused_k.data_ptr()),
+        int(scheduler_seqused_k.data_ptr()),
         int(cu_seqlens_q.data_ptr()),
         int(page_size),
         bool(causal),
         (int(window_size[0]), int(window_size[1])),
         bool(has_softcap),
         int(num_splits_cap),
+        page_resolver_kind,
     )
     entry = dummy_context.get(_MIXED_PAGE_PROFILE_SHARED_SCHED_MD_KEY)
     if (
@@ -2437,7 +2373,7 @@ def _mixed_page_profile_shared_scheduler_metadata(
         num_heads,
         num_heads_k,
         headdim,
-        seqused_k,
+        scheduler_seqused_k,
         qkv_dtype=qkv_dtype,
         headdim_v=headdim_v,
         cu_seqlens_q=cu_seqlens_q,
@@ -2449,6 +2385,7 @@ def _mixed_page_profile_shared_scheduler_metadata(
         pack_gqa=None,
         sm_margin=0,
         prefill_active_worklist=False,
+        page_resolver_kind=page_resolver_kind,
     )
     if not isinstance(metadata, torch.Tensor):
         raise RuntimeError(
@@ -2457,6 +2394,40 @@ def _mixed_page_profile_shared_scheduler_metadata(
         )
     dummy_context[_MIXED_PAGE_PROFILE_SHARED_SCHED_MD_KEY] = (key, metadata)
     return metadata
+
+
+def _require_shared_graph_live_resolved_lengths(
+    *,
+    resolver_seqused_k: object,
+    carriers: object,
+) -> torch.Tensor:
+    """Return the single length carrier shared by scheduler and RRP forward.
+
+    Both captured kernels retain a raw device pointer. Shape equality alone is
+    insufficient: two equal-valued tensors can diverge on the next replay.
+    Refuse any non-aliasing binding instead of scheduling resolved work from a
+    stale/full-capacity shadow buffer.
+    """
+    visible = getattr(carriers, "resolver_visible_seqused_k_by_head_i32", None)
+    if not isinstance(resolver_seqused_k, torch.Tensor):
+        raise RuntimeError(
+            "vLLM profile ResolvedRowPtr mixed forward requires graph-live "
+            "resolver_seqused_k"
+        )
+    if not isinstance(visible, torch.Tensor):
+        raise RuntimeError(
+            "vLLM profile ResolvedRowPtr mixed forward requires graph-live "
+            "visible lengths"
+        )
+    if (
+        tuple(resolver_seqused_k.shape) != tuple(visible.shape)
+        or int(resolver_seqused_k.data_ptr()) != int(visible.data_ptr())
+    ):
+        raise RuntimeError(
+            "vLLM profile ResolvedRowPtr scheduler producer and attention consumer "
+            "must share the same graph-live visible-length carrier"
+        )
+    return visible
 
 
 def _run_profile_resolved_row_ptr_mixed_forward(
@@ -2531,6 +2502,10 @@ def _run_profile_resolved_row_ptr_mixed_forward(
         )
 
     resolver_seqused_k = resolver_kwargs.get("resolver_seqused_k")
+    visible = _require_shared_graph_live_resolved_lengths(
+        resolver_seqused_k=resolver_seqused_k,
+        carriers=carriers,
+    )
     seqused_k = getattr(attn_metadata, "seq_lens", None)
     if not isinstance(seqused_k, torch.Tensor):
         raise RuntimeError(
@@ -2648,11 +2623,15 @@ def _run_profile_resolved_row_ptr_mixed_forward(
     )
     # [2026-07-12 K6-SCHED-MD-SINGLE-SOURCE] One prepare per run instead of one
     # per layer. The first layer of a dummy run produces the metadata via the
-    # vendored get_scheduler_metadata (single prepare launch, captured into the
-    # graph when capturing); the other 35 layers pass the same tensor so the C++
+    # vendored get_scheduler_metadata with the explicit RRP resolver policy
+    # (single prepare launch, captured into the graph when capturing); the
+    # other 35 layers pass the same tensor so the C++
     # side skips its per-call prepare launch (flash_api.cpp:1420 +
-    # flash_fwd_launch_template.h:409). Every argument below is the SAME local
-    # the launch's common_kwargs uses -- one calibre, one producer, and the C++
+    # flash_fwd_launch_template.h:409). The producer reads resolver_seqused_k,
+    # the exact graph-live pointer passed to the RRP consumer as visible below;
+    # full-capacity attn_metadata.seq_lens remains only the native forward ABI
+    # input. Every other argument below is the SAME local the launch's
+    # common_kwargs uses -- one calibre, one producer, and the C++
     # CHECK_SHAPE(scheduler_metadata, metadata_size) (flash_api.cpp:1424) hard-
     # rejects any residual size drift (constructive fix for the 2026-07-01
     # two-hand-computed-calibres rejection). SM8x-only Phase1 gate: on SM90 the
@@ -2673,13 +2652,14 @@ def _run_profile_resolved_row_ptr_mixed_forward(
                 headdim=int(q_arg.shape[2]),
                 headdim_v=int(value_cache.shape[-1]),
                 qkv_dtype=q_arg.dtype,
-                seqused_k=seqused_k,
+                scheduler_seqused_k=resolver_seqused_k,
                 cu_seqlens_q=cu_seqlens_q,
                 page_size=int(key_cache.shape[1]),
                 causal=mixed_page_causal,
                 window_size=mixed_page_window_tuple,
                 has_softcap=mixed_page_softcap > 0.0,
                 num_splits_cap=int(mixed_page_split_cap),
+                page_resolver_kind=int(PageResolverKind.RESOLVED_ROW_PTR),
             )
         )
     common_kwargs = {
@@ -2815,8 +2795,7 @@ def _run_profile_resolved_row_ptr_mixed_forward(
             )
         except Exception:
             pass
-    visible = getattr(carriers, "resolver_visible_seqused_k_by_head_i32", None)
-    if not isinstance(visible, torch.Tensor) or (row_ptr is None and not has_affine):
+    if row_ptr is None and not has_affine:
         raise RuntimeError(
             "vLLM profile ResolvedRowPtr mixed forward requires row-pointer or affine carrier plus visible lengths"
         )
@@ -3493,7 +3472,9 @@ def _patch_prepare_inputs() -> None:
                 req_ids=req_ids,
                 num_scheduled_tokens=scheduled,
                 finished_req_ids=set(),
-                scheduler_output=scheduler_output,
+                dispatch_token=int(
+                    getattr(self, "_sparse_worker_dispatch_token", -1)
+                ),
             )
             snapshot = controller.get_or_build_active_step_snapshot(
                 req_ids=req_ids,
@@ -3736,25 +3717,31 @@ def _patch_prepare_inputs() -> None:
                             )
                         # [TPX-D1] 档级一次 numpy 零拷贝视图：torch CPU 标量索引
                         # ~3.3µs/请求 vs 视图索引 ~0.1µs（event 已就绪后才读，
-                        # 无同步语义变化）。意外形态（非 CPU tensor 等）回退原对象，
-                        # 由既有 per-请求 try 兜底。
-                        try:
-                            _ids_view = (
-                                _ids_cpu.numpy()
-                                if hasattr(_ids_cpu, "numpy")
-                                else _ids_cpu
-                            )
-                        except Exception:
+                        # 无同步语义变化）。若声明为 tensor 却不能导出 CPU numpy
+                        # 视图，这是 rank-local token archive 损坏；不可回退后静默
+                        # 丢 token，否则 sentence-trigger 决策会跨 rank 分叉。
+                        if hasattr(_ids_cpu, "numpy"):
+                            try:
+                                _ids_view = _ids_cpu.numpy()
+                            except (RuntimeError, TypeError, ValueError) as exc:
+                                raise RuntimeError(
+                                    "E_TP2_TOKEN_SOURCE_INCOMPLETE: async sampled "
+                                    "ids cannot expose a CPU numpy view; "
+                                    f"shape={getattr(_ids_cpu, 'shape', None)!r}, "
+                                    f"device={getattr(_ids_cpu, 'device', None)!r}"
+                                ) from exc
+                        else:
                             _ids_view = _ids_cpu
                         for _rid, _prev_idx in _prev_map.items():
                             _cur = index_map.get(str(_rid))
                             if _cur is None:
                                 continue
                             _cur = int(_cur)
-                            try:
-                                _tok = int(_ids_view[int(_prev_idx), 0])
-                            except Exception:
-                                continue
+                            _tok = _read_async_sampled_token(
+                                _ids_view,
+                                request_id=_rid,
+                                previous_row_index=_prev_idx,
+                            )
                             if _tok < 0:
                                 # discard 行：vLLM 在该步也没写占位符，两侧同跳。
                                 continue
@@ -3874,12 +3861,179 @@ def _patch_prepare_inputs() -> None:
     _PREPARE_PATCHED = True
 
 
+def _capture_profile_device_properties(device: torch.device):
+    """Single injectable source for profile-time capability and memory facts."""
+    return torch.cuda.get_device_properties(device)
+
+
+def _capture_configured_device_bytes(runner, device_properties: object) -> int:
+    cache_config = getattr(runner, "cache_config", None)
+    utilization_raw = getattr(cache_config, "gpu_memory_utilization", None)
+    try:
+        utilization = float(utilization_raw)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "E_SFI_CAPTURE_OWNERSHIP_MEMORY: gpu_memory_utilization must be "
+            "finite and within (0, 1]"
+        ) from exc
+    if not math.isfinite(utilization) or not 0.0 < utilization <= 1.0:
+        raise RuntimeError(
+            "E_SFI_CAPTURE_OWNERSHIP_MEMORY: gpu_memory_utilization must be "
+            "finite and within (0, 1]"
+        )
+    total_memory = int(getattr(device_properties, "total_memory", 0) or 0)
+    if total_memory <= 0:
+        raise RuntimeError(
+            "E_SFI_CAPTURE_OWNERSHIP_MEMORY: device total_memory must be positive"
+        )
+    configured_device_bytes = math.floor(total_memory * utilization)
+    if configured_device_bytes <= 0:
+        raise RuntimeError(
+            "E_SFI_CAPTURE_OWNERSHIP_MEMORY: configured device bytes must be positive"
+        )
+    return int(configured_device_bytes)
+
+
+def _capture_ownership_mode(plan: object) -> str:
+    from patches.fa3_native.capture_ownership import (
+        CAPTURE_OWNERSHIP_POLICY_SCHEMA,
+        CHUNK_COHORT,
+        RING_EARLY,
+        CaptureOwnershipPlan,
+    )
+
+    if not isinstance(plan, CaptureOwnershipPlan):
+        raise RuntimeError(
+            "E_SFI_CAPTURE_OWNERSHIP_PLAN: stamped plan has an invalid type"
+        )
+    if plan.schema != CAPTURE_OWNERSHIP_POLICY_SCHEMA:
+        raise RuntimeError(
+            "E_SFI_CAPTURE_OWNERSHIP_PLAN: stamped plan schema mismatch"
+        )
+    if plan.mode not in (RING_EARLY, CHUNK_COHORT):
+        raise RuntimeError(
+            "E_SFI_CAPTURE_OWNERSHIP_PLAN: stamped plan mode is invalid"
+        )
+    return str(plan.mode)
+
+
+def _chunk_cohort_runtime_scratch_binding(
+    *,
+    plan: object,
+    global_layer_index: int,
+    slot_in_chunk: int,
+    aligned_k_bucket: int,
+    rows_bucket: int,
+    last_n_bucket: int,
+    actual_k: int,
+    actual_rows: int,
+    actual_last_n: int,
+    heads_per_rank: int,
+    chunk: int,
+    in_flight: int,
+    baseline_reduce_group: int,
+) -> tuple[int, int, int]:
+    from patches.fa3_native.capture_ownership import CHUNK_COHORT
+
+    if _capture_ownership_mode(plan) != CHUNK_COHORT:
+        raise RuntimeError(
+            "E_SFI_CAPTURE_OWNERSHIP_PLAN: runtime binding requires chunk_cohort"
+        )
+
+    expected_capacity = (
+        int(rows_bucket)
+        * int(heads_per_rank)
+        * int(last_n_bucket)
+        * int(aligned_k_bucket)
+    )
+    expected_depth = int(chunk) * int(in_flight)
+    expected_values = (
+        int(aligned_k_bucket),
+        int(rows_bucket),
+        int(last_n_bucket),
+        int(heads_per_rank),
+        int(chunk),
+        int(in_flight),
+        int(baseline_reduce_group),
+        int(chunk),
+        int(expected_depth),
+        int(expected_depth),
+        int(expected_capacity),
+        int(expected_capacity) * int(expected_depth),
+        int(expected_capacity) * int(expected_depth) * 2,
+    )
+    stamped_values = (
+        int(getattr(plan, "aligned_k")),
+        int(getattr(plan, "rows_cap")),
+        int(getattr(plan, "last_n")),
+        int(getattr(plan, "heads_per_rank")),
+        int(getattr(plan, "chunk")),
+        int(getattr(plan, "in_flight")),
+        int(getattr(plan, "baseline_reduce_group")),
+        int(getattr(plan, "cohort_size")),
+        int(getattr(plan, "target_depth")),
+        int(getattr(plan, "selected_depth")),
+        int(getattr(plan, "elements_per_slot")),
+        int(getattr(plan, "selected_capacity_elements")),
+        int(getattr(plan, "selected_bytes")),
+    )
+    if stamped_values != expected_values:
+        raise RuntimeError(
+            "E_SFI_CAPTURE_OWNERSHIP_PLAN: stamped capacities do not match "
+            "the live prebuilt bucket"
+        )
+    if not bool(getattr(plan, "dtype_is_fp16")) or int(
+        getattr(plan, "element_bytes")
+    ) != 2:
+        raise RuntimeError(
+            "E_SFI_CAPTURE_OWNERSHIP_PLAN: stamped scratch dtype contract mismatch"
+        )
+    if (
+        int(actual_k) <= 0
+        or int(actual_rows) <= 0
+        or int(actual_last_n) <= 0
+        or int(actual_k) > int(aligned_k_bucket)
+        or int(actual_rows) > int(rows_bucket)
+        or int(actual_last_n) > int(last_n_bucket)
+    ):
+        raise RuntimeError(
+            "E_SFI_CAPTURE_OWNERSHIP_PLAN: live capture shape exceeds the "
+            "stamped capacity"
+        )
+    global_layer_index = int(global_layer_index)
+    slot_in_chunk = int(slot_in_chunk)
+    cohort_size = int(getattr(plan, "cohort_size"))
+    selected_depth = int(getattr(plan, "selected_depth"))
+    if global_layer_index < 0 or not 0 <= slot_in_chunk < cohort_size:
+        raise RuntimeError(
+            "E_SFI_CAPTURE_OWNERSHIP_PLAN: invalid live layer/cohort slot"
+        )
+    cohort_origin = global_layer_index - slot_in_chunk
+    if cohort_origin < 0 or cohort_origin % cohort_size != 0:
+        raise RuntimeError(
+            "E_SFI_CAPTURE_OWNERSHIP_PLAN: layer index and cohort slot disagree"
+        )
+    cohort_lane = (cohort_origin // cohort_size) % int(in_flight)
+    scratch_slot = cohort_lane * cohort_size + slot_in_chunk
+    if not 0 <= scratch_slot < selected_depth:
+        raise RuntimeError(
+            "E_SFI_CAPTURE_OWNERSHIP_PLAN: resolved scratch slot exceeds capacity"
+        )
+    return int(scratch_slot), int(cohort_size), int(selected_depth)
+
+
 def _prebuild_capture_buffers(runner, controller) -> None:
-    """262k OOM fix: prebuild the bounded capture arena + per-chunk_id DEFER scratch
-    SET at the is_profile _dummy_run so determine_available_memory sizes the KV
-    pool AROUND them (reserve) and the live 262k capture HITS the cache (no
-    forward_capture.py:459 torch.empty on the hot path). is_profile-only,
-    one-shot, fail-closed: only fires for the gt1 one_shot capture config.
+    """Prebuild the bounded capture arena and DEFER scratch before profile work.
+
+    The caller must run this before the profile ``_dummy_run``.  vLLM derives the
+    KV budget from the peak allocated bytes observed during that dummy forward;
+    allocating these persistent buffers afterwards records ``max(activation,
+    SFI)`` even though the live request needs ``activation + SFI``.  Keeping the
+    buffers resident while the profile forward runs makes the measured peak
+    match their real lifetime overlap.
+
+    This remains profile-only, one-shot and fail-closed: it only fires for the
+    gt1 one-shot capture config, and the live bucket stamps are written last.
     """
     import torch
 
@@ -3889,7 +4043,20 @@ def _prebuild_capture_buffers(runner, controller) -> None:
         _CAPTURE_REDUCE_GROUP,
         _CAPTURE_KV_BUCKET_CACHED,
     )
-    from patches.sparse_utils import _align_up_int
+    from patches.fa3_native.capture_ownership import (
+        CHUNK_COHORT,
+        plan_capture_ownership,
+    )
+    from patches.fa3_native.capture_cohort_tape import (
+        plan_capture_cohort_tape,
+        prepare_capture_cohort_tape,
+    )
+    from patches.fa3_native.postprocess import (
+        TILED_CAPTURE_POSTPROCESS_MAX_SLOT_COUNT,
+        plan_tiled_capture_postprocess_resources,
+        prepare_tiled_capture_postprocess_resources,
+    )
+    from patches.sparse_utils import _align_up_int, _selector_fixed_k_enabled
 
     cfg = getattr(controller, "config", None)
     if cfg is None or not bool(getattr(cfg, "enabled", False)):
@@ -3911,7 +4078,10 @@ def _prebuild_capture_buffers(runner, controller) -> None:
     num_heads = int(getattr(runner, "num_query_heads", 0) or 0)
     device = getattr(runner, "device", None)
     if max_model_len <= 0 or num_heads <= 0 or device is None:
-        return
+        raise RuntimeError(
+            "E_SFI_CAPTURE_PREBUILD_GEOMETRY: capture prebuild requires "
+            "positive max_model_len, positive num_query_heads, and a device"
+        )
     dev = torch.device(device)
 
     kv_min = max(256, int(_CAPTURE_KV_BUCKET_CACHED))
@@ -3976,8 +4146,88 @@ def _prebuild_capture_buffers(runner, controller) -> None:
             hf = getattr(mc, "hf_text_config", None) or getattr(mc, "hf_config", None)
             num_layers = int(getattr(hf, "num_hidden_layers", 0) or 0) if hf is not None else 0
     if num_layers <= 0:
-        return
+        raise RuntimeError(
+            "E_SFI_CAPTURE_PREBUILD_GEOMETRY: capture prebuild could not "
+            "prove the per-rank model layer count"
+        )
     num_chunks = max(1, (num_layers + int(_CAPTURE_CHUNK) - 1) // int(_CAPTURE_CHUNK))
+
+    device_properties = _capture_profile_device_properties(dev)
+    capability = (
+        int(getattr(device_properties, "major", -1)),
+        int(getattr(device_properties, "minor", -1)),
+    )
+    configured_device_bytes = _capture_configured_device_bytes(
+        runner, device_properties
+    )
+    alpha_fair = getattr(cfg, "alpha_fair", None)
+    alpha = float(getattr(alpha_fair, "alpha", 0.5))
+    async_refresh_enabled = getattr(controller, "_async_refresh_enabled", None)
+    ensure_refresh_stream = getattr(controller, "_ensure_refresh_stream", None)
+    async_owner_requested = bool(
+        callable(async_refresh_enabled) and bool(async_refresh_enabled())
+    )
+    refresh_stream = None
+    if async_owner_requested and callable(ensure_refresh_stream):
+        ensure_refresh_stream(dev)
+        refresh_stream = getattr(controller, "refresh_stream", None)
+    async_owner_available = bool(refresh_stream is not None)
+
+    # Both owners may use the dynamic tiled selector kernel.  Plan the exact
+    # persistent device footprint before choosing ownership so the 5% budget
+    # compares complete live allocations rather than scratch alone.  ring_early
+    # launches one layer at a time and keeps the bounded host-staging ring;
+    # chunk_cohort launches at most C*rows in one sequence and needs only the
+    # configured in-flight depth.  The policy zeros these costs when the tiled
+    # kernel is structurally ineligible for the stamped geometry.
+    ring_tiled_resources = plan_tiled_capture_postprocess_resources(
+        slot_count=int(TILED_CAPTURE_POSTPROCESS_MAX_SLOT_COUNT),
+        num_rows_capacity=int(producer_rows_worst),
+        num_query_heads=int(num_heads),
+        logical_k_capacity=int(kv_max_bucket),
+    )
+    cohort_tiled_resources = plan_tiled_capture_postprocess_resources(
+        slot_count=int(_CAPTURE_IN_FLIGHT),
+        num_rows_capacity=int(producer_rows_worst) * int(_CAPTURE_CHUNK),
+        num_query_heads=int(num_heads),
+        logical_k_capacity=int(kv_max_bucket),
+    )
+    selector_fixed_k = bool(_selector_fixed_k_enabled())
+    cohort_tape_report = plan_capture_cohort_tape(
+        bank_capacity=int(_CAPTURE_IN_FLIGHT),
+        layer_capacity=int(num_layers),
+        rows_capacity=int(producer_rows_worst),
+        num_query_heads=int(num_heads),
+        logical_k_capacity=int(kv_max_bucket),
+        cohort_size=int(_CAPTURE_CHUNK),
+    )
+    ownership_plan = plan_capture_ownership(
+        one_shot=bool(getattr(cfg, "one_shot_bootstrap_only", False)),
+        async_owner_available=async_owner_available,
+        selector_fixed_k=selector_fixed_k,
+        last_n=int(last_n),
+        dtype_is_fp16=True,
+        element_bytes=int(torch.finfo(torch.float16).bits // 8),
+        alpha=alpha,
+        capability=capability,
+        aligned_k=int(kv_max_bucket),
+        rows_cap=int(producer_rows_worst),
+        heads_per_rank=int(num_heads),
+        chunk=int(_CAPTURE_CHUNK),
+        in_flight=int(_CAPTURE_IN_FLIGHT),
+        layer_count=int(num_layers),
+        tape_bank_count=int(cohort_tape_report.bank_capacity),
+        baseline_reduce_group=int(_CAPTURE_REDUCE_GROUP),
+        baseline_postprocess_device_bytes=int(
+            ring_tiled_resources.total_device_bytes
+        ),
+        target_postprocess_device_bytes=int(
+            cohort_tiled_resources.total_device_bytes
+        ),
+        baseline_tape_device_bytes=0,
+        target_tape_device_bytes=int(cohort_tape_report.total_device_bytes),
+        configured_device_bytes=int(configured_device_bytes),
+    )
 
     # (finding-5 fail-safe) The live buckets (kv / last_n / rows) are stamped LAST,
     # only after the arena reserve + every per-chunk scratch slab is resident (see the
@@ -3987,7 +4237,71 @@ def _prebuild_capture_buffers(runner, controller) -> None:
     # uses the raw per-forward shape == exact HEAD behaviour (still bounded by
     # chunk_id), instead of force-forming a large shape with no slab to HIT (re-OOM).
 
-    # (2) Prebuild the arena max-bucket via the existing reserve path (allocates the
+    # (2) Seal the selector workspace against the stream and maximum live
+    # geometry selected above.  Live acquisition may use any smaller N/K within
+    # this capacity but may never create another slot or cache key after profile.
+    # This allocation must precede the dummy forward for honest KV budgeting.
+    selected_tiled_resources = None
+    if int(ownership_plan.selected_postprocess_device_bytes) > 0:
+        if ownership_plan.mode == CHUNK_COHORT:
+            if refresh_stream is None:
+                raise RuntimeError(
+                    "E_SFI_CAPTURE_TILED_PREBUILD: chunk cohort has no refresh stream"
+                )
+            tiled_stream = refresh_stream
+            selected_tiled_resources = cohort_tiled_resources
+        else:
+            tiled_stream = (
+                refresh_stream
+                if refresh_stream is not None
+                else torch.cuda.current_stream(device=dev)
+            )
+            selected_tiled_resources = ring_tiled_resources
+        prepared_tiled_resources = prepare_tiled_capture_postprocess_resources(
+            controller,
+            dev,
+            tiled_stream,
+            int(selected_tiled_resources.slot_count),
+            int(selected_tiled_resources.num_rows_capacity),
+            int(selected_tiled_resources.num_query_heads_capacity),
+            int(selected_tiled_resources.logical_k_capacity),
+        )
+        if prepared_tiled_resources != selected_tiled_resources or int(
+            prepared_tiled_resources.total_device_bytes
+        ) != int(ownership_plan.selected_postprocess_device_bytes):
+            raise RuntimeError(
+                "E_SFI_CAPTURE_TILED_PREBUILD: prepared resources disagree "
+                "with the immutable ownership budget"
+            )
+
+    # (2b) The chunk owner publishes request-major full-layer generation banks.
+    # Their complete footprint participated in the policy gate above; allocate
+    # exactly that report before the ownership signature becomes visible.
+    if ownership_plan.mode == CHUNK_COHORT:
+        if refresh_stream is None:
+            raise RuntimeError(
+                "E_SFI_CAPTURE_COHORT_TAPE_PREBUILD: chunk cohort has no refresh stream"
+            )
+        if (
+            not bool(ownership_plan.selector_fixed_k)
+            or int(ownership_plan.layer_count) != int(cohort_tape_report.layer_capacity)
+            or int(ownership_plan.tape_bank_count) != int(cohort_tape_report.bank_capacity)
+            or int(ownership_plan.selected_tape_device_bytes)
+            != int(cohort_tape_report.total_device_bytes)
+        ):
+            raise RuntimeError(
+                "E_SFI_CAPTURE_COHORT_TAPE_PREBUILD: immutable ownership plan "
+                "disagrees with the precomputed bank report"
+            )
+        prepare_capture_cohort_tape(
+            controller=controller,
+            device=dev,
+            report=cohort_tape_report,
+            plan_signature=str(ownership_plan.signature_sha256),
+            consumer_stream=refresh_stream,
+        )
+
+    # (3) Prebuild the arena max-bucket via the existing reserve path (allocates the
     # resident capture_scores/log_f_denoms tensors). Cap first so the window=1 bucket
     # is built at exactly kv_max_bucket (arena head-stride byte-match).
     arena = getattr(controller, "prefill_capture_meta_arena", None)
@@ -3998,36 +4312,41 @@ def _prebuild_capture_buffers(runner, controller) -> None:
     except Exception:
         pass
     if arena is not None:
-        try:
-            arena.kv_max_cap_bucket = int(kv_max_bucket)
-            from patches.prefill_capture_meta_arena import CaptureArenaIntent
+        arena.kv_max_cap_bucket = int(kv_max_bucket)
+        from patches.prefill_capture_meta_arena import (
+            ArenaReservationStatus,
+            CaptureArenaIntent,
+        )
 
-            arena.reserve_prefill_layouts(
-                step_epoch=-1,
-                step_handle_id=-1,
-                step_handle_generation=-1,
-                intent=CaptureArenaIntent.ONE_SHOT_BOOTSTRAP,
-                slot_list=tuple(range(producer_rows_worst)),
-                row_list=tuple(range(producer_rows_worst)),
-                batch_size=int(
-                    getattr(runner, "max_num_reqs", producer_rows_worst)
-                    or producer_rows_worst
-                ),
-                num_heads=int(num_heads),
-                kv_needed=int(kv_max_bucket),
-                device=dev,
+        arena_reservation = arena.reserve_prefill_layouts(
+            step_epoch=-1,
+            step_handle_id=-1,
+            step_handle_generation=-1,
+            intent=CaptureArenaIntent.ONE_SHOT_BOOTSTRAP,
+            slot_list=tuple(range(producer_rows_worst)),
+            row_list=tuple(range(producer_rows_worst)),
+            batch_size=int(
+                getattr(runner, "max_num_reqs", producer_rows_worst)
+                or producer_rows_worst
+            ),
+            num_heads=int(num_heads),
+            kv_needed=int(kv_max_bucket),
+            device=dev,
+        )
+        if getattr(arena_reservation, "status", None) is not ArenaReservationStatus.READY:
+            raise RuntimeError(
+                "E_SFI_CAPTURE_ARENA_PREBUILD: profile-time capture arena "
+                "reservation was not ready; refusing to stamp live cache buckets "
+                f"(status={getattr(arena_reservation, 'status', None)!r}, "
+                f"reason={getattr(arena_reservation, 'error_reason', '')!r}, "
+                f"kv_max_bucket={kv_max_bucket}, rows={producer_rows_worst})"
             )
-        except Exception:
-            _log.warning("262k capture arena prebuild reserve failed", exc_info=True)
 
-    # (3) Prebuild the DEFER scratch slab SET (one per chunk_id) under the EXACT live
-    # scratch_key (forward_capture.py:430-436) so the 262k capture HITS at :444 and the
-    # lazy torch.empty at :459 never fires. shape + extra_key MUST byte-match the live
-    # path after EDIT-1 (kv) + EDIT-7 (last_n) bucketing and the chunk_id key
-    # (sync_fa4_capture_scratch_chunkid_reuse). One slab per chunk_id (NOT per buf_id):
-    # distinct chunk_id -> distinct slab keeps layers that share a buf_id within one
-    # forward from aliasing the same scratch slot (no intra-forward WAR; matches the
-    # original design). num_chunks slabs reside; the pool was sized around them.
+    # (4) Prebuild the exact DEFER scratch ownership selected above. ring_early keeps
+    # the existing G-ring / per-chunk keys byte-for-byte. chunk_cohort owns one
+    # C*in_flight-deep slab; its lane mapping and RingWarFence provide bounded overlap
+    # without retaining one allocation per model chunk. The published plan is stamped
+    # only after this exact key and shape are resident.
     scratch_storage_shape = (
         int(_CAPTURE_CHUNK),
         int(producer_rows_worst),
@@ -4042,7 +4361,15 @@ def _prebuild_capture_buffers(runner, controller) -> None:
         setattr(controller, "_fa3_capture_scratch_cache_by_key", cache_map)
     _reduce_group = int(_CAPTURE_REDUCE_GROUP)
     _ring_slabs = int(_reduce_group) * int(_CAPTURE_IN_FLIGHT) if _reduce_group > 0 else 0
-    if _reduce_group > 0:
+    if ownership_plan.mode == CHUNK_COHORT:
+        scratch_storage_shape = (
+            int(ownership_plan.selected_depth),
+            int(producer_rows_worst),
+            int(num_heads),
+            int(last_n),
+            int(kv_max_bucket),
+        )
+    elif _reduce_group > 0:
         # Per-G ring: ONE [G*in_flight]-deep slab (constant key) instead of num_chunks
         # chunk-deep slabs -> raw staging num_layers-deep => ring_slabs-deep (the 8.4x cut).
         # NOT yet safe to ENABLE: the live key/slot + per-G reduce + refresh->main WAR event
@@ -4054,13 +4381,26 @@ def _prebuild_capture_buffers(runner, controller) -> None:
             int(last_n),
             int(kv_max_bucket),
         )
-    _prebuild_iter = 1 if _reduce_group > 0 else int(num_chunks)
+    _prebuild_iter = (
+        1
+        if ownership_plan.mode == CHUNK_COHORT or _reduce_group > 0
+        else int(num_chunks)
+    )
     for chunk_id in range(int(_prebuild_iter)):
-        extra_key = (
-            ("defer_postprocess_chunk", 0, int(_ring_slabs))
-            if _reduce_group > 0
-            else ("defer_postprocess_chunk", int(chunk_id), int(_CAPTURE_CHUNK))
-        )
+        if ownership_plan.mode == CHUNK_COHORT:
+            extra_key = (
+                "defer_postprocess_chunk",
+                int(ownership_plan.cohort_size),
+                int(ownership_plan.selected_depth),
+            )
+        elif _reduce_group > 0:
+            extra_key = ("defer_postprocess_chunk", 0, int(_ring_slabs))
+        else:
+            extra_key = (
+                "defer_postprocess_chunk",
+                int(chunk_id),
+                int(_CAPTURE_CHUNK),
+            )
         scratch_key = (
             str(dev.type),
             -1 if dev.index is None else int(dev.index),
@@ -4092,7 +4432,8 @@ def _prebuild_capture_buffers(runner, controller) -> None:
             key_kind=str(extra_key[0]),
         )
 
-    # (4) Stamp the live buckets now that the arena reserve + all num_chunks scratch
+    # (5) Stamp the live buckets now that the selector resources, arena reserve,
+    # and all num_chunks scratch
     # slabs are resident (finding-5 fail-safe; see (1) above). _capture_rows_bucket is
     # the dim-1 (concurrent-prefill row) bucket the live path rounds the keyed scratch
     # dim-1 UP to (forward_capture.py), closing the dim-1 re-OOM hazard symmetrically
@@ -4100,7 +4441,38 @@ def _prebuild_capture_buffers(runner, controller) -> None:
     setattr(controller, "_capture_kv_max_bucket", int(kv_max_bucket))
     setattr(controller, "_capture_last_n_bucket", int(last_n))
     setattr(controller, "_capture_rows_bucket", int(producer_rows_worst))
+    setattr(
+        controller,
+        "_capture_tiled_postprocess_resource_report",
+        selected_tiled_resources,
+    )
     setattr(controller, "_capture_prebuilt", True)
+    # The immutable plan is the publication latch: all capacities, resources,
+    # streams and cache entries above must already be resident before it exists.
+    setattr(controller, "_capture_ownership_plan", ownership_plan)
+
+
+def _run_dummy_after_profile_capture_prebuild(
+    *,
+    runner: object,
+    controller: object,
+    dummy_context: dict[str, object],
+    run_original,
+):
+    """Run the original dummy forward with persistent SFI buffers already live.
+
+    Non-capture configurations return normally from the prebuilder. Once a
+    capture configuration requests resident storage, allocation or contract
+    failure is terminal: continuing would move allocation back onto the live
+    path after vLLM has already sized its KV budget.
+    """
+    if (
+        bool(dummy_context.get("is_profile"))
+        and not bool(dummy_context.get("is_graph_capturing"))
+        and not bool(getattr(controller, "_capture_prebuilt", False))
+    ):
+        _prebuild_capture_buffers(runner, controller)
+    return run_original()
 
 
 _EXP4_PREFLIGHT_LATCHED = False
@@ -4111,15 +4483,46 @@ def _custom_allreduce_is_live(parallel_config: object) -> bool:
     try:
         from vllm.distributed.parallel_state import get_tp_group  # type: ignore[import]
 
-        ca = getattr(get_tp_group(), "ca_comm", None)
-        if ca is None:
-            return False
-        return not bool(getattr(ca, "disabled", False))
+        tp_group = get_tp_group()
+        # vLLM 0.19 owns the CUDA communicator under the TP group; the custom
+        # communicator is not a direct group attribute.  Reading
+        # ``get_tp_group().ca_comm`` therefore returned None on every healthy
+        # TP run and silently disabled this capture-safety guard.  Keep the
+        # direct form only for older compatible layouts.
+        device_communicator = getattr(tp_group, "device_communicator", None)
+        if device_communicator is not None:
+            ca = getattr(device_communicator, "ca_comm", None)
+            return ca is not None and not bool(getattr(ca, "disabled", False))
+        ca = getattr(tp_group, "ca_comm", None)
+        if ca is not None:
+            return not bool(getattr(ca, "disabled", False))
+        raise AttributeError("TP group exposes no custom-all-reduce communicator")
     except Exception:
         # parallel_state 内省不可用(版本形态差异)时退到配置旗标——方向更严:
         # 预检宁可多拦(报错给出关 AR 的操作口),不可漏拦撞 capture 收尾的
         # 隐晦崩溃。
         return not bool(getattr(parallel_config, "disable_custom_all_reduce", True))
+
+
+def _expandable_segments_enabled_from_env() -> bool:
+    """Return whether either PyTorch allocator alias explicitly enables it.
+
+    PyTorch allocator configuration is a comma-separated ``key:value`` list.
+    Treat key/value case and surrounding whitespace as presentation details so
+    a shell spelling such as ``expandable_segments:true`` cannot bypass the
+    capture-safety preflight that historically matched only ``True``.
+    """
+    for name in ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_ALLOC_CONF"):
+        raw = os.environ.get(name, "")
+        for item in raw.split(","):
+            key, separator, value = item.partition(":")
+            if not separator:
+                continue
+            if key.strip().lower() != "expandable_segments":
+                continue
+            if value.strip().lower() in {"1", "true"}:
+                return True
+    return False
 
 
 def _exp4_capture_alloc_preflight(runner: object) -> None:
@@ -4144,11 +4547,7 @@ def _exp4_capture_alloc_preflight(runner: object) -> None:
     tp_size = int(getattr(parallel_config, "tensor_parallel_size", 1) or 1)
     if tp_size <= 1:
         return
-    alloc_conf = ",".join(
-        os.environ.get(name, "")
-        for name in ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_ALLOC_CONF")
-    )
-    if "expandable_segments:True" not in alloc_conf:
+    if not _expandable_segments_enabled_from_env():
         return
     if not _custom_allreduce_is_live(parallel_config):
         return
@@ -4270,30 +4669,18 @@ def _patch_dummy_run() -> None:
         except Exception:
             _log.warning("PHASE-2B cudagraph latch set skipped", exc_info=True)
         try:
-            _dummy_result = original_dummy_run(self, *args, **kwargs)
-            # 262k OOM fix (prebuild + reserve): on the is_profile _dummy_run only,
-            # allocate the bounded buf_id DEFER capture-scratch slab SET + the arena
-            # at the max_model_len kv bucket and KEEP them resident. The KV pool is
-            # sized from the profile torch_peak_increase / non_kv_cache_memory
-            # (gpu_worker.py:387-391; empty_cache() before measure frees only
-            # UNREFERENCED blocks, and the controller dict + arena hold these), so
-            # the resident footprint shrinks the native KV pool by exactly itself
-            # and the live 262k capture finds the slabs via cache HIT -> the
-            # ~3.14GB torch.empty at forward_capture.py:459 never fires. Runs ONCE
-            # (latch), is_profile-only, never while stream-capturing -> ZERO
-            # hot-path cost. fail-closed: any failure leaves the cache as-is and the
-            # live path reallocates exactly as today (no correctness change).
-            try:
-                _ctx = _dummy_run_context_from_call(args, kwargs)
-                if (
-                    bool(_ctx.get("is_profile"))
-                    and not bool(_ctx.get("is_graph_capturing"))
-                    and not bool(getattr(controller, "_capture_prebuilt", False))
-                ):
-                    _prebuild_capture_buffers(self, controller)
-            except Exception:
-                _log.warning("262k capture prebuild/reserve at profile skipped", exc_info=True)
-            return _dummy_result
+            # The resident SFI capture arena/scratch must exist BEFORE vLLM's
+            # profile forward reaches its activation peak.  Building it after
+            # original_dummy_run records max(activation, SFI), while live execution
+            # needs their sum and can OOM after startup when the auto-sized KV pool
+            # consumes the missing overlap.  The helper keeps the old one-shot gates
+            # and failure fallback, but fixes the lifetime ordering.
+            return _run_dummy_after_profile_capture_prebuild(
+                runner=self,
+                controller=controller,
+                dummy_context=_dummy_ctx,
+                run_original=lambda: original_dummy_run(self, *args, **kwargs),
+            )
         finally:
             if previous_depth <= 0:
                 setattr(controller, "_vllm_dummy_run_depth", 0)
@@ -4307,6 +4694,7 @@ def _patch_dummy_run() -> None:
 
 def _patch_update_states() -> None:
     global _UPDATE_STATES_PATCHED, _ORIGINAL_UPDATE_STATES
+    global _INSTALLED_UPDATE_STATES_WRAPPER
     if _UPDATE_STATES_PATCHED:
         return
     try:
@@ -4322,16 +4710,66 @@ def _patch_update_states() -> None:
         controller = _GLOBAL_CONTROLLER or _ensure_controller()
         if controller is not None:
             finished_req_ids = _get_finished_req_ids(scheduler_output)
-            step_token = int(getattr(self, "_sparse_worker_step_token", 0)) + 1
-            setattr(self, "_sparse_worker_step_token", step_token)
+            dispatch_token = int(
+                getattr(self, "_sparse_worker_dispatch_token", 0)
+            ) + 1
+            setattr(self, "_sparse_worker_dispatch_token", dispatch_token)
             controller.consume_finished_at_worker_boundary(
-                step_token=step_token,
+                step_token=dispatch_token,
                 finished_req_ids=finished_req_ids,
             )
         return original_update(self, scheduler_output)
 
+    setattr(
+        _sparse_update_states,
+        "_sfi_sparse_update_states_predecessor_abi",
+        SPARSE_UPDATE_STATES_PREDECESSOR_ABI,
+    )
+    setattr(
+        _sparse_update_states,
+        "_sfi_sparse_update_states_predecessor",
+        original_update,
+    )
     GPUModelRunner._update_states = _sparse_update_states  # type: ignore[assignment]
+    _INSTALLED_UPDATE_STATES_WRAPPER = _sparse_update_states
     _UPDATE_STATES_PATCHED = True
+
+
+def is_exact_sparse_update_states_predecessor(candidate: object) -> bool:
+    """Return whether ``candidate`` owns the live sparse hook lease."""
+
+    return bool(
+        _UPDATE_STATES_PATCHED
+        and candidate is _INSTALLED_UPDATE_STATES_WRAPPER
+        and getattr(
+            candidate,
+            "_sfi_sparse_update_states_predecessor_abi",
+            None,
+        )
+        == SPARSE_UPDATE_STATES_PREDECESSOR_ABI
+        and getattr(
+            candidate,
+            "_sfi_sparse_update_states_predecessor",
+            None,
+        )
+        is _ORIGINAL_UPDATE_STATES
+    )
+
+
+def _preflight_update_states_hook_lease() -> None:
+    """Reject out-of-order teardown before any sparse state is mutated."""
+
+    if not _UPDATE_STATES_PATCHED:
+        return
+    if (
+        _ORIGINAL_UPDATE_STATES is None
+        or _INSTALLED_UPDATE_STATES_WRAPPER is None
+    ):
+        raise RuntimeError("E_SPARSE_UPDATE_STATES_HOOK_LEASE_STATE")
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner  # type: ignore[import]
+
+    if GPUModelRunner._update_states is not _INSTALLED_UPDATE_STATES_WRAPPER:
+        raise RuntimeError("E_SPARSE_UPDATE_STATES_HOOK_LEASE_LOST")
 
 
 
@@ -5177,166 +5615,6 @@ def _prebound_rrp_graph_state_static_cache_key(
     return key
 
 
-def _try_prepare_prebound_rrp_external_visible_minimal(
-    *,
-    controller: object,
-    metadata_items: tuple[object, ...],
-    step_authority: object,
-    live_batch_size: int,
-    expected_batch_size: int,
-    block_size: int,
-    num_kv_heads: int,
-    device: torch.device,
-) -> bool:
-    if int(live_batch_size) != int(expected_batch_size) or not metadata_items:
-        return False
-    from patches.decode_runtime.metadata_builder import (
-        _attach_resolved_row_ptr_ready_event_state,
-        _decode_runtime_classification_is_current,
-        _decode_runtime_mode_for_controller,
-        _publish_resolved_row_ptr_graph_binding_state,
-        _publish_resolved_row_ptr_profile_max_seqlen_k,
-        _resolved_row_ptr_q_layout_key,
-        _resolved_row_ptr_ready_event_state,
-        _same_page_rrp_signature_matches_step_authority,
-        _stamp_resolved_row_ptr_graph_binding_step,
-    )
-    from patches.decode_runtime.rrp_row_table_manager import RrpRowTableManager
-    from patches.decode_runtime.thin_builder_state import (
-        DecodeDeltaPacket,
-        DecodeRuntimeMode,
-    )
-    from patches.fa_sparse_runtime.resolved_row_ptr_arena import (
-        ResolvedRowPtrArena,
-        ResolvedRowPtrReplayMetadataBinding,
-        attach_resolved_row_ptr_replay_metadata,
-    )
-
-    if _decode_runtime_mode_for_controller(controller) is not DecodeRuntimeMode.STEADY_DELTA:
-        return False
-    if not _decode_runtime_classification_is_current(controller, step_authority):
-        return False
-    delta = getattr(controller, "_decode_runtime_delta", None)
-    if not isinstance(delta, DecodeDeltaPacket):
-        return False
-    if int(delta.batch_size) != int(live_batch_size):
-        return False
-    replay_arena = getattr(controller, "_resolved_row_ptr_replay_arena", None)
-    if not isinstance(replay_arena, ResolvedRowPtrArena):
-        return False
-    if (
-        int(replay_arena.batch_size) != int(expected_batch_size)
-        or int(replay_arena.num_kv_heads) != int(num_kv_heads)
-    ):
-        return False
-    binding = getattr(controller, "_resolved_row_ptr_replay_metadata_binding", None)
-    if not isinstance(binding, ResolvedRowPtrReplayMetadataBinding):
-        return False
-    if binding.replay_arena is not replay_arena:
-        return False
-    descriptor = getattr(binding, "descriptor", None)
-    if int(getattr(descriptor, "batch", -1)) != int(expected_batch_size):
-        return False
-    if int(getattr(descriptor, "page_block_size", -1)) != int(block_size):
-        return False
-    q_layout_key = _resolved_row_ptr_q_layout_key(
-        step_authority=step_authority,
-        batch_size=int(live_batch_size),
-    )
-    if q_layout_key is None or str(getattr(descriptor, "q_layout_key", "")) != str(
-        q_layout_key
-    ):
-        return False
-    manager = getattr(controller, "_rrp_row_table_manager", None)
-    if not isinstance(manager, RrpRowTableManager):
-        return False
-    if not _same_page_rrp_signature_matches_step_authority(
-        manager=manager,
-        step_authority=step_authority,
-        batch_size=int(live_batch_size),
-    ):
-        return False
-    launch_plan = getattr(
-        getattr(controller, "step_bound_meta", None),
-        "compact_recent_launch_plan",
-        None,
-    )
-    visible = replay_arena.carriers.resolver_visible_seqused_k_by_head_i32
-    if not isinstance(visible, torch.Tensor):
-        return False
-    captured_visible = binding.replay_carriers.resolver_visible_seqused_k_by_head_i32
-    if not (
-        isinstance(captured_visible, torch.Tensor)
-        and captured_visible.device == visible.device
-        and int(captured_visible.data_ptr()) == int(visible.data_ptr())
-    ):
-        return False
-    source_kind = str(getattr(replay_arena, "_resolved_seqused_source_kind", "") or "")
-    visible_is_current_source = source_kind in {
-        "arena_batch_seqused",
-        "dense_seqused",
-        "launch_effective",
-    }
-    if not visible_is_current_source:
-        return False
-
-    row_effective_k_by_row = delta.row_effective_k_by_row
-    update = manager.try_apply_same_page_delta(
-        replay_arena,
-        row_effective_k_by_row,
-        recent_first_page_by_row=delta.recent_first_page_by_row,
-    )
-    if update is None or int(getattr(update, "update_kernel_count", 0)) != 0:
-        return False
-    _attach_resolved_row_ptr_replay_metadata_if_needed(
-        metadata_items,
-        binding=binding,
-        attach_fn=attach_resolved_row_ptr_replay_metadata,
-    )
-    first_metadata = metadata_items[0]
-    _publish_resolved_row_ptr_profile_max_seqlen_k(
-        attn_metadata=first_metadata,
-        launch_plan=launch_plan,
-        row_effective_k_by_row=row_effective_k_by_row,
-        batch_size=int(expected_batch_size),
-        block_size=int(block_size),
-        max_pages_per_row=int(replay_arena.max_pages_per_row),
-    )
-    (
-        ready_event_generation,
-        ready_event,
-        ready_event_stream,
-    ) = _resolved_row_ptr_ready_event_state(first_metadata)
-    for metadata in metadata_items:
-        _attach_resolved_row_ptr_ready_event_state(
-            metadata,
-            ready_event_generation=int(ready_event_generation),
-            ready_event=ready_event,
-            ready_event_stream=int(ready_event_stream),
-        )
-    _publish_resolved_row_ptr_graph_binding_state(
-        controller,
-        binding=binding,
-        arena_key=tuple(getattr(controller, "_resolved_row_ptr_arena_key", ())),
-        ready_event_generation=int(ready_event_generation),
-        ready_event=ready_event,
-        ready_event_stream=int(ready_event_stream),
-        metadata_count=len(metadata_items),
-    )
-    _stamp_resolved_row_ptr_graph_binding_step(
-        controller=controller,
-        step_authority=step_authority,
-        live_batch_size=int(live_batch_size),
-        effective_batch_size=int(expected_batch_size),
-    )
-    controller._resolved_row_ptr_metadata_ready = True
-    controller._decode_runtime_rrp_metadata_light_attach_count = (
-        int(getattr(controller, "_decode_runtime_rrp_metadata_light_attach_count", 0))
-        + 1
-    )
-    return True
-
-
 def _attach_resolved_row_ptr_replay_metadata_if_needed(
     metadata_items: tuple[object, ...],
     *,
@@ -5563,32 +5841,6 @@ def _maybe_rebind_rrp_for_full_graph_replay(
             graph_batch_size=graph_batch_size,
             num_kv_heads=num_kv_heads,
         )
-
-    if (
-        not step_markers_match
-        and not graph_capacity_or_mode_rebind
-        and _try_prepare_prebound_rrp_external_visible_minimal(
-            controller=controller,
-            metadata_items=metadata_items,
-            step_authority=step_authority,
-            live_batch_size=live_batch_size,
-            expected_batch_size=expected_batch_size,
-            block_size=block_size,
-            num_kv_heads=num_kv_heads,
-            device=device,
-        )
-    ):
-        _append_rebind_probe(
-            "external_visible_minimal_attached_without_carrier_rebind",
-            live_batch_size=live_batch_size,
-            graph_batch_size=graph_batch_size,
-            expected_batch_size=expected_batch_size,
-            metadata_items_count=len(metadata_items),
-            step_markers_match=step_markers_match,
-            graph_capacity_or_mode_rebind=graph_capacity_or_mode_rebind,
-            has_existing_binding=existing_binding is not None,
-        )
-        return False
 
     if existing_binding is not None:
         descriptor = getattr(existing_binding, "descriptor", None)
@@ -6248,22 +6500,20 @@ def _prebound_rrp_current_cuda_stream_identity_raw() -> int | None:
     try:
         import torch
 
+        # `_cuda_getCurrentStream` exposes Torch's stream id tuple, not the
+        # cudaStream_t persisted by `Stream.cuda_stream` in producer state.
         get_current_raw_stream = getattr(
             getattr(torch, "_C", None),
-            "_cuda_getCurrentStream",
+            "_cuda_getCurrentRawStream",
             None,
         )
         current_device = getattr(torch.cuda, "current_device", None)
         if not callable(get_current_raw_stream) or not callable(current_device):
             return None
-        raw_stream = get_current_raw_stream(int(current_device()))
-        if isinstance(raw_stream, (list, tuple)):
-            if not raw_stream:
-                return None
-            return int(raw_stream[0])
-        return int(raw_stream)
+        return int(get_current_raw_stream(int(current_device())))
     except Exception:
         return None
+
 
 def _wait_prebound_rrp_ready_event_from_graph_state(
     *,
@@ -6272,35 +6522,85 @@ def _wait_prebound_rrp_ready_event_from_graph_state(
     state: dict[str, object],
     profile_pre_timing: Optional[dict[str, float]] = None,
 ) -> int | None:
-    event = state.get("ready_event")
-    if event is None:
-        return None
-    try:
-        generation = int(state.get("ready_event_generation", -1))
-        ready_stream_raw = state.get("ready_event_stream", -1)
-        ready_stream_id = -1 if ready_stream_raw is None else int(ready_stream_raw)
-    except Exception:
-        return None
-    if generation < 0:
-        return None
+    from patches.fa_sparse_runtime.mixed_page_cudagraph_replay import (
+        validate_resolved_row_ptr_ready_state,
+    )
+
+    ready_state = validate_resolved_row_ptr_ready_state(
+        event=state.get("ready_event"),
+        generation=state.get("ready_event_generation", -1),
+        ready_stream=state.get("ready_event_stream", -1),
+        same_stream_ordered=state.get("same_stream_ordered", False),
+        require_published=True,
+        context="mixed-page CUDA graph replay prebound RRP state",
+    )
+    event = ready_state.event
+    same_stream_ordered = ready_state.same_stream_ordered
+    generation = ready_state.generation
+    ready_stream_id = ready_state.ready_stream_id
 
     _t_current_stream_ns = _full_cudagraph_pre_timing_start(profile_pre_timing)
     import torch
 
     wait_stream = None
     wait_stream_id = _prebound_rrp_current_cuda_stream_identity_raw()
+    raw_stream_identity_available = wait_stream_id is not None
     if wait_stream_id is None:
         wait_stream = torch.cuda.current_stream()
         wait_stream_id = _prebound_rrp_cuda_stream_identity(wait_stream)
+        # Producer state also stores `Stream.cuda_stream`, so this fallback
+        # remains a proven raw-handle comparison on older Torch builds.
+        wait_stream_raw = getattr(wait_stream, "cuda_stream", None)
+        if wait_stream_raw is not None:
+            try:
+                wait_stream_id = int(wait_stream_raw)
+                raw_stream_identity_available = True
+            except (TypeError, ValueError):
+                pass
     _full_cudagraph_pre_timing_add(
         profile_pre_timing,
         "pre_ready_event_current_stream_us",
         _t_current_stream_ns,
     )
-    wait_key = (id(event), int(generation), int(wait_stream_id))
+    if same_stream_ordered and event is None:
+        if (
+            not raw_stream_identity_available
+            or ready_stream_id < 0
+            or ready_stream_id != wait_stream_id
+        ):
+            raise RuntimeError(
+                "mixed-page CUDA graph replay cannot consume same-stream ordered "
+                "RRP metadata without an equal proven raw CUDA stream"
+            )
+        wait_key_owner = state
+        wait_key_ordered = True
+    else:
+        wait_key_owner = event
+        wait_key_ordered = False
+    wait_key = (
+        wait_key_owner,
+        int(generation),
+        int(wait_stream_id),
+        wait_key_ordered,
+    )
+    previous_wait_key = getattr(
+        controller,
+        "_prebound_rrp_ready_event_waited_key",
+        None,
+    )
+    already_waited = bool(
+        isinstance(previous_wait_key, tuple)
+        and len(previous_wait_key) == 4
+        and previous_wait_key[0] is wait_key_owner
+        and previous_wait_key[1:] == wait_key[1:]
+    )
     wait_count = 0
-    if getattr(controller, "_prebound_rrp_ready_event_waited_key", None) != wait_key:
-        if ready_stream_id < 0 or ready_stream_id != wait_stream_id:
+    if not already_waited:
+        if event is not None and (
+            not raw_stream_identity_available
+            or ready_stream_id < 0
+            or ready_stream_id != wait_stream_id
+        ):
             _t_wait_call_ns = _full_cudagraph_pre_timing_start(profile_pre_timing)
             if wait_stream is None:
                 wait_stream = torch.cuda.current_stream()
@@ -6317,6 +6617,28 @@ def _wait_prebound_rrp_ready_event_from_graph_state(
                 _t_wait_call_ns,
             )
         setattr(controller, "_prebound_rrp_ready_event_waited_key", wait_key)
+
+    # The next metadata-owner update may elide its event only after this exact
+    # state object and generation have reached a FULL replay consumer on a
+    # proven stream.  Holding the object is intentional: an integer ``id`` can
+    # be reused after state replacement and create an ABA false proof.
+    if raw_stream_identity_available:
+        setattr(
+            controller,
+            "_prebound_rrp_observed_ready_state",
+            (state, int(generation), int(wait_stream_id)),
+        )
+    else:
+        setattr(controller, "_prebound_rrp_observed_ready_state", None)
+    # This is the exact descriptor generation the immediately following graph
+    # replay will consume.  Unlike the same-stream proof above it remains valid
+    # when raw stream identity is unavailable, because the post-replay event is
+    # the ordering authority for the next writer.
+    setattr(
+        controller,
+        "_prebound_rrp_replay_generation",
+        (state, int(generation)),
+    )
 
     _t_attr_publish_ns = _full_cudagraph_pre_timing_start(profile_pre_timing)
     previous_total = int(
@@ -6342,6 +6664,73 @@ def _wait_prebound_rrp_ready_event_from_graph_state(
         _t_attr_publish_ns,
     )
     return int(wait_count)
+
+
+def _record_prebound_rrp_replay_consumed_generation(
+    *,
+    controller: object,
+    state: dict[str, object] | None,
+) -> int:
+    if state is None or not torch.cuda.is_available():
+        return 0
+    from patches.fa_sparse_runtime.rrp_replay_handshake import (
+        record_rrp_replay_consumed_generation,
+    )
+
+    stream = torch.cuda.current_stream()
+    stream_identity = _prebound_rrp_current_cuda_stream_identity_raw()
+    if stream_identity is None:
+        stream_identity = _prebound_rrp_cuda_stream_identity(stream)
+    return int(
+        record_rrp_replay_consumed_generation(
+            controller,
+            state=state,
+            stream=stream,
+            stream_identity=int(stream_identity),
+            event_factory=lambda: torch.cuda.Event(
+                blocking=False,
+                enable_timing=False,
+            ),
+        )
+    )
+
+
+def _prebound_rrp_replay_consumed_by_nested_wrapper(
+    *,
+    controller: object,
+    state: dict[str, object] | None,
+    previous_consumed_state: object,
+) -> bool:
+    if state is None:
+        raise RuntimeError("prebound RRP replay is missing its graph state")
+    from patches.fa_sparse_runtime.rrp_replay_handshake import (
+        replay_consumed_generation_was_recorded_since,
+    )
+
+    return bool(
+        replay_consumed_generation_was_recorded_since(
+            controller,
+            state=state,
+            previous_consumed_state=previous_consumed_state,
+        )
+    )
+
+
+def _snapshot_prebound_rrp_replay_consumed_generation(
+    *,
+    controller: object,
+    state: dict[str, object] | None,
+) -> object:
+    if state is None:
+        raise RuntimeError("prebound RRP replay is missing its graph state")
+    from patches.fa_sparse_runtime.rrp_replay_handshake import (
+        snapshot_rrp_replay_consumed_generation,
+    )
+
+    return snapshot_rrp_replay_consumed_generation(
+        controller,
+        state=state,
+    )
 
 
 def _full_cudagraph_replay_wait_device(controller: object) -> torch.device | None:
@@ -6923,7 +7312,7 @@ def _wait_pending_async_refresh_before_full_cudagraph_replay(
                     "_mixed_page_full_cudagraph_last_selector_writer_submit_summary",
                     submit_summary,
                 )
-            if _fa3_route_trace_enabled():
+            if _fa3_route_trace_enabled() and submitted > 0:
                 try:
                     from patches.fa3_native.install import append_fa3_route_trace
 
@@ -7005,21 +7394,7 @@ def _mark_prebound_rrp_full_cudagraph_replay(
     from patches.fa_sparse_runtime.mixed_page_cudagraph_replay import (
         MixedPageForwardContextReplayStats,
         iter_attention_metadata,
-        wait_mixed_page_resolver_ready_events_for_forward_context,
     )
-
-    # GRAPH-WAR FENCE (event, GPU-side, no CPU block): the descriptor REPUBLISH below
-    # overwrites the RRP descriptor in place every step; the prior step's decode FULL
-    # cudagraph producers may still be reading it. Wait (GPU-side) on the event recorded
-    # after the prior replay before republishing. Armed only in the bootstrap window
-    # (shared via sparse_constants) -> no host block, no drain, zero steady-state cost.
-    from patches import sparse_constants as _war_sc
-    if _war_sc._RRP_WAR_FENCE_ARMED[0]:
-        _war_evt = _war_sc._RRP_WAR_FENCE_EVT[0]
-        if _war_evt is not None:
-            import torch as _war_torch
-            if _war_torch.cuda.is_available():
-                _war_torch.cuda.current_stream().wait_event(_war_evt)
 
     _t_state_ns = _full_cudagraph_pre_timing_start(profile_pre_timing)
     if state is None:
@@ -7093,66 +7468,21 @@ def _mark_prebound_rrp_full_cudagraph_replay(
     )
     step_id = -1 if step_id_value is None else int(step_id_value)
     carrier_publish = None
-    # [RAW-FENCE 2026-07-02] Symmetric counterpart of the GRAPH-WAR fence below: the
-    # WAR fence orders "descriptor republish AFTER the prior replay's reads", but
-    # nothing ordered "this replay's reads AFTER the refresh-stream compact writes"
-    # (the bootstrap/refresh producer's gather groups run on refresh_stream and are
-    # tracked by no ledger). During the war transient window (dirty carrier rows,
-    # i.e. the bootstrap/refresh switchover steps) make the decode stream wait on
-    # the refresh stream's current tail before replaying. Content forensics: carrier
-    # fingerprints and host timelines are bit-identical between drifted and golden
-    # runs while outputs diverge inside this exact window -> the only free variable
-    # is the GPU-side interleaving of those gather writes vs the replay's KV reads.
-    # Steady state (war inactive) pays nothing.
-    if getattr(controller, "_rrp_war_active", False):
-        _raw_rs = getattr(controller, "refresh_stream", None)
-        if _raw_rs is not None:
-            try:
-                _raw_evt = torch.cuda.Event()
-                _raw_evt.record(_raw_rs)
-                torch.cuda.current_stream().wait_event(_raw_evt)
-            except Exception:
-                pass
-    # GRAPH-WAR window tracking: the RRP descriptor is rewritten only while bootstrapping
-    # (RRP is graph-stable in steady state). Keep a sticky 'war active' flag so the post-graph
-    # device wait fires across the whole bootstrap transient (incl. the first rewrite) and
-    # becomes a no-op once the descriptor stabilizes -> zero steady-state decode cost.
-    _war_dirty = carrier_publish is not None and bool(getattr(carrier_publish, "delta_rows", ()))
-    if _war_dirty:
-        controller._rrp_war_active = True
-        controller._rrp_war_clean_streak = 0
-    else:
-        _war_streak = int(getattr(controller, "_rrp_war_clean_streak", 0)) + 1
-        controller._rrp_war_clean_streak = _war_streak
-        if _war_streak >= 4:
-            controller._rrp_war_active = False
-    ready_event_wait_count = 0
-    if state.get("ready_event") is not None:
-        _t_wait_ns = _full_cudagraph_pre_timing_start(profile_pre_timing)
-        ready_event_wait_count = (
-            _wait_prebound_rrp_ready_event_from_graph_state(
-                controller=controller,
-                forward_context=forward_context,
-                state=state,
-                profile_pre_timing=profile_pre_timing,
-            )
-            or 0
+    _t_wait_ns = _full_cudagraph_pre_timing_start(profile_pre_timing)
+    ready_event_wait_count = (
+        _wait_prebound_rrp_ready_event_from_graph_state(
+            controller=controller,
+            forward_context=forward_context,
+            state=state,
+            profile_pre_timing=profile_pre_timing,
         )
-        _full_cudagraph_pre_timing_add(
-            profile_pre_timing,
-            "pre_ready_event_wait_us",
-            _t_wait_ns,
-        )
-    elif "ready_event" not in state:
-        _t_wait_ns = _full_cudagraph_pre_timing_start(profile_pre_timing)
-        ready_event_wait_count = wait_mixed_page_resolver_ready_events_for_forward_context(
-            forward_context
-        )
-        _full_cudagraph_pre_timing_add(
-            profile_pre_timing,
-            "pre_ready_event_wait_us",
-            _t_wait_ns,
-        )
+        or 0
+    )
+    _full_cudagraph_pre_timing_add(
+        profile_pre_timing,
+        "pre_ready_event_wait_us",
+        _t_wait_ns,
+    )
     _t_group_ready_wait_ns = _full_cudagraph_pre_timing_start(profile_pre_timing)
     group_ready_wait_count = int(
         _wait_one_shot_group_ready_before_prebound_rrp_full_graph_replay(
@@ -8421,9 +8751,26 @@ def _enqueue_full_cudagraph_refresh_payloads_after_replay(
     handle_generation = int(getattr(step_ctx, "step_handle_generation", -1))
     if handle_id <= 0 or handle_generation <= 0:
         raise RuntimeError("full cudagraph replay refresh payload enqueue requires step handle identity")
-    note_post_kernel = getattr(controller, "_step_refresh_commit_note_post_kernel", None)
-    if callable(note_post_kernel):
-        note_post_kernel(handle_id=handle_id, handle_generation=handle_generation)
+    claim_generation = getattr(
+        controller,
+        "_step_refresh_commit_claim_replay_payload_generation",
+        None,
+    )
+    if not callable(claim_generation):
+        raise RuntimeError(
+            "full cudagraph replay refresh requires a generation claim hook"
+        )
+    if not bool(
+        claim_generation(
+            handle_id=handle_id,
+            handle_generation=handle_generation,
+            step_identity_token=int(
+                getattr(step_authority, "step_identity_token", -1)
+            ),
+            expected_payloads=len(layer_keys),
+        )
+    ):
+        return 0
     step_envelope = getattr(step_ctx, "step_envelope_v2", None)
     refresh_reason = str(
         getattr(
@@ -9236,6 +9583,262 @@ def _enqueue_full_cudagraph_refresh_payloads_after_replay(
     return int(enqueued)
 
 
+def _current_model_forward_refresh_identity(
+    controller: object,
+    *,
+    stage: str,
+) -> tuple[int, int, int, int]:
+    step_ctx = getattr(controller, "step_context", None)
+    step_authority = getattr(step_ctx, "step_authority", None)
+    if step_authority is None:
+        step_authority = getattr(controller, "step_authority", None)
+    if step_ctx is None or step_authority is None:
+        raise RuntimeError(f"{stage} requires step context and step authority")
+    context_identity = (
+        int(getattr(step_ctx, "epoch", -1)),
+        int(getattr(step_ctx, "step_handle_id", -1)),
+        int(getattr(step_ctx, "step_handle_generation", -1)),
+        int(getattr(step_ctx, "step_identity_token", -1)),
+    )
+    authority_identity = (
+        int(getattr(step_authority, "epoch", -1)),
+        int(getattr(step_authority, "step_handle_id", -1)),
+        int(getattr(step_authority, "step_handle_generation", -1)),
+        int(getattr(step_authority, "step_identity_token", -1)),
+    )
+    if (
+        any(value <= 0 for value in context_identity)
+        or context_identity != authority_identity
+    ):
+        raise RuntimeError(
+            f"{stage} has inconsistent step identity: "
+            f"context={context_identity!r} authority={authority_identity!r}"
+        )
+    expected_token = (
+        context_identity[0] * 1_000_000_000
+        + context_identity[1] * 1_000_000
+        + context_identity[2]
+    )
+    if context_identity[3] != expected_token:
+        raise RuntimeError(
+            f"{stage} has invalid step identity token: "
+            f"identity={context_identity!r} expected_token={expected_token}"
+        )
+    return context_identity
+
+
+def _mark_model_forward_refresh_generation_ready(
+    *,
+    controller: object,
+    graph_key: str,
+) -> None:
+    """Record that one graph segment replayed for the current model forward."""
+    if not _full_cudagraph_replay_step_has_refresh_row(controller):
+        return
+    if not bool(getattr(controller, _MODEL_FORWARD_REFRESH_ACTIVE_ATTR, False)):
+        raise RuntimeError(
+            "model-forward refresh generation ready mark occurred outside the "
+            "model-forward owner"
+        )
+    identity = _current_model_forward_refresh_identity(
+        controller,
+        stage="model-forward refresh generation ready mark",
+    )
+    current = getattr(controller, _MODEL_FORWARD_REFRESH_READY_ATTR, None)
+    if current is None:
+        setattr(
+            controller,
+            _MODEL_FORWARD_REFRESH_READY_ATTR,
+            {"identity": identity, "graph_key": str(graph_key)},
+        )
+        return
+    if not isinstance(current, dict) or tuple(current.get("identity", ())) != identity:
+        raise RuntimeError(
+            "model-forward refresh generation ready identity changed within one "
+            f"forward: previous={current!r} current={identity!r}"
+        )
+    if not str(current.get("graph_key", "") or "") and graph_key:
+        current["graph_key"] = str(graph_key)
+
+
+def _patch_model_forward_refresh_owner() -> None:
+    """Move generation-wide producer work behind the complete model forward."""
+    global _MODEL_FORWARD_REFRESH_OWNER_PATCHED
+    global _ORIGINAL_MODEL_FORWARD_FOR_REFRESH_OWNER
+    if _MODEL_FORWARD_REFRESH_OWNER_PATCHED:
+        return
+    try:
+        from vllm.v1.worker.gpu_model_runner import GPUModelRunner  # type: ignore[import]
+        original_model_forward = GPUModelRunner._model_forward  # type: ignore[attr-defined]
+    except Exception as exc:
+        raise RuntimeError(
+            "sparse patch requires GPUModelRunner._model_forward for the "
+            "single-owner refresh lifecycle"
+        ) from exc
+    if not callable(original_model_forward):
+        raise RuntimeError(
+            "sparse patch requires callable GPUModelRunner._model_forward"
+        )
+    ready_attr = _MODEL_FORWARD_REFRESH_READY_ATTR
+    active_attr = _MODEL_FORWARD_REFRESH_ACTIVE_ATTR
+
+    def _sparse_model_forward(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        controller = _GLOBAL_CONTROLLER
+        if controller is None:
+            return original_model_forward(self, *args, **kwargs)
+        staged_intents = tuple(
+            getattr(controller, "_deferred_bootstrap_launch_intents", tuple())
+            or tuple()
+        )
+        staged_identity = None
+        try:
+            if staged_intents:
+                staged_identity = _current_model_forward_refresh_identity(
+                    controller,
+                    stage="deferred producer post-forward owner entry",
+                )
+                staged_epochs = tuple(int(intent[0]) for intent in staged_intents)
+                if any(epoch != int(staged_identity[0]) for epoch in staged_epochs):
+                    raise RuntimeError(
+                        "deferred producer launch intent epoch drift at model-forward "
+                        f"entry: staged={staged_epochs!r} current={staged_identity[0]}"
+                    )
+                if not callable(
+                    getattr(
+                        controller,
+                        "_drain_staged_deferred_bootstrap_producer_jobs",
+                        None,
+                    )
+                ):
+                    raise RuntimeError(
+                        "model-forward owner requires deferred producer intent drain"
+                    )
+            stale_ready = getattr(controller, ready_attr, None)
+            if stale_ready is not None:
+                raise RuntimeError(
+                    "model-forward refresh owner found an unconsumed generation at "
+                    f"forward entry: ready={stale_ready!r}"
+                )
+            if bool(getattr(controller, active_attr, False)):
+                raise RuntimeError(
+                    "model-forward refresh owner does not support nested entry"
+                )
+        except Exception as exc:
+            if staged_intents:
+                discard = getattr(
+                    controller,
+                    "_discard_staged_deferred_bootstrap_producer_jobs",
+                    None,
+                )
+                if not callable(discard):
+                    raise RuntimeError(
+                        "model-forward owner preflight cannot retire staged deferred "
+                        "producer intents"
+                    ) from exc
+                discard(
+                    reason=f"model-forward owner preflight failed: {exc}"
+                )
+            raise
+        setattr(controller, active_attr, True)
+        try:
+            result = original_model_forward(self, *args, **kwargs)
+        except Exception as exc:
+            setattr(controller, ready_attr, None)
+            setattr(controller, active_attr, False)
+            if staged_intents:
+                discard = getattr(
+                    controller,
+                    "_discard_staged_deferred_bootstrap_producer_jobs",
+                    None,
+                )
+                if not callable(discard):
+                    raise RuntimeError(
+                        "model-forward failure cannot retire staged deferred "
+                        "producer intents"
+                    ) from exc
+                discard(
+                    reason=f"model forward failed before deferred producer drain: {exc}"
+                )
+            raise
+        setattr(controller, active_attr, False)
+        ready = getattr(controller, ready_attr, None)
+        setattr(controller, ready_attr, None)
+        deferred_launch_count = 0
+        if staged_intents:
+            assert staged_identity is not None
+            drain = getattr(
+                controller,
+                "_drain_staged_deferred_bootstrap_producer_jobs",
+            )
+            deferred_launch_count = int(
+                drain(epoch=int(staged_identity[0]))
+            )
+        if not isinstance(ready, dict):
+            return result
+
+        current_identity = _current_model_forward_refresh_identity(
+            controller,
+            stage="model-forward refresh owner completion",
+        )
+        ready_identity = tuple(ready.get("identity", ()))
+        if ready_identity != current_identity:
+            raise RuntimeError(
+                "model-forward refresh owner identity mismatch: "
+                f"ready={ready_identity!r} current={current_identity!r}"
+            )
+
+        refresh_enabled = _mixed_page_full_cudagraph_replay_refresh_enabled(
+            controller
+        )
+        if not refresh_enabled:
+            raise RuntimeError(
+                "model-forward refresh generation was marked while refresh is disabled"
+            )
+        profile_path = _full_cudagraph_hook_profile_log(refresh_enabled)
+        start_ns = time.perf_counter_ns() if profile_path else 0
+        payload_count = _enqueue_full_cudagraph_refresh_payloads_after_replay(
+            controller=controller,
+            graph_key=str(ready.get("graph_key", "") or ""),
+        )
+        refresh_us = (
+            (time.perf_counter_ns() - start_ns) / 1000.0 if profile_path else 0.0
+        )
+        if profile_path:
+            stage_profile = getattr(
+                controller,
+                "_mixed_page_full_cudagraph_last_replay_refresh_stage_profile",
+                None,
+            )
+            _append_mixed_page_full_cudagraph_profile_event(
+                profile_path,
+                {
+                    "event": "mixed_page_full_cudagraph_model_forward_refresh",
+                    "hook": "model_forward_completion",
+                    "step_id": int(current_identity[0]),
+                    "step_handle_id": int(current_identity[1]),
+                    "step_handle_generation": int(current_identity[2]),
+                    "step_identity_token": int(current_identity[3]),
+                    "graph_key": str(ready.get("graph_key", "") or ""),
+                    "refresh_called": bool(payload_count > 0),
+                    "post_replay_refresh_payloads": int(payload_count),
+                    "post_forward_deferred_producer_launches": int(
+                        deferred_launch_count
+                    ),
+                    "refresh_us": float(refresh_us),
+                    "refresh_stage_profile": (
+                        dict(stage_profile)
+                        if isinstance(stage_profile, dict)
+                        else None
+                    ),
+                },
+            )
+        return result
+
+    _ORIGINAL_MODEL_FORWARD_FOR_REFRESH_OWNER = original_model_forward
+    GPUModelRunner._model_forward = _sparse_model_forward  # type: ignore[assignment]
+    _MODEL_FORWARD_REFRESH_OWNER_PATCHED = True
+
+
 def _patch_cuda_graph_wrapper_for_sparse_cudagraph() -> None:
     global _CUDAGRAPH_WRAPPER_PATCHED, _ORIGINAL_CUDAGRAPH_WRAPPER_CALL
     if _CUDAGRAPH_WRAPPER_PATCHED:
@@ -9268,12 +9871,6 @@ def _patch_cuda_graph_wrapper_for_sparse_cudagraph() -> None:
         profile_enabled = bool(profile_path)
         route_trace_enabled = _fa3_route_trace_enabled()
         diagnostic_enabled = bool(profile_enabled or cuda_event_path or route_trace_enabled)
-        if (
-            _full_cudagraph_replay_wrapper_ablate_extra_enabled(refresh_enabled)
-        ):
-            _ensure_full_cudagraph_replay_wrapper_ablate_hit_log_registered(
-                refresh_enabled
-            )
         if (
             not refresh_enabled
             and not release_pending
@@ -9621,34 +10218,6 @@ def _patch_cuda_graph_wrapper_for_sparse_cudagraph() -> None:
                                 route_family_mismatch=route_family_mismatch,
                                 bridge_graph_policy=bridge_graph_policy,
                             )
-                        steady_fast_path_ready = False
-                        ablation_fast_path_ready = (
-                            not diagnostic_enabled
-                            and _full_cudagraph_replay_wrapper_ablate_extra_enabled(
-                                refresh_enabled
-                            )
-                            and _full_cudagraph_replay_wrapper_ablate_extra_ready(
-                                controller=controller,
-                                state=prebound_rrp_graph_state,
-                            )
-                        )
-                        if steady_fast_path_ready or ablation_fast_path_ready:
-                            _bump_controller_int_attr(
-                                controller,
-                                "_mixed_page_full_cudagraph_wrapper_steady_fast_path_hit_count",
-                            )
-                            if ablation_fast_path_ready:
-                                _bump_controller_int_attr(
-                                    controller,
-                                    "_mixed_page_full_cudagraph_wrapper_ablation_hit_count",
-                                )
-                            try:
-                                return original_call(self, *args, **kwargs)
-                            finally:
-                                if refresh_enabled or release_pending:
-                                    _release_refresh_producer_after_decode_if_pending(
-                                        controller
-                                    )
                         _evt_bisect_mark("pre_drain", controller)
                         if _full_cudagraph_replay_refresh_defer_to_deadline_enabled(
                             controller
@@ -9809,33 +10378,11 @@ def _patch_cuda_graph_wrapper_for_sparse_cudagraph() -> None:
             if refresh_enabled or release_pending:
                 _release_refresh_producer_after_decode_if_pending(controller)
         _evt_bisect_mark("post_replay", controller)
-        # [2026-07-12 RRP-DONE-EVTS-RETIRED] post-replay done-event record
-        # deleted: _RRP_GRAPH_DONE_EVTS had zero wait/query consumers repo-wide;
-        # the REAL cross-step ordering is the GRAPH-WAR FENCE right below.
-        # GRAPH-WAR FENCE (event, GPU-side, no CPU block): record an event on the launch
-        # stream S right AFTER the graph replay. The racer (FA4 producer descriptor reads)
-        # is on S -- proven: a stream-scoped wait on S fixes it -- so same-stream ordering
-        # puts this event after those reads. The NEXT step's data build (side stream W)
-        # wait_event's it GPU-side. Shared via sparse_constants so record & wait need no
-        # common object. Armed only in the bootstrap window -> steady-state pays nothing.
-        from patches import sparse_constants as _war_sc
-        _war_armed = (
-            os.environ.get("VLLM_SPARSE_RRP_GRAPH_WAR_FENCE", "1") == "1"
-            and bool(getattr(controller, "_rrp_war_active", True))
-        )
-        _war_sc._RRP_WAR_FENCE_ARMED[0] = _war_armed
-        if _war_armed:
-            import torch as _war_torch
-            if _war_torch.cuda.is_available():
-                # [DEBUG-RUINS-RETIRE 2026-07-08] 调试期三态旋钮
-                # (VLLM_SPARSE_RRP_WAR_FENCE_MODE: stream/device 全同步备用臂)
-                # 与 _RRP_WAR_PROBE_N 探针残渣一并下线:event 单路径已金测,
-                # 备用同步臂=过期无效兜底(全仓零引用零测试)。
-                _evt = _war_sc._RRP_WAR_FENCE_EVT[0]
-                if _evt is None:
-                    _evt = _war_torch.cuda.Event()
-                    _war_sc._RRP_WAR_FENCE_EVT[0] = _evt
-                _evt.record(_war_torch.cuda.current_stream())
+        if profile_reason == "prebound_rrp_graph_state":
+            _record_prebound_rrp_replay_consumed_generation(
+                controller=controller,
+                state=profile_prebound_rrp_graph_state,
+            )
         # Cut A: run the deferred writer-ready commit now (post-replay), BEFORE
         # the deferred-replay drain + post-replay enqueue below -- those mutate /
         # coalesce / re-register _pending_refresh_rebuilds, so the commit
@@ -9858,36 +10405,15 @@ def _patch_cuda_graph_wrapper_for_sparse_cudagraph() -> None:
             and pre_call_had_cudagraph
             and profile_reason == "prebound_rrp_graph_state"
         ):
-            profile_refresh_start_ns = time.perf_counter_ns() if profile_enabled else 0
-            # [B-GRADE-1 2026-07-09] deferred replay-refresh FIFO 死码下线:
-            # 生产者(_append_...)全树零调用 → 队列属性恒 None → 本处 drain 门
-            # 恒假。5 函数+守卫+profile 管道随删(§10.20 拍板材料项 1)。
             if (
                 not _REPLAY_REFRESH_NOOP_FAST_SKIP_CACHED
                 or _full_cudagraph_replay_step_has_refresh_row(controller)
             ):
-                profile_payload_enqueue_count = _enqueue_full_cudagraph_refresh_payloads_after_replay(
+                _mark_model_forward_refresh_generation_ready(
                     controller=controller,
                     graph_key=profile_graph_key,
                 )
-            elif profile_enabled:
-                setattr(
-                    controller,
-                    "_mixed_page_full_cudagraph_last_replay_refresh_stage_profile",
-                    None,
-                )
             _evt_bisect_mark("post_deferred", controller)
-            profile_refresh_stage_profile = getattr(
-                controller,
-                "_mixed_page_full_cudagraph_last_replay_refresh_stage_profile",
-                None,
-            )
-            if profile_payload_enqueue_count > 0:
-                profile_refresh_called = True
-                if profile_enabled:
-                    profile_refresh_us += (
-                        time.perf_counter_ns() - profile_refresh_start_ns
-                    ) / 1000.0
         if refresh_enabled and forward_context_available:
             try:
                 forward_context_after = get_forward_context()
@@ -10442,6 +10968,14 @@ def _patch_gpu_ubatch_wrapper_for_sparse_cudagraph() -> None:
             if cuda_event_path
             else None
         )
+        prebound_consumed_state_before = (
+            _snapshot_prebound_rrp_replay_consumed_generation(
+                controller=controller,
+                state=profile_prebound_rrp_graph_state,
+            )
+            if profile_reason == "prebound_rrp_graph_state"
+            else None
+        )
         try:
             result = original_call(self, *args, **kwargs)
         finally:
@@ -10449,33 +10983,26 @@ def _patch_gpu_ubatch_wrapper_for_sparse_cudagraph() -> None:
             _end_full_cudagraph_replay_cuda_event(profile_cuda_event_sample)
             if refresh_enabled or release_pending:
                 _release_refresh_producer_after_decode_if_pending(controller)
+        if profile_reason == "prebound_rrp_graph_state" and not (
+            _prebound_rrp_replay_consumed_by_nested_wrapper(
+                controller=controller,
+                state=profile_prebound_rrp_graph_state,
+                previous_consumed_state=prebound_consumed_state_before,
+            )
+        ):
+            _record_prebound_rrp_replay_consumed_generation(
+                controller=controller,
+                state=profile_prebound_rrp_graph_state,
+            )
         if refresh_enabled and profile_reason == "prebound_rrp_graph_state":
-            profile_refresh_start_ns = time.perf_counter_ns() if profile_path else 0
             if (
                 not _REPLAY_REFRESH_NOOP_FAST_SKIP_CACHED
                 or _full_cudagraph_replay_step_has_refresh_row(controller)
             ):
-                profile_payload_enqueue_count = _enqueue_full_cudagraph_refresh_payloads_after_replay(
+                _mark_model_forward_refresh_generation_ready(
                     controller=controller,
                     graph_key=profile_graph_key,
                 )
-            elif profile_path:
-                setattr(
-                    controller,
-                    "_mixed_page_full_cudagraph_last_replay_refresh_stage_profile",
-                    None,
-                )
-            profile_refresh_stage_profile = getattr(
-                controller,
-                "_mixed_page_full_cudagraph_last_replay_refresh_stage_profile",
-                None,
-            )
-            if profile_payload_enqueue_count > 0:
-                profile_refresh_called = True
-                if profile_path:
-                    profile_refresh_us += (
-                        time.perf_counter_ns() - profile_refresh_start_ns
-                    ) / 1000.0
         if profile_path:
             profile_pre_consume_drain_stats = (
                 profile_pre_consume_drain_stats or {}
@@ -10657,6 +11184,60 @@ def _patch_gpu_ubatch_wrapper_for_sparse_cudagraph() -> None:
 # -1 回填 6 元素尾窗按 6>5 仍覆盖满深度。
 _ASYNC_SAMPLED_STASH_MAX = 5
 _ORIGINAL_SET_ASYNC_SAMPLED_TOKEN_IDS = None
+
+
+def _read_async_sampled_token(
+    sampled_ids: object,
+    *,
+    request_id: object,
+    previous_row_index: object,
+) -> int:
+    """Read one TP async token without allowing a rank-local dropout."""
+    shape_raw = getattr(sampled_ids, "shape", None)
+    try:
+        shape = tuple(int(value) for value in shape_raw)
+    except (RuntimeError, TypeError, ValueError, OverflowError) as exc:
+        raise RuntimeError(
+            "E_TP2_TOKEN_SOURCE_INCOMPLETE: async sampled ids have no valid "
+            f"rank-2 shape for request={request_id!r}, "
+            f"previous_row_index={previous_row_index!r}, shape={shape_raw!r}"
+        ) from exc
+    if len(shape) != 2 or shape[1] != 1:
+        raise RuntimeError(
+            "E_TP2_TOKEN_SOURCE_INCOMPLETE: async sampled ids require shape "
+            f"[batch, 1] for request={request_id!r}, "
+            f"previous_row_index={previous_row_index!r}, shape={shape!r}"
+        )
+    try:
+        row_index = int(previous_row_index)
+    except (RuntimeError, TypeError, ValueError, OverflowError) as exc:
+        raise RuntimeError(
+            "E_TP2_TOKEN_SOURCE_INCOMPLETE: async sampled row index is not an "
+            f"integer for request={request_id!r}, "
+            f"previous_row_index={previous_row_index!r}, shape={shape!r}"
+        ) from exc
+    if row_index < 0 or row_index >= shape[0]:
+        raise RuntimeError(
+            "E_TP2_TOKEN_SOURCE_INCOMPLETE: async sampled row index out of "
+            f"range for request={request_id!r}, previous_row_index={row_index}, "
+            f"shape={shape!r}"
+        )
+    try:
+        raw_token = sampled_ids[row_index, 0]  # type: ignore[index]
+    except (RuntimeError, IndexError, KeyError, TypeError) as exc:
+        raise RuntimeError(
+            "E_TP2_TOKEN_SOURCE_INCOMPLETE: async sampled token access failed "
+            f"for request={request_id!r}, previous_row_index={row_index}, "
+            f"shape={shape!r}"
+        ) from exc
+    try:
+        return int(raw_token)
+    except (RuntimeError, TypeError, ValueError, OverflowError) as exc:
+        raise RuntimeError(
+            "E_TP2_TOKEN_SOURCE_INCOMPLETE: async sampled token is not an "
+            f"integer for request={request_id!r}, previous_row_index={row_index}, "
+            f"shape={shape!r}, value={raw_token!r}"
+        ) from exc
 
 
 def _install_async_sampled_token_stash() -> None:
@@ -11064,6 +11645,7 @@ def _set_controller(config: SparseControllerConfig) -> "VLLMSparseController":
     _patch_prepare_inputs()
     _patch_dummy_run()
     _patch_update_states()
+    _patch_model_forward_refresh_owner()
     _patch_request_append()
     _install_async_sampled_token_stash()
     _patch_initialize_kv_cache()
@@ -11779,9 +12361,15 @@ def _run_capture_only_mixed_forward(
 ):
     v1_flash_attn, fa_utils = _get_v1_flash_attn_modules()
 
+    from patches.fa3_native.capture_cohort import (
+        CaptureCohortCoordinator,
+        publish_capture_cohort_completion,
+    )
+    from patches.fa3_native.capture_ownership import CHUNK_COHORT
     from patches.fa3_native.forward_capture import prepare_capture_forward_side_outputs
     from patches.fa3_native.install import load_vendored_flash_attn_bridge
     from patches.fa3_native.postprocess import (
+        run_capture_postprocess_job_sequence,
         run_capture_postprocess_job_if_needed,
         run_prefill_capture_postprocess_if_needed,
     )
@@ -11789,7 +12377,10 @@ def _run_capture_only_mixed_forward(
     from patches.sparse_constants import _CAPTURE_CHUNK, _CAPTURE_IN_FLIGHT, _CAPTURE_REDUCE_GROUP
     from patches.fa3_native.ring_capture import ring_scratch_slot, ring_depth, RingWarFence
     from patches.sparse_types import CapturePostprocessJob, SelectorBatchPayload
-    from patches.sparse_utils import _make_selector_fast_signature
+    from patches.sparse_utils import (
+        _make_selector_fast_signature,
+        _selector_fixed_k_enabled,
+    )
     from patches.vllm_sparse_patch import (
         _prepare_prefill_capture_payload,
         _prepare_refresh_capture_payload,
@@ -11924,6 +12515,7 @@ def _run_capture_only_mixed_forward(
         (context_lengths[r] for r in producer_rows_cpu if r < len(context_lengths)),
         default=0,
     )
+    _actual_planned_max_capture_k = int(planned_max_capture_k)
     # 262k OOM fix (prebuild byte-match): force the capture-scratch WIDTH to the
     # single max-bucket the profile prebuild reserved, so the deferred capture
     # scratch_key (forward_capture.py:430-436, shape-keyed via
@@ -11939,6 +12531,29 @@ def _run_capture_only_mixed_forward(
     _capture_kv_max_bucket = int(getattr(controller, "_capture_kv_max_bucket", 0) or 0)
     if _capture_kv_max_bucket > 0 and int(planned_max_capture_k) > 0:
         planned_max_capture_k = int(_capture_kv_max_bucket)
+    _capture_ownership_plan = getattr(
+        controller, "_capture_ownership_plan", None
+    )
+    _capture_ownership_mode_value = ""
+    _capture_ownership_plan_signature = ""
+    if _capture_ownership_plan is not None:
+        _capture_ownership_mode_value = _capture_ownership_mode(
+            _capture_ownership_plan
+        )
+        _capture_ownership_plan_signature = str(
+            getattr(_capture_ownership_plan, "signature_sha256")
+        )
+    if _capture_ownership_mode_value == CHUNK_COHORT:
+        if not bool(getattr(_capture_ownership_plan, "selector_fixed_k", False)):
+            raise RuntimeError(
+                "E_SFI_CAPTURE_COHORT_FIXED_K: stamped chunk cohort plan did "
+                "not prove fixed-K selector ownership"
+            )
+        if not bool(_selector_fixed_k_enabled()):
+            raise RuntimeError(
+                "E_SFI_CAPTURE_COHORT_FIXED_K: live selector fixed-K contract "
+                "drifted after ownership planning"
+            )
 
     # Build slot sets from owner_plan (CPU) instead of GPU row_plan iteration.
     prefill_slot_set: set[int] = set()
@@ -11967,6 +12582,14 @@ def _run_capture_only_mixed_forward(
     global_layer_index = int(controller.layer_index_by_cache_key.get(cache_key, -1))
     if global_layer_index < 0:
         raise RuntimeError("native FA3 capture mixed route requires registered layer cache key")
+    # Freeze the step owner once and carry the same identity through the
+    # postprocess job and every transport payload.  Deferred launch validation
+    # must never reconstruct ownership from mutable controller state.
+    capture_handle_id = int(getattr(step_ctx, "step_handle_id", -1))
+    capture_handle_generation = int(
+        getattr(step_ctx, "step_handle_generation", -1)
+    )
+    capture_epoch = int(getattr(step_authority, "epoch", -1))
     prefill_layout = None
     prefill_slot_list = sorted(int(slot) for slot in prefill_slot_set)
     if prefill_slot_list:
@@ -12024,18 +12647,54 @@ def _run_capture_only_mixed_forward(
     if prefill_layout is None and refresh_layout is None:
         raise RuntimeError("native FA3 capture mixed route resolved zero capture layouts")
 
-    _, _, slot_in_chunk = controller._map_global_layer_to_capture_slot(global_layer_index)
+    capture_chunk_id, _, slot_in_chunk = (
+        controller._map_global_layer_to_capture_slot(global_layer_index)
+    )
     _rg = int(_CAPTURE_REDUCE_GROUP)
     _ring_slabs = ring_depth(_rg, int(_CAPTURE_IN_FLIGHT))
     _ring_slot = ring_scratch_slot(int(global_layer_index), _rg, int(_CAPTURE_IN_FLIGHT))
     _ek_chunk_id = 0 if _rg > 0 else (int(global_layer_index) // max(1, int(_CAPTURE_CHUNK)))
     _ek_depth = int(_ring_slabs) if _rg > 0 else int(_CAPTURE_CHUNK)
-    if _rg > 0:
+    if _capture_ownership_mode_value == CHUNK_COHORT:
+        _ring_slot, _ek_chunk_id, _ek_depth = (
+            _chunk_cohort_runtime_scratch_binding(
+                plan=_capture_ownership_plan,
+                global_layer_index=int(global_layer_index),
+                slot_in_chunk=int(slot_in_chunk),
+                aligned_k_bucket=int(_capture_kv_max_bucket),
+                rows_bucket=int(
+                    getattr(controller, "_capture_rows_bucket", 0) or 0
+                ),
+                last_n_bucket=int(
+                    getattr(controller, "_capture_last_n_bucket", 0) or 0
+                ),
+                actual_k=int(_actual_planned_max_capture_k),
+                actual_rows=int(len(producer_rows_cpu)),
+                actual_last_n=int(planned_max_capture_last_n),
+                heads_per_rank=int(query.shape[1]),
+                chunk=int(_CAPTURE_CHUNK),
+                in_flight=int(_CAPTURE_IN_FLIGHT),
+                baseline_reduce_group=int(_CAPTURE_REDUCE_GROUP),
+            )
+        )
+    _effective_capture_ring_slot = int(_ring_slot)
+    _effective_capture_scratch_depth = int(_ek_depth)
+    _effective_capture_cohort_size = (
+        int(_ek_chunk_id)
+        if _capture_ownership_mode_value == CHUNK_COHORT
+        else int(_CAPTURE_CHUNK)
+    )
+    _capture_ring_fence_active = bool(
+        _rg > 0 or _capture_ownership_mode_value == CHUNK_COHORT
+    )
+    if _capture_ring_fence_active:
         _fence = getattr(controller, "_ring_war_fence", None)
         if _fence is None:
             _fence = RingWarFence()
             setattr(controller, "_ring_war_fence", _fence)
-        _prev_evt = _fence.war_event_before_capture(int(_ring_slot))
+        _prev_evt = _fence.war_event_before_capture(
+            int(_effective_capture_ring_slot)
+        )
         if _prev_evt is not None:
             # [RING-GUARD 2026-07-03] a residual fence event while the current stream
             # is capturing would bake an external-event wait into the graph (capture
@@ -12080,10 +12739,7 @@ def _run_capture_only_mixed_forward(
             return False
         if not torch.cuda.is_available():
             return False
-        try:
-            if torch.cuda.is_current_stream_capturing():
-                return False
-        except Exception:
+        if torch.cuda.is_current_stream_capturing():
             return False
         async_refresh_enabled = getattr(controller, "_async_refresh_enabled", None)
         if not callable(async_refresh_enabled) or not bool(async_refresh_enabled()):
@@ -12098,23 +12754,27 @@ def _run_capture_only_mixed_forward(
     if auto_early_capture_postprocess_requested:
         defer_capture_postprocess_requested = True
         early_capture_postprocess_requested = True
-    # [RING-GUARD 2026-07-03] with the per-G scratch RING (G>0, default G=1), every
-    # raw-scratch reader must publish its completion through the RingWarFence, which
-    # only the EARLY-reduce path does. Pure defer (DEFER=1 without EARLY=1) floats the
-    # job past the ring rewrite (depth G*in_flight << chunk) and ASYNC mode reads on
-    # refresh_stream without any fence registration -- both would consume overwritten
-    # slots and silently corrupt capture scores. Reject the combination up front; the
-    # production auto-early path sets both flags and is unaffected.
-    if _rg > 0 and (
+    if _capture_ownership_mode_value == CHUNK_COHORT and not (
+        defer_capture_postprocess_requested
+        and early_capture_postprocess_requested
+    ):
+        raise RuntimeError(
+            "E_SFI_CAPTURE_COHORT_OWNER: stamped chunk cohort requires the "
+            "deferred early owner on every live capture step"
+        )
+    # Every reusable scratch owner (the per-G ring or chunk cohort) publishes reduce
+    # completion through the same RingWarFence. Pure defer and the legacy async arm
+    # have no such publication, so reject them before they can consume a reused slot.
+    if _capture_ring_fence_active and (
         (defer_capture_postprocess_requested and not early_capture_postprocess_requested)
         or async_capture_postprocess_requested
     ):
         raise RuntimeError(
-            "VLLM_SPARSE_CAPTURE_REDUCE_GROUP>0 requires the early-reduce fence: "
+            "capture scratch reuse requires the early-reduce fence: "
             "pure-defer (VLLM_SPARSE_DEFER_CAPTURE_POSTPROCESS=1 without "
             "VLLM_SPARSE_EARLY_CAPTURE_POSTPROCESS=1) and VLLM_SPARSE_ASYNC_CAPTURE_"
-            "POSTPROCESS modes read ring scratch without a WAR fence event; enable "
-            "EARLY=1 or set VLLM_SPARSE_CAPTURE_REDUCE_GROUP=0 (chunk-deep scratch)"
+            "POSTPROCESS modes read reusable scratch without a WAR fence event; "
+            "enable EARLY=1 or use a ring_early ownership plan"
         )
     # 262k OOM fix (last_n bucketing; symmetric with the EDIT-1 kv_max force-form):
     # round the DEFER capture-scratch last_n dim UP to the configured
@@ -12131,10 +12791,16 @@ def _run_capture_only_mixed_forward(
     # mechanism the kv_max width bucket relies on). GUARD > 1: never promote a decode
     # last_n==1 step (the auto-early gate at :12172 already used the RAW planned
     # value); per-row logits_last_n_by_row (the actual write counts) pass UNCHANGED.
-    # 0 bucket (prebuild skipped) => no-op => exact HEAD behaviour (fail-safe).
+    # 0 bucket (prebuild skipped) => no-op. A stamped chunk cohort always uses its
+    # prebuilt R capacity, including an actual last_n==1 tail; unused rows remain
+    # unwritten and unread, while preserving the single cache key.
     _capture_last_n_bucket = int(getattr(controller, "_capture_last_n_bucket", 0) or 0)
     _planned_max_capture_last_n_alloc = int(planned_max_capture_last_n)
-    if _capture_last_n_bucket > 1 and _planned_max_capture_last_n_alloc > 1:
+    if _capture_ownership_mode_value == CHUNK_COHORT:
+        _planned_max_capture_last_n_alloc = int(
+            getattr(_capture_ownership_plan, "last_n")
+        )
+    elif _capture_last_n_bucket > 1 and _planned_max_capture_last_n_alloc > 1:
         _planned_max_capture_last_n_alloc = max(
             _planned_max_capture_last_n_alloc, int(_capture_last_n_bucket)
         )
@@ -12143,7 +12809,7 @@ def _run_capture_only_mixed_forward(
         refresh_layout=refresh_layout,
         row_plan=row_plan,
         slot_in_chunk=int(slot_in_chunk),
-        ring_scratch_slot=int(_ring_slot),
+        ring_scratch_slot=int(_effective_capture_ring_slot),
         seqused_k=seqused_k,
         device=query.device,
         producer_rows_cpu=producer_rows_cpu,
@@ -12155,6 +12821,13 @@ def _run_capture_only_mixed_forward(
         seqused_k_cpu=context_lengths[:batch_size],
         scratch_cache_owner=controller,
         scratch_cache_extra_key=(
+            (
+                "defer_postprocess_chunk",
+                _effective_capture_cohort_size,
+                _effective_capture_scratch_depth,
+            )
+            if _capture_ownership_mode_value == CHUNK_COHORT
+            else
             (
                 "defer_postprocess_chunk",
                 # 262k OOM fix: drop the per-step nonce (step_handle_id/generation) from
@@ -12241,7 +12914,7 @@ def _run_capture_only_mixed_forward(
         # layer_stride=0 fail-fast)。
         _phase = str(capture_postprocess_state.get("direct_capture_phase", ""))
         return bool(
-            _rg > 0
+            _capture_ring_fence_active
             and (refresh_layout is None or _phase == "")
             and _phase != "prefill"
         )
@@ -12508,10 +13181,7 @@ def _run_capture_only_mixed_forward(
             return False
         if not torch.cuda.is_available():
             return False
-        try:
-            if torch.cuda.is_current_stream_capturing():
-                return False
-        except Exception:
+        if torch.cuda.is_current_stream_capturing():
             return False
         return True
 
@@ -12522,10 +13192,7 @@ def _run_capture_only_mixed_forward(
             return False
         if not torch.cuda.is_available():
             return False
-        try:
-            if torch.cuda.is_current_stream_capturing():
-                return False
-        except Exception:
+        if torch.cuda.is_current_stream_capturing():
             return False
         async_refresh_enabled = getattr(controller, "_async_refresh_enabled", None)
         if not callable(async_refresh_enabled) or not bool(async_refresh_enabled()):
@@ -12602,8 +13269,8 @@ def _run_capture_only_mixed_forward(
             debug_layer_index=int(getattr(state, "layer_index", -1)),
             ready_event=ready_event,
             job_key=(
-                int(getattr(step_ctx, "step_handle_id", -1)),
-                int(getattr(step_ctx, "step_handle_generation", -1)),
+                capture_handle_id,
+                capture_handle_generation,
                 int(global_layer_index),
             ),
             # [DETERMINISTIC-TAPE-WAW 2026-07-03] flush retarget 与 deferred
@@ -12629,22 +13296,81 @@ def _run_capture_only_mixed_forward(
                     "VLLM_SPARSE_EARLY_CAPTURE_POSTPROCESS requires refresh_stream"
                 )
 
-            def _run_early_capture_postprocess_job() -> bool:
-                return run_capture_postprocess_job_if_needed(
-                    capture_postprocess_job,
-                    meta_cache_owner=controller,
+            if _capture_ownership_mode_value == CHUNK_COHORT:
+                coordinator = getattr(
+                    controller, "_capture_cohort_coordinator", None
                 )
-
-            with torch.cuda.stream(refresh_stream):
-                postprocess_ran = _run_early_capture_postprocess_job()
-                if bool(getattr(capture_postprocess_job, "completed", False)):
-                    completion_event = torch.cuda.Event(enable_timing=False)
-                    completion_event.record(refresh_stream)
-                    setattr(capture_postprocess_job, "completion_event", completion_event)
-                    if int(_CAPTURE_REDUCE_GROUP) > 0:
-                        _fence = getattr(controller, "_ring_war_fence", None)
-                        if _fence is not None:
-                            _fence.on_reduce(int(_ring_slot), completion_event, postprocess_ran)
+                if coordinator is None:
+                    coordinator = CaptureCohortCoordinator()
+                    setattr(controller, "_capture_cohort_coordinator", coordinator)
+                elif not isinstance(coordinator, CaptureCohortCoordinator):
+                    raise RuntimeError(
+                        "E_SFI_CAPTURE_COHORT_OWNER: controller coordinator "
+                        "has an invalid type"
+                    )
+                total_layers = len(
+                    tuple(getattr(controller, "layer_cache_keys", tuple()) or tuple())
+                )
+                ready_cohort = coordinator.submit(
+                    job=capture_postprocess_job,
+                    handle_id=capture_handle_id,
+                    handle_generation=capture_handle_generation,
+                    epoch=capture_epoch,
+                    plan_signature=_capture_ownership_plan_signature,
+                    global_layer_index=int(global_layer_index),
+                    total_layers=int(total_layers),
+                    chunk_id=int(capture_chunk_id),
+                    slot_in_chunk=int(slot_in_chunk),
+                    scratch_slot=int(_effective_capture_ring_slot),
+                    cohort_size=int(_effective_capture_cohort_size),
+                    selected_depth=int(_effective_capture_scratch_depth),
+                )
+                postprocess_ran = False
+                if ready_cohort is not None:
+                    with torch.cuda.stream(refresh_stream):
+                        ran_count = run_capture_postprocess_job_sequence(
+                            ready_cohort.jobs,
+                            meta_cache_owner=controller,
+                        )
+                        cohort_completion_event = torch.cuda.Event(
+                            enable_timing=False
+                        )
+                        cohort_completion_event.record(refresh_stream)
+                        fence = getattr(controller, "_ring_war_fence", None)
+                        publish_capture_cohort_completion(
+                            ready_cohort,
+                            ran_count=int(ran_count),
+                            completion_event=cohort_completion_event,
+                            fence=fence,
+                        )
+                    postprocess_ran = True
+            else:
+                with torch.cuda.stream(refresh_stream):
+                    postprocess_ran = run_capture_postprocess_job_if_needed(
+                        capture_postprocess_job,
+                        meta_cache_owner=controller,
+                    )
+                    if bool(getattr(capture_postprocess_job, "completed", False)):
+                        completion_event = getattr(
+                            capture_postprocess_job, "completion_event", None
+                        )
+                        if completion_event is None:
+                            raise RuntimeError(
+                                "E_SFI_CAPTURE_POSTPROCESS_EVENT: completed job "
+                                "has no completion event"
+                            )
+                        if _capture_ring_fence_active:
+                            fence = getattr(controller, "_ring_war_fence", None)
+                            if fence is None:
+                                raise RuntimeError(
+                                    "E_SFI_CAPTURE_POSTPROCESS_FENCE: reusable "
+                                    "scratch has no WAR fence owner"
+                                )
+                            fence.on_reduce(
+                                int(_effective_capture_ring_slot),
+                                completion_event,
+                                postprocess_ran,
+                            )
     elif _async_capture_postprocess_available():
         refresh_stream = getattr(controller, "refresh_stream", None)
         if refresh_stream is None:
@@ -12842,6 +13568,9 @@ def _run_capture_only_mixed_forward(
                     kv_lengths=kv_lengths,
                     block_table=block_table,
                 ),
+                capture_handle_id=capture_handle_id,
+                capture_handle_generation=capture_handle_generation,
+                capture_epoch=capture_epoch,
             ),
         )
         # native FA3 prefill enqueue 只提交 transport payload；
@@ -12935,9 +13664,9 @@ def _run_capture_only_mixed_forward(
                     kv_lengths=kv_lengths_tensor,
                     block_table=block_table,
                 ),
-                capture_handle_id=int(getattr(step_ctx, "step_handle_id", -1)),
-                capture_handle_generation=int(getattr(step_ctx, "step_handle_generation", -1)),
-                capture_epoch=int(getattr(step_ctx, "epoch", -1)),
+                capture_handle_id=capture_handle_id,
+                capture_handle_generation=capture_handle_generation,
+                capture_epoch=capture_epoch,
                 refresh_reason=refresh_reason,
                 refresh_intent_req_ids=refresh_intent_req_ids,
             )
@@ -12951,6 +13680,15 @@ def _run_capture_only_mixed_forward(
     chunk_id, buf_id, slot_in_chunk = controller._map_global_layer_to_capture_slot(layer_index_global)
     if (int(slot_in_chunk) == int(_CAPTURE_CHUNK) - 1) or is_last_layer:
         chunk_size = (int(slot_in_chunk) + 1) if is_last_layer else int(_CAPTURE_CHUNK)
+        if _capture_ownership_mode_value == CHUNK_COHORT:
+            coordinator = getattr(controller, "_capture_cohort_coordinator", None)
+            if coordinator is not None:
+                if not isinstance(coordinator, CaptureCohortCoordinator):
+                    raise RuntimeError(
+                        "E_SFI_CAPTURE_COHORT_OWNER: controller coordinator "
+                        "has an invalid type at the flush boundary"
+                    )
+                coordinator.assert_idle()
         controller._flush_prefill_batches(
             buf_id=int(buf_id),
             chunk_id=int(chunk_id),
@@ -13536,7 +14274,10 @@ def disable_vllm_sparse_patch() -> None:
     global _KV_INIT_PATCHED, _ORIGINAL_INIT_KV_CACHE
     global _UBATCH_WRAPPER_PATCHED, _ORIGINAL_UBATCH_WRAPPER_CALL
     global _CUDAGRAPH_WRAPPER_PATCHED, _ORIGINAL_CUDAGRAPH_WRAPPER_CALL
+    global _MODEL_FORWARD_REFRESH_OWNER_PATCHED
+    global _ORIGINAL_MODEL_FORWARD_FOR_REFRESH_OWNER
     global _UPDATE_STATES_PATCHED, _ORIGINAL_UPDATE_STATES
+    global _INSTALLED_UPDATE_STATES_WRAPPER
     global _ORIGINAL_V1_FLASH_ATTN_VARLEN_FUNC
     global _ORIGINAL_V1_FLASH_ATTN_FORWARD, _ORIGINAL_V1_FLASH_ATTN_GET_SCHEDULER_METADATA
     global _ORIGINAL_V1_FLASH_ATTN_GET_FLASH_ATTN_VERSION
@@ -13547,6 +14288,7 @@ def disable_vllm_sparse_patch() -> None:
     global _COMPACT_PAGE_RESIDENCY_PATCHED, _ORIGINAL_KV_CACHE_MANAGER_INIT
     global _ORIGINAL_BLOCK_POOL_METHODS, _COMPACT_PAGE_BLOCK_POOL_CLS
     global _COMPACT_PAGE_KV_CACHE_MANAGER_CLS
+    _preflight_update_states_hook_lease()
     _GLOBAL_CONTROLLER = None
     if _SERIALIZED_CONFIG_ENV in os.environ:
         del os.environ[_SERIALIZED_CONFIG_ENV]
@@ -13572,6 +14314,18 @@ def disable_vllm_sparse_patch() -> None:
             raise
     _CUDAGRAPH_WRAPPER_PATCHED = False
     _ORIGINAL_CUDAGRAPH_WRAPPER_CALL = None
+    if (
+        _MODEL_FORWARD_REFRESH_OWNER_PATCHED
+        and _ORIGINAL_MODEL_FORWARD_FOR_REFRESH_OWNER is not None
+    ):
+        try:
+            from vllm.v1.worker.gpu_model_runner import GPUModelRunner  # type: ignore[import]
+            GPUModelRunner._model_forward = _ORIGINAL_MODEL_FORWARD_FOR_REFRESH_OWNER  # type: ignore[assignment]
+        except Exception:
+            _log.error("Failed to restore _model_forward during patch uninstall")
+            raise
+    _MODEL_FORWARD_REFRESH_OWNER_PATCHED = False
+    _ORIGINAL_MODEL_FORWARD_FOR_REFRESH_OWNER = None
     if _ORIGINAL_V1_FLASH_ATTN_VARLEN_FUNC is not None:
         try:
             from vllm.v1.attention.backends import flash_attn as v1_flash_attn
@@ -13611,15 +14365,27 @@ def disable_vllm_sparse_patch() -> None:
     _ORIGINAL_FA_UTILS_GET_FLASH_ATTN_VERSION = None
     _ORIGINAL_V1_FLASH_METADATA_FULL_CUDAGRAPH_SUPPORTED = None
     _FLASH_ATTN_FORWARD_PATCHED = False
-    if _UPDATE_STATES_PATCHED and _ORIGINAL_UPDATE_STATES is not None:
+    if _UPDATE_STATES_PATCHED:
+        if (
+            _ORIGINAL_UPDATE_STATES is None
+            or _INSTALLED_UPDATE_STATES_WRAPPER is None
+        ):
+            raise RuntimeError("E_SPARSE_UPDATE_STATES_HOOK_LEASE_STATE")
         try:
             from vllm.v1.worker.gpu_model_runner import GPUModelRunner  # type: ignore[import]
+
+            if (
+                GPUModelRunner._update_states
+                is not _INSTALLED_UPDATE_STATES_WRAPPER
+            ):
+                raise RuntimeError("E_SPARSE_UPDATE_STATES_HOOK_LEASE_LOST")
             GPUModelRunner._update_states = _ORIGINAL_UPDATE_STATES  # type: ignore[assignment]
         except Exception:
             _log.error("Failed to restore _update_states during patch uninstall")
             raise
-    _UPDATE_STATES_PATCHED = False
-    _ORIGINAL_UPDATE_STATES = None
+        _UPDATE_STATES_PATCHED = False
+        _ORIGINAL_UPDATE_STATES = None
+        _INSTALLED_UPDATE_STATES_WRAPPER = None
     if _PREPARE_PATCHED and _ORIGINAL_PREPARE_INPUTS is not None:
         try:
             from vllm.v1.worker.gpu_model_runner import GPUModelRunner  # type: ignore[import]

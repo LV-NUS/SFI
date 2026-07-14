@@ -199,13 +199,15 @@ class RefreshRebuildMixin:
         self._step_refresh_commit_planned_rows: int = 0
         self._step_refresh_commit_num_actual_tokens: int = 0
         self._step_refresh_commit_payload_enqueues: int = 0
-        self._step_refresh_commit_post_kernel_calls: int = 0
+        self._step_refresh_commit_replay_payload_claims: int = 0
         # commit-path single writer（exactly-once per request within one step-handle）
         self._step_refresh_commit_written_handle_id: int = -1
         self._step_refresh_commit_written_handle_generation: int = -1
         self._step_refresh_commit_written_req_ids: Set[str] = set()
         # handle-ledger ring（slot = handle_id % ring_size）：
-        # [handle_id, generation, planned_reqs, planned_rows, num_actual_tokens, post_kernel_calls, payload_enqueues]
+        # [handle_id, generation, planned_reqs, planned_rows, num_actual_tokens,
+        #  replay_payload_claims, payload_enqueues, expected_replay_payloads,
+        #  step_identity_token]
         self._step_refresh_handle_ledger: List[List[int]] = []
         self._step_refresh_handle_ledger_size: int = 0
         # pending refresh rebuilds
@@ -298,7 +300,8 @@ class RefreshRebuildMixin:
         # ASYNC_PRODUCER_WRITER_GRAPH (task #9): captured writer-graph holder.
         # ``graphs`` maps key -> CUDAGraph (each graph owns a PRIVATE mempool,
         # [POOL-PRIVATE] — never the decode-graph pool, never shared);
-        # ``bypass`` is the fail-open / thrash latch.
+        # ``bypass`` is retained only to reject stale in-process state from the
+        # retired fail-open implementation. Current code never sets it.
         self._writer_graph_state: Optional[Dict[str, object]] = None
         self._writer_graph_recapture_window: int = 0
         self._writer_graph_recapture_count: int = 0
@@ -2247,8 +2250,9 @@ class RefreshRebuildMixin:
     ) -> None:
         """Replay the captured writer graph on a key hit; else eager (+recapture).
 
-        Fail-OPEN: any capture/replay error discards the graph, runs eager and
-        latches bypass. Byte output is identical across eager/cold/replay.
+        Capture/replay failures are terminal. Retrying through eager after an
+        asynchronous graph failure can double-submit a partial writer and hide
+        the exact condition that would make a remote run silently slow.
 
         [PTR-REPUBLISH-REPLAY-SAFE 2026-07-09] ``pointer_rebuild_miss`` (a
         pointer-ARRAY republish happened while building launch_args) no longer
@@ -2290,10 +2294,6 @@ class RefreshRebuildMixin:
                 pass
 
         state = self._writer_graph_state
-        if isinstance(state, dict) and bool(state.get("bypass")):
-            _wg_dbg_note("bypass_latched")
-            eager_fn()
-            return
         # Defect #4: never capture/replay under the split/deferred writer path.
         if self._writer_graph_split_active():
             _wg_dbg_note("split_bypass")
@@ -2320,26 +2320,17 @@ class RefreshRebuildMixin:
         entry = graphs.get(key) if isinstance(graphs, dict) else None
         # Hot path: key hit and a captured graph exists -> replay only.
         if entry is not None:
-            try:
-                # #9-KEY v3: drain the writer-input ready latch before replay so
-                # the captured kernel sees the refreshed seq_lens/slot/selected
-                # buffers. Same-stream this is a no-op; it guards a future
-                # side-stream refactor. Fail-open inside the helper.
-                _wait_input_ready = getattr(self, "_wait_writer_input_ready", None)
-                if callable(_wait_input_ready):
-                    _wait_input_ready(device=device)
-                entry.replay()
-                self._record_deadline_async_producer_count("graph_replay")
-                _wg_dbg_note("replay")
-                return
-            except Exception:
-                _log.warning(
-                    "writer graph replay failed; bypassing capture", exc_info=True
-                )
-                self._writer_graph_state = {"bypass": True}
-                _wg_dbg_note("replay_fail")
-                eager_fn()
-                return
+            # #9-KEY v3: drain the writer-input ready latch before replay so
+            # the captured kernel sees the refreshed seq_lens/slot/selected
+            # buffers. Same-stream this is a no-op; it guards a future
+            # side-stream refactor. Any ordering/replay error propagates.
+            _wait_input_ready = getattr(self, "_wait_writer_input_ready", None)
+            if callable(_wait_input_ready):
+                _wait_input_ready(device=device)
+            entry.replay()
+            self._record_deadline_async_producer_count("graph_replay")
+            _wg_dbg_note("replay")
+            return
         # Cold / new-key step: run eager NOW, then capture. A pointer-array
         # republish this step is NOT an obstacle: the H2D lands on this stream
         # before the eager launch and before the capture's pre-drain
@@ -2347,30 +2338,10 @@ class RefreshRebuildMixin:
         # event on the capture stream), and the capture bakes only the kernel
         # launch — never the H2D.
         eager_fn()
-        try:
-            self._capture_writer_graph(
-                ext=ext, launch_args=launch_args, device=device, key=key
-            )
-            _wg_dbg_note("eager_capture")
-        except Exception:
-            _log.warning(
-                "writer graph capture failed; bypassing capture", exc_info=True
-            )
-            self._writer_graph_state = {"bypass": True}
-            if _wg_dbg:
-                # capture 异常全文落盘:vLLM logger 默认走 stdout 被 bench IPC
-                # 吞(§10.1 坑),此处是拿到 traceback 的唯一稳定通道。
-                try:
-                    import traceback as _tb
-
-                    with open(_wg_dbg, "a") as _fh:
-                        _fh.write(
-                            f"{os.getpid()}\twriter_capture_exc\t"
-                            f"{_tb.format_exc()!r}\n"
-                        )
-                except OSError:
-                    pass
-            _wg_dbg_note("capture_fail")
+        self._capture_writer_graph(
+            ext=ext, launch_args=launch_args, device=device, key=key
+        )
+        _wg_dbg_note("eager_capture")
 
     def _capture_writer_graph(
         self,
@@ -2394,15 +2365,9 @@ class RefreshRebuildMixin:
         """
         # Must run under the existing refresh_stream context; never nested inside
         # the outer decode cudagraph capture.
-        try:
-            if bool(torch.cuda.is_current_stream_capturing()):
-                # Already capturing the outer decode graph -> do NOT nest.
-                return
-        except Exception:
-            _log.warning(
-                "writer graph: failed to query outer capture state; skip capture",
-                exc_info=True,
-            )
+        if bool(torch.cuda.is_current_stream_capturing()):
+            # Already capturing the outer decode graph -> do NOT nest. The
+            # eager launch issued by the caller is part of that outer graph.
             return
         state = self._writer_graph_state
         # [POOL-PRIVATE 2026-07-09] each graph owns a PRIVATE mempool (default
@@ -2426,9 +2391,7 @@ class RefreshRebuildMixin:
         # inputs -> replay-safe under ANY arena state. Eager launches keep the
         # skip_unchanged variant (the eager-order bandwidth saver).
         if not hasattr(ext, "gather_compact_kv_into_arena_ptrs_tiled_autolen"):
-            # Prebuilt ext without the stateless symbol: never capture (fail-open).
-            self._writer_graph_state = {"bypass": True}
-            return
+            raise RuntimeError("E_SFI_WRITER_GRAPH_STATELESS_SYMBOL_MISSING")
 
         def _replay_body() -> None:
             ext.gather_compact_kv_into_arena_ptrs_tiled_autolen(
@@ -2473,7 +2436,7 @@ class RefreshRebuildMixin:
         # #9-KEY v5: per-key cache insert (state may be None / legacy shape).
         key_t = tuple(int(v) for v in key)
         if not isinstance(state, dict) or not isinstance(state.get("graphs"), dict):
-            state = {"graphs": {}, "bypass": False}
+            state = {"graphs": {}}
             self._writer_graph_state = state
         graphs_map = state["graphs"]
         # Defensive bound: beyond any plausible (layer-group x batch-shape)
@@ -2497,7 +2460,7 @@ class RefreshRebuildMixin:
             except OSError:
                 pass
         if self._writer_graph_record_recapture():
-            self._writer_graph_state = {"bypass": True}
+            raise RuntimeError("E_SFI_WRITER_GRAPH_UNBOUNDED_KEY_CHURN")
 
     def _run_pending_refresh_rebuild_compact_writer(
         self,
@@ -4295,11 +4258,12 @@ class RefreshRebuildMixin:
             isinstance(ledger, list)
             and ledger_size == ring_size
             and len(ledger) == ring_size
+            and all(isinstance(entry, list) and len(entry) == 9 for entry in ledger)
         ):
             return
         self._step_refresh_handle_ledger_size = ring_size
         self._step_refresh_handle_ledger = [
-            [-1, -1, 0, 0, 0, 0, 0] for _ in range(ring_size)
+            [-1, -1, 0, 0, 0, 0, 0, 0, 0] for _ in range(ring_size)
         ]
 
     def _step_refresh_handle_ledger_clear_slot(self, *, slot: int) -> None:
@@ -4314,6 +4278,8 @@ class RefreshRebuildMixin:
         entry[4] = 0
         entry[5] = 0
         entry[6] = 0
+        entry[7] = 0
+        entry[8] = 0
 
     def _step_refresh_handle_ledger_get(
         self,
@@ -4355,10 +4321,24 @@ class RefreshRebuildMixin:
             planned = entry[2]
             planned_rows = entry[3]
             num_actual_tokens = entry[4]
-            post_kernel_calls = entry[5]
+            replay_payload_claims = entry[5]
             enqueued = entry[6]
+            expected_replay_payloads = entry[7]
+            step_identity_token = entry[8]
             # 单真源：仅以同 handle 的实证执行统计判定，不混入 profile 派生字段。
-            has_confirmed_refresh_path = post_kernel_calls > 0
+            has_confirmed_refresh_path = replay_payload_claims > 0
+            if expected_replay_payloads > 0 and (
+                replay_payload_claims != 1
+                or enqueued != expected_replay_payloads
+            ):
+                raise RuntimeError(
+                    "refresh commit invariant violated: replay payload generation "
+                    "must be claimed once and enqueue every expected layer "
+                    f"(handle_id={handle_id}, generation={handle_generation}, "
+                    f"claims={replay_payload_claims}, enqueued={enqueued}, "
+                    f"expected={expected_replay_payloads}, "
+                    f"step_identity_token={step_identity_token}, stage={stage})"
+                )
             if (
                 planned > 0
                 and num_actual_tokens > 0
@@ -4369,7 +4349,8 @@ class RefreshRebuildMixin:
                     "refresh commit invariant violated: planned refresh reqs but zero payload enqueues "
                     f"(handle_id={handle_id}, generation={handle_generation}, "
                     f"planned={planned}, planned_rows={planned_rows}, "
-                    f"num_actual_tokens={num_actual_tokens}, post_kernel_calls={post_kernel_calls}, "
+                    f"num_actual_tokens={num_actual_tokens}, "
+                    f"replay_payload_claims={replay_payload_claims}, "
                     f"stage={stage}, noop_empty={noop_empty}, payload_none={payload_none}, "
                     f"slot_empty={slot_empty})"
                 )
@@ -4380,16 +4361,23 @@ class RefreshRebuildMixin:
         *,
         handle_id: int,
         handle_generation: int,
+        step_identity_token: int,
         planned_reqs: int,
         planned_rows: int,
         num_actual_tokens: int,
     ) -> int:
         commit_handle_id = handle_id
         commit_handle_generation = handle_generation
-        if commit_handle_id <= 0 or commit_handle_generation <= 0:
+        commit_identity_token = int(step_identity_token)
+        if (
+            commit_handle_id <= 0
+            or commit_handle_generation <= 0
+            or commit_identity_token <= 0
+        ):
             raise RuntimeError(
                 "refresh commit begin missing handle identity: "
-                f"handle_id={commit_handle_id} generation={commit_handle_generation}"
+                f"handle_id={commit_handle_id} generation={commit_handle_generation} "
+                f"step_identity_token={commit_identity_token}"
             )
         self._step_refresh_commit_assert_prev_enqueued(
             next_handle_hint=commit_handle_id,
@@ -4402,7 +4390,7 @@ class RefreshRebuildMixin:
         self._step_refresh_commit_planned_rows = max(0, planned_rows)
         self._step_refresh_commit_num_actual_tokens = max(0, num_actual_tokens)
         self._step_refresh_commit_payload_enqueues = 0
-        self._step_refresh_commit_post_kernel_calls = 0
+        self._step_refresh_commit_replay_payload_claims = 0
         self._step_refresh_commit_written_handle_id = commit_handle_id
         self._step_refresh_commit_written_handle_generation = commit_handle_generation
         self._step_refresh_commit_written_req_ids.clear()
@@ -4417,6 +4405,8 @@ class RefreshRebuildMixin:
         entry[4] = self._step_refresh_commit_num_actual_tokens
         entry[5] = 0
         entry[6] = 0
+        entry[7] = 0
+        entry[8] = commit_identity_token
         return self._step_refresh_commit_id
 
     def _step_refresh_commit_note_enqueue(
@@ -4452,36 +4442,96 @@ class RefreshRebuildMixin:
                 "refresh commit enqueue missing handle-ledger entry: "
                 f"handle_id={commit_handle_id} generation={commit_handle_generation}"
             )
-        entry[6] = entry[6] + count_i
+        next_count = entry[6] + count_i
+        expected_replay_payloads = entry[7]
+        if expected_replay_payloads > 0 and next_count > expected_replay_payloads:
+            raise RuntimeError(
+                "refresh commit enqueue exceeded claimed replay payload count: "
+                f"handle_id={commit_handle_id} "
+                f"generation={commit_handle_generation} "
+                f"next_count={next_count} expected={expected_replay_payloads}"
+            )
+        entry[6] = next_count
         if (
             self._step_refresh_commit_handle_id == commit_handle_id
             and self._step_refresh_commit_handle_generation == commit_handle_generation
         ):
             self._step_refresh_commit_payload_enqueues += count_i
 
-    def _step_refresh_commit_note_post_kernel(
+    def _step_refresh_commit_claim_replay_payload_generation(
         self,
         *,
         handle_id: int,
         handle_generation: int,
-    ) -> None:
+        step_identity_token: int,
+        expected_payloads: int,
+    ) -> bool:
+        """Claim the single replay-payload materialization for one step handle.
+
+        The complete model-forward boundary owns payload materialization.  The
+        claim remains a fail-closed idempotence barrier against accidental
+        owner re-entry for the same generation.
+        """
         commit_handle_id = handle_id
         commit_handle_generation = handle_generation
+        commit_identity_token = int(step_identity_token)
+        expected_payload_count = int(expected_payloads)
+        if expected_payload_count <= 0:
+            raise RuntimeError(
+                "refresh commit replay payload claim requires a positive expected count"
+            )
         entry = self._step_refresh_handle_ledger_get(
             handle_id=commit_handle_id,
             handle_generation=commit_handle_generation,
         )
         if entry is None:
             raise RuntimeError(
-                "refresh commit post-kernel missing handle-ledger entry: "
+                "refresh commit replay payload claim missing handle-ledger entry: "
                 f"handle_id={commit_handle_id} generation={commit_handle_generation}"
             )
-        entry[5] = entry[5] + 1
-        if (
-            self._step_refresh_commit_handle_id == commit_handle_id
-            and self._step_refresh_commit_handle_generation == commit_handle_generation
-        ):
-            self._step_refresh_commit_post_kernel_calls += 1
+        claims = entry[5]
+        enqueued = entry[6]
+        recorded_expected = entry[7]
+        recorded_identity_token = entry[8]
+        if recorded_identity_token != commit_identity_token:
+            raise RuntimeError(
+                "refresh commit replay payload claim identity token mismatch: "
+                f"handle_id={commit_handle_id} "
+                f"generation={commit_handle_generation} "
+                f"recorded={recorded_identity_token} actual={commit_identity_token}"
+            )
+        if claims == 0:
+            if enqueued != 0 or recorded_expected != 0:
+                raise RuntimeError(
+                    "refresh commit replay payload ledger is dirty before first claim: "
+                    f"handle_id={commit_handle_id} "
+                    f"generation={commit_handle_generation} enqueued={enqueued} "
+                    f"recorded_expected={recorded_expected}"
+                )
+            entry[5] = 1
+            entry[7] = expected_payload_count
+            if (
+                self._step_refresh_commit_handle_id == commit_handle_id
+                and self._step_refresh_commit_handle_generation
+                == commit_handle_generation
+            ):
+                self._step_refresh_commit_replay_payload_claims = 1
+            return True
+        if claims != 1 or recorded_expected != expected_payload_count:
+            raise RuntimeError(
+                "refresh commit replay payload duplicate claim identity mismatch: "
+                f"handle_id={commit_handle_id} "
+                f"generation={commit_handle_generation} claims={claims} "
+                f"recorded_expected={recorded_expected} "
+                f"expected={expected_payload_count}"
+            )
+        if enqueued == expected_payload_count:
+            return False
+        raise RuntimeError(
+            "refresh commit replay payload duplicate arrived before exact completion: "
+            f"handle_id={commit_handle_id} generation={commit_handle_generation} "
+            f"enqueued={enqueued} expected={expected_payload_count}"
+        )
 
     def _step_refresh_commit_note_inflight_from_payload(self, payload: "SelectorBatchPayload") -> None:
         """Commit-phase single writer for scheduled refresh markers.

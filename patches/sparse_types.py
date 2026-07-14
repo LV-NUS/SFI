@@ -681,7 +681,7 @@ class StepTicket:
     scheduled_signature: int
     finished_signature: int
     source_signature: int
-    scheduler_token: int = field(compare=False)
+    dispatch_token: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -1600,6 +1600,20 @@ class SelectorBatchPayload:
     q_is_sub: bool = False
     fast_signature: Optional[Tuple[object, ...]] = None
     capture_postprocess_job: Optional[CapturePostprocessJob] = None
+    # Explicit chunk-cohort tape provenance. Empty fields mean the legacy arena
+    # payload; a stamped chunk_cohort requires every payload in the layer group
+    # to carry one contiguous same-lane binding.
+    cohort_tape_plan_signature: str = ""
+    cohort_tape_bank: int = -1
+    cohort_tape_slot: int = -1
+    cohort_tape_lane: int = -1
+    cohort_tape_cohort_size: int = 0
+    cohort_tape_expected_group_size: int = 0
+    cohort_tape_row_start: int = -1
+    cohort_tape_owner_key: object | None = None
+    cohort_tape_scores_base: Optional[torch.Tensor] = None
+    cohort_tape_denoms_base: Optional[torch.Tensor] = None
+    cohort_tape_consumer_tokens: Tuple[object, ...] = tuple()
 
 
 @dataclass(slots=True)

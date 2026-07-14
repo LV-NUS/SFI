@@ -74,6 +74,7 @@ _DESCRIPTOR_FIELD_NAMES = (
     "producer_stream_key",
     "resolver_subkind",
     "max_seqlen_q_bucket",
+    "max_seqlen_k_bucket",
 )
 
 _CARRIER_FIELD_NAMES = (

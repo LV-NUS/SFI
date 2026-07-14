@@ -43,6 +43,7 @@ _ROW_SOURCE_KEYS = (
     "compact_full_native_fallback_rows",
 )
 SOURCE_COUNTER_SCHEMA_VERSION = 1
+LIVE_PAGES_PUBLISH_METRICS_SCHEMA_VERSION = 1
 _AFFINE_ROW_PTR_FALLBACK_SEGMENT_PAGES = -1
 # [ARENA-AFFINE-DEVICE-RETIRED 2026-07-03] The zero-consumer device tensors
 # affine_i32 / affine_row_consume_mode_i32 and everything that ONLY served
@@ -95,6 +96,267 @@ class ResolvedRowPtrDescriptorPayload:
     affine_descriptor_by_row: tuple[object, ...]
     row_table_pages_by_row: tuple[tuple[int, ...], ...]
     segment_pages_by_row: tuple[int, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class LivePageRowsTensorSource:
+    """Canonical CPU tensor slices for one live-page publication.
+
+    The legacy page-boundary path flattened every canonical block-table scalar
+    through ``int(tensor[row, col])`` and then rebuilt a tensor from the Python
+    tuple in ``publish_live_rows``.  This descriptor keeps both compact and
+    recent page sources tensor-native until they are copied into the existing
+    pinned carrier.  Only O(batch) slice metadata is materialized in Python.
+
+    ``try_create`` deliberately returns ``None`` for unsupported source
+    layouts, allowing the caller to use the byte-identical tuple fallback
+    *before* device publication.  Once a descriptor is admitted, malformed
+    slice bounds raise and must not be converted into a post-publication
+    fallback.
+    """
+
+    block_table_i32: torch.Tensor
+    compact_reserved_i32: torch.Tensor
+    compact_offset_by_row: tuple[int, ...]
+    compact_count_by_row: tuple[int, ...]
+    recent_first_page_by_row: tuple[int, ...]
+    recent_count_by_row: tuple[int, ...]
+
+    @classmethod
+    def try_create(
+        cls,
+        *,
+        block_table_cpu: object,
+        compact_reserved_cpu: object,
+        compact_offset_by_row: Sequence[int],
+        compact_count_by_row: Sequence[int],
+        recent_first_page_by_row: Sequence[int],
+        recent_count_by_row: Sequence[int],
+    ) -> "LivePageRowsTensorSource | None":
+        block_table = block_table_cpu
+        compact_reserved = compact_reserved_cpu
+        if (
+            not isinstance(block_table, torch.Tensor)
+            or block_table.device.type != "cpu"
+            or block_table.dtype != torch.int32
+            or block_table.dim() != 2
+            or int(block_table.stride(1)) != 1
+            or not isinstance(compact_reserved, torch.Tensor)
+            or compact_reserved.device.type != "cpu"
+            or compact_reserved.dtype != torch.int32
+            or compact_reserved.dim() != 1
+            or not compact_reserved.is_contiguous()
+        ):
+            return None
+        try:
+            compact_offsets = tuple(int(v) for v in compact_offset_by_row)
+            compact_counts = tuple(int(v) for v in compact_count_by_row)
+            recent_first = tuple(int(v) for v in recent_first_page_by_row)
+            recent_counts = tuple(int(v) for v in recent_count_by_row)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("live-page tensor slice metadata must be integers") from exc
+        batch_size = len(compact_counts)
+        if (
+            len(compact_offsets) != batch_size
+            or len(recent_first) != batch_size
+            or len(recent_counts) != batch_size
+        ):
+            raise ValueError("live-page tensor slice metadata lengths must match")
+        return cls(
+            block_table_i32=block_table,
+            compact_reserved_i32=compact_reserved,
+            compact_offset_by_row=compact_offsets,
+            compact_count_by_row=compact_counts,
+            recent_first_page_by_row=recent_first,
+            recent_count_by_row=recent_counts,
+        )
+
+    @property
+    def batch_size(self) -> int:
+        return len(self.compact_count_by_row)
+
+    def validate_rows(
+        self,
+        *,
+        dirty_rows: Sequence[int],
+        expected_batch_size: int,
+        max_pages_per_row: int,
+    ) -> tuple[int, ...]:
+        if self.batch_size != int(expected_batch_size):
+            raise ValueError(
+                "live-page tensor source batch size does not match arena: "
+                f"source={self.batch_size} arena={int(expected_batch_size)}"
+            )
+        if int(self.block_table_i32.shape[0]) < self.batch_size:
+            raise ValueError("canonical block table must cover live-page batch rows")
+        compact_len = int(self.compact_reserved_i32.numel())
+        recent_width = int(self.block_table_i32.shape[1])
+        max_pages = int(max_pages_per_row)
+        counts: list[int] = []
+        for batch_row in dirty_rows:
+            row = int(batch_row)
+            compact_offset = self.compact_offset_by_row[row]
+            compact_count = self.compact_count_by_row[row]
+            recent_first = self.recent_first_page_by_row[row]
+            recent_count = self.recent_count_by_row[row]
+            if (
+                compact_offset < 0
+                or compact_count < 0
+                or compact_offset + compact_count > compact_len
+            ):
+                raise ValueError(
+                    "compact live-page slice is out of range for batch row "
+                    f"{row}: [{compact_offset}:{compact_offset + compact_count}] "
+                    f"capacity={compact_len}"
+                )
+            if (
+                recent_first < 0
+                or recent_count < 0
+                or recent_first + recent_count > recent_width
+            ):
+                raise ValueError(
+                    "recent live-page slice is out of range for batch row "
+                    f"{row}: [{recent_first}:{recent_first + recent_count}] "
+                    f"width={recent_width}"
+                )
+            page_count = compact_count + recent_count
+            if page_count > max_pages:
+                raise ValueError(
+                    f"live-page tensor source length {page_count} exceeds "
+                    f"max_pages_per_row {max_pages} for batch_row {row}"
+                )
+            counts.append(page_count)
+        return tuple(counts)
+
+    @staticmethod
+    def _affine_nonnegative_step(values: Sequence[int]) -> int | None:
+        if len(values) <= 1:
+            return 0
+        step = int(values[1]) - int(values[0])
+        if step < 0:
+            return None
+        base = int(values[0])
+        if any(int(value) != base + step * idx for idx, value in enumerate(values)):
+            return None
+        return step
+
+    def copy_rows_into_(
+        self,
+        *,
+        destination_i32: torch.Tensor,
+        dirty_rows: Sequence[int],
+        page_counts: Sequence[int],
+        previous_page_counts: Sequence[int],
+    ) -> None:
+        """Pack validated rows into the already-owned CPU carrier in place."""
+
+        if (
+            destination_i32.device.type != "cpu"
+            or destination_i32.dtype != torch.int32
+            or destination_i32.dim() != 2
+        ):
+            raise TypeError("live-page tensor destination must be a rank-2 CPU int32 tensor")
+        dirty = tuple(int(row) for row in dirty_rows)
+        counts = tuple(int(count) for count in page_counts)
+        previous = tuple(int(count) for count in previous_page_counts)
+        if len(dirty) != len(counts) or len(previous) < len(dirty):
+            raise ValueError("live-page tensor pack metadata lengths must match")
+
+        # Common TP-sharded GQA face: all batch rows are published in order,
+        # selected/compact lengths are uniform, and lease offsets are affine.
+        # Compact pages use one rectangular copy. Recent pages use a second
+        # rectangular copy when every row shares recent_first; otherwise one
+        # gather handles heterogeneous starts without Python scalar extraction.
+        # Heterogeneous lengths/partial rows use the exact focused slice loop
+        # below rather than growing a second arena or ring.
+        full_ordered = dirty == tuple(range(self.batch_size))
+        compact_counts = tuple(self.compact_count_by_row[row] for row in dirty)
+        recent_counts = tuple(self.recent_count_by_row[row] for row in dirty)
+        compact_offsets = tuple(self.compact_offset_by_row[row] for row in dirty)
+        recent_first = tuple(self.recent_first_page_by_row[row] for row in dirty)
+        uniform_compact = len(set(compact_counts)) <= 1
+        uniform_recent = len(set(recent_counts)) <= 1
+        uniform_recent_first = len(set(recent_first)) <= 1
+        compact_step = (
+            self._affine_nonnegative_step(compact_offsets)
+            if uniform_compact
+            else None
+        )
+        if full_ordered and uniform_compact and uniform_recent and compact_step is not None:
+            compact_count = compact_counts[0] if compact_counts else 0
+            recent_count = recent_counts[0] if recent_counts else 0
+            total_count = compact_count + recent_count
+            rows = len(dirty)
+            if compact_count:
+                compact_view = self.compact_reserved_i32.as_strided(
+                    (rows, compact_count),
+                    (compact_step, 1),
+                    storage_offset=compact_offsets[0],
+                )
+                destination_i32[:rows, :compact_count].copy_(compact_view)
+            if recent_count:
+                recent_destination = destination_i32[
+                    :rows,
+                    compact_count : compact_count + recent_count,
+                ]
+                if uniform_recent_first:
+                    first = recent_first[0]
+                    recent_destination.copy_(
+                        self.block_table_i32[
+                            :rows,
+                            first : first + recent_count,
+                        ]
+                    )
+                else:
+                    recent_starts = torch.as_tensor(
+                        recent_first,
+                        dtype=torch.int64,
+                        device="cpu",
+                    )
+                    recent_columns = torch.arange(
+                        recent_count,
+                        dtype=torch.int64,
+                        device="cpu",
+                    )
+                    recent_indices = (
+                        recent_starts[:, None] + recent_columns[None, :]
+                    )
+                    torch.gather(
+                        self.block_table_i32,
+                        1,
+                        recent_indices,
+                        out=recent_destination,
+                    )
+            stale_stop = max(previous[:rows], default=total_count)
+            if stale_stop > total_count:
+                destination_i32[:rows, total_count:stale_stop].fill_(-1)
+            return
+
+        for packed_row, batch_row in enumerate(dirty):
+            compact_offset = self.compact_offset_by_row[batch_row]
+            compact_count = self.compact_count_by_row[batch_row]
+            recent_first = self.recent_first_page_by_row[batch_row]
+            recent_count = self.recent_count_by_row[batch_row]
+            total_count = counts[packed_row]
+            destination_row = destination_i32[packed_row]
+            if compact_count:
+                destination_row[:compact_count].copy_(
+                    self.compact_reserved_i32[
+                        compact_offset : compact_offset + compact_count
+                    ]
+                )
+            if recent_count:
+                destination_row[
+                    compact_count : compact_count + recent_count
+                ].copy_(
+                    self.block_table_i32[
+                        batch_row,
+                        recent_first : recent_first + recent_count,
+                    ]
+                )
+            stale_stop = previous[packed_row]
+            if stale_stop > total_count:
+                destination_row[total_count:stale_stop].fill_(-1)
 
 
 def _reject_tensor_metadata(value: object, *, label: str) -> None:
@@ -946,8 +1208,8 @@ class ResolvedRowPtrArena:
     generation: int = 0
     mixed_page_resolver_replay_ready_event: object | None = None
     mixed_page_resolver_replay_ready_event_generation: int = -1
-    mixed_page_resolver_replay_ready_event_waited_generation: int = -1
     mixed_page_resolver_replay_ready_event_stream: int = -1
+    mixed_page_resolver_replay_same_stream_ordered: bool = False
     _carriers: MixedPageResolverCarrierSet = field(init=False, repr=False)
     _row_batch_index_i64: torch.Tensor = field(init=False, repr=False)
     _row_head_index_i64: torch.Tensor = field(init=False, repr=False)
@@ -972,8 +1234,36 @@ class ResolvedRowPtrArena:
     # ring + persistent GPU staging (slots-declared for the same reason).
     _live_pages_pinned_ring: object = field(default=None, init=False, repr=False)
     _live_pages_pinned_ring_events: object = field(default=None, init=False, repr=False)
+    _live_pages_pinned_ring_page_counts: object = field(
+        default=None, init=False, repr=False
+    )
     _live_pages_pinned_ring_idx: int = field(default=0, init=False, repr=False)
     _live_pages_staging_gpu: object = field(default=None, init=False, repr=False)
+    # The page-boundary publisher owns one GPU staging tensor. Reusing it is
+    # ordered only when every publish is submitted by the same writer stream;
+    # a stream change is therefore a contract violation, not a fallback case.
+    _live_pages_writer_stream_id: int = field(default=-1, init=False, repr=False)
+    # Always-on integer evidence is intentionally allocation-free on the hot
+    # path. Wall time is sampled only when a query proves that the host will
+    # block; it is a backpressure ceiling, never claimed as recoverable E2E.
+    _live_pages_publish_call_count: int = field(default=0, init=False, repr=False)
+    _live_pages_publish_complete_count: int = field(default=0, init=False, repr=False)
+    _live_pages_dirty_rows_total: int = field(default=0, init=False, repr=False)
+    _live_pages_h2d_bytes_total: int = field(default=0, init=False, repr=False)
+    _live_pages_direct_full_hkv1_count: int = field(default=0, init=False, repr=False)
+    _live_pages_slot_query_count: int = field(default=0, init=False, repr=False)
+    _live_pages_slot_wait_count: int = field(default=0, init=False, repr=False)
+    _live_pages_slot_wait_ns_total: int = field(default=0, init=False, repr=False)
+    _live_pages_cold_sync_count: int = field(default=0, init=False, repr=False)
+    _live_pages_cold_sync_ns_total: int = field(default=0, init=False, repr=False)
+    _live_pages_writer_stream_change_count: int = field(default=0, init=False, repr=False)
+    _live_pages_last_publish_epoch: int = field(default=-1, init=False, repr=False)
+    _live_pages_last_dirty_rows_count: int = field(default=0, init=False, repr=False)
+    _live_pages_last_dirty_rows_mask: int = field(default=0, init=False, repr=False)
+    _live_pages_last_page_count_signature: int = field(default=0, init=False, repr=False)
+    _live_pages_last_h2d_bytes: int = field(default=0, init=False, repr=False)
+    _live_pages_last_slot_wait_ns: int = field(default=0, init=False, repr=False)
+    _live_pages_last_direct_full_hkv1: bool = field(default=False, init=False, repr=False)
     # [ARENA-AFFINE-DEVICE-RETIRED 2026-07-03] The #12 v6 affine-clean
     # write-skip cache slot ``_affine_clean_last_key_by_row`` was removed with
     # the affine device tensors it gated (it only ever skipped those two
@@ -1462,12 +1752,78 @@ class ResolvedRowPtrArena:
         self.generation += 1
         return True
 
+    def _claim_live_pages_writer_stream(self, stream_id: int) -> None:
+        """Bind the single-staging publisher to exactly one CUDA stream."""
+
+        stream_id_i = int(stream_id)
+        owner = int(self._live_pages_writer_stream_id)
+        if owner < 0:
+            self._live_pages_writer_stream_id = stream_id_i
+            return
+        if owner != stream_id_i:
+            self._live_pages_writer_stream_change_count += 1
+            raise RuntimeError(
+                "publish_live_rows writer stream changed while reusing a single "
+                f"GPU staging tensor: owner={owner} current={stream_id_i}"
+            )
+
+    def live_pages_publish_metrics_fields(self) -> dict[str, int | bool]:
+        """Return a debug-only snapshot; callers decide when to allocate it."""
+
+        return {
+            "rrp_live_pages_metrics_schema_version": (
+                LIVE_PAGES_PUBLISH_METRICS_SCHEMA_VERSION
+            ),
+            "rrp_live_pages_publish_call_count": self._live_pages_publish_call_count,
+            "rrp_live_pages_publish_complete_count": (
+                self._live_pages_publish_complete_count
+            ),
+            "rrp_live_pages_dirty_rows_total": self._live_pages_dirty_rows_total,
+            "rrp_live_pages_h2d_bytes_total": self._live_pages_h2d_bytes_total,
+            "rrp_live_pages_direct_full_hkv1_count": (
+                self._live_pages_direct_full_hkv1_count
+            ),
+            "rrp_live_pages_slot_query_count": self._live_pages_slot_query_count,
+            "rrp_live_pages_slot_wait_count": self._live_pages_slot_wait_count,
+            "rrp_live_pages_slot_wait_observed_ns_total": (
+                self._live_pages_slot_wait_ns_total
+            ),
+            "rrp_live_pages_cold_sync_count": self._live_pages_cold_sync_count,
+            "rrp_live_pages_cold_sync_observed_ns_total": (
+                self._live_pages_cold_sync_ns_total
+            ),
+            "rrp_live_pages_writer_stream_id": self._live_pages_writer_stream_id,
+            "rrp_live_pages_writer_stream_change_count": (
+                self._live_pages_writer_stream_change_count
+            ),
+            "rrp_live_pages_last_publish_epoch": self._live_pages_last_publish_epoch,
+            "rrp_live_pages_last_dirty_rows_count": (
+                self._live_pages_last_dirty_rows_count
+            ),
+            "rrp_live_pages_last_dirty_rows_mask": (
+                self._live_pages_last_dirty_rows_mask
+            ),
+            "rrp_live_pages_last_page_count_signature": (
+                self._live_pages_last_page_count_signature
+            ),
+            "rrp_live_pages_last_h2d_bytes": self._live_pages_last_h2d_bytes,
+            "rrp_live_pages_last_slot_wait_observed_ns": (
+                self._live_pages_last_slot_wait_ns
+            ),
+            "rrp_live_pages_last_direct_full_hkv1": (
+                self._live_pages_last_direct_full_hkv1
+            ),
+            "rrp_live_pages_slot_wait_is_backpressure_ceiling": True,
+        }
+
     def publish_live_rows(
         self,
         *,
-        pages_by_row: dict[int, tuple[int, ...]],
+        pages_by_row: dict[int, tuple[int, ...]] | None = None,
+        tensor_source: LivePageRowsTensorSource | None = None,
         dirty_rows: Iterable[int],
         compact_pages_by_row: dict[int, tuple[int, ...]] | None = None,
+        publish_epoch: int = -1,
     ) -> None:
         """Cheap in-place live-table page writer for recent-window boundary rows.
 
@@ -1476,13 +1832,25 @@ class ResolvedRowPtrArena:
         ``row_table_i32`` is never reassigned.
 
         ``dirty_rows`` are BATCH row indices (0..batch_size-1), not flat rows.
+        CUDA publication is single-writer-stream: changing streams while this
+        arena owns one staging tensor raises instead of relying on accidental
+        cross-stream ordering.
 
         [ARENA-AFFINE-DEVICE-RETIRED 2026-07-03] ``compact_pages_by_row`` only
         fed the removed B2 affine-publish device writes into affine_i32 /
         affine_row_consume_mode_i32; it is accepted-and-ignored so existing
         callers keep working.
+
+        Exactly one page source is required. ``pages_by_row`` preserves the
+        generic tuple contract; ``tensor_source`` is the production canonical
+        CPU block-table/lease path and avoids O(B*K) Python scalar round trips.
         """
         del compact_pages_by_row  # [ARENA-AFFINE-DEVICE-RETIRED 2026-07-03]
+        if (pages_by_row is None) == (tensor_source is None):
+            raise ValueError(
+                "publish_live_rows requires exactly one of pages_by_row or "
+                "tensor_source"
+            )
         # [LIVE-PAGES-PINNED-ASYNC 2026-07-08] the old per-row
         # ``new_tensor(list(pages))`` built a CUDA tensor from a Python list =
         # a SYNCHRONOUS pageable H2D that stalls the host until the main
@@ -1498,7 +1866,75 @@ class ResolvedRowPtrArena:
         dirty = [int(r) for r in dirty_rows]
         if not dirty:
             return
+        dirty_rows_mask = 0
+        full_ordered_dirty = len(dirty) == int(self.batch_size)
+        for expected_row, row in enumerate(dirty):
+            if row < 0 or row >= int(self.batch_size):
+                raise ValueError(
+                    "dirty_rows must contain batch rows in "
+                    f"[0, {int(self.batch_size)}): {dirty}"
+                )
+            row_bit = 1 << row
+            if dirty_rows_mask & row_bit:
+                raise ValueError("dirty_rows must not contain duplicate batch rows")
+            dirty_rows_mask |= row_bit
+            if row != expected_row:
+                full_ordered_dirty = False
+        self._live_pages_publish_call_count += 1
+        self._live_pages_last_publish_epoch = int(publish_epoch)
+        self._live_pages_last_dirty_rows_count = len(dirty)
+        self._live_pages_last_dirty_rows_mask = dirty_rows_mask
+        self._live_pages_last_slot_wait_ns = 0
+        self._live_pages_last_direct_full_hkv1 = False
         max_pages = int(self.max_pages_per_row)
+        validated_pages: list[tuple[int, ...]] = []
+        counts: list[int]
+        # Keep the rank/epoch signature O(dirty_rows): page ids are excluded.
+        page_count_signature = 1469598103934665603
+        if tensor_source is not None:
+            counts = list(
+                tensor_source.validate_rows(
+                    dirty_rows=dirty,
+                    expected_batch_size=int(self.batch_size),
+                    max_pages_per_row=max_pages,
+                )
+            )
+        else:
+            assert pages_by_row is not None
+            counts = []
+            for batch_row in dirty:
+                if batch_row not in pages_by_row:
+                    raise KeyError(
+                        f"pages_by_row is missing dirty batch row {batch_row}"
+                    )
+                pages = pages_by_row[batch_row]
+                if not isinstance(pages, tuple):
+                    raise TypeError(
+                        "pages_by_row values must be tuples of page ids: "
+                        f"batch_row={batch_row} type={type(pages).__name__}"
+                    )
+                page_count = len(pages)
+                if page_count > max_pages:
+                    raise ValueError(
+                        f"pages length {page_count} exceeds max_pages_per_row "
+                        f"{max_pages} for batch_row {batch_row}"
+                    )
+                validated_pages.append(pages)
+                counts.append(page_count)
+        for batch_row, page_count in zip(dirty, counts):
+            page_count_signature ^= (
+                ((batch_row & 0xFFFFFFFF) << 32) | (page_count & 0xFFFFFFFF)
+            )
+            page_count_signature = (
+                page_count_signature * 1099511628211
+            ) & 0xFFFFFFFFFFFFFFFF
+        current_stream = None
+        if self.row_table_i32.device.type == "cuda":
+            current_stream = torch.cuda.current_stream(
+                device=self.row_table_i32.device
+            )
+            self._claim_live_pages_writer_stream(int(current_stream.cuda_stream))
+
         ring = getattr(self, "_live_pages_pinned_ring", None)
         if (
             ring is None
@@ -1509,17 +1945,30 @@ class ResolvedRowPtrArena:
                 # Cold-path regeneration guard (batch growth only): the old
                 # pinned buffers may still feed an in-flight H2D; dropping the
                 # refs hands them to GC mid-copy (SLOT-STAGING-UAF family).
-                torch.cuda.current_stream(self.row_table_i32.device).synchronize()
+                if current_stream is not None:
+                    cold_sync_start_ns = time.perf_counter_ns()
+                    current_stream.synchronize()
+                    self._live_pages_cold_sync_count += 1
+                    self._live_pages_cold_sync_ns_total += (
+                        time.perf_counter_ns() - cold_sync_start_ns
+                    )
             depth = 4
             rows_cap = max(len(dirty), int(self.batch_size))
+            pin_memory = self.row_table_i32.device.type == "cuda"
             ring = [
                 torch.full(
-                    (rows_cap, max_pages), -1, dtype=torch.int32, pin_memory=True
+                    (rows_cap, max_pages),
+                    -1,
+                    dtype=torch.int32,
+                    pin_memory=pin_memory,
                 )
                 for _ in range(depth)
             ]
             self._live_pages_pinned_ring = ring
             self._live_pages_pinned_ring_events = [None] * depth
+            self._live_pages_pinned_ring_page_counts = [
+                [0] * rows_cap for _ in range(depth)
+            ]
             self._live_pages_pinned_ring_idx = 0
             self._live_pages_staging_gpu = torch.full(
                 (rows_cap, max_pages),
@@ -1532,64 +1981,127 @@ class ResolvedRowPtrArena:
             # A live ring without completion events can only come from an
             # in-process code reload. Drain once before adopting the guarded
             # representation; otherwise an old slot may still feed an H2D.
-            torch.cuda.current_stream(self.row_table_i32.device).synchronize()
+            if current_stream is not None:
+                cold_sync_start_ns = time.perf_counter_ns()
+                current_stream.synchronize()
+                self._live_pages_cold_sync_count += 1
+                self._live_pages_cold_sync_ns_total += (
+                    time.perf_counter_ns() - cold_sync_start_ns
+                )
             events = [None] * len(ring)
             self._live_pages_pinned_ring_events = events
+        ring_page_counts = getattr(
+            self, "_live_pages_pinned_ring_page_counts", None
+        )
+        if (
+            not isinstance(ring_page_counts, list)
+            or len(ring_page_counts) != len(ring)
+            or any(
+                not isinstance(slot_counts, list)
+                or len(slot_counts) < int(ring[0].shape[0])
+                for slot_counts in ring_page_counts
+            )
+        ):
+            # In-process code reload compatibility: each old carrier row may
+            # contain a full-width prefix. Mark it as such so first reuse
+            # clears every byte not overwritten by the new source.
+            ring_page_counts = [
+                [max_pages] * int(ring[0].shape[0]) for _ in range(len(ring))
+            ]
+            self._live_pages_pinned_ring_page_counts = ring_page_counts
         idx = int(getattr(self, "_live_pages_pinned_ring_idx", 0))
         evt = events[idx]
-        if evt is not None and not evt.query():
-            evt.synchronize()
+        if evt is not None:
+            self._live_pages_slot_query_count += 1
+            if not evt.query():
+                wait_start_ns = time.perf_counter_ns()
+                evt.synchronize()
+                wait_ns = time.perf_counter_ns() - wait_start_ns
+                self._live_pages_slot_wait_count += 1
+                self._live_pages_slot_wait_ns_total += wait_ns
+                self._live_pages_last_slot_wait_ns = wait_ns
         pinned = ring[idx]
+        pinned_page_counts = ring_page_counts[idx]
         self._live_pages_pinned_ring_idx = (idx + 1) % len(ring)
         staging = self._live_pages_staging_gpu
-        counts: list[int] = []
-        for i, batch_row in enumerate(dirty):
-            pages = pages_by_row.get(batch_row, ())
-            page_count = len(pages)
-            if page_count > max_pages:
-                raise ValueError(
-                    f"pages length {page_count} exceeds max_pages_per_row "
-                    f"{max_pages} for batch_row {batch_row}"
-                )
-            row = pinned[i]
-            row[:page_count] = torch.as_tensor(
-                pages, dtype=torch.int32
-            )  # host->pinned memcpy (no device traffic)
-            if page_count < max_pages:
-                row[page_count:] = -1
-            counts.append(page_count)
+        previous_page_counts = tuple(
+            int(pinned_page_counts[i]) for i in range(len(dirty))
+        )
+        if tensor_source is not None:
+            tensor_source.copy_rows_into_(
+                destination_i32=pinned,
+                dirty_rows=dirty,
+                page_counts=counts,
+                previous_page_counts=previous_page_counts,
+            )
+        else:
+            for i, pages in enumerate(validated_pages):
+                page_count = counts[i]
+                row = pinned[i]
+                row[:page_count] = torch.as_tensor(
+                    pages, dtype=torch.int32
+                )  # host->pinned memcpy (no device traffic)
+                stale_stop = previous_page_counts[i]
+                if stale_stop > page_count:
+                    row[page_count:stale_stop] = -1
+        for i, page_count in enumerate(counts):
+            pinned_page_counts[i] = int(page_count)
         n = len(dirty)
-        staging[:n].copy_(pinned[:n], non_blocking=True)
+        self._live_pages_last_page_count_signature = page_count_signature
+        h2d_bytes = n * max_pages * self.row_table_i32.element_size()
+        if self.row_table_i32.device.type != "cuda":
+            h2d_bytes = 0
+        self._live_pages_last_h2d_bytes = h2d_bytes
+        # TP shards Qwen3 GQA down to Hkv-per-rank=1.  On the common
+        # page-boundary face every batch row is dirty in row order, so the
+        # pinned carrier already has the exact final row-table image.  Publish
+        # it directly in one H2D instead of staging once and then launching a
+        # fill+copy pair for every row.  Partial/non-ordered/Hkv>1 shapes keep
+        # the existing fan-out path unchanged.
+        direct_full_hkv1 = (
+            full_ordered_dirty
+            and int(self.num_kv_heads) == 1
+            and n == int(self.batch_size)
+        )
+        if direct_full_hkv1:
+            self.row_table_i32.copy_(pinned[:n], non_blocking=True)
+            self._live_pages_direct_full_hkv1_count += 1
+            self._live_pages_last_direct_full_hkv1 = True
+        else:
+            staging[:n].copy_(pinned[:n], non_blocking=True)
         if self.row_table_i32.device.type == "cuda":
             if evt is None:
                 evt = torch.cuda.Event(enable_timing=False)
-            evt.record(torch.cuda.current_stream(device=self.row_table_i32.device))
+            assert current_stream is not None
+            evt.record(current_stream)
             events[idx] = evt
-        for i, batch_row in enumerate(dirty):
-            page_count = counts[i]
-            row_start = batch_row * self.num_kv_heads
-            row_slice = slice(row_start, row_start + self.num_kv_heads)
-            # [WAR-SAFE-FILL-RETIRED 2026-07-07] 兜底下线,同上臂:恢复 fill_(-1)
-            # fail-fast 语义。
-            self.row_table_i32[row_slice].fill_(-1)
-            if page_count:
-                self.row_table_i32[row_slice, :page_count].copy_(
-                    staging[i, :page_count]
-                    .reshape(1, page_count)
-                    .expand(self.num_kv_heads, page_count),
-                    non_blocking=True,
-                )
-            # B1 stale-baseline guard: this path rewrote row_table_i32 for
-            # batch_row outside B1's own writer, so the cached last-written
-            # pages are no longer valid for it. Drop the per-row baseline so
-            # the next B1 publish does a full (non-incremental) upload for
-            # this row. No-op when B1 is off.
-            _b1_last_pages_by_row = getattr(
-                self, "_b1_last_pages_by_row", None
-            )
-            if _b1_last_pages_by_row is not None:
+        if not direct_full_hkv1:
+            for i, batch_row in enumerate(dirty):
+                page_count = counts[i]
+                row_start = batch_row * self.num_kv_heads
+                row_slice = slice(row_start, row_start + self.num_kv_heads)
+                # [WAR-SAFE-FILL-RETIRED 2026-07-07] 兜底下线,同上臂:恢复 fill_(-1)
+                # fail-fast 语义。
+                self.row_table_i32[row_slice].fill_(-1)
+                if page_count:
+                    self.row_table_i32[row_slice, :page_count].copy_(
+                        staging[i, :page_count]
+                        .reshape(1, page_count)
+                        .expand(self.num_kv_heads, page_count),
+                        non_blocking=True,
+                    )
+
+        # B1 stale-baseline guard: this path rewrote row_table_i32 outside
+        # B1's own writer.  Invalidate once per dirty batch row for both the
+        # direct and fan-out publication paths.
+        _b1_last_pages_by_row = getattr(self, "_b1_last_pages_by_row", None)
+        if _b1_last_pages_by_row is not None:
+            for batch_row in dirty:
                 _b1_last_pages_by_row.pop(batch_row, None)
 
+        self._live_pages_dirty_rows_total += n
+        self._live_pages_h2d_bytes_total += h2d_bytes
+        self._live_pages_publish_complete_count += 1
 
     @staticmethod
     def _descriptor_row_epoch_current(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 import logging
 import os
@@ -28,6 +29,7 @@ from patches.refresh_runtime.producer_workspace import (
     build_refresh_producer_work_item,
     get_refresh_producer_workspace,
 )
+from patches.refresh_runtime import deferred_p0_shadow
 from patches.sparse_types import SelectorBatchPayload
 
 
@@ -242,6 +244,16 @@ def flush_prefill_batches_impl(
     # buffer 零额外 clone。
     snap_payloads = list(prefill_payloads or ()) + list(refresh_payloads or ())
     if work_payloads:
+        from patches.fa3_native.capture_ownership import (
+            CHUNK_COHORT,
+            CaptureOwnershipPlan,
+        )
+
+        capture_ownership_plan = getattr(self, "_capture_ownership_plan", None)
+        chunk_cohort_stamped = bool(
+            isinstance(capture_ownership_plan, CaptureOwnershipPlan)
+            and str(capture_ownership_plan.mode) == CHUNK_COHORT
+        )
         device = work_payloads[0].capture_scores.device
         # [DETERMINISTIC-CAPTURE-SNAPSHOT 2026-07-02] flush is entered on the
         # decode thread BEFORE the refresh_stream context is created, so the
@@ -329,6 +341,11 @@ def flush_prefill_batches_impl(
             self._ensure_refresh_stream(device)
             if self.refresh_stream is None or not self.chunk_ready_evt or not self.chunk_done_evt:
                 do_async = False
+        if chunk_cohort_stamped and not do_async:
+            raise RuntimeError(
+                "E_SFI_CAPTURE_COHORT_ASYNC_OWNER: stamped chunk cohort lost "
+                "its refresh-stream owner"
+            )
 
         # split-wait flags：只在“最终确定异步提交”时置位。
         # 这样可避免 async 被动态关闭时残留 flags（例如 capture 中强制同步）。
@@ -392,6 +409,10 @@ def flush_prefill_batches_impl(
         lastn1_direct_count = 0
         gt1_reduce_count = 0
         gt1_scalar_fallback_count = 0
+        cohort_private_tape_used = False
+        cohort_tape_deferred_producer_used = False
+        cohort_snapshot_copy_event = None
+        cohort_tape_tokens_by_slot: Dict[int, object] = {}
 
         def _producer_work_int(name: str, default: int = -1) -> int:
             prof_value = (
@@ -987,8 +1008,10 @@ def flush_prefill_batches_impl(
             )
             finalize_req_id_set = set(finalize_req_ids)
             finalize_slot_set: set[int] = set()
+            batch_request_ids = tuple(
+                getattr(first.state, "batch_request_ids", tuple())
+            )
             if finalize_req_id_set:
-                batch_request_ids = tuple(getattr(first.state, "batch_request_ids", tuple()))
                 for slot_i in slot_list_full:
                     if 0 <= int(slot_i) < len(batch_request_ids):
                         req_id = batch_request_ids[int(slot_i)]
@@ -1055,6 +1078,138 @@ def flush_prefill_batches_impl(
             # subset 的 slot→pos 映射在同一 chunk 内可复用（最多拆 2 组），避免重复构造 dict
             slot_list_ref = slot_list_full
             pos_map = {int(s): idx for idx, s in enumerate(slot_list_ref)}
+            if chunk_cohort_stamped:
+                nonlocal cohort_private_tape_used
+                nonlocal cohort_snapshot_copy_event
+                nonlocal cohort_tape_tokens_by_slot
+                if not bool(
+                    getattr(
+                        getattr(self, "config", None),
+                        "one_shot_bootstrap_only",
+                        False,
+                    )
+                ):
+                    raise RuntimeError(
+                        "E_SFI_CAPTURE_COHORT_FINALIZE: chunk cohort requires "
+                        "one-shot finalization"
+                    )
+                if not finalize_slot_set:
+                    return
+                from patches.fa3_native.capture_cohort_tape import (
+                    CaptureCohortTapeLeaseTracker,
+                    CaptureCohortTapeState,
+                    capture_cohort_consumer_token,
+                    capture_cohort_tape_owner_key,
+                    require_capture_cohort_consumer_coverage,
+                    snapshot_capture_cohort_payload_group,
+                )
+
+                tape_state = getattr(self, "_capture_cohort_tape_state", None)
+                tape_tracker = getattr(
+                    self, "_capture_cohort_tape_lease_tracker", None
+                )
+                if not isinstance(tape_state, CaptureCohortTapeState) or not isinstance(
+                    tape_tracker, CaptureCohortTapeLeaseTracker
+                ):
+                    raise RuntimeError(
+                        "E_SFI_CAPTURE_COHORT_TAPE_PREBUILD: stamped chunk cohort "
+                        "has no prebuilt tape state"
+                    )
+                if (
+                    str(tape_state.plan_signature)
+                    != str(capture_ownership_plan.signature_sha256)
+                    or int(tape_state.report.logical_k_capacity)
+                    != int(first.capture_scores.shape[-1])
+                ):
+                    raise RuntimeError(
+                        "E_SFI_CAPTURE_COHORT_FIXED_K: live payload disagrees "
+                        "with the immutable tape plan"
+                    )
+                owner_key = capture_cohort_tape_owner_key(
+                    tape_state, prefill_payloads
+                )
+                # Registering a request token without a corresponding deferred
+                # producer would poison the bounded generation bank until a
+                # later request reports BANKS_EXHAUSTED.  Prove the one-to-one
+                # consumer set before snapshot acquires any bank ownership.
+                registered_consumer_slots = (
+                    require_capture_cohort_consumer_coverage(
+                        registered_slots=tuple(sorted(finalize_slot_set)),
+                        producer_slots=tuple(slots_lastn1) + tuple(slots_lastn_gt1),
+                    )
+                )
+                cohort_tape_tokens_by_slot = {}
+                for slot_i in registered_consumer_slots:
+                    if slot_i < 0 or slot_i >= len(batch_request_ids):
+                        raise RuntimeError(
+                            "E_SFI_CAPTURE_COHORT_CONSUMER: finalize slot is "
+                            "outside batch_request_ids"
+                        )
+                    request_id = batch_request_ids[slot_i]
+                    if request_id is None or _is_free_slot_id(request_id):
+                        raise RuntimeError(
+                            "E_SFI_CAPTURE_COHORT_CONSUMER: finalize slot has "
+                            "no live request identity"
+                        )
+                    cohort_tape_tokens_by_slot[slot_i] = (
+                        capture_cohort_consumer_token(
+                            owner_key,
+                            slot=slot_i,
+                            request_id=str(request_id),
+                        )
+                    )
+                lastn1_row_positions = tuple(
+                    sorted(pos_map[int(slot)] for slot in slots_lastn1)
+                )
+                # Finalization is the single source boundary: drain any still
+                # pending postprocess jobs on this same refresh stream before
+                # snapshotting.  Completed early-cohort jobs are deduplicated
+                # no-ops; no wait is submitted against an unrecorded event.
+                from patches.fa3_native.postprocess import (
+                    run_capture_postprocess_jobs_for_payloads,
+                )
+
+                run_capture_postprocess_jobs_for_payloads(
+                    prefill_payloads,
+                    meta_cache_owner=self,
+                )
+                cohort_snapshot = snapshot_capture_cohort_payload_group(
+                    state=tape_state,
+                    tracker=tape_tracker,
+                    payloads=prefill_payloads,
+                    consumer_tokens=tuple(cohort_tape_tokens_by_slot.values()),
+                    lastn1_row_positions=lastn1_row_positions,
+                    stream=torch.cuda.current_stream(device=device),
+                )
+                cohort_snapshot_copy_event = (
+                    cohort_snapshot.copy_completion_event
+                )
+                fence = getattr(self, "_ring_war_fence", None)
+                on_reduce = getattr(fence, "on_reduce", None)
+                if not callable(on_reduce):
+                    raise RuntimeError(
+                        "E_SFI_CAPTURE_COHORT_FENCE: snapshot publication has "
+                        "no scratch WAR owner"
+                    )
+                cohort_size = int(capture_ownership_plan.cohort_size)
+                in_flight = int(capture_ownership_plan.in_flight)
+                for global_layer in cohort_snapshot.group.layer_slots:
+                    cohort_origin = (
+                        int(global_layer) // cohort_size
+                    ) * cohort_size
+                    cohort_lane = (
+                        cohort_origin // cohort_size
+                    ) % in_flight
+                    scratch_slot = (
+                        cohort_lane * cohort_size
+                        + int(global_layer) % cohort_size
+                    )
+                    on_reduce(
+                        int(scratch_slot),
+                        cohort_snapshot_copy_event,
+                        True,
+                    )
+                cohort_private_tape_used = True
             # [DETERMINISTIC-CAPTURE-SNAPSHOT 2026-07-02] one private tape per
             # flush per source kind (True=capture+denoms, False=lastn1), shared
             # by every subset of this flush so all per-slot payloads and the
@@ -1132,6 +1287,34 @@ def flush_prefill_batches_impl(
                 # length tensor ONCE per flush on the submission stream (a few
                 # KB, bootstrap-only) so all subsets see submission-step values.
                 len_snap = subset_tape_cache.get("len_snap")
+                if len_snap is None and chunk_cohort_stamped:
+                    _sl_snap = first_in.seq_lens_batch
+                    _sl32_snap = getattr(first_in, "seq_lens_batch_i32", None)
+                    _kvpr_snap = first_in.kv_len_per_row_i32
+                    if not all(
+                        isinstance(tensor, torch.Tensor)
+                        for tensor in (_sl_snap, _sl32_snap, _kvpr_snap)
+                    ):
+                        raise RuntimeError(
+                            "E_SFI_CAPTURE_COHORT_METADATA: stamped payload "
+                            "lost its submission-step length snapshots"
+                        )
+                    _kv_ptr_snaps = {}
+                    for _p in payloads_in:
+                        _kv = _p.kv_lengths
+                        if not isinstance(_kv, torch.Tensor):
+                            raise RuntimeError(
+                                "E_SFI_CAPTURE_COHORT_METADATA: stamped payload "
+                                "lost kv_lengths"
+                            )
+                        _kv_ptr_snaps[int(_kv.data_ptr())] = _kv
+                    len_snap = (
+                        _sl_snap,
+                        _sl32_snap,
+                        _kvpr_snap,
+                        _kv_ptr_snaps,
+                    )
+                    subset_tape_cache["len_snap"] = len_snap
                 if len_snap is None:
                     _kv_ptr_snaps: Dict[int, torch.Tensor] = {}
                     with torch.cuda.stream(submission_stream):
@@ -1176,6 +1359,8 @@ def flush_prefill_batches_impl(
                     kv_lengths_snap_by_ptr,
                 ) = len_snap
 
+                if not isinstance(seq_lens_batch_src, torch.Tensor):
+                    raise RuntimeError("prefill subset: missing seq_lens_batch")
                 seq_lens_batch_sub = seq_lens_batch_src[start : start + batch_sub]
                 seq_lens_batch_i32_sub = seq_lens_batch_i32_src
                 if (
@@ -1187,11 +1372,18 @@ def flush_prefill_batches_impl(
                 ):
                     seq_lens_batch_i32_sub = seq_lens_batch_i32_sub[start : start + batch_sub]
                 else:
+                    if chunk_cohort_stamped:
+                        raise RuntimeError(
+                            "E_SFI_CAPTURE_COHORT_METADATA: missing prebuilt "
+                            "seq_lens_batch_i32"
+                        )
                     seq_lens_batch_i32_sub = seq_lens_batch_sub.to(
                         device=device,
                         dtype=torch.int32,
                     )
 
+                if not isinstance(first_in.row_tensor, torch.Tensor):
+                    raise RuntimeError("prefill subset: missing row_tensor")
                 row_tensor_sub = first_in.row_tensor[start : start + batch_sub]
                 # row_tensor_i32：优先复用 layout 内已有的 int32 view，避免额外的 dtype 转换 kernel。
                 row_tensor_i32_src = first_in.row_tensor_i32
@@ -1203,14 +1395,32 @@ def flush_prefill_batches_impl(
                 ):
                     row_tensor_i32_sub = row_tensor_i32_src[start : start + batch_sub]
                 else:
+                    if chunk_cohort_stamped:
+                        raise RuntimeError(
+                            "E_SFI_CAPTURE_COHORT_METADATA: missing prebuilt row_tensor_i32"
+                        )
                     row_tensor_i32_sub = row_tensor_sub.to(device=device, dtype=torch.int32)
 
                 kv_len_per_row_i32_sub = kv_len_per_row_i32_src
                 if kv_len_per_row_i32_sub is not None:
+                    if not isinstance(kv_len_per_row_i32_sub, torch.Tensor):
+                        raise RuntimeError(
+                            "prefill subset: invalid kv_len_per_row_i32"
+                        )
                     kv_len_per_row_i32_sub = kv_len_per_row_i32_sub[start : start + batch_sub]
                     if kv_len_per_row_i32_sub.dtype != torch.int32:
+                        if chunk_cohort_stamped:
+                            raise RuntimeError(
+                                "E_SFI_CAPTURE_COHORT_METADATA: kv_len_per_row_i32 "
+                                "dtype drift"
+                            )
                         kv_len_per_row_i32_sub = kv_len_per_row_i32_sub.to(device=device, dtype=torch.int32)
                 else:
+                    if chunk_cohort_stamped:
+                        raise RuntimeError(
+                            "E_SFI_CAPTURE_COHORT_METADATA: missing authoritative "
+                            "kv_len_per_row_i32"
+                        )
                     # 保底：确保 rebuild/key_norms 路线始终有 int32 的 kv_len_per_row
                     kv_len_per_row_i32_sub = seq_lens_batch_sub.to(device=device, dtype=torch.int32)
 
@@ -1225,10 +1435,15 @@ def flush_prefill_batches_impl(
                 if (
                     slot_tensor_sub is not None
                     and slot_tensor_sub.device == device
+                    and slot_tensor_sub.dtype == torch.long
                     and slot_tensor_sub.shape[0] >= len(slot_list_ref)
                 ):
                     slot_tensor_sub = slot_tensor_sub[start : start + batch_sub]
                 else:
+                    if chunk_cohort_stamped:
+                        raise RuntimeError(
+                            "E_SFI_CAPTURE_COHORT_METADATA: missing prebuilt slot_tensor"
+                        )
                     slot_tensor_sub = torch.tensor(slots_use_ordered, device=device, dtype=torch.long)
 
                 slot_tensor_i32_sub = getattr(first_in, "slot_tensor_i32", None)
@@ -1241,6 +1456,10 @@ def flush_prefill_batches_impl(
                 ):
                     slot_tensor_i32_sub = slot_tensor_i32_sub[start : start + batch_sub]
                 else:
+                    if chunk_cohort_stamped:
+                        raise RuntimeError(
+                            "E_SFI_CAPTURE_COHORT_METADATA: missing prebuilt slot_tensor_i32"
+                        )
                     slot_tensor_i32_sub = slot_tensor_sub.to(device=device, dtype=torch.int32)
 
                 slot_tensor_cpu_sub: Optional[torch.Tensor] = getattr(first_in, "slot_tensor_cpu", None)
@@ -1248,10 +1467,15 @@ def flush_prefill_batches_impl(
                     slot_tensor_cpu_sub is not None
                     and isinstance(slot_tensor_cpu_sub, torch.Tensor)
                     and slot_tensor_cpu_sub.device.type == "cpu"
+                    and slot_tensor_cpu_sub.dtype == torch.long
                     and slot_tensor_cpu_sub.numel() >= len(slot_list_ref)
                 ):
                     slot_tensor_cpu_sub = slot_tensor_cpu_sub[start : start + batch_sub]
                 else:
+                    if chunk_cohort_stamped:
+                        raise RuntimeError(
+                            "E_SFI_CAPTURE_COHORT_METADATA: missing CPU slot snapshot"
+                        )
                     slot_tensor_cpu_sub = torch.tensor(slots_use_ordered, dtype=torch.long)
 
                 seq_lens_tensor_cpu_sub: Optional[torch.Tensor] = getattr(first_in, "seq_lens_tensor_cpu", None)
@@ -1259,10 +1483,15 @@ def flush_prefill_batches_impl(
                     seq_lens_tensor_cpu_sub is not None
                     and isinstance(seq_lens_tensor_cpu_sub, torch.Tensor)
                     and seq_lens_tensor_cpu_sub.device.type == "cpu"
+                    and seq_lens_tensor_cpu_sub.dtype == torch.long
                     and seq_lens_tensor_cpu_sub.numel() >= len(slot_list_ref)
                 ):
                     seq_lens_tensor_cpu_sub = seq_lens_tensor_cpu_sub[start : start + batch_sub]
                 else:
+                    if chunk_cohort_stamped:
+                        raise RuntimeError(
+                            "E_SFI_CAPTURE_COHORT_METADATA: missing CPU length snapshot"
+                        )
                     seq_lens_tensor_cpu_sub = torch.tensor(
                         [max(0, int(s)) for s in seq_lens_cpu_sub], dtype=torch.long
                     )
@@ -1293,6 +1522,26 @@ def flush_prefill_batches_impl(
                 # Decode keeps exclusive ownership of the arena; the deferred
                 # producer keeps floating (async overlap preserved); bootstrap-only
                 # path, no steady-state cost.
+                if chunk_cohort_stamped:
+                    from patches.fa3_native.capture_cohort_tape import (
+                        resolve_capture_cohort_tape_group,
+                    )
+
+                    tape_group = resolve_capture_cohort_tape_group(payloads_in)
+                    if tape_group is None:
+                        raise RuntimeError(
+                            "E_SFI_CAPTURE_COHORT_TAPE_PUBLICATION_MISSING: "
+                            "stamped chunk cohort cannot fall back to an arena stack"
+                        )
+                    tape_denoms = tape_group.denoms
+                    if use_denoms and tape_denoms is None:
+                        raise RuntimeError(
+                            "E_SFI_CAPTURE_COHORT_TAPE_DENOM_MISSING"
+                        )
+                    subset_tape_cache[bool(use_denoms)] = (
+                        tape_group.scores,
+                        tape_denoms if use_denoms else None,
+                    )
                 tape_entry = subset_tape_cache.get(bool(use_denoms))
                 if tape_entry is None:
                     capture_views_all: List[torch.Tensor] = []
@@ -1384,6 +1633,18 @@ def flush_prefill_batches_impl(
                     tape_entry = (capture_tape, denoms_tape)
                     subset_tape_cache[bool(use_denoms)] = tape_entry
                 capture_tape, denoms_tape = tape_entry
+                cohort_consumer_tokens_sub = tuple()
+                if chunk_cohort_stamped:
+                    try:
+                        cohort_consumer_tokens_sub = tuple(
+                            cohort_tape_tokens_by_slot[int(slot)]
+                            for slot in slots_use_ordered
+                        )
+                    except KeyError as exc:
+                        raise RuntimeError(
+                            "E_SFI_CAPTURE_COHORT_CONSUMER: subset contains a "
+                            f"non-finalized slot {int(exc.args[0])}"
+                        ) from None
 
                 payloads_out = []
                 for layer_pos, p in enumerate(payloads_in):
@@ -1404,10 +1665,18 @@ def flush_prefill_batches_impl(
                         label="kv_lengths",
                         expected_dim=2,
                     )
+                    slot_req_ids_sub = None
+                    if p.slot_req_ids is not None:
+                        if len(p.slot_req_ids) != len(slot_list_ref):
+                            raise RuntimeError(
+                                "prefill subset: slot_req_ids must align with slot_list"
+                            )
+                        slot_req_ids_sub = tuple(
+                            p.slot_req_ids[start : start + batch_sub]
+                        )
                     payloads_out.append(
-                        SelectorBatchPayload(
-                            cache_key=p.cache_key,
-                            state=p.state,
+                        replace(
+                            p,
                             capture_scores=capture_view,
                             log_f_denoms=denoms_view,
                             kv_lengths=kv_lengths_sub,
@@ -1416,29 +1685,50 @@ def flush_prefill_batches_impl(
                             seq_lens_batch_i32=seq_lens_batch_i32_sub,
                             slot_list=list(slots_use_ordered),
                             row_list=row_list_sub,
+                            slot_req_ids=slot_req_ids_sub,
+                            # Query-side and refresh-only views are not aligned to
+                            # this request-local slot subset.  The historical
+                            # constructor intentionally dropped them; keep that
+                            # semantic boundary explicit while replace preserves
+                            # step identity/provenance fields automatically.
+                            q=None,
+                            cu_seqlens_q=None,
+                            softmax_scale=0.0,
+                            softcap=0.0,
+                            window_size=None,
+                            alibi_slopes=None,
+                            k_descale=None,
                             slot_tensor=slot_tensor_sub,
                             slot_tensor_i32=slot_tensor_i32_sub,
                             slot_tensor_cpu=slot_tensor_cpu_sub,
                             row_tensor=row_tensor_sub,
                             row_tensor_i32=row_tensor_i32_sub,
-                            key_cache=p.key_cache,
-                            value_cache=p.value_cache,
-                            block_table=p.block_table,
+                            refresh_rows_long=None,
+                            refresh_block_table_sub=None,
+                            refresh_seq_lens_i32=None,
                             bootstrap_slots=set(slots_use_ordered),
                             lastn1_capture_scores=None,
-                            layer_index=int(p.layer_index),
                             seq_lens_cpu=seq_lens_cpu_sub,
                             seq_lens_tensor_cpu=seq_lens_tensor_cpu_sub,
-                            capture_postprocess_job=getattr(
-                                p,
-                                "capture_postprocess_job",
-                                None,
-                            ),
+                            refresh_reason="",
+                            refresh_intent_req_ids=tuple(),
+                            stagger_layer_index=-1,
+                            q_is_sub=False,
                             fast_signature=_make_selector_fast_signature(
                                 capture_scores=capture_view,
                                 log_f_denoms=denoms_view,
                                 kv_lengths=kv_lengths_sub,
                                 block_table=p.block_table,
+                            ),
+                            cohort_tape_consumer_tokens=(
+                                cohort_consumer_tokens_sub
+                                if chunk_cohort_stamped
+                                else p.cohort_tape_consumer_tokens
+                            ),
+                            cohort_tape_row_start=(
+                                int(start)
+                                if chunk_cohort_stamped
+                                else p.cohort_tape_row_start
                             ),
                         )
                     )
@@ -1446,6 +1736,7 @@ def flush_prefill_batches_impl(
 
             def _run_prefill_group(slots_use: List[int], *, use_denoms: bool) -> None:
                 nonlocal lastn1_direct_count, gt1_reduce_count, gt1_scalar_fallback_count
+                nonlocal cohort_tape_deferred_producer_used
                 if not slots_use:
                     return
                 group_payloads = _subset_payloads_for_slots(prefill_payloads, slots_use, use_denoms=use_denoms)
@@ -1593,6 +1884,11 @@ def flush_prefill_batches_impl(
                         "deferred bootstrap producer requires one_shot_bootstrap_only"
                     )
                 defer_bootstrap_producer = defer_bootstrap_producer_requested
+                if chunk_cohort_stamped and not defer_bootstrap_producer:
+                    raise RuntimeError(
+                        "E_SFI_CAPTURE_COHORT_DEFERRED_OWNER: stamped chunk "
+                        "cohort requires the deferred bootstrap consumer"
+                    )
                 if defer_bootstrap_producer:
                     from patches.refresh_runtime.deferred_producer import (
                         DeferredProducerJob,
@@ -1640,6 +1936,19 @@ def flush_prefill_batches_impl(
                         )
                         if not per_slot_payloads:
                             continue
+                        # This is the source-ownership boundary for this
+                        # request-local frozen payload group.  _run_prefill
+                        # executes after chunk_ready on the submission stream;
+                        # recording after _subset_payloads_for_slots also
+                        # covers any request-local snapshot copies it queued.
+                        # Use one event per group so later slot snapshots cannot
+                        # accidentally fall after a shared earlier event.
+                        deferred_source_ready_event = torch.cuda.Event(
+                            enable_timing=False
+                        )
+                        deferred_source_ready_event.record(
+                            torch.cuda.current_stream(device=device)
+                        )
                         compact_lease_generation = max(
                             (
                                 int(
@@ -1665,6 +1974,7 @@ def flush_prefill_batches_impl(
                                 expected_slot=int(slot_i),
                                 payload_groups=(payload_group_snapshot,),
                                 bridge_max_tokens=bridge_max_tokens,
+                                source_ready_event=deferred_source_ready_event,
                             )
                             tracking.deferred_producer_job = job
                         else:
@@ -1672,7 +1982,11 @@ def flush_prefill_batches_impl(
                                 raise RuntimeError(
                                     "deferred bootstrap producer job already launched"
                                 )
-                            append_deferred_payload_group(job, payload_group_snapshot)
+                            append_deferred_payload_group(
+                                job,
+                                payload_group_snapshot,
+                                source_ready_event=deferred_source_ready_event,
+                            )
                         job_typed: DeferredProducerJob = job
                         tracking.bootstrap_bridge_active = True
                         tracking.bridge_max_tokens = int(job_typed.bridge_max_tokens)
@@ -1710,6 +2024,8 @@ def flush_prefill_batches_impl(
                     )
                     # Real deferred path: the producer has not run yet. The step
                     # boundary calls _launch_deferred_bootstrap_producer_jobs.
+                    if chunk_cohort_stamped:
+                        cohort_tape_deferred_producer_used = True
                     return
                 from patches.fa3_native.postprocess import (
                     run_capture_postprocess_jobs_for_payloads,
@@ -1893,6 +2209,16 @@ def flush_prefill_batches_impl(
                 def _run_selector_for_segment(
                     segment_payloads: Sequence[SelectorBatchPayload],
                 ) -> Optional[Any]:
+                    if chunk_cohort_stamped:
+                        from patches.fa3_native.capture_cohort_tape import (
+                            require_capture_cohort_selector_view,
+                        )
+
+                        if require_capture_cohort_selector_view(segment_payloads) is None:
+                            raise RuntimeError(
+                                "E_SFI_CAPTURE_COHORT_SELECTOR_VIEW: stamped "
+                                "selector payload lost tape provenance"
+                            )
                     selector_evt_pair: Optional[
                         Tuple[torch.cuda.Event, torch.cuda.Event]
                     ] = None
@@ -2589,18 +2915,71 @@ def flush_prefill_batches_impl(
                     # prefill flushes carry this: decode refresh steps and the decode hot path are
                     # untouched, and prefill stays ASYNC (not force-synced).
                     if prefill_payloads:
+                        cohort_deferred_overlap_proven = bool(
+                            chunk_cohort_stamped
+                            and cohort_private_tape_used
+                            and cohort_tape_deferred_producer_used
+                            and not refresh_payloads
+                        )
+                        if cohort_deferred_overlap_proven:
+                            if cohort_snapshot_copy_event is None:
+                                raise RuntimeError(
+                                    "E_SFI_CAPTURE_COHORT_COPY_EVENT: private "
+                                    "tape publication has no arena-release event"
+                                )
+                            # The only main-stream dependency is source lifetime:
+                            # once the R-stream snapshot copy completes, the arena
+                            # may be rewritten. Selector/rebuild remain deferred and
+                            # therefore overlap the next main-stream forward.
+                            main_stream.wait_event(cohort_snapshot_copy_event)
                         # CLEAN-BASELINE FIX: gold's prefill_done_evt gate is recorded BEFORE
                         # _run_refresh, so it does NOT cover descriptor writes the native-lifecycle
                         # / compact rebuild performs during _run_refresh on refresh_stream. Wait on
                         # the WHOLE refresh_stream (the existing fallback primitive) so main never
                         # launches a forward while a descriptor write is still in flight. Ordering
                         # family (gold-proven); bootstrap-only; decode hot path untouched.
-                        if __import__("os").environ.get("VLLM_SPARSE_STRICT_FLUSH_GATE", "1") == "1":
-                            main_stream.wait_stream(self.refresh_stream)
+                        if cohort_deferred_overlap_proven:
+                            pass
+                        elif __import__("os").environ.get("VLLM_SPARSE_STRICT_FLUSH_GATE", "1") == "1":
+                            if deferred_p0_shadow.DEFERRED_P0_SHADOW_ENABLED:
+                                shadow_wait = deferred_p0_shadow.begin_prefill_blanket_wait_shadow(
+                                    self,
+                                    epoch=int(getattr(self, "step_context_epoch", -1)),
+                                    buf_id=int(buf),
+                                    prefill_payload_count=len(prefill_payloads),
+                                    refresh_payload_count=len(refresh_payloads),
+                                    source_event=self.chunk_done_evt[buf],
+                                    wait_kind="strict_refresh_stream",
+                                )
+                                try:
+                                    main_stream.wait_stream(self.refresh_stream)
+                                finally:
+                                    deferred_p0_shadow.finish_prefill_blanket_wait_shadow(
+                                        shadow_wait
+                                    )
+                            else:
+                                main_stream.wait_stream(self.refresh_stream)
                         elif self.prefill_done_evt:
                             main_stream.wait_event(self.prefill_done_evt[buf])
                         else:
-                            main_stream.wait_stream(self.refresh_stream)
+                            if deferred_p0_shadow.DEFERRED_P0_SHADOW_ENABLED:
+                                shadow_wait = deferred_p0_shadow.begin_prefill_blanket_wait_shadow(
+                                    self,
+                                    epoch=int(getattr(self, "step_context_epoch", -1)),
+                                    buf_id=int(buf),
+                                    prefill_payload_count=len(prefill_payloads),
+                                    refresh_payload_count=len(refresh_payloads),
+                                    source_event=self.chunk_done_evt[buf],
+                                    wait_kind="fallback_refresh_stream",
+                                )
+                                try:
+                                    main_stream.wait_stream(self.refresh_stream)
+                                finally:
+                                    deferred_p0_shadow.finish_prefill_blanket_wait_shadow(
+                                        shadow_wait
+                                    )
+                            else:
+                                main_stream.wait_stream(self.refresh_stream)
                     # WAR FIX(bs8 async-prefill compact arena): compact_arena_k/v/pos is
                     # SLOT-keyed but chunk_done_evt/_buf_pending_work_flags are BUF-keyed, so the
                     # consumer's flags==0 early-return can skip the wait -> torn compact read ->

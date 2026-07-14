@@ -21,7 +21,7 @@ from patches.sparse_utils import (
     _make_step_cache_key,
 )
 
-from triton_kernel.flash_attn_score_dump_fwd import pack_req_meta_decode_fast
+from utils.req_meta_pack import pack_req_meta_decode_fast
 
 # P12 lever-2 (2026-06-12): one-shot equivalence-assert gate for the
 # layer_state_refresh loop hoists (precomputed cache_key / active_slots).

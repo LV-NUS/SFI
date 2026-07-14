@@ -29,6 +29,13 @@ class DeferredProducerJob:
     payload_count: int
     bridge_max_tokens: int
     payload_groups: tuple[Any, ...] = ()
+    # Producer inputs are frozen while the prefill flush runs on the refresh
+    # stream.  Each event is recorded at that ownership boundary, after the
+    # corresponding capture-ready dependency.  A later producer launch must
+    # wait these events, not a launch-time event on the decode stream: the
+    # latter would either submit before anchor attention or, when launched
+    # post-forward, serialize selector work behind the whole forward.
+    source_ready_events: tuple[Any, ...] = ()
     final_event: Any | None = None
     launched: bool = False
     launched_epoch: int = -1
@@ -54,12 +61,18 @@ def build_deferred_bootstrap_job(
     expected_slot: int,
     payload_groups: tuple[Any, ...],
     bridge_max_tokens: int,
+    source_ready_event: Any | None = None,
 ) -> DeferredProducerJob:
     if not payload_groups:
         raise RuntimeError("deferred bootstrap producer requires payload groups")
     if int(bridge_max_tokens) <= 0:
         raise RuntimeError("bridge max tokens must be positive")
     payload_groups_t = tuple(payload_groups)
+    if source_ready_event is not None and len(payload_groups_t) != 1:
+        raise RuntimeError(
+            "deferred bootstrap producer requires one source-ready event per "
+            "payload group"
+        )
     return DeferredProducerJob(
         request_id=str(request_id),
         producer_job_epoch=int(producer_job_epoch),
@@ -70,6 +83,9 @@ def build_deferred_bootstrap_job(
         payload_count=len(payload_groups_t),
         bridge_max_tokens=int(bridge_max_tokens),
         payload_groups=payload_groups_t,
+        source_ready_events=(
+            (source_ready_event,) if source_ready_event is not None else tuple()
+        ),
     )
 
 
@@ -77,15 +93,59 @@ def deferred_payload_count(job: DeferredProducerJob) -> int:
     return len(tuple(job.payload_groups or tuple()))
 
 
+def ordered_payload_layer_indices(payloads: tuple[Any, ...]) -> tuple[int, ...]:
+    """Return the one-to-one global layer identity for a deferred payload group."""
+
+    indices = tuple(
+        int(getattr(getattr(payload, "state", None), "layer_index", -1))
+        for payload in tuple(payloads)
+    )
+    if not indices or any(layer < 0 for layer in indices):
+        raise RuntimeError(
+            "deferred bootstrap producer requires one global layer index per payload"
+        )
+    if len(set(indices)) != len(indices):
+        raise RuntimeError(
+            "deferred bootstrap producer payload layer indices must be unique"
+        )
+    if any(right <= left for left, right in zip(indices, indices[1:])):
+        raise RuntimeError(
+            "deferred bootstrap producer payload layer indices must be strictly increasing"
+        )
+    return indices
+
+
 def append_deferred_payload_group(
     job: DeferredProducerJob,
     payload_group: tuple[Any, ...],
+    *,
+    source_ready_event: Any | None = None,
 ) -> None:
     group = tuple(payload_group)
     if not group:
         raise RuntimeError("deferred bootstrap producer requires payload groups")
+    source_ready_events = tuple(job.source_ready_events or tuple())
+    payload_group_count = deferred_payload_count(job)
+    if source_ready_events and len(source_ready_events) != payload_group_count:
+        raise RuntimeError(
+            "deferred producer source-ready event count does not match payload groups"
+        )
+    if source_ready_events and source_ready_event is None:
+        raise RuntimeError(
+            "deferred bootstrap producer requires one source-ready event per "
+            "payload group"
+        )
+    if not source_ready_events and source_ready_event is not None and payload_group_count:
+        raise RuntimeError(
+            "deferred bootstrap producer cannot append a source-ready event to "
+            "an eventless payload snapshot"
+        )
     job.payload_groups = tuple(job.payload_groups or tuple()) + (group,)
     job.payload_count = deferred_payload_count(job)
+    if source_ready_event is not None:
+        job.source_ready_events = tuple(job.source_ready_events or tuple()) + (
+            source_ready_event,
+        )
 
 
 def validate_deferred_producer_job_for_publish(
@@ -139,6 +199,9 @@ def deferred_producer_job_summary(job: DeferredProducerJob | None) -> dict[str, 
         "building_compact_epoch": int(job.building_compact_epoch),
         "bridge_max_tokens": int(job.bridge_max_tokens),
         "payload_count": int(deferred_payload_count(job)),
+        "source_ready_event_count": len(
+            tuple(getattr(job, "source_ready_events", tuple()) or tuple())
+        ),
         "expected_slot": int(job.expected_slot),
         "compact_lease_generation": int(job.compact_lease_generation),
         "compact_storage_owner": str(job.compact_storage_owner),
@@ -224,6 +287,17 @@ def run_deferred_bootstrap_producer_job(
     refresh_stream = getattr(controller, "refresh_stream", None)
     if refresh_stream is None:
         _fail_deferred_producer("deferred bootstrap producer requires refresh_stream")
+    source_ready_events = tuple(
+        getattr(job, "source_ready_events", tuple()) or tuple()
+    )
+    if not source_ready_events:
+        _fail_deferred_producer(
+            "deferred bootstrap producer requires frozen source-ready events"
+        )
+    if len(source_ready_events) != len(payload_groups):
+        _fail_deferred_producer(
+            "deferred producer source-ready event count does not match payload groups"
+        )
 
     rid = str(job.request_id)
     tracking = controller.request_states.get(rid)
@@ -290,10 +364,17 @@ def run_deferred_bootstrap_producer_job(
         except Exception:
             writer_pointer_snapshot = None
 
-    handoff_event = torch.cuda.Event(enable_timing=False)
-    handoff_event.record(torch.cuda.current_stream(device=device))
     with torch.cuda.stream(refresh_stream):
-        torch.cuda.current_stream(device=device).wait_event(handoff_event)
+        producer_stream = torch.cuda.current_stream(device=device)
+        waited_source_events: set[int] = set()
+        for source_ready_event in source_ready_events[
+            start_group_index:end_group_index
+        ]:
+            event_id = id(source_ready_event)
+            if event_id in waited_source_events:
+                continue
+            producer_stream.wait_event(source_ready_event)
+            waited_source_events.add(event_id)
         for payload_group in payload_groups[start_group_index:end_group_index]:
             group_payloads = tuple(payload_group)
             if not group_payloads:
@@ -307,15 +388,10 @@ def run_deferred_bootstrap_producer_job(
                 "payload_group_index": int(payload_group_index),
                 "payload_count": len(group_payloads),
             }
-            layer_indices = tuple(
-                int(getattr(getattr(payload, "state", None), "layer_index", -1))
-                for payload in group_payloads
-            )
-            layer_indices = tuple(layer for layer in layer_indices if layer >= 0)
-            if not layer_indices:
-                _fail_deferred_producer(
-                    "deferred bootstrap producer requires layer indices"
-                )
+            try:
+                layer_indices = ordered_payload_layer_indices(group_payloads)
+            except RuntimeError as exc:
+                _fail_deferred_producer(str(exc))
             group_id = producer_group_id_for_layer(
                 layer_index=min(layer_indices),
                 capture_chunk=int(ready_chunk),
@@ -436,6 +512,11 @@ def run_deferred_bootstrap_producer_job(
             selector_per_ready_group = len(ready_subgroups) > 1
             prefill_result = None
             if not selector_per_ready_group:
+                from patches.fa3_native.capture_cohort_tape import (
+                    require_capture_cohort_selector_view,
+                )
+
+                require_capture_cohort_selector_view(group_payloads)
                 prefill_result = _profile_deferred_producer_call(
                     label="deferred_prefill_selector",
                     metadata={
@@ -479,6 +560,11 @@ def run_deferred_bootstrap_producer_job(
                 )
                 writer_result = prefill_result
                 if selector_per_ready_group:
+                    from patches.fa3_native.capture_cohort_tape import (
+                        require_capture_cohort_selector_view,
+                    )
+
+                    require_capture_cohort_selector_view(ready_group_payloads)
                     writer_result = _profile_deferred_producer_call(
                         label="deferred_prefill_selector",
                         metadata={
@@ -611,6 +697,25 @@ def run_deferred_bootstrap_producer_job(
                     ready_state,
                     group_id=int(ready_group_id),
                     done_event=slot_group_done_event,
+                )
+            from patches.fa3_native.capture_cohort_tape import (
+                release_capture_cohort_payload_group,
+                resolve_capture_cohort_tape_group,
+            )
+
+            # Only the prebuilt tape owns a cross-step lease.  The ring path has
+            # no such lifetime to retire, so do not inject a CUDA event into its
+            # steady state.
+            if resolve_capture_cohort_tape_group(group_payloads) is not None:
+                tape_consumer_done_event = torch.cuda.Event(enable_timing=False)
+                tape_consumer_done_event.record(
+                    torch.cuda.current_stream(device=device)
+                )
+                release_capture_cohort_payload_group(
+                    controller=controller,
+                    payloads=group_payloads,
+                    completion_event=tape_consumer_done_event,
+                    consumer_stream=producer_stream,
                 )
             group_end_ns = time.perf_counter_ns()
             _append_deferred_timeline(

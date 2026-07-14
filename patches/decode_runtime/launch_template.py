@@ -21,6 +21,11 @@ class LaunchTemplate:
     use_compact_signature: Tuple[int, ...]
     compact_meta_epoch: int
     max_seqlen_k_capacity: int
+    # ``update_gpu=False`` advances only the plan's canonical CPU tuples.  The
+    # pinned descriptor is an H2D staging image, not a second source of truth;
+    # leave it untouched while a prior async copy may still consume it and
+    # rebuild all dynamic rows on the next requested GPU publication.
+    descriptor_dynamic_rows_stale: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,12 +67,12 @@ def _fresh_descriptor_cpu_mirror(
     """[ARM-WAR-R1-PINNED-INDEPENDENT 2026-07-12] fresh pinned CPU 镜像克隆。
 
     E1 后向 WAR 根修(组X 案):常驻 pinned 镜像的全量异步 H2D 可能仍未决
-    (整建步 enqueue 深埋在在途 forward 之后,未决窗 ms 级),下一步 delta 的
-    无条件 host 行写若打在同一缓冲=在途 H2D 读到"未来值"。每次 delta 改写
-    前克隆到独立 fresh pinned 分配,旧块由 torch CachingHostAllocator 事件
-    护栏保到未决 H2D 完成,WAR 窗物理消灭。clone 同时保全 CPU 镜像残留语义
-    (delta 只写行 2-5,行 0/1 靠整建残留)。代价=一次尺寸桶分配+≤768B
-    CPU memcpy(µs 级)。
+    (整建步 enqueue 深埋在在途 forward 之后,未决窗 ms 级),下一次真正发布
+    GPU descriptor 时若原地 host 行写=在途 H2D 读到"未来值"。因此每次
+    GPU-publishing delta 先克隆到独立 fresh pinned 分配,旧块由 torch
+    CachingHostAllocator 事件护栏保到未决 H2D 完成。CPU-only delta 不触碰
+    staging mirror，只更新 plan tuple truth，并由 stale 标志要求下次发布重建
+    rows 2-5。clone 同时保全静态行 0/1。代价只由真正 H2D 的步骤承担。
     """
     if pin_memory:
         try:
@@ -155,12 +160,38 @@ def apply_launch_template_row_delta(
             or _row_changed(plan.recent_count_cpu, row, recent_count[row])
         )
     )
-    gpu_refresh_requested = bool(update_gpu) and bool(force_gpu_refresh)
+    # A CPU-only delta deliberately leaves the pinned staging descriptor
+    # untouched.  Therefore ``stale`` is itself a pending GPU publication,
+    # even when the next caller supplies values already equal to plan truth
+    # and does not need to force an otherwise redundant refresh.
+    gpu_refresh_requested = bool(update_gpu) and bool(
+        force_gpu_refresh or template.descriptor_dynamic_rows_stale
+    )
     if not updated_rows and not gpu_refresh_requested:
         return LaunchTemplateUpdateResult(
             requires_recompile=False,
             reason="hit",
             updated_rows=tuple(),
+            carrier_update_kernel_count=0,
+        )
+
+    if not bool(update_gpu):
+        # The RRP ``arena_batch_seqused`` route does not consume the launch
+        # descriptor on same-page steps.  Updating its pinned mirror here used
+        # to allocate and clone a fresh buffer every step even though no H2D
+        # followed.  Keep the four CPU tuples as the single canonical truth
+        # and preserve the staging image byte-for-byte; this is both cheaper
+        # and stronger than manufacturing another buffer to avoid host/H2D
+        # write-after-read.  A later GPU publication reconstructs rows 2..5.
+        plan.request_recent_len_cpu = request_recent_len
+        plan.recent_first_cpu = recent_first
+        plan.recent_count_cpu = recent_count
+        plan.launch_effective_k_len_cpu = launch_effective_k
+        template.descriptor_dynamic_rows_stale = True
+        return LaunchTemplateUpdateResult(
+            requires_recompile=False,
+            reason="row_delta_applied_cpu_only",
+            updated_rows=updated_rows,
             carrier_update_kernel_count=0,
         )
 
@@ -183,7 +214,10 @@ def apply_launch_template_row_delta(
     # tuple→int32 slice 赋值域与旧标量路径同(request_recent_len 等已由
     # _tuple_from_rows 走 int() 归一,行/列切片长度均 == batch_size)。
     descriptor_np = descriptor_cpu.numpy()
-    if bool(recent_window_changed):
+    refresh_all_dynamic_rows = bool(
+        recent_window_changed or template.descriptor_dynamic_rows_stale
+    )
+    if refresh_all_dynamic_rows:
         descriptor_np[2, :batch_size] = recent_first
         descriptor_np[3, :batch_size] = recent_count
         descriptor_np[4, :batch_size] = request_recent_len
@@ -192,12 +226,12 @@ def apply_launch_template_row_delta(
         descriptor_np[4, :batch_size] = request_recent_len
         descriptor_np[5, :batch_size] = launch_effective_k
 
-    if bool(update_gpu):
-        descriptor_row_start = 2 if bool(recent_window_changed) else 4
-        template.descriptor_gpu_i32[descriptor_row_start:6, :batch_size].copy_(
-            descriptor_cpu[descriptor_row_start:6, :batch_size],
-            non_blocking=non_blocking,
-        )
+    descriptor_row_start = 2 if refresh_all_dynamic_rows else 4
+    template.descriptor_gpu_i32[descriptor_row_start:6, :batch_size].copy_(
+        descriptor_cpu[descriptor_row_start:6, :batch_size],
+        non_blocking=non_blocking,
+    )
+    template.descriptor_dynamic_rows_stale = False
 
     # 双引用替换:template 镜像与 controller 常驻属性同步指向 fresh,保持
     # 「controller 属性=活镜像」不变量(metadata_builder 收尾处的模板身份
@@ -221,11 +255,9 @@ def apply_launch_template_row_delta(
         requires_recompile=False,
         reason=(
             "row_delta_applied"
-            if bool(updated_rows) and bool(update_gpu)
-            else "row_delta_applied_cpu_only"
             if bool(updated_rows)
             else "gpu_refreshed"
         ),
         updated_rows=updated_rows,
-        carrier_update_kernel_count=1 if bool(update_gpu) and non_blocking else 0,
+        carrier_update_kernel_count=1 if non_blocking else 0,
     )

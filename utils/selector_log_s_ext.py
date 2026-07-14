@@ -7,18 +7,29 @@ import re
 import shutil
 import subprocess
 import sys
+from pathlib import Path
 from typing import Optional, Tuple
 
 import torch
 from torch.utils.cpp_extension import load_inline
+from utils.selector_log_s_identity import (
+    SELECTOR_LOG_S_EXTENSION_NAME,
+    SELECTOR_LOG_S_SEMANTIC_IDENTITY,
+    SELECTOR_LOG_S_SEMANTIC_IDENTITY_SYMBOL,
+)
 from utils.torch_extension_cache import load_prebuilt_extension
 
 _MODULE: Optional[torch.nn.Module] = None
+_VALIDATED_MODULE: Optional[object] = None
 _LOAD_ERROR: Optional[Exception] = None
 _REQUIRED_EXT_SYMBOLS = (
+    SELECTOR_LOG_S_SEMANTIC_IDENTITY_SYMBOL,
     "fused_log_f_prior_logits",
     "fused_log_f_prior_pre_denom",
     "reduce_log_f_pre_scratch",
+    "reduce_log_f_pre_scratch_r2_alpha0p5_fp16_resident",
+    "reduce_log_f_pre_scratch_r2_alpha0p5_fp16_tiled",
+    "reduce_log_f_pre_scratch_r2_alpha0p5_fp16_tiled_workspace_nbytes",
     "copy_log_f_lastn1_scratch",
     "copy_log_f_lastn1_scratch_scalar",
     "reduce_log_f_pre_scratch_scalar",
@@ -28,9 +39,196 @@ _REQUIRED_EXT_SYMBOLS = (
 )
 _NVCC_RELEASE_RE = re.compile(r"release\s+(\d+)\.(\d+)")
 
+LOG_F_R2_TILED_TILE_K = 2_048
+LOG_F_R2_TILED_ROWS = 2
+
+
+def log_f_r2_tiled_workspace_layout(
+    *,
+    num_seqs_capacity: int,
+    num_query_heads_capacity: int,
+    logical_k_capacity: int,
+) -> dict[str, tuple[int, int]]:
+    """Return the raw-byte workspace ABI for the dynamic large-K owner."""
+
+    n = int(num_seqs_capacity)
+    h = int(num_query_heads_capacity)
+    k = int(logical_k_capacity)
+    if n <= 0 or h <= 0 or k <= 0:
+        raise ValueError("tiled workspace capacities must be positive")
+    tiles = (k + LOG_F_R2_TILED_TILE_K - 1) // LOG_F_R2_TILED_TILE_K
+    row_partial = n * h * LOG_F_R2_TILED_ROWS * tiles
+    row_state = n * h * LOG_F_R2_TILED_ROWS
+    token_partial = n * h * tiles
+    element_counts = (
+        ("row_partial_max", row_partial),
+        ("row_partial_sum", row_partial),
+        ("row_lse", row_state),
+        ("row_has", row_state),
+        ("token_partial_max", token_partial),
+        ("token_partial_sum", token_partial),
+        ("token_has", token_partial),
+    )
+    layout: dict[str, tuple[int, int]] = {}
+    cursor = 0
+    for name, count in element_counts:
+        begin = cursor
+        cursor += int(count) * 4
+        layout[name] = (begin, cursor)
+    return layout
+
+
+def log_f_r2_tiled_workspace_nbytes(
+    *,
+    num_seqs_capacity: int,
+    num_query_heads_capacity: int,
+    logical_k_capacity: int,
+) -> int:
+    """Return the caller-owned workspace size without loading the extension."""
+
+    layout = log_f_r2_tiled_workspace_layout(
+        num_seqs_capacity=num_seqs_capacity,
+        num_query_heads_capacity=num_query_heads_capacity,
+        logical_k_capacity=logical_k_capacity,
+    )
+    return next(reversed(layout.values()))[1]
+
+
+def allocate_log_f_r2_tiled_workspace(
+    device: torch.device | str,
+    *,
+    num_seqs_capacity: int,
+    num_query_heads_capacity: int,
+    logical_k_capacity: int,
+) -> torch.Tensor:
+    """Allocate raw workspace; the caller owns its stream and graph lifetime."""
+
+    return torch.empty(
+        log_f_r2_tiled_workspace_nbytes(
+            num_seqs_capacity=num_seqs_capacity,
+            num_query_heads_capacity=num_query_heads_capacity,
+            logical_k_capacity=logical_k_capacity,
+        ),
+        dtype=torch.uint8,
+        device=device,
+    )
+
+
+def log_f_r2_tiled_contract_reasons(
+    *,
+    req_meta_i32: torch.Tensor,
+    req_meta_i64: torch.Tensor,
+    workspace: torch.Tensor,
+    num_seqs: int,
+    num_query_heads: int,
+    num_seqs_capacity: int,
+    num_query_heads_capacity: int,
+    logical_k_capacity: int,
+) -> tuple[str, ...]:
+    """Validate the host-visible ABI without reading device-authored values."""
+
+    n = int(num_seqs)
+    h = int(num_query_heads)
+    n_cap = int(num_seqs_capacity)
+    h_cap = int(num_query_heads_capacity)
+    k_cap = int(logical_k_capacity)
+    reasons: list[str] = []
+    if n <= 0 or h <= 0:
+        reasons.append("runtime_shape")
+    if n_cap <= 0 or h_cap <= 0 or k_cap <= 0:
+        reasons.append("capacity")
+    if n > n_cap or h > h_cap:
+        reasons.append("runtime_exceeds_capacity")
+    if req_meta_i32.dtype != torch.int32:
+        reasons.append("meta_i32_dtype")
+    if req_meta_i64.dtype != torch.int64:
+        reasons.append("meta_i64_dtype")
+    if workspace.dtype != torch.uint8:
+        reasons.append("workspace_dtype")
+    if (
+        req_meta_i32.dim() != 2
+        or int(req_meta_i32.shape[0]) < max(n, 0)
+        or int(req_meta_i32.shape[1]) < 10
+        or not req_meta_i32.is_contiguous()
+    ):
+        reasons.append("meta_i32_shape")
+    if (
+        req_meta_i64.dim() != 2
+        or int(req_meta_i64.shape[0]) < max(n, 0)
+        or int(req_meta_i64.shape[1]) < 4
+        or not req_meta_i64.is_contiguous()
+    ):
+        reasons.append("meta_i64_shape")
+    if workspace.dim() != 1 or not workspace.is_contiguous():
+        reasons.append("workspace_shape")
+    elif n_cap > 0 and h_cap > 0 and k_cap > 0:
+        required = log_f_r2_tiled_workspace_nbytes(
+            num_seqs_capacity=n_cap,
+            num_query_heads_capacity=h_cap,
+            logical_k_capacity=k_cap,
+        )
+        if int(workspace.numel()) < required:
+            reasons.append("workspace_too_small")
+    devices = {
+        tensor.device
+        for tensor in (req_meta_i32, req_meta_i64, workspace)
+    }
+    if len(devices) != 1:
+        reasons.append("device_mismatch")
+    if any(device.type != "cuda" for device in devices):
+        reasons.append("device_not_cuda")
+    return tuple(reasons)
+
 
 class SelectorLogSExtUnavailable(RuntimeError):
     """Raised when the optional selector CUDA extension is unavailable."""
+
+
+def _module_contract_error(module: object) -> str | None:
+    missing = tuple(
+        name for name in _REQUIRED_EXT_SYMBOLS if not hasattr(module, name)
+    )
+    if missing:
+        return "missing symbols: " + ",".join(missing)
+    identity_fn = getattr(module, SELECTOR_LOG_S_SEMANTIC_IDENTITY_SYMBOL, None)
+    if not callable(identity_fn):
+        return "semantic identity symbol is not callable"
+    try:
+        identity = identity_fn()
+    except Exception as exc:
+        return f"semantic identity query failed: {type(exc).__name__}"
+    if type(identity) is not str or identity != SELECTOR_LOG_S_SEMANTIC_IDENTITY:
+        return (
+            "semantic identity mismatch: "
+            f"actual={identity!r}:expected={SELECTOR_LOG_S_SEMANTIC_IDENTITY!r}"
+        )
+    return None
+
+
+def _immutable_namespace_error(*, origin: str, contract_error: str) -> RuntimeError:
+    return RuntimeError(
+        f"{origin} {SELECTOR_LOG_S_EXTENSION_NAME} violates the selector log_s "
+        f"semantic contract ({contract_error}); imported native extension "
+        "namespaces are immutable in-process, so changed source/ABI requires "
+        "a fresh extension namespace"
+    )
+
+
+def _prebuilt_extension_artifact() -> Path | None:
+    """Return the current namespace artifact, if one already exists."""
+
+    try:
+        from torch.utils.cpp_extension import _get_build_directory
+
+        build_dir = Path(
+            _get_build_directory(SELECTOR_LOG_S_EXTENSION_NAME, verbose=False)
+        )
+        artifact = build_dir / f"{SELECTOR_LOG_S_EXTENSION_NAME}.so"
+        if artifact.is_file() and int(artifact.stat().st_size) > 0:
+            return artifact
+    except OSError:
+        return None
+    return None
 
 
 def _should_enable() -> bool:
@@ -131,29 +329,70 @@ def _cuda_std_flag_for_current_nvcc() -> str:
 
 
 def _load_ext(*, force: bool = False) -> Optional[torch.nn.Module]:
-    global _MODULE, _LOAD_ERROR
+    global _MODULE, _VALIDATED_MODULE, _LOAD_ERROR
+    if _LOAD_ERROR is not None:
+        return None
     if _MODULE is not None:
-        if all(hasattr(_MODULE, name) for name in _REQUIRED_EXT_SYMBOLS):
+        loaded_module = _MODULE
+        if loaded_module is _VALIDATED_MODULE:
+            return _MODULE
+        contract_error = _module_contract_error(loaded_module)
+        if contract_error is None:
+            _VALIDATED_MODULE = loaded_module
             return _MODULE
         _MODULE = None
-        _LOAD_ERROR = None
-    if _LOAD_ERROR is not None:
+        _VALIDATED_MODULE = None
+        _LOAD_ERROR = _immutable_namespace_error(
+            origin="already-loaded module",
+            contract_error=contract_error,
+        )
         return None
     if not force and not _should_enable():
         return None
-    # [FLFP-ILP4 2026-07-10] kernel 改动随 ext 名 bump(prebuilt 按名取件不看
-    # hash,BIND-CPP dg2 先例):旧预编件绝不能按旧名装上。
-    prebuilt = load_prebuilt_extension("selector_log_s_ext_ilp4")
-    if prebuilt is not None and all(
-        hasattr(prebuilt, name) for name in _REQUIRED_EXT_SYMBOLS
-    ):
-        _MODULE = prebuilt
+
+    registered = sys.modules.get(SELECTOR_LOG_S_EXTENSION_NAME)
+    if registered is not None:
+        contract_error = _module_contract_error(registered)
+        if contract_error is not None:
+            _LOAD_ERROR = _immutable_namespace_error(
+                origin="already-imported module",
+                contract_error=contract_error,
+            )
+            return None
+        _MODULE = registered
+        _VALIDATED_MODULE = registered
         return _MODULE
+
+    # A native extension name is a process-lifetime ABI namespace.  A valid
+    # v12 prebuilt is reusable; an invalid/unimportable v12 artifact is
+    # terminal.  Compilation is allowed only when this fresh namespace has no
+    # artifact yet.
+    prebuilt_artifact = _prebuilt_extension_artifact()
+    prebuilt = load_prebuilt_extension(SELECTOR_LOG_S_EXTENSION_NAME)
+    if prebuilt is not None:
+        contract_error = _module_contract_error(prebuilt)
+        if contract_error is not None:
+            _LOAD_ERROR = _immutable_namespace_error(
+                origin="prebuilt module",
+                contract_error=contract_error,
+            )
+            return None
+        _MODULE = prebuilt
+        _VALIDATED_MODULE = prebuilt
+        return _MODULE
+    if prebuilt_artifact is not None:
+        _LOAD_ERROR = RuntimeError(
+            f"prebuilt {SELECTOR_LOG_S_EXTENSION_NAME} artifact could not be "
+            f"imported: {prebuilt_artifact}; refusing to rebuild an existing "
+            "native extension namespace in-process"
+        )
+        return None
 
     cpp_source = r"""
 #include <torch/extension.h>
-#include <vector>
 #include <cstdlib>
+#include <string>
+#include <vector>
 
 std::vector<torch::Tensor> fused_log_f_prior_logits_cuda(
     torch::Tensor scores,
@@ -202,6 +441,28 @@ void reduce_log_f_pre_scratch_cuda(
     bool scratch_in_fp16,
     bool log_f_out_fp32,
     double alpha);
+
+void reduce_log_f_pre_scratch_r2_alpha0p5_fp16_resident_cuda(
+    torch::Tensor req_meta_i32,
+    torch::Tensor req_meta_i64,
+    int64_t num_seqs,
+    int64_t num_query_heads,
+    int64_t logical_k_bucket);
+
+void reduce_log_f_pre_scratch_r2_alpha0p5_fp16_tiled_cuda(
+    torch::Tensor req_meta_i32,
+    torch::Tensor req_meta_i64,
+    torch::Tensor workspace,
+    int64_t num_seqs,
+    int64_t num_query_heads,
+    int64_t num_seqs_capacity,
+    int64_t num_query_heads_capacity,
+    int64_t logical_k_capacity);
+
+int64_t reduce_log_f_pre_scratch_r2_alpha0p5_fp16_tiled_workspace_nbytes_cuda(
+    int64_t num_seqs_capacity,
+    int64_t num_query_heads_capacity,
+    int64_t logical_k_capacity);
 
 void copy_log_f_lastn1_scratch_cuda(
     torch::Tensor req_meta_i32,
@@ -327,6 +588,50 @@ void reduce_log_f_pre_scratch(
         alpha);
 }
 
+void reduce_log_f_pre_scratch_r2_alpha0p5_fp16_resident(
+    torch::Tensor req_meta_i32,
+    torch::Tensor req_meta_i64,
+    int64_t num_seqs,
+    int64_t num_query_heads,
+    int64_t logical_k_bucket) {
+    reduce_log_f_pre_scratch_r2_alpha0p5_fp16_resident_cuda(
+        req_meta_i32,
+        req_meta_i64,
+        num_seqs,
+        num_query_heads,
+        logical_k_bucket);
+}
+
+void reduce_log_f_pre_scratch_r2_alpha0p5_fp16_tiled(
+    torch::Tensor req_meta_i32,
+    torch::Tensor req_meta_i64,
+    torch::Tensor workspace,
+    int64_t num_seqs,
+    int64_t num_query_heads,
+    int64_t num_seqs_capacity,
+    int64_t num_query_heads_capacity,
+    int64_t logical_k_capacity) {
+    reduce_log_f_pre_scratch_r2_alpha0p5_fp16_tiled_cuda(
+        req_meta_i32,
+        req_meta_i64,
+        workspace,
+        num_seqs,
+        num_query_heads,
+        num_seqs_capacity,
+        num_query_heads_capacity,
+        logical_k_capacity);
+}
+
+int64_t reduce_log_f_pre_scratch_r2_alpha0p5_fp16_tiled_workspace_nbytes(
+    int64_t num_seqs_capacity,
+    int64_t num_query_heads_capacity,
+    int64_t logical_k_capacity) {
+    return reduce_log_f_pre_scratch_r2_alpha0p5_fp16_tiled_workspace_nbytes_cuda(
+        num_seqs_capacity,
+        num_query_heads_capacity,
+        logical_k_capacity);
+}
+
 void copy_log_f_lastn1_scratch(
     torch::Tensor req_meta_i32,
     torch::Tensor req_meta_i64,
@@ -388,12 +693,24 @@ bool reduce_log_f_pre_scratch_accum_supported() {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("selector_log_s_semantic_identity", []() {
+        return std::string("__SFI_SELECTOR_LOG_S_SEMANTIC_IDENTITY__");
+    }, "Fixed selector log_s kernel/ABI semantic identity");
     m.def("fused_log_f_prior_logits", &fused_log_f_prior_logits,
           "Fused log_f + prior (logits path)");
     m.def("fused_log_f_prior_pre_denom", &fused_log_f_prior_pre_denom,
           "Fused log_f + prior (log_f_pre + denom path)");
     m.def("reduce_log_f_pre_scratch", &reduce_log_f_pre_scratch,
           "Reduce FA scratch logits into log_f_pre + denom");
+    m.def("reduce_log_f_pre_scratch_r2_alpha0p5_fp16_resident",
+          &reduce_log_f_pre_scratch_r2_alpha0p5_fp16_resident,
+          "Resident two-pass SM80 reduce for R=2 K buckets, fp16, alpha=0.5");
+    m.def("reduce_log_f_pre_scratch_r2_alpha0p5_fp16_tiled",
+          &reduce_log_f_pre_scratch_r2_alpha0p5_fp16_tiled,
+          "Dynamic tiled four-stage reduce for R=2, fp16, alpha=0.5");
+    m.def("reduce_log_f_pre_scratch_r2_alpha0p5_fp16_tiled_workspace_nbytes",
+          &reduce_log_f_pre_scratch_r2_alpha0p5_fp16_tiled_workspace_nbytes,
+          "Caller-owned byte workspace required by the dynamic tiled reduce");
     m.def("reduce_log_f_pre_scratch_accum_supported",
           &reduce_log_f_pre_scratch_accum_supported,
           "Marker: reduce supports chunked-prefill accumulate meta "
@@ -407,9 +724,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 }
 """
 
+    semantic_token = "__SFI_SELECTOR_LOG_S_SEMANTIC_IDENTITY__"
+    if cpp_source.count(semantic_token) != 1:
+        raise RuntimeError("selector log_s semantic identity token drift")
+    cpp_source = cpp_source.replace(
+        semantic_token,
+        SELECTOR_LOG_S_SEMANTIC_IDENTITY,
+    )
+
     cuda_source = r"""
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -471,6 +797,59 @@ __device__ __forceinline__ float block_reduce_max(float val) {
     }
     __syncthreads();
     if (wid == 0 && lane == 0) {
+        shared[0] = out;
+    }
+    __syncthreads();
+    return shared[0];
+}
+
+// Reproduce the generic reduce kernel's 256-thread reduction order inside a
+// larger resident CTA.  All CTA threads call these helpers; only logical lanes
+// [0, 256) contribute, so NaN propagation matches the generic owner exactly.
+__device__ __forceinline__ float block_reduce_sum_first_256(float val) {
+    static __shared__ float shared[8];
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int wid = tid >> 5;
+    if (tid < 256) {
+        val = warp_reduce_sum(val);
+        if (lane == 0) {
+            shared[wid] = val;
+        }
+    }
+    __syncthreads();
+    float out = 0.0f;
+    if (wid == 0) {
+        out = lane < 8 ? shared[lane] : 0.0f;
+        out = warp_reduce_sum(out);
+    }
+    __syncthreads();
+    if (tid == 0) {
+        shared[0] = out;
+    }
+    __syncthreads();
+    return shared[0];
+}
+
+__device__ __forceinline__ float block_reduce_max_first_256(float val) {
+    static __shared__ float shared[8];
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int wid = tid >> 5;
+    if (tid < 256) {
+        val = warp_reduce_max(val);
+        if (lane == 0) {
+            shared[wid] = val;
+        }
+    }
+    __syncthreads();
+    float out = -INFINITY;
+    if (wid == 0) {
+        out = lane < 8 ? shared[lane] : -INFINITY;
+        out = warp_reduce_max(out);
+    }
+    __syncthreads();
+    if (tid == 0) {
         shared[0] = out;
     }
     __syncthreads();
@@ -1340,6 +1719,15 @@ std::vector<torch::Tensor> fused_log_f_prior_pre_denom_cuda(
 
 constexpr int kLogFPreMaxR = 16;
 constexpr float kLogFPreMinVal = -3.402823466e38f;
+constexpr int kLogFPreR2Bucket12K = 12288;
+constexpr int kLogFPreR2Bucket16K = 16384;
+constexpr int kLogFPreR2Bucket24K = 24576;
+constexpr int kLogFPreR2Bucket32K = 32768;
+constexpr int kLogFPreR2TiledRows = 2;
+constexpr int kLogFPreR2TiledTileK = 2048;
+constexpr int kLogFPreR2TiledThreads = 256;
+constexpr int kLogFPreR2TiledItemsPerThread =
+    kLogFPreR2TiledTileK / kLogFPreR2TiledThreads;
 
 template <typename out_t>
 __device__ __forceinline__ void store_log_f_pre_value(out_t* ptr, float value);
@@ -1485,10 +1873,780 @@ __device__ __forceinline__ float compute_log_f_pre_token_unnormalized(
     return amax + logf(asum + 1.0e-20f);
 }
 
+// Shared resident owner for the real R=2 buckets.  K, N, H and physical
+// strides remain metadata-driven; only the loop ceiling is specialized.  The
+// ceiling is never an effective length: bucket padding is neither loaded nor
+// written.  This keeps one contract for TP1/TP8 and batch>1 instead of cloning
+// the former K=11744 single-row path.
+template <int kLogicalKBucket>
+__device__ __forceinline__ bool log_f_pre_r2_resident_contract(
+    const int32_t* meta32,
+    const int64_t* meta64,
+    int64_t meta32_stride_col,
+    int64_t meta64_stride_col) {
+    const int logical_k = meta32[0 * meta32_stride_col];
+    const int scratch_head_stride = meta32[1 * meta32_stride_col];
+    const int out_head_stride = meta32[6 * meta32_stride_col];
+    const int scratch_row_stride = meta32[7 * meta32_stride_col];
+    const uint64_t scratch_base = static_cast<uint64_t>(
+        meta64[1 * meta64_stride_col]);
+    const uint64_t out_base = static_cast<uint64_t>(
+        meta64[2 * meta64_stride_col]);
+    const uint64_t denom_base = static_cast<uint64_t>(
+        meta64[3 * meta64_stride_col]);
+    // Two fp32 row LSE values occupy out_head[0:4] between the two kernels.
+    // K<4 cannot provide that transient workspace without crossing the head.
+    return logical_k >= 4
+        && logical_k <= kLogicalKBucket
+        && meta32[2 * meta32_stride_col] == 2
+        && meta32[3 * meta32_stride_col] == 0
+        && meta32[4 * meta32_stride_col] == logical_k
+        && meta32[5 * meta32_stride_col] == 8
+        && scratch_row_stride >= logical_k
+        && scratch_head_stride == 2 * scratch_row_stride
+        && out_head_stride >= logical_k
+        && meta32[8 * meta32_stride_col] == 0
+        && meta32[9 * meta32_stride_col] == 0
+        && scratch_base != 0
+        && out_base != 0
+        && denom_base != 0;
+}
+
+__device__ __forceinline__ void log_f_pre_contract_trap() {
+    asm volatile("trap;");
+}
+
+// out_head is a half tensor, so an arbitrary legal physical head stride only
+// guarantees two-byte alignment.  Preserve each transient float LSE bit-for-
+// bit without imposing a hidden four-byte stride contract: split it into two
+// naturally aligned u16 stores, then reconstruct the same bits in pass two.
+__device__ __forceinline__ void store_float_bits_half_aligned(
+    half* base,
+    int index,
+    float value) {
+    const uint32_t bits = __float_as_uint(value);
+    uint16_t* words = reinterpret_cast<uint16_t*>(base) + 2 * index;
+    words[0] = static_cast<uint16_t>(bits & 0xffffU);
+    words[1] = static_cast<uint16_t>(bits >> 16);
+}
+
+__device__ __forceinline__ float load_float_bits_half_aligned(
+    const half* base,
+    int index) {
+    const uint16_t* words = reinterpret_cast<const uint16_t*>(base)
+        + 2 * index;
+    const uint32_t bits = static_cast<uint32_t>(words[0])
+        | (static_cast<uint32_t>(words[1]) << 16);
+    return __uint_as_float(bits);
+}
+
+template <int kLogicalKBucket, int kThreads, int kItemsPerThread>
+__global__ __launch_bounds__(kThreads, 1)
+void reduce_log_f_pre_r2_resident_row_lse_kernel(
+    const int32_t* __restrict__ req_meta_i32,
+    const int64_t* __restrict__ req_meta_i64,
+    int64_t req_meta_i32_stride_row,
+    int64_t req_meta_i32_stride_col,
+    int64_t req_meta_i64_stride_row,
+    int64_t req_meta_i64_stride_col) {
+    static_assert(kThreads * kItemsPerThread >= kLogicalKBucket,
+                  "resident bucket must be fully covered");
+    const int seq = blockIdx.z;
+    const int head = blockIdx.x;
+    const int row = blockIdx.y;
+    const int32_t* meta32 = req_meta_i32
+        + static_cast<int64_t>(seq) * req_meta_i32_stride_row;
+    const int64_t* meta64 = req_meta_i64
+        + static_cast<int64_t>(seq) * req_meta_i64_stride_row;
+    __shared__ int contract_ok;
+    __shared__ int logical_k;
+    __shared__ int scratch_head_stride;
+    __shared__ int scratch_row_stride;
+    __shared__ int64_t scratch_base_raw;
+    __shared__ int64_t out_base_raw;
+    if (threadIdx.x == 0) {
+        contract_ok = log_f_pre_r2_resident_contract<kLogicalKBucket>(
+            meta32,
+            meta64,
+            req_meta_i32_stride_col,
+            req_meta_i64_stride_col) ? 1 : 0;
+        logical_k = meta32[0 * req_meta_i32_stride_col];
+        scratch_head_stride = meta32[1 * req_meta_i32_stride_col];
+        scratch_row_stride = meta32[7 * req_meta_i32_stride_col];
+        scratch_base_raw = meta64[1 * req_meta_i64_stride_col];
+        out_base_raw = meta64[2 * req_meta_i64_stride_col];
+    }
+    __syncthreads();
+    if (contract_ok == 0) {
+        if (threadIdx.x == 0) {
+            log_f_pre_contract_trap();
+        }
+        return;
+    }
+
+    const half* scratch = reinterpret_cast<const half*>(scratch_base_raw)
+        + static_cast<int64_t>(head) * scratch_head_stride
+        + static_cast<int64_t>(row) * scratch_row_stride;
+    float values[kItemsPerThread];
+    float local_max = kLogFPreMinVal;
+#pragma unroll
+    for (int item = 0; item < kItemsPerThread; ++item) {
+        const int token = threadIdx.x + item * kThreads;
+        const float value = token < logical_k
+            ? __half2float(scratch[token])
+            : kLogFPreMinVal;
+        values[item] = value;
+        if (value > kLogFPreMinVal) {
+            local_max = local_max > value ? local_max : value;
+        }
+    }
+    const float row_max = block_reduce_max(local_max);
+    float local_sum = 0.0f;
+    if (row_max > kLogFPreMinVal) {
+#pragma unroll
+        for (int item = 0; item < kItemsPerThread; ++item) {
+            const float value = values[item];
+            if (value > kLogFPreMinVal) {
+                local_sum += expf(value - row_max);
+            }
+        }
+    }
+    const float row_sum = block_reduce_sum(local_sum);
+    if (threadIdx.x == 0) {
+        half* out_head = reinterpret_cast<half*>(out_base_raw)
+            + static_cast<int64_t>(head)
+                * meta32[6 * req_meta_i32_stride_col];
+        // The first eight output bytes are a transient two-float workspace.
+        // The output tensor is only half-aligned for odd physical strides, so
+        // keep the float bits in two u16 words.  The second pass overwrites
+        // every logical token on the same stream.
+        store_float_bits_half_aligned(
+            out_head,
+            row,
+            row_max > kLogFPreMinVal
+                ? row_max + logf(row_sum + 1.0e-20f)
+                : kLogFPreMinVal);
+    }
+}
+
+__device__ __noinline__ void reduce_log_f_pre_r2_nonfinite_generic_256(
+    const half* scratch_head,
+    half* out_head,
+    float* denom,
+    int head,
+    int logical_k,
+    int scratch_row_stride,
+    float* generic_row_lse,
+    int* generic_row_has,
+    float* generic_row_count,
+    float* generic_token_max) {
+    const bool generic_lane = threadIdx.x < 256;
+    for (int row = 0; row < 2; ++row) {
+        float local_max = kLogFPreMinVal;
+        if (generic_lane) {
+            for (int token = threadIdx.x; token < logical_k; token += 256) {
+                const float value = __half2float(
+                    scratch_head[static_cast<int64_t>(row)
+                        * scratch_row_stride + token]);
+                if (value > kLogFPreMinVal) {
+                    local_max = local_max > value ? local_max : value;
+                }
+            }
+        }
+        const float row_max = block_reduce_max_first_256(local_max);
+        if (threadIdx.x == 0) {
+            generic_row_has[row] = row_max > kLogFPreMinVal ? 1 : 0;
+            generic_row_lse[row] = row_max;
+        }
+        __syncthreads();
+
+        float local_sum = 0.0f;
+        if (generic_lane && generic_row_has[row] != 0) {
+            for (int token = threadIdx.x; token < logical_k; token += 256) {
+                const float value = __half2float(
+                    scratch_head[static_cast<int64_t>(row)
+                        * scratch_row_stride + token]);
+                if (value > kLogFPreMinVal) {
+                    local_sum += expf(value - generic_row_lse[row]);
+                }
+            }
+        }
+        const float row_sum = block_reduce_sum_first_256(local_sum);
+        if (threadIdx.x == 0) {
+            generic_row_lse[row] = generic_row_has[row] != 0
+                ? generic_row_lse[row] + logf(row_sum + 1.0e-20f)
+                : kLogFPreMinVal;
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        const int row_count = generic_row_has[0] + generic_row_has[1];
+        *generic_row_count = row_count > 0
+            ? static_cast<float>(row_count)
+            : 1.0f;
+    }
+    __syncthreads();
+
+    float local_token_max = kLogFPreMinVal;
+    bool local_token_poison = false;
+    if (generic_lane) {
+        for (int token = threadIdx.x; token < logical_k; token += 256) {
+            bool has_token = false;
+            const float log_f = compute_log_f_pre_token(
+                scratch_head,
+                static_cast<int64_t>(scratch_row_stride),
+                token,
+                2,
+                generic_row_lse,
+                generic_row_has,
+                *generic_row_count,
+                0.5f,
+                false,
+                &has_token);
+            out_head[token] = __float2half_rn(log_f);
+            if (has_token) {
+                if (isnan(log_f)) {
+                    local_token_poison = true;
+                } else {
+                    local_token_max = local_token_max > log_f
+                        ? local_token_max
+                        : log_f;
+                }
+            }
+        }
+    }
+    const int token_poison = __syncthreads_count(local_token_poison) > 0
+        ? 1
+        : 0;
+    if (token_poison != 0) {
+        if (threadIdx.x == 0) {
+            denom[head] = NAN;
+        }
+        return;
+    }
+    const float token_max = block_reduce_max_first_256(local_token_max);
+    if (threadIdx.x == 0) {
+        *generic_token_max = token_max;
+    }
+    __syncthreads();
+    if (*generic_token_max <= kLogFPreMinVal) {
+        if (threadIdx.x == 0) {
+            denom[head] = 0.0f;
+        }
+        return;
+    }
+
+    float local_token_sum = 0.0f;
+    if (generic_lane) {
+        for (int token = threadIdx.x; token < logical_k; token += 256) {
+            bool has_token = false;
+            const float log_f = compute_log_f_pre_token(
+                scratch_head,
+                static_cast<int64_t>(scratch_row_stride),
+                token,
+                2,
+                generic_row_lse,
+                generic_row_has,
+                *generic_row_count,
+                0.5f,
+                false,
+                &has_token);
+            if (has_token) {
+                local_token_sum += expf(log_f - *generic_token_max);
+            }
+        }
+    }
+    const float token_sum = block_reduce_sum_first_256(local_token_sum);
+    if (threadIdx.x == 0) {
+        denom[head] = *generic_token_max + logf(token_sum + 1.0e-20f);
+    }
+}
+
+template <int kLogicalKBucket, int kThreads, int kItemsPerThread>
+__global__ __launch_bounds__(kThreads, 1)
+void reduce_log_f_pre_r2_resident_log_f_denom_kernel(
+    const int32_t* __restrict__ req_meta_i32,
+    const int64_t* __restrict__ req_meta_i64,
+    int64_t req_meta_i32_stride_row,
+    int64_t req_meta_i32_stride_col,
+    int64_t req_meta_i64_stride_row,
+    int64_t req_meta_i64_stride_col) {
+    static_assert(kThreads * kItemsPerThread >= kLogicalKBucket,
+                  "resident bucket must be fully covered");
+    const int seq = blockIdx.z;
+    const int head = blockIdx.x;
+    const int32_t* meta32 = req_meta_i32
+        + static_cast<int64_t>(seq) * req_meta_i32_stride_row;
+    const int64_t* meta64 = req_meta_i64
+        + static_cast<int64_t>(seq) * req_meta_i64_stride_row;
+    __shared__ int contract_ok;
+    __shared__ int logical_k;
+    __shared__ int scratch_head_stride;
+    __shared__ int scratch_row_stride;
+    __shared__ int out_head_stride;
+    __shared__ int64_t scratch_base_raw;
+    __shared__ int64_t out_base_raw;
+    __shared__ int64_t denom_base_raw;
+    __shared__ float row_lse0;
+    __shared__ float row_lse1;
+    __shared__ float log_row_count;
+    __shared__ int row_lse_nonfinite;
+    __shared__ float generic_row_lse[2];
+    __shared__ int generic_row_has[2];
+    __shared__ float generic_row_count;
+    __shared__ float generic_token_max;
+    if (threadIdx.x == 0) {
+        contract_ok = log_f_pre_r2_resident_contract<kLogicalKBucket>(
+            meta32,
+            meta64,
+            req_meta_i32_stride_col,
+            req_meta_i64_stride_col) ? 1 : 0;
+        logical_k = meta32[0 * req_meta_i32_stride_col];
+        scratch_head_stride = meta32[1 * req_meta_i32_stride_col];
+        scratch_row_stride = meta32[7 * req_meta_i32_stride_col];
+        out_head_stride = meta32[6 * req_meta_i32_stride_col];
+        scratch_base_raw = meta64[1 * req_meta_i64_stride_col];
+        out_base_raw = meta64[2 * req_meta_i64_stride_col];
+        denom_base_raw = meta64[3 * req_meta_i64_stride_col];
+    }
+    __syncthreads();
+    if (contract_ok == 0) {
+        if (threadIdx.x == 0) {
+            log_f_pre_contract_trap();
+        }
+        return;
+    }
+
+    half* out_head = reinterpret_cast<half*>(out_base_raw)
+        + static_cast<int64_t>(head) * out_head_stride;
+    if (threadIdx.x == 0) {
+        row_lse0 = load_float_bits_half_aligned(out_head, 0);
+        row_lse1 = load_float_bits_half_aligned(out_head, 1);
+        row_lse_nonfinite = (!isfinite(row_lse0) || !isfinite(row_lse1))
+            ? 1
+            : 0;
+        const int row_count = (row_lse0 > kLogFPreMinVal ? 1 : 0)
+            + (row_lse1 > kLogFPreMinVal ? 1 : 0);
+        log_row_count = row_count > 0 ? logf(static_cast<float>(row_count)) : 0.0f;
+    }
+    __syncthreads();
+
+    const half* scratch_head = reinterpret_cast<const half*>(scratch_base_raw)
+        + static_cast<int64_t>(head) * scratch_head_stride;
+
+    // A +inf scratch value can make a row LSE non-finite.  Generic semantics
+    // are token-local (a masked token in that row need not become NaN), and its
+    // denom follows the exact 256-thread reduction order.  Recompute only this
+    // exceptional data path with the same 256 logical lanes and math; this is
+    // not a fallback launch and adds no host decision or collective.
+    if (row_lse_nonfinite != 0) {
+        reduce_log_f_pre_r2_nonfinite_generic_256(
+            scratch_head,
+            out_head,
+            reinterpret_cast<float*>(denom_base_raw),
+            head,
+            logical_k,
+            scratch_row_stride,
+            generic_row_lse,
+            generic_row_has,
+            &generic_row_count,
+            &generic_token_max);
+        return;
+    }
+
+    float log_f_values[kItemsPerThread];
+    float local_token_max = kLogFPreMinVal;
+#pragma unroll
+    for (int item = 0; item < kItemsPerThread; ++item) {
+        const int token = threadIdx.x + item * kThreads;
+        float log_f = kLogFPreMinVal;
+        if (token < logical_k) {
+            const float value0 = __half2float(scratch_head[token]);
+            const float value1 = __half2float(
+                scratch_head[scratch_row_stride + token]);
+            const bool valid0 = row_lse0 > kLogFPreMinVal
+                && value0 > kLogFPreMinVal;
+            const bool valid1 = row_lse1 > kLogFPreMinVal
+                && value1 > kLogFPreMinVal;
+            if (valid0 || valid1) {
+                float score_max = kLogFPreMinVal;
+                float score0 = kLogFPreMinVal;
+                float score1 = kLogFPreMinVal;
+                if (valid0) {
+                    score0 = 0.5f * (value0 - row_lse0);
+                    score_max = score0;
+                }
+                if (valid1) {
+                    score1 = 0.5f * (value1 - row_lse1);
+                    score_max = score_max > score1 ? score_max : score1;
+                }
+                float score_sum = 0.0f;
+                if (valid0) {
+                    score_sum += expf(score0 - score_max);
+                }
+                if (valid1) {
+                    score_sum += expf(score1 - score_max);
+                }
+                log_f = 2.0f * (
+                    score_max + logf(score_sum + 1.0e-20f) - log_row_count);
+                local_token_max = local_token_max > log_f
+                    ? local_token_max
+                    : log_f;
+            }
+            out_head[token] = __float2half_rn(log_f);
+        }
+        log_f_values[item] = log_f;
+    }
+
+    const float token_max = block_reduce_max(local_token_max);
+    if (token_max <= kLogFPreMinVal) {
+        if (threadIdx.x == 0) {
+            reinterpret_cast<float*>(denom_base_raw)[head] = 0.0f;
+        }
+        return;
+    }
+    float local_token_sum = 0.0f;
+#pragma unroll
+    for (int item = 0; item < kItemsPerThread; ++item) {
+        const float log_f = log_f_values[item];
+        if (log_f > kLogFPreMinVal) {
+            local_token_sum += expf(log_f - token_max);
+        }
+    }
+    const float token_sum = block_reduce_sum(local_token_sum);
+    if (threadIdx.x == 0) {
+        reinterpret_cast<float*>(denom_base_raw)[head] =
+            token_max + logf(token_sum + 1.0e-20f);
+    }
+}
+
+struct LogFPreR2TiledWorkspaceLayout {
+    int64_t tile_capacity;
+    int64_t row_partial_max;
+    int64_t row_partial_sum;
+    int64_t row_lse;
+    int64_t row_has;
+    int64_t token_partial_max;
+    int64_t token_partial_sum;
+    int64_t token_has;
+    int64_t total_words;
+};
+
+inline LogFPreR2TiledWorkspaceLayout log_f_pre_r2_tiled_workspace_layout(
+    int64_t num_seqs_capacity,
+    int64_t num_query_heads_capacity,
+    int64_t logical_k_capacity) {
+    const int64_t tile_capacity =
+        (logical_k_capacity + kLogFPreR2TiledTileK - 1)
+        / kLogFPreR2TiledTileK;
+    const int64_t row_partial_elements = num_seqs_capacity
+        * num_query_heads_capacity * kLogFPreR2TiledRows * tile_capacity;
+    const int64_t row_state_elements = num_seqs_capacity
+        * num_query_heads_capacity * kLogFPreR2TiledRows;
+    const int64_t token_partial_elements = num_seqs_capacity
+        * num_query_heads_capacity * tile_capacity;
+    LogFPreR2TiledWorkspaceLayout layout{};
+    layout.tile_capacity = tile_capacity;
+    layout.row_partial_max = 0;
+    layout.row_partial_sum = layout.row_partial_max + row_partial_elements;
+    layout.row_lse = layout.row_partial_sum + row_partial_elements;
+    layout.row_has = layout.row_lse + row_state_elements;
+    layout.token_partial_max = layout.row_has + row_state_elements;
+    layout.token_partial_sum =
+        layout.token_partial_max + token_partial_elements;
+    layout.token_has = layout.token_partial_sum + token_partial_elements;
+    layout.total_words = layout.token_has + token_partial_elements;
+    return layout;
+}
+
+__device__ __forceinline__ bool log_f_pre_r2_tiled_contract(
+    const int32_t* meta32,
+    const int64_t* meta64,
+    int64_t meta32_stride_col,
+    int64_t meta64_stride_col,
+    int logical_k_capacity) {
+    const int logical_k = meta32[0 * meta32_stride_col];
+    const int scratch_head_stride = meta32[1 * meta32_stride_col];
+    const int last_n = meta32[2 * meta32_stride_col];
+    const int flags = meta32[5 * meta32_stride_col];
+    const int out_head_stride = meta32[6 * meta32_stride_col];
+    const int scratch_row_stride = meta32[7 * meta32_stride_col];
+    const int accum_prev_rows = meta32[8 * meta32_stride_col];
+    const int accum_prev_capacity = meta32[9 * meta32_stride_col];
+    const bool plain = flags == 8
+        && last_n == 2
+        && accum_prev_rows == 0
+        && accum_prev_capacity == 0;
+    const bool accumulating = flags == 24
+        && (last_n == 1 || last_n == 2)
+        && accum_prev_rows >= 0
+        && (
+            (accum_prev_rows == 0 && accum_prev_capacity == 0)
+            || (accum_prev_rows > 0
+                && accum_prev_capacity > 0
+                && accum_prev_capacity <= logical_k));
+    return logical_k > 0
+        && logical_k <= logical_k_capacity
+        && meta32[3 * meta32_stride_col] == 0
+        && meta32[4 * meta32_stride_col] == logical_k
+        && (plain || accumulating)
+        && scratch_row_stride >= logical_k
+        && scratch_head_stride >= last_n * scratch_row_stride
+        && out_head_stride >= logical_k
+        && meta64[1 * meta64_stride_col] != 0
+        && meta64[2 * meta64_stride_col] != 0
+        && meta64[3 * meta64_stride_col] != 0;
+}
+
+__device__ __forceinline__ int64_t log_f_pre_r2_tiled_row_partial_index(
+    int seq,
+    int head,
+    int row,
+    int tile,
+    int num_query_heads_capacity,
+    int tile_capacity) {
+    return (((static_cast<int64_t>(seq) * num_query_heads_capacity + head)
+        * kLogFPreR2TiledRows + row) * tile_capacity + tile);
+}
+
+__device__ __forceinline__ int64_t log_f_pre_r2_tiled_row_state_index(
+    int seq,
+    int head,
+    int row,
+    int num_query_heads_capacity) {
+    return ((static_cast<int64_t>(seq) * num_query_heads_capacity + head)
+        * kLogFPreR2TiledRows + row);
+}
+
+__device__ __forceinline__ int64_t log_f_pre_r2_tiled_token_partial_index(
+    int seq,
+    int head,
+    int tile,
+    int num_query_heads_capacity,
+    int tile_capacity) {
+    return ((static_cast<int64_t>(seq) * num_query_heads_capacity + head)
+        * tile_capacity + tile);
+}
+
+__global__ __launch_bounds__(kLogFPreR2TiledThreads)
+void reduce_log_f_pre_r2_tiled_row_partial_kernel(
+    const int32_t* __restrict__ req_meta_i32,
+    const int64_t* __restrict__ req_meta_i64,
+    int64_t req_meta_i32_stride_row,
+    int64_t req_meta_i32_stride_col,
+    int64_t req_meta_i64_stride_row,
+    int64_t req_meta_i64_stride_col,
+    float* __restrict__ partial_max,
+    float* __restrict__ partial_sum,
+    int num_seqs,
+    int num_query_heads,
+    int num_query_heads_capacity,
+    int tile_capacity,
+    int logical_k_capacity) {
+    const int64_t linear = static_cast<int64_t>(blockIdx.x);
+    int64_t cursor = linear;
+    const int tile = static_cast<int>(cursor % tile_capacity);
+    cursor /= tile_capacity;
+    const int row = static_cast<int>(cursor % kLogFPreR2TiledRows);
+    cursor /= kLogFPreR2TiledRows;
+    const int head = static_cast<int>(cursor % num_query_heads);
+    const int seq = static_cast<int>(cursor / num_query_heads);
+    if (seq >= num_seqs) {
+        return;
+    }
+    const int32_t* meta32 = req_meta_i32
+        + static_cast<int64_t>(seq) * req_meta_i32_stride_row;
+    const int64_t* meta64 = req_meta_i64
+        + static_cast<int64_t>(seq) * req_meta_i64_stride_row;
+    __shared__ int contract_ok;
+    __shared__ int logical_k;
+    __shared__ int last_n;
+    __shared__ int scratch_head_stride;
+    __shared__ int scratch_row_stride;
+    __shared__ int64_t scratch_base_raw;
+    if (threadIdx.x == 0) {
+        contract_ok = log_f_pre_r2_tiled_contract(
+            meta32,
+            meta64,
+            req_meta_i32_stride_col,
+            req_meta_i64_stride_col,
+            logical_k_capacity) ? 1 : 0;
+        logical_k = meta32[0 * req_meta_i32_stride_col];
+        last_n = meta32[2 * req_meta_i32_stride_col];
+        scratch_head_stride = meta32[1 * req_meta_i32_stride_col];
+        scratch_row_stride = meta32[7 * req_meta_i32_stride_col];
+        scratch_base_raw = meta64[1 * req_meta_i64_stride_col];
+    }
+    __syncthreads();
+    if (contract_ok == 0) {
+        if (threadIdx.x == 0) {
+            log_f_pre_contract_trap();
+        }
+        return;
+    }
+
+    if (row >= last_n) {
+        if (threadIdx.x == 0) {
+            const int64_t index = log_f_pre_r2_tiled_row_partial_index(
+                seq,
+                head,
+                row,
+                tile,
+                num_query_heads_capacity,
+                tile_capacity);
+            partial_max[index] = kLogFPreMinVal;
+            partial_sum[index] = 0.0f;
+        }
+        return;
+    }
+
+    const half* scratch = reinterpret_cast<const half*>(scratch_base_raw)
+        + static_cast<int64_t>(head) * scratch_head_stride
+        + static_cast<int64_t>(row) * scratch_row_stride;
+    const int tile_base = tile * kLogFPreR2TiledTileK;
+    float values[kLogFPreR2TiledItemsPerThread];
+    float local_max = kLogFPreMinVal;
+#pragma unroll
+    for (int item = 0; item < kLogFPreR2TiledItemsPerThread; ++item) {
+        const int token = tile_base + threadIdx.x
+            + item * kLogFPreR2TiledThreads;
+        const float value = token < logical_k
+            ? __half2float(scratch[token])
+            : kLogFPreMinVal;
+        values[item] = value;
+        if (value > kLogFPreMinVal) {
+            local_max = local_max > value ? local_max : value;
+        }
+    }
+    const float tile_max = block_reduce_max(local_max);
+    float local_sum = 0.0f;
+    if (tile_max > kLogFPreMinVal) {
+#pragma unroll
+        for (int item = 0; item < kLogFPreR2TiledItemsPerThread; ++item) {
+            const float value = values[item];
+            if (value > kLogFPreMinVal) {
+                local_sum += expf(value - tile_max);
+            }
+        }
+    }
+    const float tile_sum = block_reduce_sum(local_sum);
+    if (threadIdx.x == 0) {
+        const int64_t index = log_f_pre_r2_tiled_row_partial_index(
+            seq,
+            head,
+            row,
+            tile,
+            num_query_heads_capacity,
+            tile_capacity);
+        partial_max[index] = tile_max;
+        partial_sum[index] = tile_sum;
+    }
+}
+
+__global__ __launch_bounds__(kLogFPreR2TiledThreads)
+void reduce_log_f_pre_r2_tiled_row_finalize_kernel(
+    const int32_t* __restrict__ req_meta_i32,
+    int64_t req_meta_i32_stride_row,
+    int64_t req_meta_i32_stride_col,
+    const float* __restrict__ partial_max,
+    const float* __restrict__ partial_sum,
+    float* __restrict__ row_lse,
+    int* __restrict__ row_has,
+    int num_seqs,
+    int num_query_heads,
+    int num_query_heads_capacity,
+    int tile_capacity) {
+    const int64_t linear = static_cast<int64_t>(blockIdx.x);
+    int64_t cursor = linear;
+    const int row = static_cast<int>(cursor % kLogFPreR2TiledRows);
+    cursor /= kLogFPreR2TiledRows;
+    const int head = static_cast<int>(cursor % num_query_heads);
+    const int seq = static_cast<int>(cursor / num_query_heads);
+    if (seq >= num_seqs) {
+        return;
+    }
+    const int32_t* meta32 = req_meta_i32
+        + static_cast<int64_t>(seq) * req_meta_i32_stride_row;
+    const int last_n = meta32[2 * req_meta_i32_stride_col];
+    if (last_n != 1 && last_n != 2) {
+        if (threadIdx.x == 0) {
+            log_f_pre_contract_trap();
+        }
+        return;
+    }
+    // R=1 accumulation still uses the fixed two-row workspace geometry.  The
+    // second row is structural padding, not an all-masked captured row.  Own
+    // that distinction here instead of inferring it from a partial sentinel:
+    // active all-masked rows remain visible to the stage3/4 causal invariant,
+    // while structural padding is deterministically excluded from row_count.
+    if (row >= last_n) {
+        if (threadIdx.x == 0) {
+            const int64_t index = log_f_pre_r2_tiled_row_state_index(
+                seq, head, row, num_query_heads_capacity);
+            row_has[index] = 0;
+            row_lse[index] = kLogFPreMinVal;
+        }
+        return;
+    }
+    float local_max = kLogFPreMinVal;
+    for (int tile = threadIdx.x; tile < tile_capacity; tile += blockDim.x) {
+        const int64_t index = log_f_pre_r2_tiled_row_partial_index(
+            seq,
+            head,
+            row,
+            tile,
+            num_query_heads_capacity,
+            tile_capacity);
+        const float value = partial_max[index];
+        if (value > kLogFPreMinVal) {
+            local_max = local_max > value ? local_max : value;
+        }
+    }
+    const float global_max = block_reduce_max(local_max);
+    __shared__ int has_row;
+    if (threadIdx.x == 0) {
+        has_row = global_max > kLogFPreMinVal ? 1 : 0;
+    }
+    __syncthreads();
+    float local_sum = 0.0f;
+    if (has_row != 0) {
+        for (int tile = threadIdx.x; tile < tile_capacity; tile += blockDim.x) {
+            const int64_t index = log_f_pre_r2_tiled_row_partial_index(
+                seq,
+                head,
+                row,
+                tile,
+                num_query_heads_capacity,
+                tile_capacity);
+            const float tile_max = partial_max[index];
+            if (tile_max > kLogFPreMinVal) {
+                local_sum += partial_sum[index] * expf(tile_max - global_max);
+            }
+        }
+    }
+    const float global_sum = block_reduce_sum(local_sum);
+    if (threadIdx.x == 0) {
+        const int64_t index = log_f_pre_r2_tiled_row_state_index(
+            seq, head, row, num_query_heads_capacity);
+        row_has[index] = has_row;
+        row_lse[index] = has_row != 0
+            ? global_max + logf(global_sum + 1.0e-20f)
+            : kLogFPreMinVal;
+    }
+}
+
 // 合并前片（out 里已存的归一化部分窗口值 prev，来自 n_prev 行）与本片
 // 未归一化 sum-form（cur，来自 n_cur 行），返回 n_prev+n_cur 行的归一化值。
-// prev 的归一化用的是全局行数 n_prev（非 per-key 贡献数），故 α·prev+log(n_prev)
-// 精确还原 per-key 的 log S_prev；合并数学等价于对全部行做单次 reduce。
+// prev 的归一化用的是全局行数 n_prev（非 per-key 贡献数），故 alpha*prev+
+// log(n_prev) 精确还原 per-key 的 log S_prev；合并数学等价于对全部行做
+// 单次 reduce。定义在 tiled stage3 之前，让 generic/tiled 共用唯一语义 owner。
+__device__ __forceinline__ bool log_f_pre_accum_value_present(float value) {
+    // fp16 stores kLogFPreMinVal as -inf.  NaN is an explicit poison state,
+    // not an absent token: once produced it must survive every later chunk.
+    return isnan(value) || value > kLogFPreMinVal;
+}
+
 template <typename out_t>
 __device__ __forceinline__ float merge_log_f_pre_accum(
     const out_t* out_ptr,
@@ -1505,7 +2663,7 @@ __device__ __forceinline__ float merge_log_f_pre_accum(
     float prev = kLogFPreMinVal;
     if (token_idx < prev_capacity) {
         const float p = load_scratch_value(out_ptr + token_idx);
-        if (isfinite(p) && p > kLogFPreMinVal) {
+        if (log_f_pre_accum_value_present(p)) {
             has_prev = true;
             prev = p;
         }
@@ -1521,8 +2679,11 @@ __device__ __forceinline__ float merge_log_f_pre_accum(
     }
     if (has_prev && has_cur) {
         const float prev_log_s = alpha * prev + logf(n_prev_f);
-        const float m = prev_log_s > cur_unnormalized ? prev_log_s : cur_unnormalized;
-        const float s = expf(prev_log_s - m) + expf(cur_unnormalized - m);
+        const float m = prev_log_s > cur_unnormalized
+            ? prev_log_s
+            : cur_unnormalized;
+        const float s = expf(prev_log_s - m)
+            + expf(cur_unnormalized - m);
         return (m + logf(s) - logf(n_cum_f)) / alpha;
     }
     if (has_prev) {
@@ -1530,6 +2691,547 @@ __device__ __forceinline__ float merge_log_f_pre_accum(
         return (prev_log_s - logf(n_cum_f)) / alpha;
     }
     return (cur_unnormalized - logf(n_cum_f)) / alpha;
+}
+
+__global__ __launch_bounds__(kLogFPreR2TiledThreads)
+void reduce_log_f_pre_r2_tiled_log_f_partial_kernel(
+    const int32_t* __restrict__ req_meta_i32,
+    const int64_t* __restrict__ req_meta_i64,
+    int64_t req_meta_i32_stride_row,
+    int64_t req_meta_i32_stride_col,
+    int64_t req_meta_i64_stride_row,
+    int64_t req_meta_i64_stride_col,
+    const float* __restrict__ row_lse,
+    const int* __restrict__ row_has,
+    float* __restrict__ token_partial_max,
+    float* __restrict__ token_partial_sum,
+    int* __restrict__ token_has,
+    int num_seqs,
+    int num_query_heads,
+    int num_query_heads_capacity,
+    int tile_capacity,
+    int logical_k_capacity) {
+    const int64_t linear = static_cast<int64_t>(blockIdx.x);
+    int64_t cursor = linear;
+    const int tile = static_cast<int>(cursor % tile_capacity);
+    cursor /= tile_capacity;
+    const int head = static_cast<int>(cursor % num_query_heads);
+    const int seq = static_cast<int>(cursor / num_query_heads);
+    if (seq >= num_seqs) {
+        return;
+    }
+    const int32_t* meta32 = req_meta_i32
+        + static_cast<int64_t>(seq) * req_meta_i32_stride_row;
+    const int64_t* meta64 = req_meta_i64
+        + static_cast<int64_t>(seq) * req_meta_i64_stride_row;
+    __shared__ int contract_ok;
+    __shared__ int logical_k;
+    __shared__ int last_n;
+    __shared__ int scratch_head_stride;
+    __shared__ int scratch_row_stride;
+    __shared__ int out_head_stride;
+    __shared__ int64_t scratch_base_raw;
+    __shared__ int64_t out_base_raw;
+    __shared__ float row_lse0;
+    __shared__ float row_lse1;
+    __shared__ int row_has0;
+    __shared__ int row_has1;
+    __shared__ float log_row_count;
+    __shared__ float accum_n_prev_f;
+    __shared__ float accum_n_cum_f;
+    __shared__ int accum_prev_capacity;
+    __shared__ int accum_do_merge;
+    __shared__ int accum_mode;
+    __shared__ int nonfinite_row_lse;
+    if (threadIdx.x == 0) {
+        contract_ok = log_f_pre_r2_tiled_contract(
+            meta32,
+            meta64,
+            req_meta_i32_stride_col,
+            req_meta_i64_stride_col,
+            logical_k_capacity) ? 1 : 0;
+        logical_k = meta32[0 * req_meta_i32_stride_col];
+        last_n = meta32[2 * req_meta_i32_stride_col];
+        scratch_head_stride = meta32[1 * req_meta_i32_stride_col];
+        scratch_row_stride = meta32[7 * req_meta_i32_stride_col];
+        out_head_stride = meta32[6 * req_meta_i32_stride_col];
+        scratch_base_raw = meta64[1 * req_meta_i64_stride_col];
+        out_base_raw = meta64[2 * req_meta_i64_stride_col];
+        const int64_t row0 = log_f_pre_r2_tiled_row_state_index(
+            seq, head, 0, num_query_heads_capacity);
+        const int64_t row1 = log_f_pre_r2_tiled_row_state_index(
+            seq, head, 1, num_query_heads_capacity);
+        row_lse0 = row_lse[row0];
+        row_lse1 = row_lse[row1];
+        row_has0 = row_has[row0];
+        row_has1 = row_has[row1];
+        const int row_count = row_has0 + row_has1;
+        log_row_count = row_count > 0
+            ? logf(static_cast<float>(row_count))
+            : 0.0f;
+        const int flags = meta32[5 * req_meta_i32_stride_col];
+        const int prev_rows = meta32[8 * req_meta_i32_stride_col];
+        accum_prev_capacity = meta32[9 * req_meta_i32_stride_col];
+        accum_mode = flags == 24 ? 1 : 0;
+        accum_do_merge = accum_mode != 0 && prev_rows > 0 ? 1 : 0;
+        accum_n_prev_f = static_cast<float>(prev_rows);
+        accum_n_cum_f = static_cast<float>(prev_rows + row_count);
+        nonfinite_row_lse = (
+            (row_has0 != 0 && !isfinite(row_lse0))
+            || (row_has1 != 0 && !isfinite(row_lse1))) ? 1 : 0;
+        if (accum_mode != 0 && row_count != last_n) {
+            contract_ok = 0;
+        }
+    }
+    __syncthreads();
+    if (contract_ok == 0) {
+        if (threadIdx.x == 0) {
+            log_f_pre_contract_trap();
+        }
+        return;
+    }
+
+    const half* scratch_head = reinterpret_cast<const half*>(scratch_base_raw)
+        + static_cast<int64_t>(head) * scratch_head_stride;
+    half* out_head = reinterpret_cast<half*>(out_base_raw)
+        + static_cast<int64_t>(head) * out_head_stride;
+    const int tile_base = tile * kLogFPreR2TiledTileK;
+
+    // The fourth stage owns the 256-lane generic-order replay when a +inf row
+    // made LSE non-finite.  Keep the prior accumulated output intact here so
+    // that replay can merge it exactly once.
+    if (nonfinite_row_lse != 0) {
+        if (threadIdx.x == 0) {
+            const int64_t index = log_f_pre_r2_tiled_token_partial_index(
+                seq,
+                head,
+                tile,
+                num_query_heads_capacity,
+                tile_capacity);
+            token_partial_max[index] = kLogFPreMinVal;
+            token_partial_sum[index] = 0.0f;
+            token_has[index] = 0;
+        }
+        return;
+    }
+
+    float log_f_values[kLogFPreR2TiledItemsPerThread];
+    unsigned int has_mask = 0U;
+    unsigned int poison_mask = 0U;
+    float local_max = kLogFPreMinVal;
+#pragma unroll
+    for (int item = 0; item < kLogFPreR2TiledItemsPerThread; ++item) {
+        const int token = tile_base + threadIdx.x
+            + item * kLogFPreR2TiledThreads;
+        float log_f = kLogFPreMinVal;
+        bool has_token = false;
+        if (token < logical_k) {
+            const float value0 = __half2float(scratch_head[token]);
+            const float value1 = last_n == 2
+                ? __half2float(scratch_head[scratch_row_stride + token])
+                : kLogFPreMinVal;
+            const bool valid0 = row_has0 != 0 && value0 > kLogFPreMinVal;
+            const bool valid1 = row_has1 != 0 && value1 > kLogFPreMinVal;
+            if (valid0 || valid1) {
+                float score_max = kLogFPreMinVal;
+                float score0 = kLogFPreMinVal;
+                float score1 = kLogFPreMinVal;
+                if (valid0) {
+                    score0 = 0.5f * (value0 - row_lse0);
+                    score_max = score0;
+                }
+                if (valid1) {
+                    score1 = 0.5f * (value1 - row_lse1);
+                    score_max = score_max > score1 ? score_max : score1;
+                }
+                float score_sum = 0.0f;
+                if (valid0) {
+                    score_sum += expf(score0 - score_max);
+                }
+                if (valid1) {
+                    score_sum += expf(score1 - score_max);
+                }
+                const float cur_unnormalized = score_max
+                    + logf(score_sum + 1.0e-20f);
+                if (accum_do_merge != 0) {
+                    log_f = merge_log_f_pre_accum<half>(
+                        out_head,
+                        token,
+                        accum_prev_capacity,
+                        accum_n_prev_f,
+                        cur_unnormalized,
+                        true,
+                        accum_n_cum_f,
+                        0.5f,
+                        false,
+                        &has_token);
+                } else {
+                    log_f = 2.0f * (cur_unnormalized - log_row_count);
+                    has_token = true;
+                }
+            } else if (accum_do_merge != 0) {
+                log_f = merge_log_f_pre_accum<half>(
+                    out_head,
+                    token,
+                    accum_prev_capacity,
+                    accum_n_prev_f,
+                    kLogFPreMinVal,
+                    false,
+                    accum_n_cum_f,
+                    0.5f,
+                    false,
+                    &has_token);
+            }
+            out_head[token] = __float2half_rn(log_f);
+            if (has_token) {
+                has_mask |= 1U << item;
+                if (isnan(log_f)) {
+                    poison_mask |= 1U << item;
+                } else {
+                    local_max = local_max > log_f ? local_max : log_f;
+                }
+            }
+        }
+        log_f_values[item] = accum_do_merge != 0 && token < logical_k
+            ? __half2float(out_head[token])
+            : log_f;
+    }
+    const float tile_max = block_reduce_max(local_max);
+    const int tile_has = __syncthreads_count(has_mask != 0U) > 0 ? 1 : 0;
+    const int tile_poison = __syncthreads_count(poison_mask != 0U) > 0
+        ? 1
+        : 0;
+    float local_sum = 0.0f;
+    if (tile_has != 0 && tile_poison == 0) {
+#pragma unroll
+        for (int item = 0; item < kLogFPreR2TiledItemsPerThread; ++item) {
+            if ((has_mask & (1U << item)) != 0U
+                && log_f_pre_accum_value_present(log_f_values[item])) {
+                local_sum += expf(log_f_values[item] - tile_max);
+            }
+        }
+    }
+    const float tile_sum = block_reduce_sum(local_sum);
+    if (threadIdx.x == 0) {
+        const int64_t index = log_f_pre_r2_tiled_token_partial_index(
+            seq,
+            head,
+            tile,
+            num_query_heads_capacity,
+            tile_capacity);
+        token_partial_max[index] = tile_poison != 0 ? NAN : tile_max;
+        token_partial_sum[index] = tile_poison != 0 ? NAN : tile_sum;
+        token_has[index] = tile_poison != 0 ? 2 : tile_has;
+    }
+}
+
+__global__ __launch_bounds__(kLogFPreR2TiledThreads)
+void reduce_log_f_pre_r2_tiled_denom_finalize_kernel(
+    const int32_t* __restrict__ req_meta_i32,
+    const int64_t* __restrict__ req_meta_i64,
+    int64_t req_meta_i32_stride_row,
+    int64_t req_meta_i32_stride_col,
+    int64_t req_meta_i64_stride_row,
+    int64_t req_meta_i64_stride_col,
+    const float* __restrict__ row_lse,
+    const int* __restrict__ row_has,
+    const float* __restrict__ token_partial_max,
+    const float* __restrict__ token_partial_sum,
+    const int* __restrict__ token_has,
+    int num_seqs,
+    int num_query_heads,
+    int num_query_heads_capacity,
+    int tile_capacity,
+    int logical_k_capacity) {
+    const int64_t linear = static_cast<int64_t>(blockIdx.x);
+    const int head = static_cast<int>(linear % num_query_heads);
+    const int seq = static_cast<int>(linear / num_query_heads);
+    if (seq >= num_seqs) {
+        return;
+    }
+    const int32_t* meta32 = req_meta_i32
+        + static_cast<int64_t>(seq) * req_meta_i32_stride_row;
+    const int64_t* meta64 = req_meta_i64
+        + static_cast<int64_t>(seq) * req_meta_i64_stride_row;
+    __shared__ int contract_ok;
+    __shared__ int logical_k;
+    __shared__ int last_n;
+    __shared__ int scratch_head_stride;
+    __shared__ int scratch_row_stride;
+    __shared__ int out_head_stride;
+    __shared__ int64_t scratch_base_raw;
+    __shared__ int64_t out_base_raw;
+    __shared__ int64_t denom_base_raw;
+    __shared__ float row_lse_s[2];
+    __shared__ int row_has_s[2];
+    __shared__ float row_count_f;
+    __shared__ float token_max_s;
+    __shared__ int nonfinite_row_lse;
+    __shared__ float accum_n_prev_f;
+    __shared__ float accum_n_cum_f;
+    __shared__ int accum_prev_capacity;
+    __shared__ int accum_do_merge;
+    __shared__ int accum_mode;
+    if (threadIdx.x == 0) {
+        contract_ok = log_f_pre_r2_tiled_contract(
+            meta32,
+            meta64,
+            req_meta_i32_stride_col,
+            req_meta_i64_stride_col,
+            logical_k_capacity) ? 1 : 0;
+        logical_k = meta32[0 * req_meta_i32_stride_col];
+        last_n = meta32[2 * req_meta_i32_stride_col];
+        scratch_head_stride = meta32[1 * req_meta_i32_stride_col];
+        scratch_row_stride = meta32[7 * req_meta_i32_stride_col];
+        out_head_stride = meta32[6 * req_meta_i32_stride_col];
+        scratch_base_raw = meta64[1 * req_meta_i64_stride_col];
+        out_base_raw = meta64[2 * req_meta_i64_stride_col];
+        denom_base_raw = meta64[3 * req_meta_i64_stride_col];
+        for (int row = 0; row < 2; ++row) {
+            const int64_t index = log_f_pre_r2_tiled_row_state_index(
+                seq, head, row, num_query_heads_capacity);
+            row_lse_s[row] = row_lse[index];
+            row_has_s[row] = row_has[index];
+        }
+        nonfinite_row_lse = (
+            (row_has_s[0] != 0 && !isfinite(row_lse_s[0]))
+            || (row_has_s[1] != 0 && !isfinite(row_lse_s[1]))) ? 1 : 0;
+        const int row_count = row_has_s[0] + row_has_s[1];
+        row_count_f = row_count > 0 ? static_cast<float>(row_count) : 1.0f;
+        const int flags = meta32[5 * req_meta_i32_stride_col];
+        const int prev_rows = meta32[8 * req_meta_i32_stride_col];
+        accum_prev_capacity = meta32[9 * req_meta_i32_stride_col];
+        accum_mode = flags == 24 ? 1 : 0;
+        accum_do_merge = accum_mode != 0 && prev_rows > 0 ? 1 : 0;
+        accum_n_prev_f = static_cast<float>(prev_rows);
+        accum_n_cum_f = static_cast<float>(prev_rows + row_count);
+        if (accum_mode != 0 && row_count != last_n) {
+            contract_ok = 0;
+        }
+    }
+    __syncthreads();
+    if (contract_ok == 0) {
+        if (threadIdx.x == 0) {
+            log_f_pre_contract_trap();
+        }
+        return;
+    }
+
+    const half* scratch_head = reinterpret_cast<const half*>(scratch_base_raw)
+        + static_cast<int64_t>(head) * scratch_head_stride;
+    half* out_head = reinterpret_cast<half*>(out_base_raw)
+        + static_cast<int64_t>(head) * out_head_stride;
+    float* denom = reinterpret_cast<float*>(denom_base_raw) + head;
+
+    // Tile combination changes the reduction tree.  If +inf made a row LSE
+    // non-finite, replay the generic 256-lane order inside this already-planned
+    // fourth stage.  This preserves token-local NaN behavior without a host
+    // branch, extra launch, whole-head sanitize, allocation, or fallback.
+    if (nonfinite_row_lse != 0) {
+        for (int row = 0; row < last_n; ++row) {
+            float local_max = kLogFPreMinVal;
+            for (int token = threadIdx.x; token < logical_k; token += blockDim.x) {
+                const float value = __half2float(
+                    scratch_head[static_cast<int64_t>(row)
+                        * scratch_row_stride + token]);
+                if (value > kLogFPreMinVal) {
+                    local_max = local_max > value ? local_max : value;
+                }
+            }
+            const float row_max = block_reduce_max(local_max);
+            if (threadIdx.x == 0) {
+                row_has_s[row] = row_max > kLogFPreMinVal ? 1 : 0;
+                row_lse_s[row] = row_max;
+            }
+            __syncthreads();
+            float local_sum = 0.0f;
+            if (row_has_s[row] != 0) {
+                for (int token = threadIdx.x; token < logical_k;
+                     token += blockDim.x) {
+                    const float value = __half2float(
+                        scratch_head[static_cast<int64_t>(row)
+                            * scratch_row_stride + token]);
+                    if (value > kLogFPreMinVal) {
+                        local_sum += expf(value - row_lse_s[row]);
+                    }
+                }
+            }
+            const float row_sum = block_reduce_sum(local_sum);
+            if (threadIdx.x == 0) {
+                row_lse_s[row] = row_has_s[row] != 0
+                    ? row_lse_s[row] + logf(row_sum + 1.0e-20f)
+                    : kLogFPreMinVal;
+            }
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) {
+            const int row_count = row_has_s[0] + row_has_s[1];
+            row_count_f = row_count > 0
+                ? static_cast<float>(row_count)
+                : 1.0f;
+            accum_n_cum_f = accum_n_prev_f
+                + static_cast<float>(row_count);
+        }
+        __syncthreads();
+
+        float local_token_max = kLogFPreMinVal;
+        bool local_token_poison = false;
+        for (int token = threadIdx.x; token < logical_k; token += blockDim.x) {
+            bool has_token = false;
+            float log_f = kLogFPreMinVal;
+            if (accum_do_merge != 0) {
+                bool has_cur = false;
+                const float cur = compute_log_f_pre_token_unnormalized(
+                    scratch_head,
+                    static_cast<int64_t>(scratch_row_stride),
+                    token,
+                    last_n,
+                    row_lse_s,
+                    row_has_s,
+                    0.5f,
+                    false,
+                    &has_cur);
+                log_f = merge_log_f_pre_accum<half>(
+                    out_head,
+                    token,
+                    accum_prev_capacity,
+                    accum_n_prev_f,
+                    cur,
+                    has_cur,
+                    accum_n_cum_f,
+                    0.5f,
+                    false,
+                    &has_token);
+            } else {
+                log_f = compute_log_f_pre_token(
+                    scratch_head,
+                    static_cast<int64_t>(scratch_row_stride),
+                    token,
+                    last_n,
+                    row_lse_s,
+                    row_has_s,
+                    row_count_f,
+                    0.5f,
+                    false,
+                    &has_token);
+            }
+            out_head[token] = __float2half_rn(log_f);
+            if (has_token) {
+                if (isnan(log_f)) {
+                    local_token_poison = true;
+                } else {
+                    local_token_max = local_token_max > log_f
+                        ? local_token_max
+                        : log_f;
+                }
+            }
+        }
+        const int token_poison = __syncthreads_count(local_token_poison) > 0
+            ? 1
+            : 0;
+        if (token_poison != 0) {
+            if (threadIdx.x == 0) {
+                *denom = NAN;
+            }
+            return;
+        }
+        const float token_max = block_reduce_max(local_token_max);
+        if (threadIdx.x == 0) {
+            token_max_s = token_max;
+        }
+        __syncthreads();
+        if (token_max_s <= kLogFPreMinVal) {
+            if (threadIdx.x == 0) {
+                *denom = 0.0f;
+            }
+            return;
+        }
+        float local_token_sum = 0.0f;
+        if (accum_do_merge != 0) {
+            for (int token = threadIdx.x; token < logical_k;
+                 token += blockDim.x) {
+                const float value = __half2float(out_head[token]);
+                if (log_f_pre_accum_value_present(value)) {
+                    local_token_sum += expf(value - token_max_s);
+                }
+            }
+        } else {
+            for (int token = threadIdx.x; token < logical_k;
+                 token += blockDim.x) {
+                bool has_token = false;
+                const float log_f = compute_log_f_pre_token(
+                    scratch_head,
+                    static_cast<int64_t>(scratch_row_stride),
+                    token,
+                    last_n,
+                    row_lse_s,
+                    row_has_s,
+                    row_count_f,
+                    0.5f,
+                    false,
+                    &has_token);
+                if (has_token) {
+                    local_token_sum += expf(log_f - token_max_s);
+                }
+            }
+        }
+        const float token_sum = block_reduce_sum(local_token_sum);
+        if (threadIdx.x == 0) {
+            *denom = token_max_s + logf(token_sum + 1.0e-20f);
+        }
+        return;
+    }
+
+    bool local_has = false;
+    bool local_poison = false;
+    float local_max = kLogFPreMinVal;
+    for (int tile = threadIdx.x; tile < tile_capacity; tile += blockDim.x) {
+        const int64_t index = log_f_pre_r2_tiled_token_partial_index(
+            seq,
+            head,
+            tile,
+            num_query_heads_capacity,
+            tile_capacity);
+        if (token_has[index] == 2) {
+            local_poison = true;
+        } else if (token_has[index] == 1) {
+            local_has = true;
+            const float value = token_partial_max[index];
+            local_max = local_max > value ? local_max : value;
+        }
+    }
+    const int any_poison = __syncthreads_count(local_poison) > 0 ? 1 : 0;
+    if (any_poison != 0) {
+        if (threadIdx.x == 0) {
+            *denom = NAN;
+        }
+        return;
+    }
+    const int any_token = __syncthreads_count(local_has) > 0 ? 1 : 0;
+    const float token_max = block_reduce_max(local_max);
+    if (any_token == 0) {
+        if (threadIdx.x == 0) {
+            *denom = 0.0f;
+        }
+        return;
+    }
+    float local_sum = 0.0f;
+    for (int tile = threadIdx.x; tile < tile_capacity; tile += blockDim.x) {
+        const int64_t index = log_f_pre_r2_tiled_token_partial_index(
+            seq,
+            head,
+            tile,
+            num_query_heads_capacity,
+            tile_capacity);
+        if (token_has[index] == 1) {
+            local_sum += token_partial_sum[index]
+                * expf(token_partial_max[index] - token_max);
+        }
+    }
+    const float token_sum = block_reduce_sum(local_sum);
+    if (threadIdx.x == 0) {
+        *denom = token_max + logf(token_sum + 1.0e-20f);
+    }
 }
 
 template <typename scratch_t, typename out_t>
@@ -1608,6 +3310,7 @@ __global__ void reduce_log_f_pre_scratch_kernel(
     __shared__ float row_count_f_shared;
     __shared__ float accum_n_cum_f_shared;
     __shared__ float token_max_shared;
+    __shared__ int accum_rows_valid;
 
     for (int r = 0; r < max_r; ++r) {
         float local_max = kLogFPreMinVal;
@@ -1650,10 +3353,21 @@ __global__ void reduce_log_f_pre_scratch_kernel(
         }
         row_count_f_shared = row_count > 0 ? static_cast<float>(row_count) : 1.0f;
         accum_n_cum_f_shared = static_cast<float>(accum_prev_rows + row_count);
+        accum_rows_valid = !accum_mode || row_count == max_r ? 1 : 0;
     }
     __syncthreads();
+    if (accum_rows_valid == 0) {
+        // The scalar n_prev ABI is exact only when every causal capture row
+        // contributes for every head.  Reject violated semantics on device;
+        // never silently merge with a per-head row-count mismatch.
+        if (threadIdx.x == 0) {
+            log_f_pre_contract_trap();
+        }
+        return;
+    }
 
     float local_token_max = kLogFPreMinVal;
+    bool local_token_poison = false;
     if (!accum_do_merge) {
         for (int j = threadIdx.x; j < logits_capacity; j += blockDim.x) {
             bool has_token = false;
@@ -1670,7 +3384,13 @@ __global__ void reduce_log_f_pre_scratch_kernel(
                 &has_token);
             store_log_f_pre_value<out_t>(out_head_ptr + j, log_f_pre);
             if (has_token) {
-                local_token_max = local_token_max > log_f_pre ? local_token_max : log_f_pre;
+                if (isnan(log_f_pre)) {
+                    local_token_poison = true;
+                } else {
+                    local_token_max = local_token_max > log_f_pre
+                        ? local_token_max
+                        : log_f_pre;
+                }
             }
         }
     } else {
@@ -1704,9 +3424,25 @@ __global__ void reduce_log_f_pre_scratch_kernel(
                 &has_any);
             store_log_f_pre_value<out_t>(out_head_ptr + j, merged);
             if (has_any) {
-                local_token_max = local_token_max > merged ? local_token_max : merged;
+                if (isnan(merged)) {
+                    local_token_poison = true;
+                } else {
+                    local_token_max = local_token_max > merged
+                        ? local_token_max
+                        : merged;
+                }
             }
         }
+    }
+
+    const int token_poison = __syncthreads_count(local_token_poison) > 0
+        ? 1
+        : 0;
+    if (token_poison != 0) {
+        if (threadIdx.x == 0) {
+            denom_ptr[pid_h] = NAN;
+        }
+        return;
     }
 
     const float token_max = block_reduce_max(local_token_max);
@@ -1746,7 +3482,7 @@ __global__ void reduce_log_f_pre_scratch_kernel(
         // 避免重放合并链；fp16 的 MinVal 存为 -inf，被 > 判定排除）。
         for (int j = threadIdx.x; j < logits_capacity; j += blockDim.x) {
             const float v = load_scratch_value(out_head_ptr + j);
-            if (isfinite(v) && v > kLogFPreMinVal) {
+            if (log_f_pre_accum_value_present(v)) {
                 local_token_sum += expf(v - token_max_shared);
             }
         }
@@ -2023,6 +3759,327 @@ __global__ void reduce_log_f_pre_scratch_scalar_kernel(
     }
 }
 
+template <int kLogicalKBucket, int kThreads, int kItemsPerThread>
+void launch_log_f_pre_r2_resident(
+    const torch::Tensor& req_meta_i32,
+    const torch::Tensor& req_meta_i64,
+    int num_seqs,
+    int num_query_heads,
+    cudaStream_t stream) {
+    const dim3 row_blocks(num_query_heads, 2, num_seqs);
+    reduce_log_f_pre_r2_resident_row_lse_kernel<
+        kLogicalKBucket, kThreads, kItemsPerThread><<<
+        row_blocks, kThreads, 0, stream>>>(
+        req_meta_i32.data_ptr<int32_t>(),
+        req_meta_i64.data_ptr<int64_t>(),
+        req_meta_i32.stride(0),
+        req_meta_i32.stride(1),
+        req_meta_i64.stride(0),
+        req_meta_i64.stride(1));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    const dim3 output_blocks(num_query_heads, 1, num_seqs);
+    reduce_log_f_pre_r2_resident_log_f_denom_kernel<
+        kLogicalKBucket, kThreads, kItemsPerThread><<<
+        output_blocks, kThreads, 0, stream>>>(
+        req_meta_i32.data_ptr<int32_t>(),
+        req_meta_i64.data_ptr<int64_t>(),
+        req_meta_i32.stride(0),
+        req_meta_i32.stride(1),
+        req_meta_i64.stride(0),
+        req_meta_i64.stride(1));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void reduce_log_f_pre_scratch_r2_alpha0p5_fp16_resident_cuda(
+    torch::Tensor req_meta_i32,
+    torch::Tensor req_meta_i64,
+    int64_t num_seqs,
+    int64_t num_query_heads,
+    int64_t logical_k_bucket) {
+    TORCH_CHECK(req_meta_i32.is_cuda(), "req_meta_i32 must be CUDA");
+    TORCH_CHECK(req_meta_i64.is_cuda(), "req_meta_i64 must be CUDA");
+    TORCH_CHECK(
+        req_meta_i32.get_device() == req_meta_i64.get_device(),
+        "exact R2 metadata tensors must share one CUDA device");
+    const c10::cuda::CUDAGuard device_guard(req_meta_i32.device());
+    TORCH_CHECK(
+        req_meta_i32.scalar_type() == torch::kInt32,
+        "req_meta_i32 must be int32");
+    TORCH_CHECK(
+        req_meta_i64.scalar_type() == torch::kInt64,
+        "req_meta_i64 must be int64");
+    TORCH_CHECK(
+        req_meta_i32.dim() == 2 && req_meta_i32.size(0) >= num_seqs
+            && req_meta_i32.size(1) >= 10 && req_meta_i32.is_contiguous(),
+        "resident R2 req_meta_i32 must be contiguous [>=N,>=10]");
+    TORCH_CHECK(
+        req_meta_i64.dim() == 2 && req_meta_i64.size(0) >= num_seqs
+            && req_meta_i64.size(1) >= 4 && req_meta_i64.is_contiguous(),
+        "resident R2 req_meta_i64 must be contiguous [>=N,>=4]");
+    TORCH_CHECK(num_seqs > 0 && num_seqs <= 65535,
+                "resident R2 num_seqs must be in [1,65535]");
+    TORCH_CHECK(num_query_heads > 0 && num_query_heads <= 65535,
+                "resident R2 num_query_heads must be in [1,65535]");
+    TORCH_CHECK(
+        logical_k_bucket == kLogFPreR2Bucket12K
+            || logical_k_bucket == kLogFPreR2Bucket16K
+            || logical_k_bucket == kLogFPreR2Bucket24K
+            || logical_k_bucket == kLogFPreR2Bucket32K,
+        "resident R2 logical_k_bucket must be one of 12288/16384/24576/32768");
+    const cudaDeviceProp* props = at::cuda::getCurrentDeviceProperties();
+    TORCH_CHECK(
+        props != nullptr && props->major == 8 && props->minor == 0,
+        "resident R2 selector reduce requires SM80");
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const int n = static_cast<int>(num_seqs);
+    const int h = static_cast<int>(num_query_heads);
+    switch (logical_k_bucket) {
+        case kLogFPreR2Bucket12K:
+            launch_log_f_pre_r2_resident<12288, 512, 24>(
+                req_meta_i32, req_meta_i64, n, h, stream);
+            break;
+        case kLogFPreR2Bucket16K:
+            launch_log_f_pre_r2_resident<16384, 512, 32>(
+                req_meta_i32, req_meta_i64, n, h, stream);
+            break;
+        case kLogFPreR2Bucket24K:
+            launch_log_f_pre_r2_resident<24576, 768, 32>(
+                req_meta_i32, req_meta_i64, n, h, stream);
+            break;
+        case kLogFPreR2Bucket32K:
+            launch_log_f_pre_r2_resident<32768, 1024, 32>(
+                req_meta_i32, req_meta_i64, n, h, stream);
+            break;
+    }
+}
+
+namespace {
+
+void check_log_f_pre_r2_tiled_capacities(
+    int64_t num_seqs_capacity,
+    int64_t num_query_heads_capacity,
+    int64_t logical_k_capacity) {
+    TORCH_CHECK(
+        num_seqs_capacity > 0 && num_seqs_capacity <= 65535,
+        "tiled R2 num_seqs_capacity must be in [1,65535]");
+    TORCH_CHECK(
+        num_query_heads_capacity > 0 && num_query_heads_capacity <= 65535,
+        "tiled R2 num_query_heads_capacity must be in [1,65535]");
+    TORCH_CHECK(
+        logical_k_capacity > 0 && logical_k_capacity <= 2147483647LL,
+        "tiled R2 logical_k_capacity must fit positive int32");
+    const int64_t tile_capacity =
+        (logical_k_capacity + kLogFPreR2TiledTileK - 1)
+        / kLogFPreR2TiledTileK;
+    TORCH_CHECK(
+        tile_capacity > 0 && tile_capacity <= 65535,
+        "tiled R2 tile_capacity must be in [1,65535]");
+    const long double words = static_cast<long double>(num_seqs_capacity)
+        * static_cast<long double>(num_query_heads_capacity)
+        * (7.0L * static_cast<long double>(tile_capacity) + 4.0L);
+    TORCH_CHECK(
+        words <= static_cast<long double>(INT64_MAX / 4),
+        "tiled R2 workspace size overflows int64");
+}
+
+}  // namespace
+
+int64_t reduce_log_f_pre_scratch_r2_alpha0p5_fp16_tiled_workspace_nbytes_cuda(
+    int64_t num_seqs_capacity,
+    int64_t num_query_heads_capacity,
+    int64_t logical_k_capacity) {
+    check_log_f_pre_r2_tiled_capacities(
+        num_seqs_capacity,
+        num_query_heads_capacity,
+        logical_k_capacity);
+    const LogFPreR2TiledWorkspaceLayout layout =
+        log_f_pre_r2_tiled_workspace_layout(
+            num_seqs_capacity,
+            num_query_heads_capacity,
+            logical_k_capacity);
+    return layout.total_words * 4;
+}
+
+void reduce_log_f_pre_scratch_r2_alpha0p5_fp16_tiled_cuda(
+    torch::Tensor req_meta_i32,
+    torch::Tensor req_meta_i64,
+    torch::Tensor workspace,
+    int64_t num_seqs,
+    int64_t num_query_heads,
+    int64_t num_seqs_capacity,
+    int64_t num_query_heads_capacity,
+    int64_t logical_k_capacity) {
+    check_log_f_pre_r2_tiled_capacities(
+        num_seqs_capacity,
+        num_query_heads_capacity,
+        logical_k_capacity);
+    TORCH_CHECK(req_meta_i32.is_cuda(), "req_meta_i32 must be CUDA");
+    TORCH_CHECK(req_meta_i64.is_cuda(), "req_meta_i64 must be CUDA");
+    TORCH_CHECK(workspace.is_cuda(), "tiled R2 workspace must be CUDA");
+    TORCH_CHECK(
+        req_meta_i32.get_device() == req_meta_i64.get_device()
+            && req_meta_i32.get_device() == workspace.get_device(),
+        "tiled R2 metadata and workspace must share one CUDA device");
+    const c10::cuda::CUDAGuard device_guard(req_meta_i32.device());
+    TORCH_CHECK(
+        req_meta_i32.scalar_type() == torch::kInt32,
+        "req_meta_i32 must be int32");
+    TORCH_CHECK(
+        req_meta_i64.scalar_type() == torch::kInt64,
+        "req_meta_i64 must be int64");
+    TORCH_CHECK(
+        workspace.scalar_type() == torch::kUInt8,
+        "tiled R2 workspace must be uint8");
+    TORCH_CHECK(
+        req_meta_i32.dim() == 2 && req_meta_i32.size(0) >= num_seqs
+            && req_meta_i32.size(1) >= 10 && req_meta_i32.is_contiguous(),
+        "tiled R2 req_meta_i32 must be contiguous [>=N,>=10]");
+    TORCH_CHECK(
+        req_meta_i64.dim() == 2 && req_meta_i64.size(0) >= num_seqs
+            && req_meta_i64.size(1) >= 4 && req_meta_i64.is_contiguous(),
+        "tiled R2 req_meta_i64 must be contiguous [>=N,>=4]");
+    TORCH_CHECK(
+        workspace.dim() == 1 && workspace.is_contiguous(),
+        "tiled R2 workspace must be contiguous rank-1 uint8");
+    TORCH_CHECK(
+        num_seqs > 0 && num_seqs <= num_seqs_capacity,
+        "tiled R2 num_seqs must be positive and within capacity");
+    TORCH_CHECK(
+        num_query_heads > 0
+            && num_query_heads <= num_query_heads_capacity,
+        "tiled R2 num_query_heads must be positive and within capacity");
+
+    const LogFPreR2TiledWorkspaceLayout layout =
+        log_f_pre_r2_tiled_workspace_layout(
+            num_seqs_capacity,
+            num_query_heads_capacity,
+            logical_k_capacity);
+    TORCH_CHECK(
+        workspace.numel() >= layout.total_words * 4,
+        "tiled R2 workspace is smaller than its declared capacity");
+    TORCH_CHECK(
+        reinterpret_cast<uintptr_t>(workspace.data_ptr()) % alignof(float) == 0,
+        "tiled R2 workspace must be float-aligned");
+    TORCH_CHECK(
+        workspace.data_ptr() != req_meta_i32.data_ptr()
+            && workspace.data_ptr() != req_meta_i64.data_ptr(),
+        "tiled R2 workspace must not alias metadata");
+
+    const cudaDeviceProp* props = at::cuda::getCurrentDeviceProperties();
+    TORCH_CHECK(props != nullptr, "tiled R2 CUDA device properties unavailable");
+    const int64_t n = num_seqs;
+    const int64_t h = num_query_heads;
+    const int64_t tiles = layout.tile_capacity;
+    const int64_t row_partial_blocks = n * h * 2 * tiles;
+    const int64_t row_finalize_blocks = n * h * 2;
+    const int64_t token_partial_blocks = n * h * tiles;
+    const int64_t denom_finalize_blocks = n * h;
+    TORCH_CHECK(
+        row_partial_blocks <= props->maxGridSize[0]
+            && row_finalize_blocks <= props->maxGridSize[0]
+            && token_partial_blocks <= props->maxGridSize[0]
+            && denom_finalize_blocks <= props->maxGridSize[0],
+        "tiled R2 launch exceeds device grid-x capacity");
+
+    uint8_t* raw_workspace = workspace.data_ptr<uint8_t>();
+    float* row_partial_max = reinterpret_cast<float*>(raw_workspace)
+        + layout.row_partial_max;
+    float* row_partial_sum = reinterpret_cast<float*>(raw_workspace)
+        + layout.row_partial_sum;
+    float* row_lse = reinterpret_cast<float*>(raw_workspace) + layout.row_lse;
+    int* row_has = reinterpret_cast<int*>(raw_workspace)
+        + layout.row_has;
+    float* token_partial_max = reinterpret_cast<float*>(raw_workspace)
+        + layout.token_partial_max;
+    float* token_partial_sum = reinterpret_cast<float*>(raw_workspace)
+        + layout.token_partial_sum;
+    int* token_has = reinterpret_cast<int*>(raw_workspace)
+        + layout.token_has;
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    reduce_log_f_pre_r2_tiled_row_partial_kernel<<<
+        static_cast<unsigned int>(row_partial_blocks),
+        kLogFPreR2TiledThreads,
+        0,
+        stream>>>(
+        req_meta_i32.data_ptr<int32_t>(),
+        req_meta_i64.data_ptr<int64_t>(),
+        req_meta_i32.stride(0),
+        req_meta_i32.stride(1),
+        req_meta_i64.stride(0),
+        req_meta_i64.stride(1),
+        row_partial_max,
+        row_partial_sum,
+        static_cast<int>(n),
+        static_cast<int>(h),
+        static_cast<int>(num_query_heads_capacity),
+        static_cast<int>(tiles),
+        static_cast<int>(logical_k_capacity));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    reduce_log_f_pre_r2_tiled_row_finalize_kernel<<<
+        static_cast<unsigned int>(row_finalize_blocks),
+        kLogFPreR2TiledThreads,
+        0,
+        stream>>>(
+        req_meta_i32.data_ptr<int32_t>(),
+        req_meta_i32.stride(0),
+        req_meta_i32.stride(1),
+        row_partial_max,
+        row_partial_sum,
+        row_lse,
+        row_has,
+        static_cast<int>(n),
+        static_cast<int>(h),
+        static_cast<int>(num_query_heads_capacity),
+        static_cast<int>(tiles));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    reduce_log_f_pre_r2_tiled_log_f_partial_kernel<<<
+        static_cast<unsigned int>(token_partial_blocks),
+        kLogFPreR2TiledThreads,
+        0,
+        stream>>>(
+        req_meta_i32.data_ptr<int32_t>(),
+        req_meta_i64.data_ptr<int64_t>(),
+        req_meta_i32.stride(0),
+        req_meta_i32.stride(1),
+        req_meta_i64.stride(0),
+        req_meta_i64.stride(1),
+        row_lse,
+        row_has,
+        token_partial_max,
+        token_partial_sum,
+        token_has,
+        static_cast<int>(n),
+        static_cast<int>(h),
+        static_cast<int>(num_query_heads_capacity),
+        static_cast<int>(tiles),
+        static_cast<int>(logical_k_capacity));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    reduce_log_f_pre_r2_tiled_denom_finalize_kernel<<<
+        static_cast<unsigned int>(denom_finalize_blocks),
+        kLogFPreR2TiledThreads,
+        0,
+        stream>>>(
+        req_meta_i32.data_ptr<int32_t>(),
+        req_meta_i64.data_ptr<int64_t>(),
+        req_meta_i32.stride(0),
+        req_meta_i32.stride(1),
+        req_meta_i64.stride(0),
+        req_meta_i64.stride(1),
+        row_lse,
+        row_has,
+        token_partial_max,
+        token_partial_sum,
+        token_has,
+        static_cast<int>(n),
+        static_cast<int>(h),
+        static_cast<int>(num_query_heads_capacity),
+        static_cast<int>(tiles),
+        static_cast<int>(logical_k_capacity));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 void reduce_log_f_pre_scratch_cuda(
     torch::Tensor req_meta_i32,
     torch::Tensor req_meta_i64,
@@ -2033,6 +4090,10 @@ void reduce_log_f_pre_scratch_cuda(
     double alpha) {
     TORCH_CHECK(req_meta_i32.is_cuda(), "req_meta_i32 must be CUDA");
     TORCH_CHECK(req_meta_i64.is_cuda(), "req_meta_i64 must be CUDA");
+    TORCH_CHECK(
+        req_meta_i32.get_device() == req_meta_i64.get_device(),
+        "generic log_f metadata tensors must share one CUDA device");
+    const c10::cuda::CUDAGuard device_guard(req_meta_i32.device());
     TORCH_CHECK(req_meta_i32.scalar_type() == torch::kInt32, "req_meta_i32 must be int32");
     TORCH_CHECK(req_meta_i64.scalar_type() == torch::kInt64, "req_meta_i64 must be int64");
     // [ACCUM-META-WIDTH 2026-07-11 EXT审计高危#2] flags bit4 (accum) rows read
@@ -2119,6 +4180,10 @@ void copy_log_f_lastn1_scratch_cuda(
     bool log_f_out_fp32) {
     TORCH_CHECK(req_meta_i32.is_cuda(), "req_meta_i32 must be CUDA");
     TORCH_CHECK(req_meta_i64.is_cuda(), "req_meta_i64 must be CUDA");
+    TORCH_CHECK(
+        req_meta_i32.get_device() == req_meta_i64.get_device(),
+        "lastn1 log_f metadata tensors must share one CUDA device");
+    const c10::cuda::CUDAGuard device_guard(req_meta_i32.device());
     TORCH_CHECK(req_meta_i32.scalar_type() == torch::kInt32, "req_meta_i32 must be int32");
     TORCH_CHECK(req_meta_i64.scalar_type() == torch::kInt64, "req_meta_i64 must be int64");
     TORCH_CHECK(req_meta_i32.dim() == 2 && req_meta_i32.size(1) >= 6, "req_meta_i32 must be [N,>=6]");
@@ -2191,6 +4256,11 @@ void copy_log_f_lastn1_scratch_scalar_cuda(
     TORCH_CHECK(scratch_capture_scores.is_cuda(), "scratch_capture_scores must be CUDA");
     TORCH_CHECK(out_capture_scores.is_cuda(), "out_capture_scores must be CUDA");
     TORCH_CHECK(out_log_f_denoms.is_cuda(), "out_log_f_denoms must be CUDA");
+    TORCH_CHECK(
+        scratch_capture_scores.get_device() == out_capture_scores.get_device()
+            && scratch_capture_scores.get_device() == out_log_f_denoms.get_device(),
+        "scalar lastn1 log_f tensors must share one CUDA device");
+    const c10::cuda::CUDAGuard device_guard(scratch_capture_scores.device());
     TORCH_CHECK(scratch_capture_scores.scalar_type() == torch::kFloat32, "scratch_capture_scores must be float32");
     TORCH_CHECK(out_log_f_denoms.scalar_type() == torch::kFloat32, "out_log_f_denoms must be float32");
     TORCH_CHECK(
@@ -2261,6 +4331,11 @@ void reduce_log_f_pre_scratch_scalar_cuda(
     TORCH_CHECK(scratch_capture_scores.is_cuda(), "scratch_capture_scores must be CUDA");
     TORCH_CHECK(out_capture_scores.is_cuda(), "out_capture_scores must be CUDA");
     TORCH_CHECK(out_log_f_denoms.is_cuda(), "out_log_f_denoms must be CUDA");
+    TORCH_CHECK(
+        scratch_capture_scores.get_device() == out_capture_scores.get_device()
+            && scratch_capture_scores.get_device() == out_log_f_denoms.get_device(),
+        "scalar reduce log_f tensors must share one CUDA device");
+    const c10::cuda::CUDAGuard device_guard(scratch_capture_scores.device());
     TORCH_CHECK(scratch_capture_scores.scalar_type() == torch::kFloat32, "scratch_capture_scores must be float32");
     TORCH_CHECK(out_log_f_denoms.scalar_type() == torch::kFloat32, "out_log_f_denoms must be float32");
     TORCH_CHECK(
@@ -2346,15 +4421,24 @@ void reduce_log_f_pre_scratch_scalar_cuda(
     # choose the lowest compatible standard at the loader boundary.
 
     try:
-        _MODULE = load_inline(
-            name="selector_log_s_ext_ilp4",
+        loaded_module = load_inline(
+            name=SELECTOR_LOG_S_EXTENSION_NAME,
             cpp_sources=cpp_source,
             cuda_sources=cuda_source,
             functions=None,
             extra_cuda_cflags=extra_cuda_cflags,
             verbose=False,
         )
+        contract_error = _module_contract_error(loaded_module)
+        if contract_error is not None:
+            raise RuntimeError(
+                "compiled selector_log_s_ext violates its semantic contract: "
+                + contract_error
+            )
+        _MODULE = loaded_module
+        _VALIDATED_MODULE = loaded_module
     except Exception as exc:
+        _VALIDATED_MODULE = None
         _LOAD_ERROR = exc
         return None
     return _MODULE
@@ -2488,6 +4572,70 @@ def reduce_log_f_pre_scratch_cuda(
     )
 
 
+def reduce_log_f_pre_scratch_r2_alpha0p5_fp16_resident_cuda(
+    *,
+    req_meta_i32: torch.Tensor,
+    req_meta_i64: torch.Tensor,
+    num_seqs: int,
+    num_query_heads: int,
+    logical_k_bucket: int,
+) -> None:
+    """Launch the shared SM80 R=2 resident K-bucket owner.
+
+    The bucket is only a compile-time loop ceiling selected from CPU-authored
+    metadata.  Effective K, N, H and physical strides remain in the staged
+    contract, which the device revalidates before touching output.
+    """
+    mod = _require_ext(force=True)
+    mod.reduce_log_f_pre_scratch_r2_alpha0p5_fp16_resident(
+        req_meta_i32,
+        req_meta_i64,
+        int(num_seqs),
+        int(num_query_heads),
+        int(logical_k_bucket),
+    )
+
+
+def reduce_log_f_pre_scratch_r2_alpha0p5_fp16_tiled_cuda(
+    *,
+    req_meta_i32: torch.Tensor,
+    req_meta_i64: torch.Tensor,
+    workspace: torch.Tensor,
+    num_seqs: int,
+    num_query_heads: int,
+    num_seqs_capacity: int,
+    num_query_heads_capacity: int,
+    logical_k_capacity: int,
+) -> None:
+    """Launch one allocation-free four-kernel cohort on the current stream."""
+
+    reasons = log_f_r2_tiled_contract_reasons(
+        req_meta_i32=req_meta_i32,
+        req_meta_i64=req_meta_i64,
+        workspace=workspace,
+        num_seqs=num_seqs,
+        num_query_heads=num_query_heads,
+        num_seqs_capacity=num_seqs_capacity,
+        num_query_heads_capacity=num_query_heads_capacity,
+        logical_k_capacity=logical_k_capacity,
+    )
+    if reasons:
+        raise ValueError(
+            "dynamic tiled R2 selector contract rejected: " + ",".join(reasons)
+        )
+    mod = _require_ext(force=True)
+    mod.reduce_log_f_pre_scratch_r2_alpha0p5_fp16_tiled(
+        req_meta_i32,
+        req_meta_i64,
+        workspace,
+        int(num_seqs),
+        int(num_query_heads),
+        int(num_seqs_capacity),
+        int(num_query_heads_capacity),
+        int(logical_k_capacity),
+    )
+
+
 def copy_log_f_lastn1_scratch_cuda(
     *,
     req_meta_i32: torch.Tensor,
@@ -2557,10 +4705,18 @@ def reduce_log_f_pre_scratch_scalar_cuda(
 
 
 __all__ = [
+    "LOG_F_R2_TILED_ROWS",
+    "LOG_F_R2_TILED_TILE_K",
     "SelectorLogSExtUnavailable",
+    "allocate_log_f_r2_tiled_workspace",
     "fused_log_f_prior_logits_flat",
     "fused_log_f_prior_pre_denom_flat",
     "reduce_log_f_pre_scratch_cuda",
+    "reduce_log_f_pre_scratch_r2_alpha0p5_fp16_resident_cuda",
+    "reduce_log_f_pre_scratch_r2_alpha0p5_fp16_tiled_cuda",
+    "log_f_r2_tiled_contract_reasons",
+    "log_f_r2_tiled_workspace_layout",
+    "log_f_r2_tiled_workspace_nbytes",
     "copy_log_f_lastn1_scratch_cuda",
     "copy_log_f_lastn1_scratch_scalar_cuda",
     "reduce_log_f_pre_scratch_scalar_cuda",

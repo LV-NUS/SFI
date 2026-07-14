@@ -961,7 +961,7 @@ class VLLMSparseController(
         self._prev_decode_logf_row_state: Optional[Tuple[Tuple[int, int, int], ...]] = None
         # vLLM V1 某些配置下可能在同一个 ctrl_step 内重复调用一次 _prepare_inputs。
         # 为避免重复递增 step_context_epoch / 重复计划 refresh / 无意义重建缓存，这里记录最近一次 prepare_step_context 的签名用于去重。
-        # StepIdentity: (target_epoch, source_signature, scheduler_token, refresh_nonce_key)
+        # StepIdentity: (target_epoch, source_signature, dispatch_token, refresh_nonce_key)
         # 作为 prepare_step_context 的复用主键；字段均为 int，比较开销极低。
         self._prepared_step_identity: Tuple[int, int, int, int] = (-1, -1, -1, -1)
         self._prepared_num_actual_tokens: int = -1
@@ -1500,14 +1500,11 @@ class VLLMSparseController(
         # data_ptr)。跨轮残留会顶满 population16 触发 clear-all 清库循环
         # (旧 12 键+新 12 键>16;单轮判速 warmup 轮走 inline 臂 0 捕故未曾
         # 显形,多轮 repeat/serve 空闲重入形态会)。整组重置=下轮从空 map
-        # 重捕;bypass latch 保留(闩死语义跨 idle 不失效)。防御 sync 同 G4:
-        # idle 时无在飞 replay,排干后再丢 graphs+mempool 引用。
+        # 重捕。idle 边界必须排干当前流再丢 graphs+mempool 引用；同步失败
+        # 直接上抛，不能继续释放仍可能被 replay 使用的 graph 状态。
         _tkg_state = getattr(self, "_selector_topk_graph_state", None)
-        if isinstance(_tkg_state, dict) and not bool(_tkg_state.get("bypass")):
-            try:
-                torch.cuda.current_stream().synchronize()
-            except Exception:
-                pass
+        if isinstance(_tkg_state, dict):
+            torch.cuda.current_stream().synchronize()
             self._selector_topk_graph_state = None
 
         # 释放 controller 级缓冲

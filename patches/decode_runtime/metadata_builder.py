@@ -42,6 +42,9 @@ _RRP_PREP_PROFILE_LOG_ENV = "VLLM_SPARSE_RRP_PREP_PROFILE_LOG"
 _RRP_READY_EVENT_ATTR = "mixed_page_resolver_replay_ready_event"
 _RRP_READY_EVENT_GENERATION_ATTR = "mixed_page_resolver_replay_ready_event_generation"
 _RRP_READY_EVENT_STREAM_ATTR = "mixed_page_resolver_replay_ready_event_stream"
+_RRP_SAME_STREAM_ORDERED_ATTR = (
+    "mixed_page_resolver_replay_same_stream_ordered"
+)
 
 from patches.runtime_deps import require_runtime_dep
 from patches.cpu_gpu_staging import _record_stage_h2d_evt, _wait_stage_h2d_evt
@@ -79,6 +82,7 @@ from patches.sparse_utils import (
     ALL_FALSE_SIGNATURE,
 )
 from patches.fa_sparse_runtime.resolved_row_ptr_arena import (
+    LivePageRowsTensorSource,
     PlannedCompactRowLayout,
     ResolvedRowPtrDescriptorPayload,
     ResolvedRowPtrArena,
@@ -112,9 +116,9 @@ from patches.decode_runtime.thin_builder_state import (
 )
 
 from patches.step_decode_pipeline import apply_reuse_ordered_plan_state
-from triton_kernel.flash_attn_score_dump_fwd import pack_req_meta_decode_fast_layers
+from utils.req_meta_pack import pack_req_meta_decode_fast_layers
 from patches.fa_sparse_runtime.materialize import derive_page_aligned_recent_window
-from triton_kernel.flash_attn_score_dump_fwd import pack_req_meta_prefill_fast_layers
+from utils.req_meta_pack import pack_req_meta_prefill_fast_layers
 
 _build_layer_step_cache = require_runtime_dep("_build_layer_step_cache")
 
@@ -164,6 +168,33 @@ def _append_mb_profile(event: dict[str, object]) -> None:
     payload.setdefault("event", "metadata_builder_step")
     with open(path, "a", encoding="utf-8") as fh:
         fh.write(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n")
+
+
+def _rrp_live_pages_publish_profile_fields(
+    controller: object,
+    *,
+    epoch: int,
+) -> dict[str, object]:
+    """Expose RRP publisher truth without conflating capture-arena syncs.
+
+    The arena maintains allocation-free integer counters. This dict is built
+    only when the metadata profile is already enabled, so normal decode pays
+    no JSON/dict/environment-read tax.
+    """
+
+    arena = getattr(controller, "_resolved_row_ptr_replay_arena", None)
+    if not isinstance(arena, ResolvedRowPtrArena):
+        return {}
+    fields = dict(arena.live_pages_publish_metrics_fields())
+    try:
+        rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "-1")))
+    except ValueError:
+        rank = -1
+    fields["rrp_live_pages_rank"] = rank
+    fields["rrp_live_pages_published_this_epoch"] = bool(
+        int(fields.get("rrp_live_pages_last_publish_epoch", -1)) == int(epoch)
+    )
+    return fields
 
 
 def _mb_cprofile_dir() -> str:
@@ -267,12 +298,34 @@ def _append_rrp_prep_profile(event: dict[str, object]) -> None:
 _CURRENT_STREAM_WRAPPER_MEMO: dict[tuple[int, int], object] = {}
 
 
+def _current_cuda_stream_identity_raw(device: torch.device) -> int | None:
+    device_t = torch.device(device)
+    idx = device_t.index
+    try:
+        if idx is None:
+            idx = torch.cuda.current_device()
+        get_current_raw_stream = getattr(
+            getattr(torch, "_C", None),
+            "_cuda_getCurrentRawStream",
+            None,
+        )
+        if not callable(get_current_raw_stream):
+            return None
+        return int(get_current_raw_stream(int(idx)))
+    except Exception:
+        return None
+
+
 def _current_stream_cached(device: torch.device) -> object:
     idx = device.index
     if idx is None:
         idx = torch.cuda.current_device()
     idx = int(idx)
-    raw = int(torch._C._cuda_getCurrentRawStream(idx))
+    raw = _current_cuda_stream_identity_raw(device)
+    if raw is None:
+        # Event recording remains the fail-safe when raw identity is not
+        # available. Do not memoize an identity that cannot be proven.
+        return torch.cuda.current_stream(device)
     key = (idx, raw)
     stream = _CURRENT_STREAM_WRAPPER_MEMO.get(key)
     if stream is None:
@@ -293,6 +346,42 @@ def _cuda_stream_identity(stream: object | None) -> int:
     return int(id(stream))
 
 
+def _wait_for_prior_rrp_replay_before_owner_mutation(
+    controller: object,
+    *,
+    device: torch.device,
+) -> int:
+    """Consume the latest replay-reader generation before an RRP device write."""
+
+    device_t = torch.device(device)
+    if device_t.type != "cuda":
+        return 0
+    from patches.fa_sparse_runtime.rrp_replay_handshake import (
+        rrp_storage_key,
+        wait_for_prior_rrp_replay_before_mutation,
+    )
+
+    arena_key = getattr(controller, "_resolved_row_ptr_arena_key", None)
+    replay_arena = getattr(controller, "_resolved_row_ptr_replay_arena", None)
+    target_storage_key = None
+    if isinstance(replay_arena, ResolvedRowPtrArena):
+        target_storage_key = rrp_storage_key(
+            arena_key=arena_key,
+        )
+    stream = _current_stream_cached(device_t)
+    stream_identity = _current_cuda_stream_identity_raw(device_t)
+    if stream_identity is None:
+        stream_identity = _cuda_stream_identity(stream)
+    return int(
+        wait_for_prior_rrp_replay_before_mutation(
+            controller,
+            stream=stream,
+            stream_identity=int(stream_identity),
+            target_storage_key=target_storage_key,
+        )
+    )
+
+
 def _resolved_row_ptr_ready_event_holders(
     attn_metadata: object,
 ) -> tuple[object, ...]:
@@ -307,17 +396,21 @@ def _resolved_row_ptr_ready_event_state(
     attn_metadata: object,
     *,
     holders: tuple[object, ...] | None = None,
-) -> tuple[int, object | None, int]:
+) -> tuple[int, object | None, int, bool]:
     best_generation = -1
     best_event: object | None = None
     best_stream = -1
+    best_same_stream_ordered = False
     if holders is None:
         holders = _resolved_row_ptr_ready_event_holders(attn_metadata)
     for holder in holders:
         if holder is None:
             continue
         event = getattr(holder, _RRP_READY_EVENT_ATTR, None)
-        if event is None:
+        same_stream_ordered = bool(
+            getattr(holder, _RRP_SAME_STREAM_ORDERED_ATTR, False)
+        )
+        if event is None and not same_stream_ordered:
             continue
         try:
             generation = int(getattr(holder, _RRP_READY_EVENT_GENERATION_ATTR, -1))
@@ -325,11 +418,25 @@ def _resolved_row_ptr_ready_event_state(
             stream = -1 if stream_raw is None else int(stream_raw)
         except Exception:
             continue
-        if generation >= best_generation:
+        # At the same generation an event is the conservative authority if a
+        # malformed/stale holder disagrees with an ordered no-event holder.
+        if generation > best_generation or (
+            generation == best_generation
+            and best_event is None
+            and event is not None
+        ):
             best_generation = generation
             best_event = event
             best_stream = stream
-    return best_generation, best_event, best_stream
+            best_same_stream_ordered = bool(
+                same_stream_ordered and event is None
+            )
+    return (
+        best_generation,
+        best_event,
+        best_stream,
+        best_same_stream_ordered,
+    )
 
 
 def _attach_resolved_row_ptr_ready_event_state(
@@ -338,18 +445,24 @@ def _attach_resolved_row_ptr_ready_event_state(
     ready_event_generation: int,
     ready_event: object | None,
     ready_event_stream: int,
+    same_stream_ordered: bool = False,
     holders: tuple[object, ...] | None = None,
 ) -> None:
-    if ready_event is None or int(ready_event_generation) < 0:
+    generation = int(ready_event_generation)
+    ordered = bool(same_stream_ordered and ready_event is None)
+    if generation < 0 or (ready_event is None and not ordered):
         return
     if holders is None:
         holders = _resolved_row_ptr_ready_event_holders(attn_metadata)
     for holder in holders:
         if holder is None:
             continue
+        # Assignment, rather than a conditional attach, is intentional: an
+        # ordered no-event generation must clear every stale event holder.
         setattr(holder, _RRP_READY_EVENT_ATTR, ready_event)
-        setattr(holder, _RRP_READY_EVENT_GENERATION_ATTR, int(ready_event_generation))
+        setattr(holder, _RRP_READY_EVENT_GENERATION_ATTR, generation)
         setattr(holder, _RRP_READY_EVENT_STREAM_ATTR, int(ready_event_stream))
+        setattr(holder, _RRP_SAME_STREAM_ORDERED_ATTR, ordered)
 
 
 def _record_resolved_row_ptr_replay_ready_event(
@@ -375,7 +488,7 @@ def _record_resolved_row_ptr_replay_ready_event(
     try:
         if holders is None:
             holders = _resolved_row_ptr_ready_event_holders(attn_metadata)
-        _generation, event, _stream = _resolved_row_ptr_ready_event_state(
+        _generation, event, _stream, _ordered = _resolved_row_ptr_ready_event_state(
             attn_metadata, holders=holders
         )
         if event is None:
@@ -407,6 +520,7 @@ def _record_resolved_row_ptr_replay_ready_event(
             setattr(holder, _RRP_READY_EVENT_ATTR, event)
             setattr(holder, _RRP_READY_EVENT_GENERATION_ATTR, generation)
             setattr(holder, _RRP_READY_EVENT_STREAM_ATTR, stream_identity)
+            setattr(holder, _RRP_SAME_STREAM_ORDERED_ATTR, False)
         _mark_rec_phase("rec_identity_publish")
         return True
     except Exception as exc:
@@ -415,15 +529,19 @@ def _record_resolved_row_ptr_replay_ready_event(
         ) from exc
 
 
-def _record_resolved_row_ptr_owner_update_ready_event(
+def _publish_resolved_row_ptr_owner_update_ready_state(
     controller: object,
     *,
     attn_metadata: object,
     device: torch.device,
-    update_kernel_count: int,
+    graph_storage_mutated: bool,
     profile_phase_us: dict[str, float] | None = None,
 ) -> bool:
-    if int(update_kernel_count) <= 0:
+    if not isinstance(graph_storage_mutated, bool):
+        raise RuntimeError(
+            "resolved-row-ptr owner update requires an exact mutation receipt"
+        )
+    if not graph_storage_mutated:
         return False
     if torch.device(device).type != "cuda":
         return False
@@ -453,17 +571,80 @@ def _record_resolved_row_ptr_owner_update_ready_event(
         )
     _ready_event_holders = _resolved_row_ptr_ready_event_holders(attn_metadata)
     _mark_re_phase("re_guards")
-    ready_event_recorded = _record_resolved_row_ptr_replay_ready_event(
-        attn_metadata,
-        device=device,
-        holders=_ready_event_holders,
-        profile_phase_us=profile_phase_us,
+    state = getattr(controller, "_resolved_row_ptr_graph_binding_state", None)
+    producer_stream = _current_cuda_stream_identity_raw(device)
+    observed = getattr(
+        controller,
+        "_prebound_rrp_observed_ready_state",
+        None,
     )
+    same_stream_ordered = False
+    if isinstance(state, dict) and isinstance(observed, tuple) and len(observed) == 3:
+        try:
+            state_generation = int(state.get("ready_event_generation", -1))
+            observed_state = observed[0]
+            observed_generation = int(observed[1])
+            observed_stream = int(observed[2])
+            same_stream_ordered = bool(
+                producer_stream is not None
+                and state.get("route_family") == "resolved_row_ptr"
+                and tuple(state.get("arena_key", ())) == tuple(arena_key)
+                and int(state.get("metadata_count", 0)) > 0
+                and state_generation >= 0
+                # Keep and compare the state object itself.  ``id(state)`` is
+                # not a durable generation identity: after a binding-state
+                # replacement CPython may reuse the retired dict's address
+                # and turn an unobserved state into a false positive (ABA).
+                and observed_state is state
+                and observed_generation == state_generation
+                and observed_stream == int(producer_stream)
+                and (
+                    state.get("ready_event") is not None
+                    or bool(state.get("same_stream_ordered", False))
+                )
+            )
+        except Exception:
+            same_stream_ordered = False
+
+    if same_stream_ordered:
+        generation = max(
+            [int(state.get("ready_event_generation", -1))]
+            + [
+                int(
+                    getattr(
+                        holder,
+                        _RRP_READY_EVENT_GENERATION_ATTR,
+                        -1,
+                    )
+                )
+                for holder in _ready_event_holders
+                if holder is not None
+            ]
+        ) + 1
+        _attach_resolved_row_ptr_ready_event_state(
+            attn_metadata,
+            ready_event_generation=int(generation),
+            ready_event=None,
+            ready_event_stream=int(producer_stream),
+            same_stream_ordered=True,
+            holders=_ready_event_holders,
+        )
+        ready_event_recorded = False
+    else:
+        # First bind/rebind, an unobserved generation, an unknown raw stream,
+        # or a producer/replay stream mismatch retains the event contract.
+        ready_event_recorded = _record_resolved_row_ptr_replay_ready_event(
+            attn_metadata,
+            device=device,
+            holders=_ready_event_holders,
+            profile_phase_us=profile_phase_us,
+        )
     _mark_re_phase("re_record")
     (
         ready_event_generation,
         ready_event,
         ready_event_stream,
+        ready_same_stream_ordered,
     ) = _resolved_row_ptr_ready_event_state(
         attn_metadata, holders=_ready_event_holders
     )
@@ -480,6 +661,7 @@ def _record_resolved_row_ptr_owner_update_ready_event(
             ready_event_generation=int(ready_event_generation),
             ready_event=ready_event,
             ready_event_stream=int(ready_event_stream),
+            same_stream_ordered=bool(ready_same_stream_ordered),
         )
     ):
         _mark_re_phase("re_publish_fast")
@@ -491,6 +673,7 @@ def _record_resolved_row_ptr_owner_update_ready_event(
         ready_event_generation=int(ready_event_generation),
         ready_event=ready_event,
         ready_event_stream=int(ready_event_stream),
+        same_stream_ordered=bool(ready_same_stream_ordered),
     ):
         _publish_resolved_row_ptr_graph_binding_state(
             controller,
@@ -499,6 +682,7 @@ def _record_resolved_row_ptr_owner_update_ready_event(
             ready_event_generation=int(ready_event_generation),
             ready_event=ready_event,
             ready_event_stream=int(ready_event_stream),
+            same_stream_ordered=bool(ready_same_stream_ordered),
         )
     _mark_re_phase("re_publish_slow")
     return bool(ready_event_recorded)
@@ -512,6 +696,7 @@ def _publish_resolved_row_ptr_graph_binding_state(
     ready_event_generation: int,
     ready_event: object | None = None,
     ready_event_stream: int = -1,
+    same_stream_ordered: bool = False,
     metadata_count: int = 1,
 ) -> None:
     def _batch_row_modes() -> tuple[str, ...]:
@@ -560,6 +745,9 @@ def _publish_resolved_row_ptr_graph_binding_state(
             "ready_event_generation": int(ready_event_generation),
             "ready_event": ready_event,
             "ready_event_stream": int(ready_event_stream),
+            "same_stream_ordered": bool(
+                same_stream_ordered and ready_event is None
+            ),
         },
     )
 
@@ -572,6 +760,7 @@ def _refresh_resolved_row_ptr_graph_binding_ready_state(
     ready_event_generation: int,
     ready_event: object | None = None,
     ready_event_stream: int = -1,
+    same_stream_ordered: bool = False,
 ) -> bool:
     state = getattr(controller, "_resolved_row_ptr_graph_binding_state", None)
     if not isinstance(state, dict):
@@ -593,6 +782,9 @@ def _refresh_resolved_row_ptr_graph_binding_ready_state(
     state["ready_event_generation"] = int(ready_event_generation)
     state["ready_event"] = ready_event
     state["ready_event_stream"] = int(ready_event_stream)
+    state["same_stream_ordered"] = bool(
+        same_stream_ordered and ready_event is None
+    )
     return True
 
 
@@ -2136,6 +2328,10 @@ def _try_attach_same_page_resolved_row_ptr_replay_metadata(
             for live_row, arena_row in enumerate(active_arena_row_indices):
                 row_effective_list[int(arena_row)] = int(row_effective_k_by_row[live_row])
             row_effective_k_by_row = tuple(row_effective_list)
+        _wait_for_prior_rrp_replay_before_owner_mutation(
+            controller,
+            device=device,
+        )
         update = manager.try_apply_same_page_delta(
             replay_arena,
             row_effective_k_by_row,
@@ -2287,6 +2483,10 @@ def _try_attach_same_page_resolved_row_ptr_replay_metadata(
         )
         if _mark_rrp_attach_phase is not None:
             _mark_rrp_attach_phase("rrp_attach_inputs_ready")
+        _wait_for_prior_rrp_replay_before_owner_mutation(
+            controller,
+            device=device,
+        )
         if descriptor_snapshot is not None:
             update = manager.publish_from_descriptor_snapshot(
                 replay_arena,
@@ -2385,6 +2585,7 @@ def _try_attach_same_page_resolved_row_ptr_replay_metadata(
         existing_ready_event_generation,
         existing_ready_event,
         existing_ready_event_stream,
+        existing_same_stream_ordered,
     ) = _resolved_row_ptr_ready_event_state(
         attn_metadata, holders=_ready_event_holders
     )
@@ -2393,6 +2594,7 @@ def _try_attach_same_page_resolved_row_ptr_replay_metadata(
         ready_event_generation=existing_ready_event_generation,
         ready_event=existing_ready_event,
         ready_event_stream=existing_ready_event_stream,
+        same_stream_ordered=bool(existing_same_stream_ordered),
         holders=_ready_event_holders,
     )
     ready_event_recorded = False
@@ -2410,6 +2612,7 @@ def _try_attach_same_page_resolved_row_ptr_replay_metadata(
         ready_event_generation,
         ready_event,
         ready_event_stream,
+        ready_same_stream_ordered,
     ) = _resolved_row_ptr_ready_event_state(
         attn_metadata, holders=_ready_event_holders
     )
@@ -2427,6 +2630,7 @@ def _try_attach_same_page_resolved_row_ptr_replay_metadata(
         ready_event_generation=int(ready_event_generation),
         ready_event=ready_event,
         ready_event_stream=int(ready_event_stream),
+        same_stream_ordered=bool(ready_same_stream_ordered),
     ):
         _publish_resolved_row_ptr_graph_binding_state(
             controller,
@@ -2435,6 +2639,7 @@ def _try_attach_same_page_resolved_row_ptr_replay_metadata(
             ready_event_generation=int(ready_event_generation),
             ready_event=ready_event,
             ready_event_stream=int(ready_event_stream),
+            same_stream_ordered=bool(ready_same_stream_ordered),
         )
     _stamp_resolved_row_ptr_graph_binding_step(
         controller=controller,
@@ -2445,6 +2650,10 @@ def _try_attach_same_page_resolved_row_ptr_replay_metadata(
     if _mark_rrp_attach_phase is not None:
         _mark_rrp_attach_phase("rrp_attach_graph_binding_publish")
     return update
+
+
+class _PageAddIncrementalEligibilityMiss(Exception):
+    """Expected host-schema miss before any page-add device publication."""
 
 
 def _try_page_add_incremental(
@@ -2468,9 +2677,11 @@ def _try_page_add_incremental(
     # diverge). Manager currency (_row_effective via _apply_seqused_delta,
     # _visible_page_count = recompute formula, _recent_first) is advanced so the
     # NEXT step _is_pure_seqused_delta is self-consistent (hit until real growth).
-    # Returns a PAGE_BOUNDARY_DELTA RrpUpdateResult, or None to fall through to
-    # the full rebind (graceful). BYTE-IDENTITY is the gate (kernel reads the
-    # fallback row_table_i32 directly; Leg-B precedent).
+    # Returns a PAGE_BOUNDARY_DELTA RrpUpdateResult, or None only while host
+    # schema/eligibility is still proven before publication. Once publication
+    # starts, errors propagate instead of letting TP ranks silently choose
+    # different routes. BYTE-IDENTITY is the gate (kernel reads the fallback
+    # row_table_i32 directly; Leg-B precedent).
     try:
         ps = int(block_size)
         if ps <= 0 or launch_plan is None:
@@ -2483,9 +2694,16 @@ def _try_page_add_incremental(
                 or block_table_cpu is None or not callable(publish)):
             return None
         bs = int(batch_size)
-        if (len(compact_valid_cpu) < bs or len(compact_offset_cpu) < bs
+        try:
+            inputs_too_short = (
+                len(compact_valid_cpu) < bs
+                or len(compact_offset_cpu) < bs
                 or len(delta.row_effective_k_by_row) < bs
-                or len(delta.recent_first_page_by_row) < bs):
+                or len(delta.recent_first_page_by_row) < bs
+            )
+        except TypeError as exc:
+            raise _PageAddIncrementalEligibilityMiss from exc
+        if inputs_too_short:
             return None
         reserved = _resolved_row_ptr_lease_snapshot(
             controller,
@@ -2500,17 +2718,27 @@ def _try_page_add_incremental(
         # page_size, bs)——reserved 经 lease snapshot memo 命中时跨步同对象,
         # id 锚成立;任一键分量变(含 lease 重建)整表重建,越界防卫随建随验,
         # miss=全量重建非跳过。消费方(derive 只读 .get/publish del 形参)均只读。
-        _cpm_valid_t = tuple(int(compact_valid_cpu[r]) for r in range(bs))
-        _cpm_off_t = tuple(int(compact_offset_cpu[r]) for r in range(bs))
+        try:
+            _cpm_valid_t = tuple(int(compact_valid_cpu[r]) for r in range(bs))
+            _cpm_off_t = tuple(int(compact_offset_cpu[r]) for r in range(bs))
+            _effk_now = tuple(
+                int(delta.row_effective_k_by_row[r]) for r in range(bs)
+            )
+            _recent_first_now = tuple(
+                int(delta.recent_first_page_by_row[r]) for r in range(bs)
+            )
+        except (IndexError, KeyError, TypeError, ValueError) as exc:
+            raise _PageAddIncrementalEligibilityMiss from exc
         _cpm_key = (id(reserved), len(reserved), _cpm_valid_t, _cpm_off_t, ps, bs)
         _cpm_cached = getattr(controller, "_page_add_compact_pages_memo", None)
         if (
             isinstance(_cpm_cached, tuple)
-            and len(_cpm_cached) == 3
+            and len(_cpm_cached) == 4
             and _cpm_cached[0] == _cpm_key
         ):
             compact_pages_by_row = _cpm_cached[1]
             compact_pages_count_by_row = _cpm_cached[2]
+            compact_reserved_i32 = _cpm_cached[3]
         else:
             compact_pages_by_row = {}
             compact_pages_count_by_row = {}
@@ -2524,20 +2752,26 @@ def _try_page_add_incremental(
                     int(v) for v in reserved[compact_off_pages:compact_off_pages + compact_pages]
                 )
                 compact_pages_count_by_row[r] = compact_pages
+            compact_reserved_i32 = torch.as_tensor(
+                reserved,
+                dtype=torch.int32,
+                device="cpu",
+            ).contiguous()
             controller._page_add_compact_pages_memo = (
                 _cpm_key,
                 compact_pages_by_row,
                 compact_pages_count_by_row,
+                compact_reserved_i32,
             )
         recent_first_by_row = {}
         recent_count_by_row = {}
         vpc = []
         for r in range(bs):
             compact_tokens = max(0, _cpm_valid_t[r])
-            row_effk = max(0, int(delta.row_effective_k_by_row[r]))
+            row_effk = max(0, _effk_now[r])
             rc = (max(0, row_effk - compact_tokens) + ps - 1) // ps
             recent_count_by_row[r] = rc
-            recent_first_by_row[r] = int(delta.recent_first_page_by_row[r])
+            recent_first_by_row[r] = _recent_first_now[r]
             vpc.append(compact_pages_count_by_row[r] + rc)
         # [PAGE-ADD-DIRTY-ONLY 2026-07-08] re-lay ONLY the rows whose page set
         # actually changed instead of the whole batch every step. A row is
@@ -2550,9 +2784,6 @@ def _try_page_add_incremental(
         # row_dynamic_signature and classifies as PAGE_BOUNDARY/REFRESH_COMMIT,
         # which never reaches this leg. Incomplete shadow state -> conservative
         # full re-lay.
-        _effk_now = tuple(
-            int(v) for v in tuple(delta.row_effective_k_by_row)[:bs]
-        )
         _shadow_now = manager._shadow_visible_pages(_effk_now)
         _shadow_stored = manager._probe_visible_page_count_by_row
         _rf_stored = manager._recent_first_page_by_row
@@ -2571,40 +2802,96 @@ def _try_page_add_incremental(
             )
         else:
             dirty = tuple(range(bs))
+        pages = None
+        tensor_source = None
         if dirty:
-            pages = derive_live_page_rows(
-                active_rows=dirty,
-                block_table_cpu=block_table_cpu,
-                compact_pages_by_row=compact_pages_by_row,
-                recent_first_page_by_row=recent_first_by_row,
-                recent_page_count_by_row=recent_count_by_row,
-            )
-            publish(pages_by_row=pages, dirty_rows=dirty,
-                    compact_pages_by_row=compact_pages_by_row)
-        manager._apply_seqused_delta(
-            replay_arena,
-            tuple(int(v) for v in tuple(delta.row_effective_k_by_row)[:bs]),
-        )
-        manager._visible_page_count_by_row = tuple(vpc)
-        # [VPC-SHADOW-METRIC] this leg's vpc uses floor compact pages
-        # (compact_tokens // ps) vs the probe's ceil — recompute the probe's
-        # own token-ceil shadow instead of copying, so a non-page-aligned
-        # compact_valid can never phase-split the comparison.
-        manager._probe_visible_page_count_by_row = manager._shadow_visible_pages(
-            tuple(int(v) for v in tuple(delta.row_effective_k_by_row)[:bs])
-        )
-        manager._recent_first_page_by_row = tuple(
-            recent_first_by_row[r] for r in range(bs)
-        )
-        return RrpUpdateResult(
-            hit=False,
-            miss_reason="page_add_incremental",
-            delta_rows=tuple(range(bs)),
-            full_bind=False,
-            kind=RrpUpdateKind.PAGE_BOUNDARY_DELTA,
-        )
-    except Exception:
+            try:
+                # Canonical production input is a CPU int32 torch.Tensor. Keep
+                # its recent slices and the memoized compact lease tensor
+                # tensor-native through the existing pinned carrier. A legacy
+                # sequence/non-contiguous source declines before publication
+                # and retains the byte-identical tuple derivation below.
+                tensor_source = LivePageRowsTensorSource.try_create(
+                    block_table_cpu=block_table_cpu,
+                    compact_reserved_cpu=compact_reserved_i32,
+                    compact_offset_by_row=tuple(
+                        _cpm_off_t[r] // ps for r in range(bs)
+                    ),
+                    compact_count_by_row=tuple(
+                        compact_pages_count_by_row[r] for r in range(bs)
+                    ),
+                    recent_first_page_by_row=tuple(
+                        recent_first_by_row[r] for r in range(bs)
+                    ),
+                    recent_count_by_row=tuple(
+                        recent_count_by_row[r] for r in range(bs)
+                    ),
+                )
+                if tensor_source is not None:
+                    tensor_source.validate_rows(
+                        dirty_rows=dirty,
+                        expected_batch_size=bs,
+                        max_pages_per_row=int(replay_arena.max_pages_per_row),
+                    )
+                else:
+                    pages = derive_live_page_rows(
+                        active_rows=dirty,
+                        block_table_cpu=block_table_cpu,
+                        compact_pages_by_row=compact_pages_by_row,
+                        recent_first_page_by_row=recent_first_by_row,
+                        recent_page_count_by_row=recent_count_by_row,
+                    )
+            except ValueError as exc:
+                raise _PageAddIncrementalEligibilityMiss from exc
+    except _PageAddIncrementalEligibilityMiss:
+        # Only malformed/missing host eligibility metadata may decline this
+        # optional incremental route. Device publication has not started yet,
+        # so the heavy owner path can still rebuild from canonical inputs.
         return None
+
+    # Transaction boundary: once device publication starts, every CUDA/event/
+    # stream/publish error must propagate. Swallowing one rank's failure here
+    # lets TP ranks choose different metadata routes and turns the root error
+    # into a later collective/replay hang.
+    if dirty:
+        if tensor_source is not None:
+            publish(
+                tensor_source=tensor_source,
+                dirty_rows=dirty,
+                compact_pages_by_row=compact_pages_by_row,
+                publish_epoch=int(getattr(step_authority, "epoch", -1)),
+            )
+        else:
+            assert pages is not None
+            publish(
+                pages_by_row=pages,
+                dirty_rows=dirty,
+                compact_pages_by_row=compact_pages_by_row,
+                publish_epoch=int(getattr(step_authority, "epoch", -1)),
+            )
+    manager._apply_seqused_delta(
+        replay_arena,
+        _effk_now,
+    )
+    manager._visible_page_count_by_row = tuple(vpc)
+    # [VPC-SHADOW-METRIC] this leg's vpc uses floor compact pages
+    # (compact_tokens // ps) vs the probe's ceil — recompute the probe's
+    # own token-ceil shadow instead of copying, so a non-page-aligned
+    # compact_valid can never phase-split the comparison.
+    manager._probe_visible_page_count_by_row = manager._shadow_visible_pages(
+        _effk_now
+    )
+    manager._recent_first_page_by_row = tuple(
+        recent_first_by_row[r] for r in range(bs)
+    )
+    return RrpUpdateResult(
+        hit=False,
+        miss_reason="page_add_incremental",
+        delta_rows=tuple(range(bs)),
+        full_bind=False,
+        kind=RrpUpdateKind.PAGE_BOUNDARY_DELTA,
+        graph_storage_mutated=True,
+    )
 
 
 def _try_update_same_page_resolved_row_ptr_step_state(
@@ -2703,6 +2990,10 @@ def _try_update_same_page_resolved_row_ptr_step_state(
         )
         if len(row_effective_k_by_row) != batch_size_i:
             return _miss("row_effective_len_mismatch")
+        _wait_for_prior_rrp_replay_before_owner_mutation(
+            controller,
+            device=device,
+        )
         update = manager.try_apply_same_page_delta(
             replay_arena,
             row_effective_k_by_row,
@@ -2811,6 +3102,10 @@ def _try_update_same_page_resolved_row_ptr_step_state(
     )
     if len(row_effective_k_by_row) != batch_size_i:
         return _miss("row_effective_len_mismatch")
+    _wait_for_prior_rrp_replay_before_owner_mutation(
+        controller,
+        device=device,
+    )
     update = manager.try_apply_same_page_delta(
         replay_arena,
         row_effective_k_by_row,
@@ -3018,83 +3313,6 @@ def _resolved_row_ptr_launch_effective_k_len_source(
     if not source.is_contiguous():
         return None
     return source
-
-
-class _ResolvedRowPtrLaunchEffectiveView:
-    __slots__ = ("valid", "launch_effective_k_len_i32", "launch_effective_k_len_cpu")
-
-    def __init__(
-        self,
-        *,
-        launch_effective_k_len_i32: torch.Tensor,
-        launch_effective_k_len_cpu: tuple[int, ...],
-    ) -> None:
-        self.valid = True
-        self.launch_effective_k_len_i32 = launch_effective_k_len_i32
-        self.launch_effective_k_len_cpu = launch_effective_k_len_cpu
-
-
-def _resolved_row_ptr_graph_launch_effective_view(
-    *,
-    controller: object,
-    launch_plan: object | None,
-    launch_effective_k_by_row: tuple[int, ...],
-    batch_size: int,
-    device: torch.device,
-) -> object | None:
-    source = _resolved_row_ptr_launch_effective_k_len_source(
-        launch_plan=launch_plan,
-        batch_size=int(batch_size),
-        device=device,
-    )
-    if source is not None:
-        return launch_plan
-    if len(launch_effective_k_by_row) != int(batch_size):
-        return launch_plan
-    try:
-        from patches.decode_runtime.compact_recent_launch_plan_builder import (
-            ensure_cached_launch_effective_k_len_i32,
-        )
-    except Exception:
-        return launch_plan
-    tensor = ensure_cached_launch_effective_k_len_i32(
-        controller,
-        batch_size=int(batch_size),
-        device=device,
-    )
-    if not (
-        isinstance(tensor, torch.Tensor)
-        and tensor.dtype == torch.int32
-        and tensor.device == device
-        and tensor.dim() == 1
-        and int(tensor.numel()) == int(batch_size)
-        and tensor.is_contiguous()
-    ):
-        return launch_plan
-    cpu_buffer = getattr(controller, "_rrp_launch_effective_cpu_staging_i32", None)
-    if not isinstance(cpu_buffer, torch.Tensor) or int(cpu_buffer.numel()) < int(batch_size):
-        cpu_buffer = torch.empty((int(batch_size),), dtype=torch.int32, device="cpu")
-        setattr(controller, "_rrp_launch_effective_cpu_staging_i32", cpu_buffer)
-    cpu_buffer[: int(batch_size)].copy_(
-        torch.as_tensor(
-            launch_effective_k_by_row[: int(batch_size)],
-            dtype=torch.int32,
-            device="cpu",
-        )
-    )
-    tensor.copy_(cpu_buffer[: int(batch_size)], non_blocking=device.type == "cuda")
-    values = tuple(int(v) for v in launch_effective_k_by_row[: int(batch_size)])
-    view = getattr(controller, "_rrp_graph_launch_effective_view", None)
-    if not isinstance(view, _ResolvedRowPtrLaunchEffectiveView):
-        view = _ResolvedRowPtrLaunchEffectiveView(
-            launch_effective_k_len_i32=tensor,
-            launch_effective_k_len_cpu=values,
-        )
-        setattr(controller, "_rrp_graph_launch_effective_view", view)
-    else:
-        view.launch_effective_k_len_i32 = tensor
-        view.launch_effective_k_len_cpu = values
-    return view
 
 
 def _resolved_row_ptr_launch_effective_covers_rows(
@@ -3430,10 +3648,11 @@ def _update_resolved_row_ptr_graph_binding_ready_event_only(
     ready_event_generation: int,
     ready_event: object | None,
     ready_event_stream: int,
+    same_stream_ordered: bool = False,
 ) -> bool:
     """Same-page steady step: the binding topology is invariant (static cache
-    key proved unchanged upstream), so only the ready-event handle/generation
-    advanced. Update the already-published dict's 3 event fields in place and
+    key proved unchanged upstream), so only the ready-state generation
+    advanced. Update the already-published dict's event/ordered fields in place and
     skip the full _publish rebuild. Stricter than the cheap branch of
     _refresh_resolved_row_ptr_graph_binding_ready_state: a missing/foreign/
     uncovered state dict returns False so the caller keeps the original
@@ -3450,6 +3669,9 @@ def _update_resolved_row_ptr_graph_binding_ready_event_only(
     state["ready_event_generation"] = int(ready_event_generation)
     state["ready_event"] = ready_event
     state["ready_event_stream"] = int(ready_event_stream)
+    state["same_stream_ordered"] = bool(
+        same_stream_ordered and ready_event is None
+    )
     return True
 
 
@@ -3606,23 +3828,6 @@ def _try_apply_same_page_minimal_metadata_update(
         else next(iter(controller.layer_states.values())).device
     )
     replay_bind_device_t = torch.device(replay_bind_device)
-    replay_arena_for_visible = getattr(controller, "_resolved_row_ptr_replay_arena", None)
-    launch_effective_source = _resolved_row_ptr_launch_effective_k_len_source(
-        launch_plan=launch_plan,
-        batch_size=batch_size,
-        device=replay_bind_device_t,
-    )
-    visible_source = (
-        replay_arena_for_visible.carriers.resolver_visible_seqused_k_by_head_i32
-        if isinstance(replay_arena_for_visible, ResolvedRowPtrArena)
-        else None
-    )
-    visible_uses_launch_effective = (
-        isinstance(visible_source, torch.Tensor)
-        and isinstance(launch_effective_source, torch.Tensor)
-        and int(visible_source.data_ptr()) == int(launch_effective_source.data_ptr())
-    )
-    _mark("same_page_minimal_device_source")
 
     old_mode = getattr(controller, "_decode_runtime_mode", None)
     old_delta = getattr(controller, "_decode_runtime_delta", None)
@@ -3638,8 +3843,10 @@ def _try_apply_same_page_minimal_metadata_update(
             launch_effective_k_by_row=predicted_delta.launch_effective_k_by_row,
             recent_first_page_by_row=predicted_delta.recent_first_page_by_row,
             recent_page_count_by_row=predicted_delta.recent_page_count_by_row,
-            update_gpu=bool(visible_uses_launch_effective),
-            force_gpu_refresh=bool(visible_uses_launch_effective),
+            # Production RRP owns its visible length in arena_batch_seqused;
+            # the retired launch-effective alias arm must not turn this CPU
+            # truth update into a graph-live descriptor write.
+            update_gpu=False,
             # [ARM-WAR-R1-PINNED-INDEPENDENT 2026-07-12] fresh 镜像双引用替换。
             controller=controller,
         )
@@ -3706,11 +3913,11 @@ def _try_apply_same_page_minimal_metadata_update(
     runtime_state.counters.carrier_update_kernel_count += int(
         same_page_update_kernel_count
     )
-    ready_event_recorded = _record_resolved_row_ptr_owner_update_ready_event(
+    ready_event_recorded = _publish_resolved_row_ptr_owner_update_ready_state(
         controller,
         attn_metadata=attn_metadata,
         device=replay_bind_device_t,
-        update_kernel_count=int(same_page_update_kernel_count),
+        graph_storage_mutated=bool(rrp_update.graph_storage_mutated),
         profile_phase_us=(
             mb_phase_us if (mb_profile_enabled or steady_phase_enabled) else None
         ),
@@ -3758,6 +3965,10 @@ def _try_apply_same_page_minimal_metadata_update(
                 "predicted_same_page_step_count": 1,
                 "phase_us": dict(mb_phase_us),
                 "rrp_update_kind": str(getattr(rrp_update, "kind", "")),
+                **_rrp_live_pages_publish_profile_fields(
+                    controller,
+                    epoch=int(getattr(step_authority, "epoch", -1)),
+                ),
                 "total_us": float(time.perf_counter_ns() - mb_total_start_ns)
                 / 1000.0,
             }
@@ -3998,27 +4209,8 @@ def _try_run_steady_decode_metadata_fast_path_inner(
         else next(iter(controller.layer_states.values())).device
     )
     replay_bind_device_t = torch.device(replay_bind_device)
-    replay_arena_for_visible = getattr(controller, "_resolved_row_ptr_replay_arena", None)
-    launch_effective_source = _resolved_row_ptr_launch_effective_k_len_source(
-        launch_plan=launch_plan,
-        batch_size=batch_size,
-        device=replay_bind_device_t,
-    )
-    visible_source = (
-        replay_arena_for_visible.carriers.resolver_visible_seqused_k_by_head_i32
-        if isinstance(replay_arena_for_visible, ResolvedRowPtrArena)
-        else None
-    )
-    visible_uses_launch_effective = (
-        isinstance(visible_source, torch.Tensor)
-        and isinstance(launch_effective_source, torch.Tensor)
-        and int(visible_source.data_ptr()) == int(launch_effective_source.data_ptr())
-    )
-    _mark_steady_phase("z_device_source")
     update = None
-    update_template_before_rrp = (
-        visible_uses_launch_effective or mode is DecodeRuntimeMode.PAGE_BOUNDARY_DELTA
-    )
+    update_template_before_rrp = mode is DecodeRuntimeMode.PAGE_BOUNDARY_DELTA
     if update_template_before_rrp:
         update = apply_launch_template_row_delta(
             template,
@@ -4027,7 +4219,6 @@ def _try_run_steady_decode_metadata_fast_path_inner(
             recent_first_page_by_row=delta.recent_first_page_by_row,
             recent_page_count_by_row=delta.recent_page_count_by_row,
             update_gpu=True,
-            force_gpu_refresh=bool(visible_uses_launch_effective),
             # [ARM-WAR-R1-PINNED-INDEPENDENT 2026-07-12] fresh 镜像双引用替换。
             controller=controller,
         )
@@ -4075,11 +4266,11 @@ def _try_run_steady_decode_metadata_fast_path_inner(
         same_page_update_kernel_count
     )
     _mark_steady_phase("z_pre_record")
-    ready_event_recorded = _record_resolved_row_ptr_owner_update_ready_event(
+    ready_event_recorded = _publish_resolved_row_ptr_owner_update_ready_state(
         controller,
         attn_metadata=attn_metadata,
         device=replay_bind_device_t,
-        update_kernel_count=int(same_page_update_kernel_count),
+        graph_storage_mutated=bool(rrp_update.graph_storage_mutated),
     )
     _mark_steady_phase("steady_launch_template_update")
 
@@ -4200,6 +4391,10 @@ def _try_run_steady_decode_metadata_fast_path_inner(
                     getattr(controller, "_forensic_ultra_first_rrp_miss_reason", "")
                 ),
                 **rrp_visible_debug_fields,
+                **_rrp_live_pages_publish_profile_fields(
+                    controller,
+                    epoch=int(getattr(step_authority, "epoch", -1)),
+                ),
                 "total_us": float(time.perf_counter_ns() - mb_total_start_ns)
                 / 1000.0,
             }
@@ -5436,6 +5631,10 @@ def _maybe_bind_resolved_row_ptr_replay_metadata(
             active_arena_row_indices=live_arena_rows,
         )
     )
+    _wait_for_prior_rrp_replay_before_owner_mutation(
+        self,
+        device=device,
+    )
     rrp_update = rrp_manager.update(
         replay_arena,
         RrpRowTableInputs(
@@ -5599,6 +5798,7 @@ def _maybe_bind_resolved_row_ptr_replay_metadata(
         existing_ready_event_generation,
         existing_ready_event,
         existing_ready_event_stream,
+        existing_same_stream_ordered,
     ) = _resolved_row_ptr_ready_event_state(
         attn_metadata, holders=_ready_event_holders
     )
@@ -5616,11 +5816,12 @@ def _maybe_bind_resolved_row_ptr_replay_metadata(
     # Design A (byte-neutral): the prior unconditional re-attach of the values
     # just read above was a value no-op (all holders stay synchronized), and the
     # second state re-read is only needed when we actually recorded a new event;
-    # otherwise reuse the existing_* triple read above (bit-identical).
+    # otherwise reuse the existing ready-state tuple above (bit-identical).
     (
         ready_event_generation,
         ready_event,
         ready_event_stream,
+        ready_same_stream_ordered,
     ) = (
         _resolved_row_ptr_ready_event_state(
             attn_metadata, holders=_ready_event_holders
@@ -5630,6 +5831,7 @@ def _maybe_bind_resolved_row_ptr_replay_metadata(
             existing_ready_event_generation,
             existing_ready_event,
             existing_ready_event_stream,
+            existing_same_stream_ordered,
         )
     )
     self._resolved_row_ptr_ready_event_recorded = bool(ready_event_recorded)
@@ -5641,6 +5843,7 @@ def _maybe_bind_resolved_row_ptr_replay_metadata(
             ready_event_generation=int(ready_event_generation),
             ready_event=ready_event,
             ready_event_stream=int(ready_event_stream),
+            same_stream_ordered=bool(ready_same_stream_ordered),
         )
         _stamp_resolved_row_ptr_graph_binding_step(
             controller=self,
@@ -5741,18 +5944,6 @@ def maybe_build_step_decode_data_from_metadata_impl(
     kv_cache_spec: Optional[object],
 ) -> None:
     """在 Triton metadata builder 阶段构建 step_cache + StepDecodeData。"""
-    # GRAPH-WAR FENCE (event, GPU-side, no CPU block): wait for the prior decode FULL
-    # cudagraph's producer reads (launch stream S) to finish before this data build
-    # overwrites the RRP descriptor on its own (side) stream. One-way cudaStreamWaitEvent
-    # -- no host block, no device drain. Shared armed-flag + event via sparse_constants;
-    # armed only in the bootstrap window -> zero steady-state cost.
-    from patches import sparse_constants as _war_sc
-    if _war_sc._RRP_WAR_FENCE_ARMED[0]:
-        _war_evt = _war_sc._RRP_WAR_FENCE_EVT[0]
-        if _war_evt is not None:
-            import torch as _war_torch
-            if _war_torch.cuda.is_available():
-                _war_torch.cuda.current_stream().wait_event(_war_evt)
     mb_profile_enabled = bool(_mb_profile_log_path())
     metadata_timing_enabled = bool(_metadata_timing_log_path())
     mb_total_start_ns = time.perf_counter_ns() if mb_profile_enabled else 0
@@ -7835,6 +8026,10 @@ def maybe_build_step_decode_data_from_metadata_impl(
                     ),
                     "phase_us": dict(mb_phase_us),
                     **_rrp_visible_debug_fields,
+                    **_rrp_live_pages_publish_profile_fields(
+                        self,
+                        epoch=int(getattr(step_authority, "epoch", -1)),
+                    ),
                     "total_us": float(time.perf_counter_ns() - mb_total_start_ns)
                     / 1000.0,
                 }
@@ -7918,15 +8113,6 @@ def maybe_build_step_decode_data_from_metadata_impl(
                 ),
                 "writer_graph_recapture_count": int(
                     getattr(self, "_writer_graph_recapture_count", 0)
-                ),
-                "writer_graph_bypass": bool(
-                    (getattr(self, "_writer_graph_state", None) or {}).get(
-                        "bypass"
-                    )
-                    if isinstance(
-                        getattr(self, "_writer_graph_state", None), dict
-                    )
-                    else False
                 ),
             },
         )

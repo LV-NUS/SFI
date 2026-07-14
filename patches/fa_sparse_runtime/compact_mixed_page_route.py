@@ -294,52 +294,38 @@ def _wait_for_compact_arena_if_needed(
     state: object,
     device: torch.device,
 ) -> None:
-    def strict_wait_errors() -> bool:
-        # [GROUP-READY-ENV-RETIRED 2026-07-03] The VLLM_SPARSE_ONE_SHOT_GROUP_READY
-        # force-on env read is retired (guard root-fixed by STAGE-RING-FIX; A/B showed
-        # 8/8 golden-identical and zero correctness contribution). Behavior is fixed to
-        # the former env-unset default: fail-open, unless the controller reports the
-        # group-ready wait machinery active via the READY_CHUNK < CAPTURE_CHUNK
-        # auto-enable path (kept below), in which case wait errors stay fail-closed.
-        enabled = getattr(controller, "_one_shot_group_ready_graph_wait_enabled", None)
-        if not callable(enabled):
-            return False
-        return bool(enabled())
+    # The compact-ready generation is a correctness fence, not an optional
+    # optimization.  Once a producer advertises a newer generation, failure to
+    # establish its stream dependency must abort the launch instead of letting
+    # FA3 consume stale arena contents.  This also keeps every TP rank on the
+    # same fail-closed contract.
+    if getattr(device, "type", "") == "cuda":
+        _car_evt = getattr(controller, "_compact_arena_ready_evt", None)
+        _car_gen = int(getattr(controller, "_compact_arena_ready_gen", 0))
+        _car_waited = int(getattr(controller, "_compact_arena_ready_waited_gen", -1))
+        if _car_gen < 0 or _car_waited < -1 or _car_waited > _car_gen:
+            raise RuntimeError("compact-ready generation state is malformed")
+        if _car_gen > 0 and _car_evt is None:
+            raise RuntimeError(
+                "compact-ready generation requires its producer event"
+            )
+        if (
+            _car_evt is not None
+            and _car_gen > max(0, _car_waited)
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            torch.cuda.current_stream(device=device).wait_event(_car_evt)
+            controller._compact_arena_ready_waited_gen = _car_gen
 
-    # WAR FIX(bs8 async-prefill compact arena): always wait the producer's dedicated
-    # compact-ready event before reading the compact arena, keyed on a monotonic gen counter
-    # (NOT buf flags, NOT 'refresh_stream is not None'). Fires once per producer generation and
-    # covers chunk 0. This is the real producer->consumer fence the buf-keyed path skips.
-    try:
-        if getattr(device, "type", "") == "cuda":
-            _car_evt = getattr(controller, "_compact_arena_ready_evt", None)
-            _car_gen = int(getattr(controller, "_compact_arena_ready_gen", 0))
-            _car_waited = int(getattr(controller, "_compact_arena_ready_waited_gen", -1))
-            if (
-                _car_evt is not None
-                and _car_gen > _car_waited
-                and not torch.cuda.is_current_stream_capturing()
-            ):
-                torch.cuda.current_stream(device=device).wait_event(_car_evt)
-                controller._compact_arena_ready_waited_gen = _car_gen
-    except Exception:
-        if strict_wait_errors():
-            raise
+    from patches.fa_sparse_runtime.compact_recent_dispatch import (
+        _maybe_wait_for_async_compact_arena,
+    )
 
-    try:
-        from patches.fa_sparse_runtime.compact_recent_dispatch import (
-            _maybe_wait_for_async_compact_arena,
-        )
-
-        _maybe_wait_for_async_compact_arena(
-            controller=controller,
-            state=state,
-            device=device,
-        )
-    except Exception:
-        if strict_wait_errors():
-            raise
-        pass
+    _maybe_wait_for_async_compact_arena(
+        controller=controller,
+        state=state,
+        device=device,
+    )
 
 
 def _recent_capacity_pages(

@@ -9,13 +9,74 @@ import sys
 import time
 from pathlib import Path
 
+_REPO_IMPORT_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_IMPORT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_IMPORT_ROOT))
+
+from utils.selector_log_s_identity import (
+    SELECTOR_LOG_F_AMORTIZED_TILED_ALLOWED_ROUTES,
+    SELECTOR_LOG_F_FAST_ROUTE,
+    SELECTOR_LOG_F_GENERIC_ROUTE,
+    SELECTOR_LOG_F_RETIRED_TP8_EXACT_ENV,
+    SELECTOR_LOG_F_TILED_ROUTE,
+    selector_log_s_artifact_identity,
+    selector_log_s_runtime_proof_reasons,
+)
+
 try:
-    from benchmarks.scheduler_contract import resolve_benchmark_max_num_seqs
+    from benchmarks.scheduler_contract import (
+        CHUNKED_PREFILL_MODES,
+        DEFAULT_MAX_SEQ_LEN_TO_CAPTURE,
+        resolve_benchmark_max_num_seqs,
+        scheduler_graph_engine_kwargs,
+        scheduler_graph_runtime_proof,
+        validate_scheduler_graph_args,
+    )
+    from benchmarks.decode_throughput_window import (
+        CUSTOM_ALL_REDUCE_RUNTIME_WORKER_EXTENSION,
+        SPARSE_ROUTE_COUNTER_RESET_RPC_METHOD,
+        SPARSE_ROUTE_COUNTER_SNAPSHOT_RPC_METHOD,
+        CustomAllReduceDecision,
+        EngineShutdownGuard,
+        collect_custom_all_reduce_runtime_proof,
+        collect_engine_core_block_pool_reservation_proof,
+        collect_engine_runtime_contract_proof,
+        benchmark_child_identity,
+        reset_cudagraph_runtime_observer,
+        resolve_custom_all_reduce_decision,
+        stop_cudagraph_runtime_observer,
+        summarize_cudagraph_runtime_observer,
+    )
 except ModuleNotFoundError:
-    from scheduler_contract import resolve_benchmark_max_num_seqs  # type: ignore[no-redef]
+    from scheduler_contract import (  # type: ignore[no-redef]
+        CHUNKED_PREFILL_MODES,
+        DEFAULT_MAX_SEQ_LEN_TO_CAPTURE,
+        resolve_benchmark_max_num_seqs,
+        scheduler_graph_engine_kwargs,
+        scheduler_graph_runtime_proof,
+        validate_scheduler_graph_args,
+    )
+    from decode_throughput_window import (  # type: ignore[no-redef]
+        CUSTOM_ALL_REDUCE_RUNTIME_WORKER_EXTENSION,
+        SPARSE_ROUTE_COUNTER_RESET_RPC_METHOD,
+        SPARSE_ROUTE_COUNTER_SNAPSHOT_RPC_METHOD,
+        CustomAllReduceDecision,
+        EngineShutdownGuard,
+        collect_custom_all_reduce_runtime_proof,
+        collect_engine_core_block_pool_reservation_proof,
+        collect_engine_runtime_contract_proof,
+        benchmark_child_identity,
+        reset_cudagraph_runtime_observer,
+        resolve_custom_all_reduce_decision,
+        stop_cudagraph_runtime_observer,
+        summarize_cudagraph_runtime_observer,
+    )
 
 ACTIVE_SM80_GT1_RUNNER = "bench_sm80_mixed_page_one_shot_graph_e2e.py"
-FA3_ROUTE_COUNTER_MMAP_BYTES = 8 * 8
+FA3_ROUTE_COUNTER_FIELDS = 10
+FA3_ROUTE_COUNTER_SLOT_BYTES = FA3_ROUTE_COUNTER_FIELDS * 8
+FA3_ROUTE_COUNTER_MMAP_BYTES = FA3_ROUTE_COUNTER_SLOT_BYTES
+FA3_ROUTE_COUNTER_SLOTS_ENV = "VLLM_SPARSE_FA3_ROUTE_COUNTER_SLOTS"
 
 
 def _fa3_interface_module() -> object | None:
@@ -36,23 +97,342 @@ def _fa3_interface_module() -> object | None:
     return None
 
 
-def _reset_fa3_route_counters_for_measurement() -> None:
+def _collect_fa3_route_counter_worker_records(
+    engine: object,
+    *,
+    rpc_method: str,
+    phase: str,
+    require_zero: bool,
+) -> list[dict[str, object]]:
+    """Run a blocking worker barrier and validate every rank-local slot record."""
+    slots = _route_counter_slots_from_env()
+    phase_code = str(phase).strip().upper()
+    collective_rpc = getattr(engine, "collective_rpc", None)
+    if not callable(collective_rpc):
+        raise RuntimeError(
+            f"E_TP_ROUTE_COUNTER_{phase_code}_RPC_UNAVAILABLE: "
+            "LLM.collective_rpc is required for a rank-local worker barrier"
+        )
+    try:
+        raw_records = collective_rpc(
+            rpc_method,
+            timeout=60.0,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"E_TP_ROUTE_COUNTER_{phase_code}_RPC_FAILED: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+    if not isinstance(raw_records, list) or len(raw_records) != slots:
+        raise RuntimeError(
+            f"E_TP_ROUTE_COUNTER_{phase_code}_SCHEMA: "
+            f"record_count={len(raw_records) if isinstance(raw_records, list) else type(raw_records).__name__} "
+            f"expected={slots}"
+        )
+    records: list[dict[str, object]] = []
+    errors: list[str] = []
+    valid_pids: list[int] = []
+    retired_exact = os.environ.get(SELECTOR_LOG_F_RETIRED_TP8_EXACT_ENV, "")
+    if retired_exact not in {"", "0"}:
+        raise RuntimeError(
+            "E_RETIRED_SELECTOR_LOG_F_TP8_EXACT_ENV: "
+            f"unset {SELECTOR_LOG_F_RETIRED_TP8_EXACT_ENV}"
+        )
+    selector_expected_route = (
+        SELECTOR_LOG_F_TILED_ROUTE
+        if os.environ.get("SFI_RUNNER_TIER", "") == "tp8x64k"
+        else None
+    )
+    selector_artifact_identities: list[tuple[object, ...]] = []
+    selector_route_signatures: list[tuple[object, ...]] = []
+    for index, raw_record in enumerate(raw_records):
+        if not isinstance(raw_record, dict):
+            errors.append(f"record[{index}]={type(raw_record).__name__}")
+            continue
+        record = dict(raw_record)
+        rank = record.get("rank")
+        slot_count = record.get("slot_count")
+        field_count = record.get("field_count")
+        values = record.get("values")
+        mmap_size_bytes = record.get("mmap_size_bytes")
+        pid = record.get("pid")
+        if isinstance(rank, bool) or not isinstance(rank, int):
+            errors.append(f"record[{index}].rank={rank!r}")
+            continue
+        if slot_count != slots:
+            errors.append(f"rank{rank}.slot_count={slot_count!r}")
+        if field_count != FA3_ROUTE_COUNTER_FIELDS:
+            errors.append(f"rank{rank}.field_count={field_count!r}")
+        values_valid = bool(
+            isinstance(values, list)
+            and len(values) == FA3_ROUTE_COUNTER_FIELDS
+            and all(
+                not isinstance(value, bool)
+                and isinstance(value, int)
+                and value >= 0
+                for value in values
+            )
+        )
+        if not values_valid:
+            errors.append(f"rank{rank}.values={values!r}")
+        elif require_zero and values != [0] * FA3_ROUTE_COUNTER_FIELDS:
+            errors.append(f"rank{rank}.values_nonzero={values!r}")
+        if mmap_size_bytes != slots * FA3_ROUTE_COUNTER_SLOT_BYTES:
+            errors.append(f"rank{rank}.mmap_size_bytes={mmap_size_bytes!r}")
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+            errors.append(f"rank{rank}.pid={pid!r}")
+        else:
+            valid_pids.append(pid)
+        if selector_expected_route is not None:
+            proof = record.get("selector_log_s_runtime_proof")
+            proof_reasons = selector_log_s_runtime_proof_reasons(
+                proof,
+                expected_route=selector_expected_route,
+                expected_phase=str(phase).lower(),
+                allowed_routes=SELECTOR_LOG_F_AMORTIZED_TILED_ALLOWED_ROUTES,
+            )
+            errors.extend(
+                f"rank{rank}.selector_log_s.{reason}"
+                for reason in proof_reasons
+            )
+            if isinstance(proof, dict) and not proof_reasons:
+                selector_artifact_identities.append(
+                    selector_log_s_artifact_identity(proof)
+                )
+                counts = proof["route_counts"]
+                assert isinstance(counts, dict)
+                selector_route_signatures.append(
+                    (
+                        proof["last_route"],
+                        proof["last_dispatch_reason"],
+                        proof["last_admission_identity"],
+                        proof["admission_event_count"],
+                        proof["admission_chain_sha256"],
+                        counts[SELECTOR_LOG_F_FAST_ROUTE],
+                        counts[SELECTOR_LOG_F_GENERIC_ROUTE],
+                        counts[SELECTOR_LOG_F_TILED_ROUTE],
+                        proof["tiled_cohort_count"],
+                        proof["tiled_job_count"],
+                        proof["tiled_direct_count"],
+                        proof["tiled_kernel_launch_count"],
+                        proof["tiled_admission_failure_count"],
+                    )
+                )
+        records.append(record)
+    records.sort(key=lambda record: int(record["rank"]))
+    ranks = [int(record["rank"]) for record in records]
+    if ranks != list(range(slots)):
+        errors.append(f"ranks={ranks!r}:expected={list(range(slots))!r}")
+    if len(set(valid_pids)) != slots:
+        errors.append(f"worker_pids={valid_pids!r}:expected_unique={slots}")
+    if selector_expected_route is not None:
+        if len(selector_artifact_identities) != slots or len(
+            set(selector_artifact_identities)
+        ) != 1:
+            errors.append(
+                "selector_log_s_artifact_identity_rank_mismatch="
+                f"{selector_artifact_identities!r}"
+            )
+        if len(selector_route_signatures) != slots or len(
+            set(selector_route_signatures)
+        ) != 1:
+            errors.append(
+                "selector_log_s_capture_route_rank_mismatch="
+                f"{selector_route_signatures!r}"
+            )
+    if errors:
+        raise RuntimeError(
+            f"E_TP_ROUTE_COUNTER_{phase_code}_MISMATCH: " + "; ".join(errors)
+        )
+    return records
+
+
+def _reset_fa3_route_counters_for_measurement(
+    engine: object,
+) -> list[dict[str, object]]:
+    """Drain warmup work, then let every TP worker reset only its own slot."""
     module = _fa3_interface_module()
     reset = getattr(module, "reset_sparse_fa3_route_counters", None)
     if callable(reset):
         reset()
-    raw_path = os.environ.get("VLLM_SPARSE_FA3_ROUTE_COUNTER_MMAP", "")
-    if raw_path:
-        _prepare_fa3_route_counter_mmap(Path(raw_path))
+    return _collect_fa3_route_counter_worker_records(
+        engine,
+        rpc_method=SPARSE_ROUTE_COUNTER_RESET_RPC_METHOD,
+        phase="reset",
+        require_zero=True,
+    )
 
 
-def _prepare_fa3_route_counter_mmap(metrics_or_counter_path: str | Path) -> Path:
+def _route_counter_snapshot_from_worker_records(
+    records: list[dict[str, object]],
+) -> dict[str, object]:
+    slot_values = [
+        tuple(int(value) for value in record["values"])  # type: ignore[arg-type]
+        for record in records
+    ]
+    aggregate = tuple(
+        sum(values[index] for values in slot_values) for index in range(10)
+    )
+    per_rank = [
+        _route_counter_slot_payload(values, rank)
+        for rank, values in enumerate(slot_values)
+    ]
+    return {
+        "actual_fwd_mixed_page_count": int(aggregate[0]),
+        "resolved_row_ptr_fwd_mixed_page_count": int(aggregate[1]),
+        "has_resolved_row_ptr_count": int(aggregate[2]),
+        "page_resolver_kind_counts": {
+            str(kind): int(aggregate[3 + kind]) for kind in range(5)
+        },
+        "compact_row_steps": int(aggregate[8]),
+        "compact_rows": int(aggregate[9]),
+        "route_counter_slots": len(slot_values),
+        "route_counter_rank_consistent": all(
+            values == slot_values[0] for values in slot_values[1:]
+        ),
+        "per_rank_route_counters": per_rank,
+    }
+
+
+def _snapshot_fa3_route_counters_after_measurement(
+    engine: object,
+    *,
+    reset_records: list[dict[str, object]],
+) -> tuple[list[dict[str, object]], dict[str, object]]:
+    """Drain final model work and return the synchronized worker snapshot."""
+    records = _collect_fa3_route_counter_worker_records(
+        engine,
+        rpc_method=SPARSE_ROUTE_COUNTER_SNAPSHOT_RPC_METHOD,
+        phase="snapshot",
+        require_zero=False,
+    )
+    reset_identity = [
+        (int(record["rank"]), int(record["pid"])) for record in reset_records
+    ]
+    snapshot_identity = [
+        (int(record["rank"]), int(record["pid"])) for record in records
+    ]
+    if snapshot_identity != reset_identity:
+        raise RuntimeError(
+            "E_TP_ROUTE_COUNTER_WORKER_IDENTITY_CHANGED: reset and snapshot "
+            "records came from different rank/worker identities"
+        )
+    if os.environ.get("SFI_RUNNER_TIER", "") == "tp8x64k":
+        for reset_record, snapshot_record in zip(
+            reset_records, records, strict=True
+        ):
+            rank = int(reset_record["rank"])
+            reset_proof = reset_record["selector_log_s_runtime_proof"]
+            snapshot_proof = snapshot_record["selector_log_s_runtime_proof"]
+            assert isinstance(reset_proof, dict)
+            assert isinstance(snapshot_proof, dict)
+            if selector_log_s_artifact_identity(
+                snapshot_proof
+            ) != selector_log_s_artifact_identity(reset_proof):
+                raise RuntimeError(
+                    "E_TP_SELECTOR_LOG_S_ARTIFACT_CHANGED: "
+                    f"rank={rank}"
+                )
+            reset_counts = reset_proof["route_counts"]
+            snapshot_counts = snapshot_proof["route_counts"]
+            assert isinstance(reset_counts, dict)
+            assert isinstance(snapshot_counts, dict)
+            regressed_routes = [
+                route
+                for route in (
+                    SELECTOR_LOG_F_FAST_ROUTE,
+                    SELECTOR_LOG_F_GENERIC_ROUTE,
+                    SELECTOR_LOG_F_TILED_ROUTE,
+                )
+                if int(snapshot_counts[route]) < int(reset_counts[route])
+            ]
+            if regressed_routes:
+                raise RuntimeError(
+                    "E_TP_SELECTOR_LOG_S_ROUTE_DRIFT: "
+                    f"rank={rank}:regressed={regressed_routes!r}:"
+                    f"reset={reset_counts!r}:"
+                    f"snapshot={snapshot_counts!r}"
+                )
+            tiled_cohorts = int(snapshot_proof["tiled_cohort_count"])
+            tiled_jobs = int(snapshot_proof["tiled_job_count"])
+            tiled_direct = int(snapshot_proof["tiled_direct_count"])
+            tiled_kernels = int(snapshot_proof["tiled_kernel_launch_count"])
+            tiled_failures = int(snapshot_proof["tiled_admission_failure_count"])
+            if (
+                tiled_cohorts <= 0
+                or tiled_jobs <= tiled_cohorts
+                or tiled_direct != 0
+                or tiled_kernels != tiled_cohorts * 4
+                or tiled_failures != 0
+            ):
+                raise RuntimeError(
+                    "E_TP_SELECTOR_LOG_F_TILED_NOT_AMORTIZED: "
+                    f"rank={rank}:cohorts={tiled_cohorts}:jobs={tiled_jobs}:"
+                    f"direct={tiled_direct}:kernels={tiled_kernels}:"
+                    f"failures={tiled_failures}"
+                )
+    snapshot = _route_counter_snapshot_from_worker_records(records)
+    shared_path = os.environ.get("VLLM_SPARSE_FA3_ROUTE_COUNTER_MMAP", "")
+    shared_snapshot = _shared_fa3_route_counter_snapshot(shared_path)
+    if shared_snapshot != snapshot:
+        raise RuntimeError(
+            "E_TP_ROUTE_COUNTER_SNAPSHOT_SHARED_MISMATCH: synchronized worker "
+            "records do not match the shared route-counter artifact"
+        )
+    return records, snapshot
+
+
+def _route_counter_slots_from_env() -> int:
+    raw = os.environ.get(FA3_ROUTE_COUNTER_SLOTS_ENV, "1")
+    try:
+        slots = int(raw)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise RuntimeError(
+            f"E_TP_ROUTE_COUNTER_SLOTS: invalid {FA3_ROUTE_COUNTER_SLOTS_ENV}={raw!r}"
+        ) from exc
+    if slots <= 0:
+        raise RuntimeError(
+            f"E_TP_ROUTE_COUNTER_SLOTS: {FA3_ROUTE_COUNTER_SLOTS_ENV} must be positive; "
+            f"got {slots}"
+        )
+    return slots
+
+
+def _prepare_fa3_route_counter_mmap(
+    metrics_or_counter_path: str | Path,
+    *,
+    slots: int = 1,
+) -> Path:
+    if int(slots) <= 0:
+        raise ValueError(f"route counter slots must be positive; got {slots}")
     path = Path(metrics_or_counter_path)
     if path.suffix != ".bin":
         path = path.with_name(path.name + ".route_counters.bin")
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(b"\x00" * FA3_ROUTE_COUNTER_MMAP_BYTES)
+    expected_bytes = int(slots) * FA3_ROUTE_COUNTER_SLOT_BYTES
+    try:
+        with path.open("xb") as fh:
+            fh.write(b"\x00" * expected_bytes)
+    except FileExistsError as exc:
+        raise RuntimeError(
+            "E_TP_ROUTE_COUNTER_STALE: refusing to overwrite an existing route "
+            f"counter artifact: {path}"
+        ) from exc
     return path
+
+
+def _route_counter_slot_payload(values: tuple[int, ...], rank: int) -> dict[str, object]:
+    return {
+        "rank": int(rank),
+        "actual_fwd_mixed_page_count": int(values[0]),
+        "resolved_row_ptr_fwd_mixed_page_count": int(values[1]),
+        "has_resolved_row_ptr_count": int(values[2]),
+        "page_resolver_kind_counts": {
+            str(kind): int(values[3 + kind]) for kind in range(5)
+        },
+        "compact_row_steps": int(values[8]),
+        "compact_rows": int(values[9]),
+    }
 
 
 def _shared_fa3_route_counter_snapshot(path: str | Path) -> dict[str, object]:
@@ -60,38 +440,41 @@ def _shared_fa3_route_counter_snapshot(path: str | Path) -> dict[str, object]:
     if not counter_path.exists():
         return {}
     data = counter_path.read_bytes()
-    if len(data) < FA3_ROUTE_COUNTER_MMAP_BYTES:
+    if (
+        len(data) < FA3_ROUTE_COUNTER_SLOT_BYTES
+        or len(data) % FA3_ROUTE_COUNTER_SLOT_BYTES != 0
+    ):
         return {}
-    values = struct.unpack_from("8q", data, 0)
+    slot_values = [
+        tuple(
+            int(value)
+            for value in struct.unpack_from(
+                "10q",
+                data,
+                rank * FA3_ROUTE_COUNTER_SLOT_BYTES,
+            )
+        )
+        for rank in range(len(data) // FA3_ROUTE_COUNTER_SLOT_BYTES)
+    ]
+    aggregate = tuple(sum(values[index] for values in slot_values) for index in range(10))
+    per_rank = [
+        _route_counter_slot_payload(values, rank)
+        for rank, values in enumerate(slot_values)
+    ]
+    rank_consistent = all(values == slot_values[0] for values in slot_values[1:])
     return {
-        "actual_fwd_mixed_page_count": int(values[0]),
-        "resolved_row_ptr_fwd_mixed_page_count": int(values[1]),
-        "has_resolved_row_ptr_count": int(values[2]),
+        "actual_fwd_mixed_page_count": int(aggregate[0]),
+        "resolved_row_ptr_fwd_mixed_page_count": int(aggregate[1]),
+        "has_resolved_row_ptr_count": int(aggregate[2]),
         "page_resolver_kind_counts": {
-            "0": int(values[3]),
-            "1": int(values[4]),
-            "2": int(values[5]),
-            "3": int(values[6]),
-            "4": int(values[7]),
+            str(kind): int(aggregate[3 + kind]) for kind in range(5)
         },
+        "compact_row_steps": int(aggregate[8]),
+        "compact_rows": int(aggregate[9]),
+        "route_counter_slots": len(slot_values),
+        "route_counter_rank_consistent": bool(rank_consistent),
+        "per_rank_route_counters": per_rank,
     }
-
-
-def _fa3_route_counter_snapshot() -> dict[str, object]:
-    shared_path = os.environ.get("VLLM_SPARSE_FA3_ROUTE_COUNTER_MMAP", "")
-    if shared_path:
-        shared = _shared_fa3_route_counter_snapshot(shared_path)
-        if int(shared.get("actual_fwd_mixed_page_count", 0) or 0) > 0:
-            return shared
-    module = _fa3_interface_module()
-    get_counters = getattr(module, "get_sparse_fa3_route_counters", None)
-    if not callable(get_counters):
-        return {}
-    try:
-        counters = get_counters(reset=False)
-    except Exception:
-        return {}
-    return dict(counters) if isinstance(counters, dict) else {}
 
 
 def _route_kind_count(counters: dict[str, object], kind: int) -> int:
@@ -122,6 +505,15 @@ def _fa3_route_counter_metrics(counters: dict[str, object]) -> dict[str, object]
         "speed_child_page_resolver_kind2_count": kind2,
         "speed_child_page_resolver_kind3_count": kind3,
         "speed_child_page_resolver_kind4_count": kind4,
+        "speed_child_route_counter_rank_slots": int(
+            counters.get("route_counter_slots", 1) or 1
+        ),
+        "speed_child_route_counter_rank_consistent": bool(
+            counters.get("route_counter_rank_consistent", True)
+        ),
+        "speed_child_route_counter_per_rank": list(
+            counters.get("per_rank_route_counters", []) or []
+        ),
     }
     if available:
         payload.update(
@@ -307,18 +699,25 @@ def _full_cudagraph_compilation_config(
         config: dict[str, object] = {"cudagraph_mode": "FULL"}
     else:
         config = {"full_cuda_graph": True}
-
     if capture_sizes_raw:
-        sizes = [
-            int(x.strip())
-            for x in str(capture_sizes_raw).split(",")
-            if x.strip()
+        config["cudagraph_capture_sizes"] = [
+            int(value.strip())
+            for value in str(capture_sizes_raw).split(",")
+            if value.strip()
         ]
-        config["cudagraph_capture_sizes"] = sizes
     return config
 
 
-def _decode_run_config(args: argparse.Namespace, *, prompt_count: int) -> dict[str, object]:
+def _decode_run_config(
+    args: argparse.Namespace,
+    *,
+    prompt_count: int,
+    custom_all_reduce_decision: CustomAllReduceDecision,
+    custom_all_reduce_runtime_proof: dict[str, object],
+    engine_runtime_contract_proof: dict[str, object] | None = None,
+    engine_scheduling_proof: dict[str, object] | None = None,
+    child_identity: dict[str, object] | None = None,
+) -> dict[str, object]:
     return {
         "runner": "run_sparse_only.py",
         "runner_scope": "worker_child_not_sm80_gt1_final_runner",
@@ -348,6 +747,11 @@ def _decode_run_config(args: argparse.Namespace, *, prompt_count: int) -> dict[s
         "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
         "attention_backend": os.environ.get("VLLM_ATTENTION_BACKEND", ""),
         "flash_attn_version": os.environ.get("VLLM_FLASH_ATTN_VERSION", ""),
+        "benchmark_child_identity": (
+            dict(child_identity)
+            if isinstance(child_identity, dict)
+            else benchmark_child_identity(args)
+        ),
         "async_refresh": os.environ.get("VLLM_SPARSE_ASYNC_REFRESH", ""),
         "attention_in_cudagraph": os.environ.get(
             "VLLM_SPARSE_ATTENTION_IN_CUDAGRAPH",
@@ -375,6 +779,10 @@ def _decode_run_config(args: argparse.Namespace, *, prompt_count: int) -> dict[s
             "",
         ),
         "controller_json_present": bool(os.environ.get("VLLM_SPARSE_CONTROLLER_JSON")),
+        **(engine_scheduling_proof or {}),
+        **custom_all_reduce_decision.as_dict(),
+        **custom_all_reduce_runtime_proof,
+        **(engine_runtime_contract_proof or {}),
     }
 
 
@@ -394,6 +802,56 @@ def _sync_scheduling_requested(args) -> bool:
         "true",
         "yes",
     )
+
+
+def _requested_engine_scheduling_mode(args: argparse.Namespace) -> str:
+    mode = str(getattr(args, "scheduling_mode", "auto") or "auto")
+    if mode not in {"auto", "async", "sync"}:
+        raise RuntimeError(f"E_ENGINE_SCHEDULING_MODE: mode={mode!r}")
+    # An explicit mode owns matched-run identity.  The legacy sparse-only
+    # sync flag/env is consulted only in auto mode, so a stale shell variable
+    # cannot silently turn one side of an explicit async pair synchronous.
+    if mode != "auto":
+        return mode
+    return "sync" if _sync_scheduling_requested(args) else "auto"
+
+
+def _engine_scheduling_kwargs(mode: str) -> dict[str, object]:
+    if mode == "auto":
+        return {}
+    if not _engine_args_accepts("async_scheduling"):
+        raise RuntimeError(
+            "E_ENGINE_SCHEDULING_UNSUPPORTED: explicit scheduling requires "
+            "EngineArgs.async_scheduling"
+        )
+    return {"async_scheduling": mode == "async"}
+
+
+def _engine_scheduling_runtime_proof(
+    engine: object,
+    *,
+    requested_mode: str,
+) -> dict[str, object]:
+    configured_async = None if requested_mode == "auto" else requested_mode == "async"
+    scheduler_config = getattr(engine, "llm_engine", None)
+    scheduler_config = getattr(scheduler_config, "vllm_config", None)
+    scheduler_config = getattr(scheduler_config, "scheduler_config", None)
+    effective_async = getattr(scheduler_config, "async_scheduling", None)
+    if type(effective_async) is not bool:
+        raise RuntimeError(
+            "E_ENGINE_SCHEDULING_PROOF_UNAVAILABLE: "
+            f"async_scheduling={effective_async!r}"
+        )
+    if configured_async is not None and effective_async is not configured_async:
+        raise RuntimeError(
+            "E_ENGINE_SCHEDULING_EFFECTIVE_MISMATCH: "
+            f"requested={requested_mode}:effective_async={effective_async!r}"
+        )
+    return {
+        "engine_scheduling_mode_requested": requested_mode,
+        "engine_async_scheduling_configured": configured_async,
+        "engine_async_scheduling_effective": effective_async,
+    }
 
 
 def _visible_gpus_all_have_nvlink() -> tuple[bool, str]:
@@ -649,13 +1107,40 @@ def build_parser() -> argparse.ArgumentParser:
         help="vLLM tensor_parallel_size (multi-GPU; pass matching --cuda-visible-devices).",
     )
     parser.add_argument(
+        "--scheduling-mode",
+        choices=("auto", "async", "sync"),
+        default="auto",
+        help=(
+            "Engine scheduling policy. An explicit mode takes precedence over "
+            "the legacy sparse-only sync environment escape hatch."
+        ),
+    )
+    parser.add_argument(
+        "--max-num-batched-tokens",
+        type=int,
+        default=0,
+        help="Explicit scheduler token budget (0 keeps the vLLM default).",
+    )
+    parser.add_argument(
+        "--kv-cache-memory-bytes",
+        type=int,
+        default=0,
+        help="Explicit per-rank KV cache allocation.",
+    )
+    parser.add_argument(
+        "--chunked-prefill",
+        choices=CHUNKED_PREFILL_MODES,
+        default="auto",
+        help="Explicit chunked-prefill policy for matched benchmark children.",
+    )
+    parser.add_argument(
         "--sync-scheduling",
         action="store_true",
         help=(
-            "Force synchronous vLLM scheduling (any TP size). TP>1 runs async "
-            "scheduling by default via [TP-ASYNC-HARVEST]; env "
-            "VLLM_SPARSE_SYNC_SCHEDULING=1 has the same effect (handy when "
-            "driving this runner through the bench)."
+            "Legacy sparse-only synchronous scheduling escape hatch. It is "
+            "consulted only when --scheduling-mode=auto; explicit matched-run "
+            "modes take precedence. VLLM_SPARSE_SYNC_SCHEDULING=1 has the "
+            "same legacy-auto behavior."
         ),
     )
     parser.add_argument(
@@ -670,7 +1155,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--enforce-eager", action="store_true")
     parser.add_argument("--full-cuda-graph", action="store_true")
-    parser.add_argument("--max-seq-len-to-capture", type=int, default=32768)
+    parser.add_argument(
+        "--collect-cudagraph-runtime-proof",
+        action="store_true",
+        help=(
+            "Diagnostic-only: collect vLLM CUDAGraphStat in memory for the "
+            "measurement window. Timed speed children must leave this off."
+        ),
+    )
+    parser.add_argument(
+        "--max-seq-len-to-capture",
+        type=int,
+        default=DEFAULT_MAX_SEQ_LEN_TO_CAPTURE,
+    )
     parser.add_argument(
         "--cudagraph-capture-sizes",
         type=str,
@@ -801,7 +1298,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if int(args.batch_size) <= 0:
         parser.error("--batch-size must be > 0")
     try:
-        _effective_max_num_seqs(args)
+        validate_scheduler_graph_args(args)
     except ValueError as exc:
         parser.error(str(exc))
     validate_deferred_bridge_args(parser, args)
@@ -816,15 +1313,24 @@ def _effective_max_num_seqs(args: argparse.Namespace) -> int:
 
 
 def _scheduler_engine_kwargs(args: argparse.Namespace) -> dict[str, object]:
-    return {"max_num_seqs": _effective_max_num_seqs(args)}
+    return scheduler_graph_engine_kwargs(
+        args,
+        engine_args_accepts=_engine_args_accepts,
+    )
 
 
 def main() -> None:
     args = parse_args()
+    child_identity = benchmark_child_identity(args)
     apply_deferred_bridge_env(args, os.environ)
     if args.decode_metrics_json:
-        counter_path = _prepare_fa3_route_counter_mmap(args.decode_metrics_json)
+        route_counter_slots = max(1, int(args.tensor_parallel_size))
+        counter_path = _prepare_fa3_route_counter_mmap(
+            args.decode_metrics_json,
+            slots=route_counter_slots,
+        )
         os.environ["VLLM_SPARSE_FA3_ROUTE_COUNTER_MMAP"] = str(counter_path)
+        os.environ[FA3_ROUTE_COUNTER_SLOTS_ENV] = str(route_counter_slots)
 
     def _read_env_sparse_json() -> dict[str, object] | None:
         raw = os.environ.get("VLLM_SPARSE_CONTROLLER_JSON", "")
@@ -1201,7 +1707,6 @@ def main() -> None:
 
     repo_root = _setup_repo_imports()
     _install_transformers_register_shim()
-
     if int(args.batch_size) > 1 and (not bool(args.disable_cascade_attn)):
         print(
             "[warn] 当前 batch 内 prompt 完全相同，且未关闭 vLLM V1 cascade attention；"
@@ -1338,42 +1843,37 @@ def main() -> None:
         "tensor_parallel_size": max(1, int(getattr(args, "tensor_parallel_size", 1) or 1)),
         "compilation_config": compilation_config,
         "disable_cascade_attn": bool(args.disable_cascade_attn),
+        "worker_extension_cls": CUSTOM_ALL_REDUCE_RUNTIME_WORKER_EXTENSION,
     }
+    if bool(args.collect_cudagraph_runtime_proof):
+        for field in ("cudagraph_metrics", "disable_log_stats"):
+            if not _engine_args_accepts(field):
+                raise RuntimeError(
+                    "E_CUDAGRAPH_RUNTIME_OBSERVER_UNSUPPORTED: " + field
+                )
+        engine_kwargs["cudagraph_metrics"] = True
+        engine_kwargs["disable_log_stats"] = False
     engine_kwargs.update(_scheduler_engine_kwargs(args))
-    if int(engine_kwargs["tensor_parallel_size"]) > 1 and (
-        os.environ.get("VLLM_SPARSE_FORCE_DISABLE_CUSTOM_AR", "") == "1"
-    ):
-        # [TP-CUSTOM-AR-ESCAPE] NVLink probe says custom AR is safe, but some
-        # boxes still crash with custom AR + FULL cudagraph (remote exp4,
-        # 2026-07-06). Probe cannot see driver/graph interactions — this env is
-        # the operator override; it wins over the probe and --enable flag.
+    engine_scheduling_mode = _requested_engine_scheduling_mode(args)
+    engine_kwargs.update(_engine_scheduling_kwargs(engine_scheduling_mode))
+    custom_all_reduce_decision = resolve_custom_all_reduce_decision(
+        tensor_parallel_size=int(engine_kwargs["tensor_parallel_size"]),
+        force_disabled=(
+            os.environ.get("VLLM_SPARSE_FORCE_DISABLE_CUSTOM_AR", "") == "1"
+        ),
+        force_enabled=bool(getattr(args, "enable_custom_all_reduce", False)),
+        nvlink_probe=_visible_gpus_all_have_nvlink,
+    )
+    if custom_all_reduce_decision.effective == "disabled":
         engine_kwargs["disable_custom_all_reduce"] = True
+    if int(engine_kwargs["tensor_parallel_size"]) > 1:
         print(
-            "[run_sparse_only] TP>1: custom all-reduce force-disabled via "
-            "VLLM_SPARSE_FORCE_DISABLE_CUSTOM_AR=1",
+            "[run_sparse_only] TP>1: custom all-reduce "
+            f"effective={custom_all_reduce_decision.effective} "
+            f"requested={custom_all_reduce_decision.requested} "
+            f"reason={custom_all_reduce_decision.reason}",
             flush=True,
         )
-    elif int(engine_kwargs["tensor_parallel_size"]) > 1 and not bool(
-        getattr(args, "enable_custom_all_reduce", False)
-    ):
-        # [TP-CUSTOM-AR-PROBE] custom all-reduce is a large win for small decode
-        # messages on NVLink boxes but crashes worker init on PCIe-only
-        # topologies ('custom_all_reduce.cuh ... invalid argument').
-        _nvlink_ok, _nvlink_reason = _visible_gpus_all_have_nvlink()
-        if _nvlink_ok:
-            print(
-                "[run_sparse_only] TP>1: %s; leaving vLLM custom all-reduce "
-                "enabled" % _nvlink_reason,
-                flush=True,
-            )
-        else:
-            engine_kwargs["disable_custom_all_reduce"] = True
-            print(
-                "[run_sparse_only] TP>1: disabling vLLM custom all-reduce "
-                "(%s); pass --enable-custom-all-reduce to force it on"
-                % _nvlink_reason,
-                flush=True,
-            )
     if int(engine_kwargs["tensor_parallel_size"]) > 1:
         # [TP-ENV-PIN] propagate TP size to every spawned child (EngineCore +
         # workers): controller._init_tp_size reads this env once at init and
@@ -1383,32 +1883,100 @@ def main() -> None:
         os.environ["VLLM_TENSOR_PARALLEL_SIZE"] = str(
             int(engine_kwargs["tensor_parallel_size"])
         )
-    if _sync_scheduling_requested(args) and _engine_args_accepts("async_scheduling"):
-        # [TP-ASYNC-HARVEST] TP>1 async scheduling is supported: the patch
-        # harvests vLLM's own async sampled-token D2H copy and repairs the -1
-        # placeholders in token_ids_cpu in place (1-step lag, semantically the
-        # same as the TP=1 enginecore sentence hook). This flag/env is only the
-        # escape hatch back to synchronous scheduling.
-        engine_kwargs["async_scheduling"] = False
     if int(getattr(args, "max_model_len", 0) or 0) > 0:
         engine_kwargs["max_model_len"] = int(args.max_model_len)
-    # Shared-GPU workaround: fix KV cache size via env to skip vLLM memory
-    # profiling (gpu_worker.py asserts free-memory consistency, which breaks when
-    # other jobs on the same GPU release memory mid-profiling). Only used when set.
-    _kvb = os.environ.get("VLLM_KV_CACHE_MEMORY_BYTES")
-    if _kvb:
-        engine_kwargs["kv_cache_memory_bytes"] = int(_kvb)
     if _engine_args_accepts("attention_config"):
         engine_kwargs["attention_config"] = {
             "backend": "FLASH_ATTN",
             "flash_attn_version": int(requested_flash_attn_version),
         }
-    if _engine_args_accepts("max_seq_len_to_capture"):
-        engine_kwargs["max_seq_len_to_capture"] = int(args.max_seq_len_to_capture)
     profiler_config = build_vllm_torch_profiler_config(_engine_args_accepts)
     if profiler_config is not None:
         engine_kwargs["profiler_config"] = profiler_config
     engine = LLM(**engine_kwargs)
+    engine_shutdown = EngineShutdownGuard(engine)
+    engine_scheduling_proof = _engine_scheduling_runtime_proof(
+        engine,
+        requested_mode=engine_scheduling_mode,
+    )
+    engine_scheduling_proof.update(
+        scheduler_graph_runtime_proof(
+            engine,
+            args,
+            engine_args_accepts=_engine_args_accepts,
+        )
+    )
+    custom_all_reduce_runtime_proof = collect_custom_all_reduce_runtime_proof(
+        engine,
+        tensor_parallel_size=int(engine_kwargs["tensor_parallel_size"]),
+        decision=custom_all_reduce_decision,
+        required_num_tokens=int(args.batch_size),
+    )
+    exact_runtime_required = os.environ.get("SFI_RUNNER_TIER", "") == "tp8x64k"
+    context_tokens = int(os.environ.get("SFI_RUNNER_CONTEXT_TOKENS", "0") or 0)
+    compact_blocks_per_slot = int(
+        os.environ.get("SFI_RUNNER_COMPACT_BLOCKS_PER_SLOT", "0") or 0
+    )
+    compact_generation_count = (
+        2
+        if os.environ.get("SFI_RUNNER_COMPACT_DUAL_GEN", "1") == "1"
+        else 1
+    )
+    expected_kv_bytes_per_token = int(
+        os.environ.get(
+            "SFI_RUNNER_KV_TOKEN_BYTES_PER_RANK_EFFECTIVE", "0"
+        )
+        or 0
+    )
+    if exact_runtime_required and (
+        context_tokens <= 0
+        or compact_blocks_per_slot <= 0
+        or expected_kv_bytes_per_token <= 0
+    ):
+        raise RuntimeError(
+            "E_ENGINE_RUNTIME_CONTRACT_INPUT: exact sparse KV/compact identity missing"
+        )
+    engine_runtime_contract_proof = collect_engine_runtime_contract_proof(
+        engine,
+        tensor_parallel_size=int(engine_kwargs["tensor_parallel_size"]),
+        required_batch_size=int(args.batch_size),
+        required_tokens_per_request=(
+            context_tokens + int(args.max_new_tokens)
+            if exact_runtime_required
+            else 0
+        ),
+        compact_blocks_per_slot=(
+            compact_blocks_per_slot if exact_runtime_required else 0
+        ),
+        compact_generation_count=(
+            compact_generation_count if exact_runtime_required else 0
+        ),
+        expected_kv_bytes_per_token=expected_kv_bytes_per_token,
+        required=exact_runtime_required,
+    )
+    engine_runtime_contract_proof.update(
+        collect_engine_core_block_pool_reservation_proof(
+            engine,
+            engine_runtime_contract_proof=engine_runtime_contract_proof,
+            expected_compact_blocks_per_slot=(
+                compact_blocks_per_slot if exact_runtime_required else 0
+            ),
+            expected_compact_generation_count=(
+                compact_generation_count if exact_runtime_required else 0
+            ),
+            expected_batch_size=int(args.batch_size),
+            required=exact_runtime_required,
+        )
+    )
+    print(
+        "[run_sparse_only] custom all-reduce worker-runtime proof "
+        f"active={custom_all_reduce_runtime_proof['custom_all_reduce_runtime_active_rank_count']}"
+        f"/{custom_all_reduce_runtime_proof['custom_all_reduce_runtime_rank_count']} "
+        f"configured={custom_all_reduce_decision.effective} "
+        f"required_payload_bytes="
+        f"{custom_all_reduce_runtime_proof['custom_all_reduce_runtime_required_payload_bytes']}",
+        flush=True,
+    )
     sp = SamplingParams(
         temperature=0.0,
         top_p=1.0,
@@ -1438,9 +2006,16 @@ def main() -> None:
 
     def _reset_prefix_cache() -> None:
         try:
-            engine.llm_engine.reset_prefix_cache()  # type: ignore[attr-defined]
-        except Exception:
-            return
+            reset_result = engine.llm_engine.reset_prefix_cache()  # type: ignore[attr-defined]
+        except Exception as exc:
+            raise RuntimeError(
+                "E_PREFIX_CACHE_RESET: reset_prefix_cache raised "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+        if reset_result is False:
+            raise RuntimeError(
+                "E_PREFIX_CACHE_RESET: reset_prefix_cache explicitly returned False"
+            )
 
     def _generate_with_engine_step() -> tuple[float, float, int, int, list[float], float, float, dict[str, object]]:
         request_ids = [f"bench-{i}-{time.time_ns()}" for i in range(len(prompts))]
@@ -1555,9 +2130,9 @@ def main() -> None:
                     first_emit_step_index = int(total_engine_steps)
                     first_emit_step_wall_s = float(step_wall_s)
                 out_tokens += step_new_tokens
-                decode_meter.observe(core_ts, step_new_tokens)
             elif first_emit_step_index < 0:
                 pre_first_emit_step_wall_s.append(float(step_wall_s))
+            decode_meter.observe(core_ts, step_new_tokens)
             total_engine_steps += 1
         t_total1 = time.perf_counter()
         if args.outputs_json:
@@ -1578,6 +2153,10 @@ def main() -> None:
             "all_decode_tokens": int(ad_tokens),
             "all_decode_tok_per_s": float(ad_tps),
             "all_decode_steps": int(ad_steps),
+            **decode_meter.all_decode_contract(),
+            "_all_decode_start_step_index": (
+                decode_meter.all_decode_start_step_index
+            ),
             "process_pid": int(os.getpid()),
             "engine_core_step_log": str(
                 os.environ.get("VLLM_DECODE_ENGINE_CORE_STEP_LOG", "") or ""
@@ -1643,7 +2222,11 @@ def main() -> None:
     if bool(args.reset_prefix_cache) and not reset_after_warmup:
         _reset_prefix_cache()
     if bool(args.measure_decode_latency):
-        _reset_fa3_route_counters_for_measurement()
+        route_counter_reset_records = _reset_fa3_route_counters_for_measurement(
+            engine
+        )
+        if bool(args.collect_cudagraph_runtime_proof):
+            reset_cudagraph_runtime_observer(engine.llm_engine)
         profiling = maybe_start_vllm_torch_profile(engine)
         warmup_measure_begin_ts_ns = time.time_ns()
         _pipeline_profile_marker("measure_begin", warmup_runs=warmup_runs)
@@ -1659,18 +2242,27 @@ def main() -> None:
             warmup_runs=warmup_runs,
         )
         try:
+            try:
+                (
+                    elapsed,
+                    decode_elapsed,
+                    out_tokens,
+                    decode_tokens,
+                    decode_step_durations_s,
+                    first_emit_delay_s,
+                    post_decode_tail_s,
+                    boundary_diagnostics,
+                ) = _generate_with_engine_step()
+            finally:
+                maybe_stop_vllm_torch_profile(engine, profiling)
             (
-                elapsed,
-                decode_elapsed,
-                out_tokens,
-                decode_tokens,
-                decode_step_durations_s,
-                first_emit_delay_s,
-                post_decode_tail_s,
-                boundary_diagnostics,
-            ) = _generate_with_engine_step()
+                route_counter_snapshot_records,
+                route_counters,
+            ) = _snapshot_fa3_route_counters_after_measurement(
+                engine,
+                reset_records=route_counter_reset_records,
+            )
         finally:
-            maybe_stop_vllm_torch_profile(engine, profiling)
             warmup_measure_end_ts_ns = time.time_ns()
             _pipeline_profile_marker("measure_end", warmup_runs=warmup_runs)
             _refresh_profile_marker("measure_end", ts_ns=warmup_measure_end_ts_ns)
@@ -1684,9 +2276,25 @@ def main() -> None:
                 ts_ns=warmup_measure_end_ts_ns,
                 warmup_runs=warmup_runs,
             )
+        if bool(args.collect_cudagraph_runtime_proof):
+            graph_records = stop_cudagraph_runtime_observer(engine.llm_engine)
+            all_decode_start_step_index = int(
+                boundary_diagnostics.pop("_all_decode_start_step_index", -1)
+            )
+            boundary_diagnostics.update(
+                summarize_cudagraph_runtime_observer(
+                    graph_records,
+                    all_decode_start_step_index=all_decode_start_step_index,
+                    expected_batch_size=int(args.batch_size),
+                    expected_total_engine_steps=int(
+                        boundary_diagnostics["total_engine_steps"]
+                    ),
+                )
+            )
+        else:
+            boundary_diagnostics.pop("_all_decode_start_step_index", None)
         tps = float(out_tokens) / elapsed if elapsed > 0 else float("nan")
         decode_tps = float(decode_tokens) / decode_elapsed if decode_elapsed > 0 else float("nan")
-        route_counters = _fa3_route_counter_snapshot()
         decode_metrics = summarize_decode_metrics(
             decode_step_durations_s=decode_step_durations_s,
             decode_tokens=int(decode_tokens),
@@ -1708,7 +2316,17 @@ def main() -> None:
         )
         print(format_decode_metrics_line(decode_metrics), flush=True)
         if args.decode_metrics_json:
-            run_config = _decode_run_config(args, prompt_count=len(prompts))
+            run_config = _decode_run_config(
+                args,
+                prompt_count=len(prompts),
+                engine_scheduling_proof=engine_scheduling_proof,
+                custom_all_reduce_decision=custom_all_reduce_decision,
+                custom_all_reduce_runtime_proof=(
+                    custom_all_reduce_runtime_proof
+                ),
+                engine_runtime_contract_proof=engine_runtime_contract_proof,
+                child_identity=child_identity,
+            )
             metrics_payload = {
                 "elapsed_s": float(elapsed),
                 "process_pid": int(os.getpid()),
@@ -1718,6 +2336,9 @@ def main() -> None:
                 "mix_max_new_tokens": run_config["mix_max_new_tokens"],
                 "split_context_prompts": run_config["split_context_prompts"],
                 "respect_eos": run_config["respect_eos"],
+                **custom_all_reduce_decision.as_dict(),
+                **custom_all_reduce_runtime_proof,
+                **engine_runtime_contract_proof,
                 "run_config": run_config,
                 "out_tokens": int(out_tokens),
                 "tok_per_s": float(tps),
@@ -1743,6 +2364,12 @@ def main() -> None:
             }
             metrics_payload.update(decode_metrics)
             metrics_payload.update(_fa3_route_counter_metrics(route_counters))
+            metrics_payload["speed_child_route_counter_reset_records"] = (
+                route_counter_reset_records
+            )
+            metrics_payload["speed_child_route_counter_snapshot_records"] = (
+                route_counter_snapshot_records
+            )
             Path(args.decode_metrics_json).write_text(
                 json.dumps(metrics_payload, ensure_ascii=True, indent=2),
                 encoding="utf-8",
@@ -1813,6 +2440,10 @@ def main() -> None:
                 json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True),
                 encoding="utf-8",
             )
+
+    # All arm artifacts are durable before teardown.  A failed shutdown must
+    # make this child non-green so a paired runner cannot start on stale workers.
+    engine_shutdown.close()
 
 
 if __name__ == "__main__":

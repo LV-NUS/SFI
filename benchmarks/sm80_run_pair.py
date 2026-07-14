@@ -19,6 +19,121 @@ ALLOWED_TRACE_ENV_KEYS = (
     "VLLM_SPARSE_REFRESH_PROFILE_EVERY",
     "VLLM_SPARSE_REFRESH_PROFILE_LOG",
 )
+
+# A speed child must not inherit observation or experimental-ablation state
+# from the caller shell.  Keep this classification in the pairing-contract
+# module so environment cleanup, artifact proof, and pair normalization use
+# one source of truth instead of independent name lists.
+SPEED_CHILD_OBSERVATION_ENV_MARKERS = (
+    "TRACE",
+    "PROFILE",
+    "PROFILER",
+    "TIMELINE",
+    "TIMING",
+    "DEBUG",
+    "DUMP",
+    "LEDGER",
+    "FORENSIC",
+    "PROBE",
+    "COMPARE",
+    "FAULTHANDLER",
+    "TEE",
+)
+SPEED_CHILD_FORBIDDEN_EXPERIMENT_ENV_MARKERS = (
+    "ASSERT",
+    "ABLATE",
+    "FASTHIT",
+)
+SPEED_CHILD_OBSERVATION_ENV_EXACT_KEYS = frozenset(
+    {
+        "CUDA_LAUNCH_BLOCKING",
+        "NCCL_DEBUG",
+        "NCCL_DEBUG_SUBSYS",
+        "TORCH_COMPILE_DEBUG",
+        "TORCH_DISTRIBUTED_DEBUG",
+        "TORCH_LOGS",
+        "TORCH_TRACE",
+        # vLLM treats DEBUG logging as a runtime validation mode: its CUDA
+        # piecewise graph replay rebuilds and compares input-address lists on
+        # every call.  A custom logging config can likewise install hot-path
+        # handlers, so final timing uses the built-in default configuration.
+        "VLLM_LOGGING_CONFIG_PATH",
+        "VLLM_LOGGING_LEVEL",
+        # Project-local diagnostics whose names intentionally do not use a
+        # broad TRACE/PROFILE marker.  Keep these exact: CHECK/VALIDATE are
+        # also reasonable names for production policy and must not become a
+        # catch-all speed-child deletion rule.
+        "VLLM_SPARSE_EVT_BISECT",
+        "VLLM_SPARSE_REFRESH_REBUILD_CHECK",
+        "VLLM_SPARSE_VALIDATE_LAYER_SLOT_MAP",
+        "VLLM_SPARSE_VALIDATE_LSR_CACHE_KEY",
+        "VLLM_SPARSE_VALIDATE_META_CONTRACT",
+        "VLLM_SPARSE_WRITER_INPUT_BTABLE_CHECK",
+    }
+)
+SPEED_CHILD_FORBIDDEN_EXPERIMENT_ENV_EXACT_KEYS = frozenset(
+    {
+        # Attribution modes deliberately change admission/producer work.
+        "VLLM_SPARSE_ATTRIB_COMPACT_CONSUME_DELAY_STEPS",
+        "VLLM_SPARSE_ATTRIB_PREFILL_PRODUCER",
+        # Test-only live env reads add hot-path lookups throughout the runtime.
+        "VLLM_SPARSE_DYNAMIC_ENV",
+        # Unpromoted replay cuts must not leak into a final timing child.
+        "VLLM_SPARSE_FULL_CUDAGRAPH_REPLAY_REFRESH_DEFER_COMMIT",
+        "VLLM_SPARSE_FULL_CUDAGRAPH_REPLAY_REFRESH_SKIP_SUBMIT_SUMMARY",
+        # Promoted production paths: the env surface is rollback/diagnostic,
+        # not an ambient final-speed tuning contract.
+        "VLLM_SPARSE_CLEAN_METADATA",
+        "VLLM_SPARSE_PSC_BSKIP",
+        "VLLM_SPARSE_PSC_BSKIP_LOGF",
+        "VLLM_SPARSE_RRP_DISABLE_DIRECT_AFFINE",
+    }
+)
+# Selector knobs are part of pair identity, but this module does not own their
+# values. The retired value mapping looked like a policy manifest without ever
+# applying or validating it; keep only the honest identity role.
+SELECTOR_POLICY_IDENTITY_ENV_KEYS = (
+    "VLLM_SPARSE_SELECTOR_CUDA_PIPELINE",
+    "VLLM_SPARSE_SELECTOR_PIPELINE_WORKSPACE",
+    "VLLM_SPARSE_SELECTOR_TRUSTED_SHAPES",
+    "VLLM_SPARSE_SELECTOR_KEY_NORMS_CACHE_CAP",
+    "VLLM_SPARSE_SELECTOR_FAST_SIG",
+    "VLLM_SPARSE_SELECTOR_CPP_PREPROC",
+    "VLLM_SPARSE_SELECTOR_CPP_STACK",
+    "VLLM_SPARSE_SELECTOR_PIPELINE_UNIFIED",
+    "VLLM_SPARSE_SELECTOR_LOGS_CACHE_R",
+    "VLLM_SPARSE_SELECTOR_LOGS_CUDA",
+    "VLLM_SPARSE_SELECTOR_LOGS_FAST_MATH",
+    "VLLM_SPARSE_SELECTOR_FIXED_K",
+    "VLLM_SPARSE_SELECTOR_SELECTED_INDICES_OUT",
+    "VLLM_SPARSE_SELECTOR_PIPELINE_WORKSPACE_RUNTIME",
+    "VLLM_SPARSE_SELECTOR_FIXED_SHAPE_TOPK",
+    "VLLM_SPARSE_SELECTOR_KBUCKET",
+    "VLLM_SPARSE_SELECTOR_TOPK_GRAPH",
+    "VLLM_SPARSE_SELECTOR_FUSE_NMS_CROSS",
+)
+REMOTE_SELECTOR_ADAPTIVE_OVERRIDE_ENVS = (
+    "VLLM_SPARSE_SELECTOR_CROSS_HEAD_BLOCK_K",
+    "VLLM_SPARSE_SELECTOR_LOGS_THREADS",
+)
+# Production tuning is allowed in matched experiments, but it must remain
+# visible to the speed/diagnostic pairing digest.  This list is deliberately
+# exact so adding an unrelated VLLM_* variable cannot silently redefine run
+# identity.
+SPEED_CHILD_PAIRING_IDENTITY_ENV_KEYS = (
+    "VLLM_SOURCE_ROOT",
+    "VLLM_SPARSE_FULL_CUDAGRAPH_REPLAY_REFRESH_BATCHED_FLUSH",
+    "VLLM_SPARSE_FULL_CUDAGRAPH_REPLAY_REFRESH_DEFER_TO_DEADLINE",
+    "VLLM_SPARSE_REFRESH_REBUILD_MAX_DELAY_STEPS",
+    "VLLM_SPARSE_REFRESH_SPLIT_SELECTOR_WRITER_RELEASE",
+    "VLLM_SPARSE_REFRESH_SPLIT_SELECTOR_WRITER_RELEASE_MAX_PER_HANDLE",
+    "VLLM_SPARSE_REFRESH_SPLIT_SELECTOR_WRITER_RELEASE_MIN_LAYER_START",
+    "VLLM_SPARSE_REFRESH_STREAM_PRIORITY",
+    "VLLM_SPARSE_REPLAY_REFRESH_PROGRESSIVE_CONSUME",
+    "VLLM_SPARSE_WRITER_TOKEN_TILE",
+    *SELECTOR_POLICY_IDENTITY_ENV_KEYS,
+    *REMOTE_SELECTOR_ADAPTIVE_OVERRIDE_ENVS,
+)
 NATIVE_ROW_SOURCE_KEYS = (
     "native_rows",
     "native_pages",
@@ -74,6 +189,35 @@ def only_allowed_trace_diffs(
     right: Mapping[str, Any],
 ) -> bool:
     return all(_is_allowed_trace_diff(key) for key in diff_config_inputs(left, right))
+
+
+def classify_speed_child_env_key(key: str) -> str | None:
+    """Classify caller state that is forbidden in a timed child.
+
+    ``observation`` keys may be re-enabled only in the separate diagnostic
+    child and are ignored by the speed/diagnostic pairing digest.  ``experiment``
+    keys alter execution or add shadow work; both children clear them and the
+    pairing digest deliberately does not hide a future mismatch.
+    """
+    upper = str(key).upper()
+    if upper in SPEED_CHILD_OBSERVATION_ENV_EXACT_KEYS:
+        return "observation"
+    if upper in SPEED_CHILD_FORBIDDEN_EXPERIMENT_ENV_EXACT_KEYS:
+        return "experiment"
+    if not upper.startswith("VLLM_"):
+        return None
+    if any(
+        marker in upper
+        for marker in SPEED_CHILD_FORBIDDEN_EXPERIMENT_ENV_MARKERS
+    ):
+        return "experiment"
+    if (
+        any(marker in upper for marker in SPEED_CHILD_OBSERVATION_ENV_MARKERS)
+        or upper.endswith("_LOG")
+        or "_LOG_" in upper
+    ):
+        return "observation"
+    return None
 
 
 def validate_shared_route_proof(summary: Mapping[str, Any]) -> RouteProofResult:
@@ -204,11 +348,10 @@ def _normalize_pairing_config(value: Any) -> Any:
         for key, child in value.items():
             if key == "env" and isinstance(child, Mapping):
                 normalized[str(key)] = {
-                    str(env_key): ""
-                    if str(env_key) in ALLOWED_TRACE_ENV_KEYS
-                    else _normalize_pairing_config(env_value)
+                    str(env_key): _normalize_pairing_config(env_value)
                     for env_key in child
                     for env_value in (child[env_key],)
+                    if classify_speed_child_env_key(str(env_key)) != "observation"
                 }
             else:
                 normalized[str(key)] = _normalize_pairing_config(child)
@@ -223,7 +366,9 @@ def _normalize_pairing_config(value: Any) -> Any:
 def _is_allowed_trace_diff(key: str) -> bool:
     if not key.startswith("env."):
         return False
-    return key.removeprefix("env.") in ALLOWED_TRACE_ENV_KEYS
+    return (
+        classify_speed_child_env_key(key.removeprefix("env.")) == "observation"
+    )
 
 
 def _mapping(value: Any) -> Mapping[str, Any]:

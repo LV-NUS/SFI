@@ -1,9 +1,9 @@
 """CUDA extension: single-entry selector pipeline (log_s -> soft-nms -> cross-head -> topk)."""
 #
-# fa4_selector_fixed_shape_topk: VLLM_SPARSE_SELECTOR_FIXED_SHAPE_TOPK (default OFF) selects a
-# fixed-shape topk in post_topk: k is always == k_head and empty slots are
-# mapped to -1 by a value-sentinel test (picked value <= -3.0e38f, the
-# finite min_val sentinel) instead of a data-dependent k_eff column cutoff.
+# fa4_selector_fixed_shape_topk: the explicit fixed_shape_topk call argument
+# selects a fixed-shape topk in post_topk: k is always == k_head and empty
+# slots are mapped to -1 by a value-sentinel test (picked value <= -3.0e38f,
+# the finite min_val sentinel) instead of a data-dependent k_eff column cutoff.
 # The C++/CUDA ext source lives in the r-strings below; editing them changes
 # the load_inline source hash -> JIT recompile. A prebuilt is accepted only
 # when its exact semantic version and required entrypoints match this source;
@@ -165,6 +165,7 @@ std::vector<torch::Tensor> selector_pipeline_logits_topk_cuda(
     double cross_eps,
     int64_t slice_start,
     int64_t slice_end,
+    bool fixed_shape_topk,
     c10::optional<torch::Tensor> log_r_cache_opt,
     c10::optional<torch::Tensor> selected_indices_out_opt,
     c10::optional<torch::Tensor> workspace_a_opt,
@@ -199,6 +200,7 @@ std::vector<torch::Tensor> selector_pipeline_pre_denom_topk_cuda(
     double cross_eps,
     int64_t slice_start,
     int64_t slice_end,
+    bool fixed_shape_topk,
     c10::optional<torch::Tensor> log_r_cache_opt,
     c10::optional<torch::Tensor> selected_indices_out_opt,
     c10::optional<torch::Tensor> workspace_a_opt,
@@ -260,6 +262,7 @@ std::vector<torch::Tensor> selector_pipeline_logits_topk(
         cross_eps,
         slice_start,
         slice_end,
+        false,
         c10::nullopt,
         c10::nullopt,
         c10::nullopt,
@@ -324,6 +327,7 @@ std::vector<torch::Tensor> selector_pipeline_pre_denom_topk(
         cross_eps,
         slice_start,
         slice_end,
+        false,
         c10::nullopt,
         c10::nullopt,
         c10::nullopt,
@@ -477,7 +481,8 @@ std::vector<torch::Tensor> selector_pipeline_logits_topk_fused(
         beta, lambda_clip_single, lambda_clip_multi,
         lambda_tail_kappa, lambda_tail_pivot, lambda_soft,
         nms_window, soft_alpha, alpha_cross, temperature, cross_eps,
-        slice_start, slice_end, c10::nullopt, c10::nullopt, c10::nullopt, c10::nullopt);
+        slice_start, slice_end, false, c10::nullopt, c10::nullopt,
+        c10::nullopt, c10::nullopt);
 
     // 4. Return [selected_indices, head_sink, recent_start, kv_len_head, allowed_lengths]
     return {idx_result[0], head_sink, recent_start, kv_len_head, allowed_lengths};
@@ -557,6 +562,7 @@ std::vector<torch::Tensor> selector_pipeline_logits_topk_with_bounds(
     double cross_eps,
     int64_t slice_start,
     int64_t slice_end,
+    bool fixed_shape_topk,
     c10::optional<torch::Tensor> log_r_cache_opt);
 
 std::vector<torch::Tensor> selector_pipeline_logits_topk_with_bounds_workspace(
@@ -589,6 +595,7 @@ std::vector<torch::Tensor> selector_pipeline_logits_topk_with_bounds_workspace(
     double cross_eps,
     int64_t slice_start,
     int64_t slice_end,
+    bool fixed_shape_topk,
     c10::optional<torch::Tensor> log_r_cache_opt,
     torch::Tensor workspace_a,
     torch::Tensor workspace_b);
@@ -623,6 +630,7 @@ std::vector<torch::Tensor> selector_pipeline_logits_topk_with_bounds_out(
     double cross_eps,
     int64_t slice_start,
     int64_t slice_end,
+    bool fixed_shape_topk,
     c10::optional<torch::Tensor> log_r_cache_opt,
     torch::Tensor selected_indices_out);
 
@@ -656,6 +664,7 @@ std::vector<torch::Tensor> selector_pipeline_logits_topk_with_bounds_workspace_o
     double cross_eps,
     int64_t slice_start,
     int64_t slice_end,
+    bool fixed_shape_topk,
     c10::optional<torch::Tensor> log_r_cache_opt,
     torch::Tensor workspace_a,
     torch::Tensor workspace_b,
@@ -692,6 +701,7 @@ std::vector<torch::Tensor> selector_pipeline_pre_denom_topk_with_bounds(
     double cross_eps,
     int64_t slice_start,
     int64_t slice_end,
+    bool fixed_shape_topk,
     c10::optional<torch::Tensor> log_r_cache_opt);
 
 std::vector<torch::Tensor> selector_pipeline_pre_denom_topk_with_bounds_workspace(
@@ -725,6 +735,7 @@ std::vector<torch::Tensor> selector_pipeline_pre_denom_topk_with_bounds_workspac
     double cross_eps,
     int64_t slice_start,
     int64_t slice_end,
+    bool fixed_shape_topk,
     c10::optional<torch::Tensor> log_r_cache_opt,
     torch::Tensor workspace_a,
     torch::Tensor workspace_b);
@@ -760,6 +771,7 @@ std::vector<torch::Tensor> selector_pipeline_pre_denom_topk_with_bounds_out(
     double cross_eps,
     int64_t slice_start,
     int64_t slice_end,
+    bool fixed_shape_topk,
     c10::optional<torch::Tensor> log_r_cache_opt,
     torch::Tensor selected_indices_out);
 
@@ -794,6 +806,7 @@ std::vector<torch::Tensor> selector_pipeline_pre_denom_topk_with_bounds_workspac
     double cross_eps,
     int64_t slice_start,
     int64_t slice_end,
+    bool fixed_shape_topk,
     c10::optional<torch::Tensor> log_r_cache_opt,
     torch::Tensor workspace_a,
     torch::Tensor workspace_b,
@@ -805,7 +818,8 @@ torch::Tensor selector_pipeline_post_topk_contract_cuda(
     torch::Tensor scores,
     int64_t k_head,
     int64_t slice_start,
-    int64_t slice_end);
+    int64_t slice_end,
+    bool fixed_shape_topk);
 
 int64_t selector_pipeline_semantic_version() {
     return __SFI_SELECTOR_PIPELINE_SEMANTIC_VERSION__;
@@ -1966,20 +1980,6 @@ bool selector_fuse_nms_cross_enabled() {
     return is_one;
 }
 
-// fa4_selector_fixed_shape_topk: env gate for fixed-shape (k == k_head) post_topk.
-bool selector_fixed_shape_topk_enabled() {
-    const char* env = std::getenv("VLLM_SPARSE_SELECTOR_FIXED_SHAPE_TOPK");
-    if (env == nullptr) {
-        return false;
-    }
-    const bool is_one = env[0] == '1' && env[1] == '\0';
-    const bool is_zero = env[0] == '0' && env[1] == '\0';
-    TORCH_CHECK(is_one || is_zero,
-                "VLLM_SPARSE_SELECTOR_FIXED_SHAPE_TOPK must be '0' or '1', got '",
-                env, "'");
-    return is_one;
-}
-
 size_t fused_nms_cross_shm_bytes(int64_t H, int block_k, int window) {
     int pad = window / 2;
     int tile_len = block_k + 2 * pad;
@@ -2510,7 +2510,8 @@ torch::Tensor post_topk(
     torch::Tensor log_s,
     int64_t k_head,
     int64_t slice_start,
-    int64_t slice_end);
+    int64_t slice_end,
+    bool fixed_shape_topk);
 
 // [POST-TOPK-TIE-DETERMINISM L2 2026-07-12] Deterministic top-k MEMBERSHIP.
 // ATen topk(sorted=false) leaves the MEMBERSHIP at the k-th-value tie-band
@@ -2634,10 +2635,11 @@ __global__ void post_topk_deterministic_i32_kernel(
             || (is_equal && tie_base_shared + equal_rank <= tie_need));
         __syncthreads();
 
-        int selected_offset = 0;
-        int tile_selected_count = 0;
-        cub::BlockScan<int, POST_TOPK_BLOCK_THREADS>(temp.scan_int).ExclusiveSum(
-            selected, selected_offset, tile_selected_count);
+        // Only the tile total feeds the final membership assertion. Computing
+        // a per-thread selected prefix here was dead work; the valid-output
+        // compaction below has its own stable prefix scan.
+        int tile_selected_count = cub::BlockReduce<int, POST_TOPK_BLOCK_THREADS>(
+            temp.reduce_int).Sum(selected);
         __syncthreads();
 
         int valid_selected = selected && value > POST_TOPK_MIN_VALID;
@@ -2751,6 +2753,7 @@ torch::Tensor post_topk(
     int64_t k_head,
     int64_t slice_start,
     int64_t slice_end,
+    bool fixed_shape_topk,
     c10::optional<torch::Tensor> selected_indices_out_opt) {
     TORCH_CHECK(log_s.dim() == 4, "log_s must be [L,B,H,K]");
     auto scores = log_s;
@@ -2766,7 +2769,7 @@ torch::Tensor post_topk(
     bool range_valid = end > start;
     bool full_range = range_valid && start == 0 && end == K;
     // fa4_selector_fixed_shape_topk: fixed-shape (k == k_head) value-sentinel branch.
-    if (selector_fixed_shape_topk_enabled()) {
+    if (fixed_shape_topk) {
         // Same [start,end) window as the OFF path (variable narrow WIDTH may
         // remain for breaker (a); 256-bucketing is breaker (c)). When the
         // window is shorter than k_head, PAD the tail to exactly k_head
@@ -2808,16 +2811,20 @@ torch::Tensor post_topk(
     torch::Tensor log_s,
     int64_t k_head,
     int64_t slice_start,
-    int64_t slice_end) {
-    return post_topk(log_s, k_head, slice_start, slice_end, c10::nullopt);
+    int64_t slice_end,
+    bool fixed_shape_topk) {
+    return post_topk(
+        log_s, k_head, slice_start, slice_end, fixed_shape_topk, c10::nullopt);
 }
 
 torch::Tensor selector_pipeline_post_topk_contract_cuda(
     torch::Tensor scores,
     int64_t k_head,
     int64_t slice_start,
-    int64_t slice_end) {
-    return post_topk(scores, k_head, slice_start, slice_end, c10::nullopt);
+    int64_t slice_end,
+    bool fixed_shape_topk) {
+    return post_topk(
+        scores, k_head, slice_start, slice_end, fixed_shape_topk, c10::nullopt);
 }
 
 std::vector<torch::Tensor> selector_pipeline_logits_topk_cuda(
@@ -2848,6 +2855,7 @@ std::vector<torch::Tensor> selector_pipeline_logits_topk_cuda(
     double cross_eps,
     int64_t slice_start,
     int64_t slice_end,
+    bool fixed_shape_topk,
     c10::optional<torch::Tensor> log_r_cache_opt,
     c10::optional<torch::Tensor> selected_indices_out_opt,
     c10::optional<torch::Tensor> workspace_a_opt,
@@ -2946,6 +2954,7 @@ std::vector<torch::Tensor> selector_pipeline_logits_topk_cuda(
         k_head,
         slice_start,
         slice_end,
+        fixed_shape_topk,
         selected_indices_out_opt);
     if (do_profile) {
         t4 = now_us();
@@ -3031,6 +3040,7 @@ std::vector<torch::Tensor> selector_pipeline_pre_denom_topk_cuda(
     double cross_eps,
     int64_t slice_start,
     int64_t slice_end,
+    bool fixed_shape_topk,
     c10::optional<torch::Tensor> log_r_cache_opt,
     c10::optional<torch::Tensor> selected_indices_out_opt,
     c10::optional<torch::Tensor> workspace_a_opt,
@@ -3129,6 +3139,7 @@ std::vector<torch::Tensor> selector_pipeline_pre_denom_topk_cuda(
         k_head,
         slice_start,
         slice_end,
+        fixed_shape_topk,
         selected_indices_out_opt);
     if (do_profile) {
         t4 = now_us();
@@ -3387,7 +3398,8 @@ std::vector<torch::Tensor> selector_pipeline_logits_topk_lazy_fused(
         log_s_full,
         k_head,
         slice_start,
-        slice_end);
+        slice_end,
+        false);
 
     // Return [selected_indices, head_sink, recent_start, kv_len_head, allowed_lengths]
     return {idx, head_sink, recent_start, kv_len_head, allowed_lengths};
@@ -3430,6 +3442,7 @@ std::vector<torch::Tensor> selector_pipeline_logits_topk_with_bounds_impl(
     double cross_eps,
     int64_t slice_start,
     int64_t slice_end,
+    bool fixed_shape_topk,
     c10::optional<torch::Tensor> log_r_cache_opt,
     c10::optional<torch::Tensor> selected_indices_out_opt,
     c10::optional<torch::Tensor> workspace_a_opt,
@@ -3508,6 +3521,7 @@ std::vector<torch::Tensor> selector_pipeline_logits_topk_with_bounds_impl(
         cross_eps,
         slice_start,
         slice_end,
+        fixed_shape_topk,
         log_r_cache_opt,
         selected_indices_out_opt,
         workspace_a_opt,
@@ -3547,6 +3561,7 @@ std::vector<torch::Tensor> selector_pipeline_logits_topk_with_bounds(
     double cross_eps,
     int64_t slice_start,
     int64_t slice_end,
+    bool fixed_shape_topk,
     c10::optional<torch::Tensor> log_r_cache_opt) {
     return selector_pipeline_logits_topk_with_bounds_impl(
         scores, row_lo, row_hi, key_norms, head_sink, recent_start,
@@ -3554,7 +3569,8 @@ std::vector<torch::Tensor> selector_pipeline_logits_topk_with_bounds(
         prior_weight_l2, prior_weight_pos, prior_pos_power, prior_pos_eta,
         beta, lambda_clip_single, lambda_clip_multi, lambda_tail_kappa,
         lambda_tail_pivot, lambda_soft, nms_window, soft_alpha, alpha_cross,
-        temperature, cross_eps, slice_start, slice_end, log_r_cache_opt,
+        temperature, cross_eps, slice_start, slice_end, fixed_shape_topk,
+        log_r_cache_opt,
         c10::nullopt, c10::nullopt, c10::nullopt);
 }
 
@@ -3588,6 +3604,7 @@ std::vector<torch::Tensor> selector_pipeline_logits_topk_with_bounds_workspace(
     double cross_eps,
     int64_t slice_start,
     int64_t slice_end,
+    bool fixed_shape_topk,
     c10::optional<torch::Tensor> log_r_cache_opt,
     torch::Tensor workspace_a,
     torch::Tensor workspace_b) {
@@ -3597,7 +3614,8 @@ std::vector<torch::Tensor> selector_pipeline_logits_topk_with_bounds_workspace(
         prior_weight_l2, prior_weight_pos, prior_pos_power, prior_pos_eta,
         beta, lambda_clip_single, lambda_clip_multi, lambda_tail_kappa,
         lambda_tail_pivot, lambda_soft, nms_window, soft_alpha, alpha_cross,
-        temperature, cross_eps, slice_start, slice_end, log_r_cache_opt,
+        temperature, cross_eps, slice_start, slice_end, fixed_shape_topk,
+        log_r_cache_opt,
         c10::nullopt, workspace_a, workspace_b);
 }
 
@@ -3631,6 +3649,7 @@ std::vector<torch::Tensor> selector_pipeline_logits_topk_with_bounds_out(
     double cross_eps,
     int64_t slice_start,
     int64_t slice_end,
+    bool fixed_shape_topk,
     c10::optional<torch::Tensor> log_r_cache_opt,
     torch::Tensor selected_indices_out) {
     return selector_pipeline_logits_topk_with_bounds_impl(
@@ -3639,7 +3658,8 @@ std::vector<torch::Tensor> selector_pipeline_logits_topk_with_bounds_out(
         prior_weight_l2, prior_weight_pos, prior_pos_power, prior_pos_eta,
         beta, lambda_clip_single, lambda_clip_multi, lambda_tail_kappa,
         lambda_tail_pivot, lambda_soft, nms_window, soft_alpha, alpha_cross,
-        temperature, cross_eps, slice_start, slice_end, log_r_cache_opt,
+        temperature, cross_eps, slice_start, slice_end, fixed_shape_topk,
+        log_r_cache_opt,
         selected_indices_out, c10::nullopt, c10::nullopt);
 }
 
@@ -3673,6 +3693,7 @@ std::vector<torch::Tensor> selector_pipeline_logits_topk_with_bounds_workspace_o
     double cross_eps,
     int64_t slice_start,
     int64_t slice_end,
+    bool fixed_shape_topk,
     c10::optional<torch::Tensor> log_r_cache_opt,
     torch::Tensor workspace_a,
     torch::Tensor workspace_b,
@@ -3683,7 +3704,8 @@ std::vector<torch::Tensor> selector_pipeline_logits_topk_with_bounds_workspace_o
         prior_weight_l2, prior_weight_pos, prior_pos_power, prior_pos_eta,
         beta, lambda_clip_single, lambda_clip_multi, lambda_tail_kappa,
         lambda_tail_pivot, lambda_soft, nms_window, soft_alpha, alpha_cross,
-        temperature, cross_eps, slice_start, slice_end, log_r_cache_opt,
+        temperature, cross_eps, slice_start, slice_end, fixed_shape_topk,
+        log_r_cache_opt,
         selected_indices_out, workspace_a, workspace_b);
 }
 
@@ -3718,6 +3740,7 @@ std::vector<torch::Tensor> selector_pipeline_pre_denom_topk_with_bounds_impl(
     double cross_eps,
     int64_t slice_start,
     int64_t slice_end,
+    bool fixed_shape_topk,
     c10::optional<torch::Tensor> log_r_cache_opt,
     c10::optional<torch::Tensor> selected_indices_out_opt,
     c10::optional<torch::Tensor> workspace_a_opt,
@@ -3806,6 +3829,7 @@ std::vector<torch::Tensor> selector_pipeline_pre_denom_topk_with_bounds_impl(
         cross_eps,
         slice_start,
         slice_end,
+        fixed_shape_topk,
         log_r_cache_opt,
         selected_indices_out_opt,
         workspace_a_opt,
@@ -3845,6 +3869,7 @@ std::vector<torch::Tensor> selector_pipeline_pre_denom_topk_with_bounds(
     double cross_eps,
     int64_t slice_start,
     int64_t slice_end,
+    bool fixed_shape_topk,
     c10::optional<torch::Tensor> log_r_cache_opt) {
     return selector_pipeline_pre_denom_topk_with_bounds_impl(
         scores, denom, row_lo, row_hi, key_norms, head_sink, recent_start,
@@ -3852,7 +3877,8 @@ std::vector<torch::Tensor> selector_pipeline_pre_denom_topk_with_bounds(
         prior_weight_l2, prior_weight_pos, prior_pos_power, prior_pos_eta,
         beta, lambda_clip_single, lambda_clip_multi, lambda_tail_kappa,
         lambda_tail_pivot, lambda_soft, nms_window, soft_alpha, alpha_cross,
-        temperature, cross_eps, slice_start, slice_end, log_r_cache_opt,
+        temperature, cross_eps, slice_start, slice_end, fixed_shape_topk,
+        log_r_cache_opt,
         c10::nullopt, c10::nullopt, c10::nullopt);
 }
 
@@ -3887,6 +3913,7 @@ std::vector<torch::Tensor> selector_pipeline_pre_denom_topk_with_bounds_workspac
     double cross_eps,
     int64_t slice_start,
     int64_t slice_end,
+    bool fixed_shape_topk,
     c10::optional<torch::Tensor> log_r_cache_opt,
     torch::Tensor workspace_a,
     torch::Tensor workspace_b) {
@@ -3896,7 +3923,8 @@ std::vector<torch::Tensor> selector_pipeline_pre_denom_topk_with_bounds_workspac
         prior_weight_l2, prior_weight_pos, prior_pos_power, prior_pos_eta,
         beta, lambda_clip_single, lambda_clip_multi, lambda_tail_kappa,
         lambda_tail_pivot, lambda_soft, nms_window, soft_alpha, alpha_cross,
-        temperature, cross_eps, slice_start, slice_end, log_r_cache_opt,
+        temperature, cross_eps, slice_start, slice_end, fixed_shape_topk,
+        log_r_cache_opt,
         c10::nullopt, workspace_a, workspace_b);
 }
 
@@ -3931,6 +3959,7 @@ std::vector<torch::Tensor> selector_pipeline_pre_denom_topk_with_bounds_out(
     double cross_eps,
     int64_t slice_start,
     int64_t slice_end,
+    bool fixed_shape_topk,
     c10::optional<torch::Tensor> log_r_cache_opt,
     torch::Tensor selected_indices_out) {
     return selector_pipeline_pre_denom_topk_with_bounds_impl(
@@ -3939,7 +3968,8 @@ std::vector<torch::Tensor> selector_pipeline_pre_denom_topk_with_bounds_out(
         prior_weight_l2, prior_weight_pos, prior_pos_power, prior_pos_eta,
         beta, lambda_clip_single, lambda_clip_multi, lambda_tail_kappa,
         lambda_tail_pivot, lambda_soft, nms_window, soft_alpha, alpha_cross,
-        temperature, cross_eps, slice_start, slice_end, log_r_cache_opt,
+        temperature, cross_eps, slice_start, slice_end, fixed_shape_topk,
+        log_r_cache_opt,
         selected_indices_out, c10::nullopt, c10::nullopt);
 }
 
@@ -3974,6 +4004,7 @@ std::vector<torch::Tensor> selector_pipeline_pre_denom_topk_with_bounds_workspac
     double cross_eps,
     int64_t slice_start,
     int64_t slice_end,
+    bool fixed_shape_topk,
     c10::optional<torch::Tensor> log_r_cache_opt,
     torch::Tensor workspace_a,
     torch::Tensor workspace_b,
@@ -3984,7 +4015,8 @@ std::vector<torch::Tensor> selector_pipeline_pre_denom_topk_with_bounds_workspac
         prior_weight_l2, prior_weight_pos, prior_pos_power, prior_pos_eta,
         beta, lambda_clip_single, lambda_clip_multi, lambda_tail_kappa,
         lambda_tail_pivot, lambda_soft, nms_window, soft_alpha, alpha_cross,
-        temperature, cross_eps, slice_start, slice_end, log_r_cache_opt,
+        temperature, cross_eps, slice_start, slice_end, fixed_shape_topk,
+        log_r_cache_opt,
         selected_indices_out, workspace_a, workspace_b);
 }
 
@@ -4195,10 +4227,10 @@ def pipeline_logits_topk_with_bounds(
     cross_eps: float,
     slice_start: int,
     slice_end: int,
+    fixed_shape_topk: bool,
     log_r_cache: Optional[torch.Tensor] = None,
     pipeline_workspaces: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
     selected_indices_out: Optional[torch.Tensor] = None,
-    fixed_shape_topk: bool = False,
 ) -> torch.Tensor:
     """Pipeline with pre-computed bounds from CUDA kernel.
 
@@ -4214,18 +4246,13 @@ def pipeline_logits_topk_with_bounds(
         recent_start: [L, B, H_kv] token upper bounds
         num_kv_heads: H_kv
         num_queries_per_kv: G
+        fixed_shape_topk: select the fixed-k value-sentinel post-topk branch
         ... other selector parameters ...
 
     Returns:
         selected_indices: [L, B, H_kv, k_head] selected token indices
     """
     mod = _require_ext()
-    # fa4_selector_fixed_shape_topk: coherence shim — make the C++ env read match the
-    # explicit python gate for the duration of this call.
-    _fst_prev = os.environ.get("VLLM_SPARSE_SELECTOR_FIXED_SHAPE_TOPK")
-    if fixed_shape_topk and _fst_prev != "1":
-        os.environ["VLLM_SPARSE_SELECTOR_FIXED_SHAPE_TOPK"] = "1"
-
     _fuse_fire_trace()
     args = (
         capture_scores,
@@ -4257,6 +4284,7 @@ def pipeline_logits_topk_with_bounds(
         float(cross_eps),
         int(slice_start),
         int(slice_end),
+        bool(fixed_shape_topk),
         log_r_cache,
     )
     # [刀E ENTRY-MEMO 2026-07-12] 四入口 callable 按 module 身份解析一次
@@ -4308,11 +4336,6 @@ def pipeline_logits_topk_with_bounds(
         )
 
     # Result is [selected_indices] only
-    if fixed_shape_topk and _fst_prev != "1":
-        if _fst_prev is None:
-            os.environ.pop("VLLM_SPARSE_SELECTOR_FIXED_SHAPE_TOPK", None)
-        else:
-            os.environ["VLLM_SPARSE_SELECTOR_FIXED_SHAPE_TOPK"] = _fst_prev
     return result[0]
 
 
@@ -4348,10 +4371,10 @@ def pipeline_pre_denom_topk_with_bounds(
     cross_eps: float,
     slice_start: int,
     slice_end: int,
+    fixed_shape_topk: bool,
     log_r_cache: Optional[torch.Tensor] = None,
     pipeline_workspaces: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
     selected_indices_out: Optional[torch.Tensor] = None,
-    fixed_shape_topk: bool = False,
 ) -> torch.Tensor:
     """Bounds-first pre-denom pipeline (decode path, W=1).
 
@@ -4359,12 +4382,6 @@ def pipeline_pre_denom_topk_with_bounds(
     Any unsupported layout triggers fail-fast in C++.
     """
     mod = _require_ext()
-    # fa4_selector_fixed_shape_topk: coherence shim — make the C++ env read match the
-    # explicit python gate for the duration of this call.
-    _fst_prev = os.environ.get("VLLM_SPARSE_SELECTOR_FIXED_SHAPE_TOPK")
-    if fixed_shape_topk and _fst_prev != "1":
-        os.environ["VLLM_SPARSE_SELECTOR_FIXED_SHAPE_TOPK"] = "1"
-
     _fuse_fire_trace()
     args = (
         capture_scores,
@@ -4397,6 +4414,7 @@ def pipeline_pre_denom_topk_with_bounds(
         float(cross_eps),
         int(slice_start),
         int(slice_end),
+        bool(fixed_shape_topk),
         log_r_cache,
     )
     if selected_indices_out is None and pipeline_workspaces is None:
@@ -4434,11 +4452,6 @@ def pipeline_pre_denom_topk_with_bounds(
             selected_indices_out,
         )
 
-    if fixed_shape_topk and _fst_prev != "1":
-        if _fst_prev is None:
-            os.environ.pop("VLLM_SPARSE_SELECTOR_FIXED_SHAPE_TOPK", None)
-        else:
-            os.environ["VLLM_SPARSE_SELECTOR_FIXED_SHAPE_TOPK"] = _fst_prev
     return result[0]
 
 

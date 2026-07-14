@@ -238,7 +238,7 @@ def _publish_bootstrap_readiness_before_step_authority(
     )
     bridge_bootstrap_ids = _bridge_bootstrap_ids()
     if defer_bootstrap_producer:
-        self._launch_deferred_bootstrap_producer_jobs(
+        self._stage_deferred_bootstrap_producer_jobs(
             epoch=self.step_context_epoch,
         )
         # A request can finish its deferred producer while another request still
@@ -280,7 +280,7 @@ def _publish_bootstrap_readiness_before_step_authority(
                     if bridge_token_count >= launch_threshold:
                         tail_launch_ids.append(str(rid))
                 if tail_launch_ids:
-                    self._launch_deferred_bootstrap_producer_jobs(
+                    self._stage_deferred_bootstrap_producer_jobs(
                         epoch=self.step_context_epoch,
                         only_request_ids=tuple(tail_launch_ids),
                         allow_same_epoch=True,
@@ -474,7 +474,7 @@ def prepare_step_context_impl(
     num_reqs = len(req_ids_tuple)
     step_token = int(step_ticket.target_epoch)
     step_source_signature = int(step_ticket.source_signature)
-    step_scheduler_token = int(step_ticket.scheduler_token)
+    step_dispatch_token = int(step_ticket.dispatch_token)
     refresh_nonce = self._refresh_nonce
     trigger_cfg = self.config.trigger
     use_refresh_nonce = trigger_cfg.enable_sentence_triggers
@@ -482,7 +482,7 @@ def prepare_step_context_impl(
     step_identity: StepIdentity = (
         step_token,
         step_source_signature,
-        step_scheduler_token,
+        step_dispatch_token,
         refresh_nonce_key,
     )
     tp_size = getattr(self, "_cached_tp_size", None)
@@ -1086,6 +1086,11 @@ def prepare_step_context_impl(
     self._step_refresh_commit_begin(
         handle_id=step_handle.handle_id,
         handle_generation=step_handle.generation,
+        step_identity_token=(
+            int(step_handle.epoch) * 1_000_000_000
+            + int(step_handle.handle_id) * 1_000_000
+            + int(step_handle.generation)
+        ),
         planned_reqs=len(refresh_reqs),
         planned_rows=len(refresh_rows),
         num_actual_tokens=num_actual_tokens,

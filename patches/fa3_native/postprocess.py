@@ -1,40 +1,909 @@
 from __future__ import annotations
 
+import hashlib
+import math
 import os
+import struct
+import threading
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Optional, Sequence
 
 import torch
+from utils.selector_log_s_identity import (
+    SELECTOR_LOG_F_COUNTER_SEMANTICS,
+    SELECTOR_LOG_F_FAST_ROUTE,
+    SELECTOR_LOG_F_GENERIC_ROUTE,
+    SELECTOR_LOG_F_RETIRED_TP8_EXACT_ENV,
+    SELECTOR_LOG_F_ROUTES,
+    SELECTOR_LOG_F_TILED_ROUTE,
+    SELECTOR_LOG_S_EXTENSION_NAME,
+    SELECTOR_LOG_S_REQUIRED_TILED_SYMBOL,
+    SELECTOR_LOG_S_RUNTIME_PROOF_SCHEMA,
+    SELECTOR_LOG_S_SEMANTIC_IDENTITY,
+    SELECTOR_LOG_S_SEMANTIC_IDENTITY_SYMBOL,
+    selector_log_s_module_signature,
+)
 
 
+_LOG_F_R2_RESIDENT_BUCKETS = (12288, 16384, 24576, 32768)
+_LOG_F_R2_RESIDENT_ROUTE = SELECTOR_LOG_F_FAST_ROUTE
+_LOG_F_R2_TILED_ROUTE = SELECTOR_LOG_F_TILED_ROUTE
+_LOG_F_GENERIC_ROUTE = SELECTOR_LOG_F_GENERIC_ROUTE
+_LOG_F_RESIDENT_REASON = "resident_r2_bucket"
+_LOG_F_TILED_REASON = "tiled_r2_large_k"
+_LOG_F_GENERIC_ARCH_REASON = "generic_arch"
+_LOG_F_GENERIC_DTYPE_REASON = "generic_dtype"
+_LOG_F_GENERIC_LAYOUT_REASON = "generic_layout"
+_LOG_F_GENERIC_ALPHA_REASON = "generic_alpha"
+_LOG_F_GENERIC_ACCUM_REASON = "generic_accumulation"
+_LOG_F_GENERIC_ROW_COUNT_REASON = "generic_row_count"
+_LOG_F_GENERIC_K_RANGE_REASON = "generic_k_range"
+_LOG_F_GENERIC_RESOURCE_REASON = "generic_resource_capacity"
+_LOG_F_ADMISSION_CHAIN_ZERO = "0" * 64
+_LOG_F_DIRECT_EVENT_SENTINEL = -1
+_LOG_F_R2_TILED_MIN_K_EXCLUSIVE = 32_768
+_LOG_F_META_I32_MIN = -(1 << 31)
+_LOG_F_META_I32_MAX = (1 << 31) - 1
+_LOG_F_WORKSPACE_I64_MAX_BYTES = (1 << 63) - 1
+# CUDA devices supported by this release expose the standard one-dimensional
+# grid-x limit.  The tiled owner uses only portable 256-thread CUDA kernels;
+# unlike the resident owner, it has no exact-architecture instruction contract.
+_LOG_F_PORTABLE_GRID_X_MAX = (1 << 31) - 1
+TILED_CAPTURE_POSTPROCESS_MAX_SLOT_COUNT = 16
+_LOG_F_R2_TILED_RESOURCE_RING_DEPTH = TILED_CAPTURE_POSTPROCESS_MAX_SLOT_COUNT
+_PROCESS_LOG_F_ROUTE_COUNTS = {route: 0 for route in SELECTOR_LOG_F_ROUTES}
+_PROCESS_LOG_F_LAST_ROUTE = "none"
+_PROCESS_LOG_F_LAST_DISPATCH_REASON = "none"
+_PROCESS_LOG_F_LAST_ADMISSION_IDENTITY = "none"
+_PROCESS_LOG_F_ADMISSION_EVENT_COUNT = 0
+_PROCESS_LOG_F_ADMISSION_CHAIN_SHA256 = _LOG_F_ADMISSION_CHAIN_ZERO
+_PROCESS_TILED_COHORT_COUNT = 0
+_PROCESS_TILED_JOB_COUNT = 0
+_PROCESS_TILED_DIRECT_COUNT = 0
+_PROCESS_TILED_KERNEL_LAUNCH_COUNT = 0
+_PROCESS_TILED_ADMISSION_FAILURE_COUNT = 0
+_PROCESS_TILED_RESOURCE_CACHE: dict[tuple[int, int, int, int, int], dict[str, Any]] = {}
+_PROCESS_TILED_RESOURCE_CACHE_LOCK = threading.Lock()
+_PROCESS_TILED_RESOURCE_CACHE_CONDITION = threading.Condition(
+    _PROCESS_TILED_RESOURCE_CACHE_LOCK
+)
 
 
+@dataclass(frozen=True, slots=True)
+class _LogFTensorContract:
+    """Pointer-free tensor facts expressible by the log_f kernel ABI."""
+
+    device_type: str
+    dtype: torch.dtype
+    shape: tuple[int, ...]
+    stride: tuple[int, ...]
+    is_contiguous: bool
 
 
+@dataclass(frozen=True, slots=True)
+class _LogFReduceAdmission:
+    """Complete CPU-authored input to the pure route resolver."""
+
+    meta_i32_rows: tuple[tuple[int, ...], ...]
+    scratch_row_indices: tuple[int, ...]
+    output_row_indices: tuple[int, ...]
+    scratch: _LogFTensorContract
+    output: _LogFTensorContract
+    denom: _LogFTensorContract
+    alpha: float
+    capability: tuple[int, ...]
+    cpu_authority_validated: bool
+    local_same_device: bool
 
 
+@dataclass(frozen=True, slots=True)
+class _LogFReduceDispatch:
+    """One valid production owner; invalid contracts never produce this value."""
+
+    route: str
+    reason: str
+    resident_k_bucket: Optional[int]
+    admission_identity: str
 
 
+@dataclass(frozen=True, slots=True)
+class _TiledJobPlan:
+    """Immutable CPU-authority view of one deferred large-K job."""
+
+    job: Any
+    meta_i32_rows: tuple[tuple[int, ...], ...]
+    scratch_row_indices: tuple[int, ...]
+    output_row_indices: tuple[int, ...]
+    scratch: torch.Tensor
+    output: torch.Tensor
+    denom: torch.Tensor
+    dispatch: _LogFReduceDispatch
+    job_key: tuple[int, int, int]
+    event_epoch: int
+    num_query_heads: int
+    logical_k_max: int
+    capability: tuple[int, int]
 
 
-def _resolve_phase_output_kv_len(
+@dataclass(frozen=True, slots=True)
+class _TouchedByteInterval:
+    """One exact contiguous region touched by the tiled kernel contract."""
+
+    device: torch.device
+    begin: int
+    end: int
+    label: str
+
+
+@dataclass(frozen=True, slots=True)
+class TiledCapturePostprocessResourceReport:
+    """Allocation-free capacity/byte contract shared by profile and runtime."""
+
+    num_rows_capacity: int
+    num_query_heads_capacity: int
+    logical_k_capacity: int
+    slot_count: int
+    workspace_bytes_per_slot: int
+    device_meta_bytes_per_slot: int
+    host_meta_bytes_per_slot: int
+    device_bytes_per_slot: int
+    total_workspace_bytes: int
+    total_device_meta_bytes: int
+    total_host_meta_bytes: int
+    total_device_bytes: int
+
+
+def _tensor_contract(tensor: torch.Tensor) -> _LogFTensorContract:
+    return _LogFTensorContract(
+        device_type=str(tensor.device.type),
+        dtype=tensor.dtype,
+        shape=tuple(int(value) for value in tensor.shape),
+        stride=tuple(int(value) for value in tensor.stride()),
+        is_contiguous=bool(tensor.is_contiguous()),
+    )
+
+
+def _selector_log_f_contract_error(code: str, detail: str) -> None:
+    raise RuntimeError(f"E_SELECTOR_LOG_F_{code}: {detail}")
+
+
+def _digest_text(digest: Any, value: str) -> None:
+    encoded = str(value).encode("utf-8")
+    digest.update(struct.pack("<I", len(encoded)))
+    digest.update(encoded)
+
+
+def _digest_i64_sequence(digest: Any, values: Sequence[int]) -> None:
+    digest.update(struct.pack("<I", len(values)))
+    for value in values:
+        digest.update(struct.pack("<q", int(value)))
+
+
+def _rectangular_rows_overlap(
     *,
-    kv_len: int,
-    capture_row: int,
-    out_capture_scores: Optional[torch.Tensor],
-    out_kv_len_per_capture_row_i32: Optional[torch.Tensor],
-) -> int:
-    effective_kv_len = max(0, int(kv_len))
-    if (
-        isinstance(out_kv_len_per_capture_row_i32, torch.Tensor)
-        and 0 <= int(capture_row) < int(out_kv_len_per_capture_row_i32.numel())
-    ):
-        effective_kv_len = min(
-            effective_kv_len,
-            max(0, int(out_kv_len_per_capture_row_i32[int(capture_row)].item())),
+    row_indices: Sequence[int],
+    seq_stride: int,
+    head_stride: int,
+    row_stride: int,
+    head_count: int,
+    row_counts: Sequence[int],
+    token_counts: Sequence[int],
+) -> bool:
+    """Exact overlap test for ABI rectangles with unit token stride."""
+
+    for left in range(len(row_indices)):
+        for right in range(left + 1, len(row_indices)):
+            if int(row_indices[left]) == int(row_indices[right]):
+                return True
+            seq_delta = int(row_indices[right]) - int(row_indices[left])
+            base = seq_delta * int(seq_stride)
+            token_lower = -(int(token_counts[right]) - 1)
+            token_upper = int(token_counts[left]) - 1
+            row_delta_min = -(int(row_counts[left]) - 1)
+            row_delta_max = int(row_counts[right]) - 1
+            for head_delta in range(-(int(head_count) - 1), int(head_count)):
+                head_base = base + head_delta * int(head_stride)
+                first_row_delta = max(
+                    row_delta_min,
+                    -((-(token_lower - head_base)) // int(row_stride)),
+                )
+                last_row_delta = min(
+                    row_delta_max,
+                    (token_upper - head_base) // int(row_stride),
+                )
+                if first_row_delta <= last_row_delta:
+                    return True
+    return False
+
+
+def _log_f_admission_identity(
+    admission: _LogFReduceAdmission,
+    *,
+    route: str,
+    reason: str,
+    resident_k_bucket: Optional[int],
+) -> str:
+    """Hash the small canonical contract without pointers or tensor reprs."""
+
+    digest = hashlib.sha256()
+    digest.update(b"sfi.selector_log_f.admission.v2\0")
+    _digest_text(digest, SELECTOR_LOG_S_EXTENSION_NAME)
+    _digest_text(digest, route)
+    _digest_text(digest, reason)
+    digest.update(
+        struct.pack(
+            "<qd??",
+            -1 if resident_k_bucket is None else int(resident_k_bucket),
+            float(admission.alpha),
+            bool(admission.cpu_authority_validated),
+            bool(admission.local_same_device),
         )
-    if isinstance(out_capture_scores, torch.Tensor) and out_capture_scores.dim() >= 4:
-        effective_kv_len = min(effective_kv_len, int(out_capture_scores.shape[-1]))
-    return effective_kv_len
+    )
+    _digest_i64_sequence(digest, admission.capability)
+    _digest_i64_sequence(digest, admission.scratch_row_indices)
+    _digest_i64_sequence(digest, admission.output_row_indices)
+    digest.update(struct.pack("<I", len(admission.meta_i32_rows)))
+    for row in admission.meta_i32_rows:
+        _digest_i64_sequence(digest, row)
+    for name, layout in (
+        ("scratch", admission.scratch),
+        ("output", admission.output),
+        ("denom", admission.denom),
+    ):
+        _digest_text(digest, name)
+        _digest_text(digest, layout.device_type)
+        _digest_text(digest, str(layout.dtype))
+        _digest_i64_sequence(digest, layout.shape)
+        _digest_i64_sequence(digest, layout.stride)
+        digest.update(b"\x01" if layout.is_contiguous else b"\x00")
+    return digest.hexdigest()
+
+
+def _log_f_r2_resident_bucket_for_meta(
+    meta_i32_rows: Sequence[Sequence[int]],
+) -> Optional[int]:
+    """Choose a loop ceiling without treating bucket padding as logical K."""
+    if not meta_i32_rows:
+        return None
+    logical_k_max = 0
+    for raw_row in meta_i32_rows:
+        if len(raw_row) < 10:
+            return None
+        row = tuple(int(value) for value in raw_row)
+        logical_k = row[0]
+        scratch_head_stride = row[1]
+        out_head_stride = row[6]
+        scratch_row_stride = row[7]
+        if not (
+            # The resident two-pass owner stores two fp32 row LSE values in
+            # the first four half slots until pass two overwrites them.
+            logical_k >= 4
+            and row[2] == 2
+            and row[3] == 0
+            and row[4] == logical_k
+            and row[5] == 8
+            and scratch_row_stride >= logical_k
+            and scratch_head_stride == 2 * scratch_row_stride
+            and out_head_stride >= logical_k
+            and row[8] == 0
+            and row[9] == 0
+        ):
+            return None
+        logical_k_max = max(logical_k_max, logical_k)
+    return next(
+        (
+            bucket
+            for bucket in _LOG_F_R2_RESIDENT_BUCKETS
+            if logical_k_max <= bucket
+        ),
+        None,
+    )
+
+
+def _log_f_r2_tiled_resource_reasons(
+    *,
+    meta_i32_rows: Sequence[Sequence[int]],
+    num_query_heads: int,
+) -> tuple[str, ...]:
+    """Return structural capacity failures for the portable tiled owner."""
+
+    if not meta_i32_rows:
+        return ("row_capacity",)
+    num_rows = len(meta_i32_rows)
+    num_heads = int(num_query_heads)
+    logical_k_max = max(int(row[0]) for row in meta_i32_rows)
+    n_capacity = _tiled_n_capacity(num_rows)
+    k_capacity = _tiled_k_capacity(logical_k_max)
+
+    from utils import selector_log_s_ext
+
+    tile_k = int(selector_log_s_ext.LOG_F_R2_TILED_TILE_K)
+    tile_capacity = k_capacity // tile_k
+    reasons: list[str] = []
+    if n_capacity > 65_535:
+        reasons.append("row_capacity")
+    if num_heads <= 0 or num_heads > 65_535:
+        reasons.append("head_capacity")
+    if k_capacity > _LOG_F_META_I32_MAX or tile_capacity > 65_535:
+        reasons.append("k_capacity")
+
+    workspace_words = n_capacity * num_heads * (7 * tile_capacity + 4)
+    if workspace_words > _LOG_F_WORKSPACE_I64_MAX_BYTES // 4:
+        reasons.append("workspace_capacity")
+
+    max_blocks = num_rows * num_heads * 2 * tile_capacity
+    if max_blocks > _LOG_F_PORTABLE_GRID_X_MAX:
+        reasons.append("grid_x_capacity")
+    return tuple(reasons)
+
+
+def _resolve_log_f_reduce_dispatch(
+    admission: _LogFReduceAdmission,
+) -> _LogFReduceDispatch:
+    """Resolve one total valid route; malformed production contracts fail closed."""
+
+    if not bool(admission.cpu_authority_validated):
+        _selector_log_f_contract_error(
+            "CPU_AUTHORITY",
+            "validated replicated CPU row truth is required",
+        )
+    rows = admission.meta_i32_rows
+    if not rows:
+        _selector_log_f_contract_error("META", "gt1 metadata must be non-empty")
+    if not math.isfinite(float(admission.alpha)):
+        _selector_log_f_contract_error("ALPHA", "alpha must be finite")
+    if len(admission.capability) != 2 or any(
+        isinstance(value, bool) or int(value) < 0 for value in admission.capability
+    ):
+        _selector_log_f_contract_error(
+            "CAPABILITY",
+            f"invalid CUDA capability {admission.capability!r}",
+        )
+
+    scratch = admission.scratch
+    output = admission.output
+    denom = admission.denom
+    if not bool(admission.local_same_device):
+        _selector_log_f_contract_error(
+            "DEVICE",
+            "scratch/output/denom must share one local CUDA device",
+        )
+    if {scratch.device_type, output.device_type, denom.device_type} != {"cuda"}:
+        _selector_log_f_contract_error(
+            "DEVICE",
+            "scratch/output/denom must share a CUDA device type",
+        )
+    if len(scratch.shape) != 4 or len(scratch.stride) != 4:
+        _selector_log_f_contract_error("SCRATCH_LAYOUT", "scratch must be rank-4")
+    if len(output.shape) != 4 or len(output.stride) != 4:
+        _selector_log_f_contract_error("OUTPUT_LAYOUT", "output must be rank-4")
+    if len(denom.shape) != 2 or len(denom.stride) != 2:
+        _selector_log_f_contract_error("DENOM_LAYOUT", "denom must be rank-2")
+    if scratch.dtype not in {torch.float16, torch.float32}:
+        _selector_log_f_contract_error(
+            "SCRATCH_DTYPE",
+            f"generic ABI supports only float16/float32, got {scratch.dtype}",
+        )
+    if output.dtype not in {torch.float16, torch.float32}:
+        _selector_log_f_contract_error(
+            "OUTPUT_DTYPE",
+            f"generic ABI supports only float16/float32, got {output.dtype}",
+        )
+    if denom.dtype != torch.float32:
+        _selector_log_f_contract_error(
+            "DENOM_DTYPE",
+            f"denom pointer ABI requires float32, got {denom.dtype}",
+        )
+    if scratch.stride[3] != 1 or output.stride[3] != 1 or denom.stride[1] != 1:
+        _selector_log_f_contract_error(
+            "TOKEN_STRIDE",
+            "token and denominator head strides must be one",
+        )
+    if any(int(scratch.stride[index]) <= 0 for index in (0, 1, 2)):
+        _selector_log_f_contract_error(
+            "SCRATCH_LAYOUT",
+            "scratch sequence, head, and row strides must be positive",
+        )
+    if any(int(output.stride[index]) <= 0 for index in (0, 1)):
+        _selector_log_f_contract_error(
+            "OUTPUT_LAYOUT",
+            "output sequence and head strides must be positive",
+        )
+    if int(denom.stride[0]) <= 0:
+        _selector_log_f_contract_error(
+            "DENOM_LAYOUT",
+            "denominator sequence stride must be positive",
+        )
+    if min(scratch.shape) <= 0 or min(output.shape) <= 0 or min(denom.shape) <= 0:
+        _selector_log_f_contract_error("CAPACITY", "tensor shapes must be positive")
+    if output.shape[2] != 1:
+        _selector_log_f_contract_error("OUTPUT_WINDOW", "output window must equal one")
+    if len(admission.scratch_row_indices) != len(rows) or len(
+        admission.output_row_indices
+    ) != len(rows):
+        _selector_log_f_contract_error(
+            "CPU_AUTHORITY_SHAPE",
+            "scratch and output row indices must align with metadata rows",
+        )
+    if any(
+        index < 0 or index >= scratch.shape[0]
+        for index in admission.scratch_row_indices
+    ):
+        _selector_log_f_contract_error(
+            "ROW_CAPACITY",
+            "scratch row indices exceed tensor capacity",
+        )
+    if any(
+        index < 0
+        or index >= output.shape[0]
+        or index >= denom.shape[0]
+        for index in admission.output_row_indices
+    ):
+        _selector_log_f_contract_error(
+            "ROW_CAPACITY",
+            "output row indices exceed output or denominator capacity",
+        )
+    if len(set(admission.scratch_row_indices)) != len(
+        admission.scratch_row_indices
+    ):
+        _selector_log_f_contract_error(
+            "SCRATCH_SEQ_OVERLAP",
+            "metadata rows must own distinct scratch rows",
+        )
+    if len(set(admission.output_row_indices)) != len(
+        admission.output_row_indices
+    ):
+        _selector_log_f_contract_error(
+            "OUTPUT_SEQ_OVERLAP",
+            "metadata rows must own distinct output rows",
+        )
+    if scratch.shape[0] < len(rows) or output.shape[0] < len(rows) or denom.shape[0] < len(rows):
+        _selector_log_f_contract_error(
+            "ROW_CAPACITY",
+            "scratch/output/denom rows must cover metadata rows",
+        )
+    if output.shape[1] < scratch.shape[1] or denom.shape[1] < scratch.shape[1]:
+        _selector_log_f_contract_error(
+            "HEAD_CAPACITY",
+            "output/denom heads must cover scratch heads",
+        )
+    for row_index, row in enumerate(rows):
+        if len(row) != 10:
+            _selector_log_f_contract_error(
+                "META_WIDTH",
+                f"row {row_index} must have exactly 10 columns",
+            )
+        if any(
+            int(value) < _LOG_F_META_I32_MIN
+            or int(value) > _LOG_F_META_I32_MAX
+            for value in row
+        ):
+            _selector_log_f_contract_error(
+                "META_INT32",
+                f"row {row_index} contains a value outside the int32 ABI",
+            )
+        logical_k = int(row[0])
+        last_n = int(row[2])
+        flags = int(row[5])
+        if logical_k <= 0:
+            _selector_log_f_contract_error(
+                "LOGICAL_K",
+                f"row {row_index} logical K must be positive",
+            )
+        if logical_k > scratch.shape[3] or logical_k > output.shape[3]:
+            _selector_log_f_contract_error(
+                "K_CAPACITY",
+                f"row {row_index} logical K exceeds scratch/output capacity",
+            )
+        if last_n < 1 or last_n > 16 or last_n > scratch.shape[2]:
+            _selector_log_f_contract_error(
+                "ROW_COUNT",
+                f"row {row_index} last_n is outside the kernel ABI",
+            )
+        if int(row[3]) != 0 or int(row[4]) != logical_k:
+            _selector_log_f_contract_error(
+                "META_RANGE",
+                f"row {row_index} must cover canonical [0, logical_k)",
+            )
+        if flags not in {8, 24}:
+            _selector_log_f_contract_error(
+                "FLAGS",
+                f"row {row_index} flags must be exactly 8 or 24",
+            )
+        if int(row[1]) != scratch.stride[1] or int(row[7]) != scratch.stride[2]:
+            _selector_log_f_contract_error(
+                "SCRATCH_STRIDE",
+                f"row {row_index} scratch metadata disagrees with tensor layout",
+            )
+        if int(row[6]) != output.stride[1]:
+            _selector_log_f_contract_error(
+                "OUTPUT_STRIDE",
+                f"row {row_index} output metadata disagrees with tensor layout",
+            )
+        scratch_head_extent = (last_n - 1) * scratch.stride[2] + logical_k
+        if scratch.stride[2] < logical_k or scratch.stride[1] < scratch_head_extent:
+            _selector_log_f_contract_error(
+                "SCRATCH_HEAD_OVERLAP",
+                f"row {row_index} scratch rows or heads overlap",
+            )
+        if output.stride[1] < logical_k:
+            _selector_log_f_contract_error(
+                "OUTPUT_HEAD_OVERLAP",
+                f"row {row_index} output heads overlap",
+            )
+        accum_prev_rows = int(row[8])
+        accum_prev_capacity = int(row[9])
+        if flags == 8 and (accum_prev_rows != 0 or accum_prev_capacity != 0):
+            _selector_log_f_contract_error(
+                "ACCUM_META",
+                f"row {row_index} non-accumulating fields must be zero",
+            )
+        if flags == 24 and (
+            accum_prev_rows < 0
+            or accum_prev_capacity < 0
+            or (accum_prev_rows == 0 and accum_prev_capacity != 0)
+            or (
+                accum_prev_rows > 0
+                and not 0 < accum_prev_capacity <= logical_k
+            )
+            or accum_prev_capacity > output.shape[3]
+        ):
+            _selector_log_f_contract_error(
+                "ACCUM_META",
+                f"row {row_index} accumulating fields are inconsistent",
+            )
+
+    row_counts = tuple(int(row[2]) for row in rows)
+    token_counts = tuple(int(row[0]) for row in rows)
+    if _rectangular_rows_overlap(
+        row_indices=admission.scratch_row_indices,
+        seq_stride=scratch.stride[0],
+        head_stride=scratch.stride[1],
+        row_stride=scratch.stride[2],
+        head_count=scratch.shape[1],
+        row_counts=row_counts,
+        token_counts=token_counts,
+    ):
+        _selector_log_f_contract_error(
+            "SCRATCH_SEQ_OVERLAP",
+            "scratch sequence rectangles overlap",
+        )
+    unit_rows = (1,) * len(rows)
+    if _rectangular_rows_overlap(
+        row_indices=admission.output_row_indices,
+        seq_stride=output.stride[0],
+        head_stride=output.stride[1],
+        row_stride=1,
+        head_count=scratch.shape[1],
+        row_counts=unit_rows,
+        token_counts=token_counts,
+    ):
+        _selector_log_f_contract_error(
+            "OUTPUT_SEQ_OVERLAP",
+            "output sequence rectangles overlap",
+        )
+    if _rectangular_rows_overlap(
+        row_indices=admission.output_row_indices,
+        seq_stride=denom.stride[0],
+        head_stride=denom.stride[1],
+        row_stride=1,
+        head_count=scratch.shape[1],
+        row_counts=unit_rows,
+        token_counts=unit_rows,
+    ):
+        _selector_log_f_contract_error(
+            "DENOM_SEQ_OVERLAP",
+            "denominator sequence rows overlap",
+        )
+
+    capability = tuple(int(value) for value in admission.capability)
+    resident_k_bucket: Optional[int] = None
+    if scratch.dtype != torch.float16 or output.dtype != torch.float16:
+        route = _LOG_F_GENERIC_ROUTE
+        reason = _LOG_F_GENERIC_DTYPE_REASON
+    elif not (
+        scratch.is_contiguous and output.is_contiguous and denom.is_contiguous
+    ):
+        route = _LOG_F_GENERIC_ROUTE
+        reason = _LOG_F_GENERIC_LAYOUT_REASON
+    elif float(admission.alpha) != 0.5:
+        route = _LOG_F_GENERIC_ROUTE
+        reason = _LOG_F_GENERIC_ALPHA_REASON
+    elif any(
+        int(row[2]) != 2
+        and not (int(row[5]) == 24 and int(row[2]) == 1)
+        for row in rows
+    ):
+        route = _LOG_F_GENERIC_ROUTE
+        reason = _LOG_F_GENERIC_ROW_COUNT_REASON
+    else:
+        accumulating = any(int(row[5]) == 24 for row in rows)
+        resident_candidate = None
+        if not accumulating:
+            resident_candidate = _log_f_r2_resident_bucket_for_meta(rows)
+        all_large_k = all(
+            int(row[0]) > _LOG_F_R2_TILED_MIN_K_EXCLUSIVE for row in rows
+        )
+        if accumulating and not all_large_k:
+            route = _LOG_F_GENERIC_ROUTE
+            reason = _LOG_F_GENERIC_ACCUM_REASON
+        elif all_large_k:
+            tiled_resource_reasons = _log_f_r2_tiled_resource_reasons(
+                meta_i32_rows=rows,
+                num_query_heads=int(scratch.shape[1]),
+            )
+            if tiled_resource_reasons:
+                route = _LOG_F_GENERIC_ROUTE
+                reason = _LOG_F_GENERIC_RESOURCE_REASON
+            else:
+                route = _LOG_F_R2_TILED_ROUTE
+                reason = _LOG_F_TILED_REASON
+        elif resident_candidate is not None and capability == (8, 0):
+            resident_k_bucket = resident_candidate
+            route = _LOG_F_R2_RESIDENT_ROUTE
+            reason = _LOG_F_RESIDENT_REASON
+        elif resident_candidate is not None:
+            route = _LOG_F_GENERIC_ROUTE
+            reason = _LOG_F_GENERIC_ARCH_REASON
+        else:
+            route = _LOG_F_GENERIC_ROUTE
+            reason = _LOG_F_GENERIC_K_RANGE_REASON
+
+    identity = _log_f_admission_identity(
+        admission,
+        route=route,
+        reason=reason,
+        resident_k_bucket=resident_k_bucket,
+    )
+    return _LogFReduceDispatch(
+        route=route,
+        reason=reason,
+        resident_k_bucket=resident_k_bucket,
+        admission_identity=identity,
+    )
+
+
+def _record_log_f_reduce_route(
+    cache_owner: Optional[object],
+    route: str,
+    *,
+    dispatch_reason: Optional[str] = None,
+    admission_identity: str = "none",
+    event_epoch: int = -1,
+    event_layer: int = -1,
+    event_handle_id: int = _LOG_F_DIRECT_EVENT_SENTINEL,
+    event_handle_generation: int = _LOG_F_DIRECT_EVENT_SENTINEL,
+) -> None:
+    global _PROCESS_LOG_F_LAST_ROUTE
+    global _PROCESS_LOG_F_LAST_DISPATCH_REASON
+    global _PROCESS_LOG_F_LAST_ADMISSION_IDENTITY
+    global _PROCESS_LOG_F_ADMISSION_EVENT_COUNT
+    global _PROCESS_LOG_F_ADMISSION_CHAIN_SHA256
+
+    route = str(route)
+    if route not in SELECTOR_LOG_F_ROUTES:
+        raise ValueError(f"unknown selector log_f route: {route!r}")
+    if dispatch_reason is None:
+        raise ValueError("selector log_f dispatch reason is required")
+    dispatch_reason = str(dispatch_reason)
+    if not dispatch_reason or dispatch_reason == "none":
+        raise ValueError("selector log_f dispatch reason must be concrete")
+    if admission_identity != "none" and (
+        len(admission_identity) != 64
+        or any(ch not in "0123456789abcdef" for ch in admission_identity)
+    ):
+        raise ValueError("selector admission identity must be a lowercase sha256")
+    event_handle_id = int(event_handle_id)
+    event_handle_generation = int(event_handle_generation)
+    direct_event = (
+        event_handle_id == _LOG_F_DIRECT_EVENT_SENTINEL
+        and event_handle_generation == _LOG_F_DIRECT_EVENT_SENTINEL
+    )
+    if not direct_event and (
+        event_handle_id < 0 or event_handle_generation < 0
+    ):
+        raise ValueError(
+            "selector event handle and generation must both be non-negative, "
+            "or both use the direct-event sentinel"
+        )
+
+    _PROCESS_LOG_F_ROUTE_COUNTS[route] = int(
+        _PROCESS_LOG_F_ROUTE_COUNTS[route]
+    ) + 1
+    _PROCESS_LOG_F_LAST_ROUTE = route
+    _PROCESS_LOG_F_LAST_DISPATCH_REASON = dispatch_reason
+    _PROCESS_LOG_F_LAST_ADMISSION_IDENTITY = admission_identity
+    event_digest = hashlib.sha256()
+    event_digest.update(b"sfi.selector_log_f.admission_chain.v2\0")
+    event_digest.update(bytes.fromhex(_PROCESS_LOG_F_ADMISSION_CHAIN_SHA256))
+    event_digest.update(
+        struct.pack(
+            "<qqqq",
+            int(event_epoch),
+            int(event_layer),
+            event_handle_id,
+            event_handle_generation,
+        )
+    )
+    _digest_text(event_digest, "direct" if direct_event else "job")
+    _digest_text(event_digest, route)
+    _digest_text(event_digest, dispatch_reason)
+    _digest_text(event_digest, admission_identity)
+    _PROCESS_LOG_F_ADMISSION_CHAIN_SHA256 = event_digest.hexdigest()
+    _PROCESS_LOG_F_ADMISSION_EVENT_COUNT += 1
+    if cache_owner is None:
+        return
+    counts = getattr(cache_owner, "_selector_log_f_reduce_route_counts", None)
+    if not isinstance(counts, dict):
+        counts = {}
+        setattr(cache_owner, "_selector_log_f_reduce_route_counts", counts)
+    counts[route] = int(counts.get(route, 0)) + 1
+    setattr(cache_owner, "_selector_log_f_reduce_last_route", route)
+    setattr(
+        cache_owner,
+        "_selector_log_f_reduce_last_dispatch_reason",
+        dispatch_reason,
+    )
+    setattr(
+        cache_owner,
+        "_selector_log_f_reduce_last_admission_identity",
+        admission_identity,
+    )
+
+
+def reset_selector_log_s_runtime_proof_counters() -> None:
+    """Reset only process-local selector counters at the measurement barrier."""
+
+    global _PROCESS_LOG_F_LAST_ROUTE
+    global _PROCESS_LOG_F_LAST_DISPATCH_REASON
+    global _PROCESS_LOG_F_LAST_ADMISSION_IDENTITY
+    global _PROCESS_LOG_F_ADMISSION_EVENT_COUNT
+    global _PROCESS_LOG_F_ADMISSION_CHAIN_SHA256
+    global _PROCESS_TILED_COHORT_COUNT
+    global _PROCESS_TILED_JOB_COUNT
+    global _PROCESS_TILED_DIRECT_COUNT
+    global _PROCESS_TILED_KERNEL_LAUNCH_COUNT
+    global _PROCESS_TILED_ADMISSION_FAILURE_COUNT
+
+    for route in SELECTOR_LOG_F_ROUTES:
+        _PROCESS_LOG_F_ROUTE_COUNTS[route] = 0
+    _PROCESS_LOG_F_LAST_ROUTE = "none"
+    _PROCESS_LOG_F_LAST_DISPATCH_REASON = "none"
+    _PROCESS_LOG_F_LAST_ADMISSION_IDENTITY = "none"
+    _PROCESS_LOG_F_ADMISSION_EVENT_COUNT = 0
+    _PROCESS_LOG_F_ADMISSION_CHAIN_SHA256 = _LOG_F_ADMISSION_CHAIN_ZERO
+    _PROCESS_TILED_COHORT_COUNT = 0
+    _PROCESS_TILED_JOB_COUNT = 0
+    _PROCESS_TILED_DIRECT_COUNT = 0
+    _PROCESS_TILED_KERNEL_LAUNCH_COUNT = 0
+    _PROCESS_TILED_ADMISSION_FAILURE_COUNT = 0
+
+
+def _reject_retired_selector_log_f_tp8_exact_env() -> None:
+    raw = os.environ.get(SELECTOR_LOG_F_RETIRED_TP8_EXACT_ENV, "")
+    if raw not in {"", "0"}:
+        raise RuntimeError(
+            "E_RETIRED_SELECTOR_LOG_F_TP8_EXACT_ENV: "
+            f"unset {SELECTOR_LOG_F_RETIRED_TP8_EXACT_ENV}; the dynamic tiled "
+            "route is selected from the validated request contract"
+        )
+
+
+def snapshot_selector_log_s_runtime_proof() -> dict[str, object]:
+    """Bind capture-route evidence to the already-loaded worker-local .so."""
+    _reject_retired_selector_log_f_tp8_exact_env()
+    from utils import selector_log_s_ext
+
+    module = selector_log_s_ext._MODULE
+    extension_name = SELECTOR_LOG_S_EXTENSION_NAME
+    required_symbol = SELECTOR_LOG_S_REQUIRED_TILED_SYMBOL
+    if module is None:
+        raise RuntimeError(
+            "E_SELECTOR_LOG_S_PROOF_MODULE_NOT_LOADED: warmup did not load "
+            f"{extension_name}"
+        )
+    symbol = getattr(module, required_symbol, None)
+    if not callable(symbol):
+        raise RuntimeError(
+            "E_SELECTOR_LOG_S_PROOF_SYMBOL_MISSING: "
+            f"{required_symbol}"
+        )
+    semantic_identity_fn = getattr(
+        module, SELECTOR_LOG_S_SEMANTIC_IDENTITY_SYMBOL, None
+    )
+    if not callable(semantic_identity_fn):
+        raise RuntimeError(
+            "E_SELECTOR_LOG_S_PROOF_SEMANTIC_SYMBOL_MISSING: "
+            f"{SELECTOR_LOG_S_SEMANTIC_IDENTITY_SYMBOL}"
+        )
+    try:
+        semantic_identity = semantic_identity_fn()
+    except Exception as exc:
+        raise RuntimeError(
+            "E_SELECTOR_LOG_S_PROOF_SEMANTIC_QUERY_FAILED"
+        ) from exc
+    if (
+        type(semantic_identity) is not str
+        or semantic_identity != SELECTOR_LOG_S_SEMANTIC_IDENTITY
+    ):
+        raise RuntimeError(
+            "E_SELECTOR_LOG_S_PROOF_SEMANTIC_IDENTITY_MISMATCH: "
+            f"actual={semantic_identity!r}:"
+            f"expected={SELECTOR_LOG_S_SEMANTIC_IDENTITY!r}"
+        )
+    raw_path = Path(str(getattr(module, "__file__", "") or ""))
+    if raw_path.is_symlink():
+        raise RuntimeError(
+            f"E_SELECTOR_LOG_S_PROOF_SYMLINK: {raw_path}"
+        )
+    try:
+        module_path = raw_path.resolve(strict=True)
+        stat_result = module_path.stat()
+    except OSError as exc:
+        raise RuntimeError(
+            f"E_SELECTOR_LOG_S_PROOF_ARTIFACT_MISSING: {raw_path}"
+        ) from exc
+    if not module_path.is_file() or stat_result.st_size <= 0:
+        raise RuntimeError(
+            f"E_SELECTOR_LOG_S_PROOF_ARTIFACT_INVALID: {module_path}"
+        )
+    digest = hashlib.sha256()
+    with module_path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    module_sha256 = digest.hexdigest()
+    module_name = str(getattr(module, "__name__", "") or "")
+    module_signature = selector_log_s_module_signature(
+        extension_name=extension_name,
+        module_name=module_name,
+        module_path=str(module_path),
+        module_sha256=module_sha256,
+        module_size_bytes=int(stat_result.st_size),
+        required_symbol=required_symbol,
+        semantic_identity_symbol=SELECTOR_LOG_S_SEMANTIC_IDENTITY_SYMBOL,
+        semantic_identity=semantic_identity,
+    )
+    return {
+        "schema": SELECTOR_LOG_S_RUNTIME_PROOF_SCHEMA,
+        "counter_semantics": SELECTOR_LOG_F_COUNTER_SEMANTICS,
+        "extension_name": extension_name,
+        "module_name": module_name,
+        "module_path": str(module_path),
+        "module_sha256": module_sha256,
+        "module_size_bytes": int(stat_result.st_size),
+        "required_symbol": required_symbol,
+        "required_symbol_present": True,
+        "semantic_identity_symbol": SELECTOR_LOG_S_SEMANTIC_IDENTITY_SYMBOL,
+        "semantic_identity": semantic_identity,
+        "module_signature": module_signature,
+        "last_route": _PROCESS_LOG_F_LAST_ROUTE,
+        "last_dispatch_reason": _PROCESS_LOG_F_LAST_DISPATCH_REASON,
+        "last_admission_identity": _PROCESS_LOG_F_LAST_ADMISSION_IDENTITY,
+        "admission_event_count": int(_PROCESS_LOG_F_ADMISSION_EVENT_COUNT),
+        "admission_chain_sha256": _PROCESS_LOG_F_ADMISSION_CHAIN_SHA256,
+        "route_counts": {
+            route: int(_PROCESS_LOG_F_ROUTE_COUNTS.get(route, 0))
+            for route in SELECTOR_LOG_F_ROUTES
+        },
+        "tiled_cohort_count": int(_PROCESS_TILED_COHORT_COUNT),
+        "tiled_job_count": int(_PROCESS_TILED_JOB_COUNT),
+        "tiled_direct_count": int(_PROCESS_TILED_DIRECT_COUNT),
+        "tiled_kernel_launch_count": int(_PROCESS_TILED_KERNEL_LAUNCH_COUNT),
+        "tiled_admission_failure_count": int(
+            _PROCESS_TILED_ADMISSION_FAILURE_COUNT
+        ),
+    }
+
+
+
+
+
+
+
+
+
+
 
 
 def _resolve_phase_output_kv_len_cpu(
@@ -56,6 +925,44 @@ def _resolve_phase_output_kv_len_cpu(
     if isinstance(out_capture_scores, torch.Tensor) and out_capture_scores.dim() >= 4:
         effective_kv_len = min(effective_kv_len, int(out_capture_scores.shape[-1]))
     return effective_kv_len
+
+
+def _canonical_cpu_values(
+    name: str,
+    values: object,
+    *,
+    as_bool: bool = False,
+) -> tuple[int | bool, ...]:
+    """Canonicalize replicated host truth without ever reading a CUDA scalar."""
+
+    if values is None:
+        _selector_log_f_contract_error(
+            "CPU_AUTHORITY",
+            f"{name} must be supplied by the CPU authority",
+        )
+    if isinstance(values, torch.Tensor):
+        _selector_log_f_contract_error(
+            "CPU_AUTHORITY_TYPE",
+            f"{name} must be an immutable host sequence, not a tensor",
+        )
+    try:
+        raw_values = tuple(values)  # type: ignore[arg-type]
+    except TypeError as exc:
+        raise RuntimeError(
+            f"E_SELECTOR_LOG_F_CPU_AUTHORITY_TYPE: {name} must be a host sequence"
+        ) from exc
+    if any(isinstance(value, torch.Tensor) for value in raw_values):
+        _selector_log_f_contract_error(
+            "CPU_AUTHORITY_TYPE",
+            f"{name} must not contain tensor scalars",
+        )
+    caster = bool if as_bool else int
+    try:
+        return tuple(caster(value) for value in raw_values)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise RuntimeError(
+            f"E_SELECTOR_LOG_F_CPU_AUTHORITY_VALUE: {name} contains invalid values"
+        ) from exc
 
 
 
@@ -229,30 +1136,472 @@ def _stage_meta_rows(
     return gpu_stage
 
 
-def _select_phase_outputs(
-    *,
-    batch_row: int,
-    row_is_prefill_producer: torch.Tensor,
-    active_capture_row_by_batch_row_i32: torch.Tensor,
-    prefill_out_capture_scores: Optional[torch.Tensor],
-    prefill_out_log_f_denoms: Optional[torch.Tensor],
-    refresh_out_capture_scores: Optional[torch.Tensor],
-    refresh_out_log_f_denoms: Optional[torch.Tensor],
-) -> tuple[int, torch.Tensor, torch.Tensor]:
-    if bool(row_is_prefill_producer[batch_row].item()):
-        if prefill_out_capture_scores is None or prefill_out_log_f_denoms is None:
-            raise ValueError("prefill producer rows require prefill output tensors")
-        capture_row = int(active_capture_row_by_batch_row_i32[batch_row].item())
-        if capture_row < 0:
-            raise ValueError("prefill producer row is missing prefill capture row mapping")
-        return capture_row, prefill_out_capture_scores, prefill_out_log_f_denoms
+def _tiled_k_capacity(logical_k: int) -> int:
+    from utils import selector_log_s_ext
 
-    if refresh_out_capture_scores is None or refresh_out_log_f_denoms is None:
-        raise ValueError("decode producer rows require refresh output tensors")
-    capture_row = int(active_capture_row_by_batch_row_i32[batch_row].item())
-    if capture_row < 0:
-        raise ValueError("decode producer row is missing refresh capture row mapping")
-    return capture_row, refresh_out_capture_scores, refresh_out_log_f_denoms
+    logical_k = int(logical_k)
+    if logical_k <= 0:
+        raise ValueError("tiled logical K capacity must be positive")
+    tile_k = int(selector_log_s_ext.LOG_F_R2_TILED_TILE_K)
+    return ((logical_k + tile_k - 1) // tile_k) * tile_k
+
+
+def _tiled_n_capacity(num_rows: int) -> int:
+    num_rows = int(num_rows)
+    if num_rows <= 0:
+        raise ValueError("tiled row capacity must be positive")
+    return 1 << (num_rows - 1).bit_length()
+
+
+def plan_tiled_capture_postprocess_resources(
+    *,
+    slot_count: int,
+    num_rows_capacity: int,
+    num_query_heads: int,
+    logical_k_capacity: int,
+) -> TiledCapturePostprocessResourceReport:
+    """Return the canonical sealed-resource geometry without allocating."""
+
+    from utils import selector_log_s_ext
+
+    slots = int(slot_count)
+    if slots <= 0 or slots > TILED_CAPTURE_POSTPROCESS_MAX_SLOT_COUNT:
+        raise ValueError(
+            "tiled slot_count must be in [1, "
+            f"{TILED_CAPTURE_POSTPROCESS_MAX_SLOT_COUNT}]"
+        )
+    n_capacity = _tiled_n_capacity(num_rows_capacity)
+    h_capacity = int(num_query_heads)
+    if h_capacity <= 0:
+        raise ValueError("tiled head capacity must be positive")
+    k_capacity = _tiled_k_capacity(logical_k_capacity)
+    workspace_bytes = int(
+        selector_log_s_ext.log_f_r2_tiled_workspace_nbytes(
+            num_seqs_capacity=n_capacity,
+            num_query_heads_capacity=h_capacity,
+            logical_k_capacity=k_capacity,
+        )
+    )
+    # Each slot owns [N,10] int32 + [N,4] int64 on host and device.
+    meta_bytes = n_capacity * (10 * 4 + 4 * 8)
+    device_bytes = workspace_bytes + meta_bytes
+    return TiledCapturePostprocessResourceReport(
+        num_rows_capacity=n_capacity,
+        num_query_heads_capacity=h_capacity,
+        logical_k_capacity=k_capacity,
+        slot_count=slots,
+        workspace_bytes_per_slot=workspace_bytes,
+        device_meta_bytes_per_slot=meta_bytes,
+        host_meta_bytes_per_slot=meta_bytes,
+        device_bytes_per_slot=device_bytes,
+        total_workspace_bytes=workspace_bytes * slots,
+        total_device_meta_bytes=meta_bytes * slots,
+        total_host_meta_bytes=meta_bytes * slots,
+        total_device_bytes=device_bytes * slots,
+    )
+
+
+def _tiled_resource_key(
+    *,
+    device: torch.device,
+    stream: torch.cuda.Stream,
+    n_capacity: int,
+    h_capacity: int,
+    k_capacity: int,
+) -> tuple[int, int, int, int, int]:
+    return (
+        -1 if device.index is None else int(device.index),
+        int(stream.cuda_stream),
+        int(n_capacity),
+        int(h_capacity),
+        int(k_capacity),
+    )
+
+
+def _tiled_resource_cache_for_owner_locked(
+    cache_owner: Optional[object],
+) -> dict[tuple[int, int, int, int, int], dict[str, Any]]:
+    if cache_owner is None:
+        return _PROCESS_TILED_RESOURCE_CACHE
+    cache = getattr(cache_owner, "_selector_log_f_r2_tiled_resources", None)
+    if cache is None:
+        cache = {}
+        setattr(cache_owner, "_selector_log_f_r2_tiled_resources", cache)
+    if not isinstance(cache, dict):
+        raise RuntimeError("E_SELECTOR_LOG_F_TILED_RESOURCE_CACHE_DRIFT")
+    return cache
+
+
+def _allocate_tiled_resource_slot(
+    *,
+    device: torch.device,
+    n_capacity: int,
+    h_capacity: int,
+    k_capacity: int,
+) -> dict[str, Any]:
+    from utils import selector_log_s_ext
+
+    return {
+        "cpu_i32": torch.empty(
+            (n_capacity, 10), dtype=torch.int32, device="cpu", pin_memory=True
+        ),
+        "cpu_i64": torch.empty(
+            (n_capacity, 4), dtype=torch.int64, device="cpu", pin_memory=True
+        ),
+        "gpu_i32": torch.empty(
+            (n_capacity, 10), dtype=torch.int32, device=device
+        ),
+        "gpu_i64": torch.empty(
+            (n_capacity, 4), dtype=torch.int64, device=device
+        ),
+        "workspace": selector_log_s_ext.allocate_log_f_r2_tiled_workspace(
+            device,
+            num_seqs_capacity=n_capacity,
+            num_query_heads_capacity=h_capacity,
+            logical_k_capacity=k_capacity,
+        ),
+        "meta_copy_event": torch.cuda.Event(enable_timing=False),
+        "meta_copy_recorded": False,
+        "completion_event": None,
+        "reserved": False,
+    }
+
+
+def prepare_tiled_capture_postprocess_resources(
+    meta_cache_owner: object,
+    device: torch.device,
+    stream: torch.cuda.Stream,
+    slot_count: int,
+    num_rows_capacity: int,
+    num_query_heads: int,
+    logical_k_capacity: int,
+) -> TiledCapturePostprocessResourceReport:
+    """Build and seal the exact profile-stamped tiled resource pool."""
+
+    from utils import selector_log_s_ext
+
+    if meta_cache_owner is None:
+        raise ValueError("sealed tiled resources require an explicit cache owner")
+    device = torch.device(device)
+    if device.type != "cuda":
+        raise ValueError("sealed tiled resources require a CUDA device")
+    report = plan_tiled_capture_postprocess_resources(
+        slot_count=slot_count,
+        num_rows_capacity=num_rows_capacity,
+        num_query_heads=num_query_heads,
+        logical_k_capacity=logical_k_capacity,
+    )
+    key = _tiled_resource_key(
+        device=device,
+        stream=stream,
+        n_capacity=report.num_rows_capacity,
+        h_capacity=report.num_query_heads_capacity,
+        k_capacity=report.logical_k_capacity,
+    )
+    selector_log_s_ext._require_ext(force=True)
+
+    with _PROCESS_TILED_RESOURCE_CACHE_CONDITION:
+        cache = _tiled_resource_cache_for_owner_locked(meta_cache_owner)
+        seal = getattr(
+            meta_cache_owner, "_selector_log_f_r2_tiled_resource_seal", None
+        )
+        if seal is not None:
+            if not isinstance(seal, dict) or seal.get("key") != key:
+                raise RuntimeError(
+                    "E_SELECTOR_LOG_F_TILED_RESOURCE_SEALED_KEY_MISMATCH"
+                )
+            state = cache.get(key)
+            if (
+                seal.get("report") != report
+                or not isinstance(state, dict)
+                or int(state.get("sealed_slot_count", -1)) != report.slot_count
+                or len(state.get("slots", ())) != report.slot_count
+            ):
+                raise RuntimeError("E_SELECTOR_LOG_F_TILED_RESOURCE_SEAL_DRIFT")
+            return report
+        if any(existing_key != key for existing_key in cache):
+            raise RuntimeError("E_SELECTOR_LOG_F_TILED_RESOURCE_PREBUILD_KEY_DRIFT")
+        state = cache.get(key)
+        if state is None:
+            state = {"slots": [], "next": 0}
+            cache[key] = state
+        if not isinstance(state, dict) or not isinstance(state.get("slots"), list):
+            raise RuntimeError("E_SELECTOR_LOG_F_TILED_RESOURCE_STATE_DRIFT")
+        if bool(state.get("prebuilding", False)):
+            raise RuntimeError("E_SELECTOR_LOG_F_TILED_RESOURCE_PREBUILD_REENTRY")
+        slots = state["slots"]
+        if len(slots) > report.slot_count or any(
+            bool(slot.get("reserved", False)) for slot in slots
+        ):
+            raise RuntimeError("E_SELECTOR_LOG_F_TILED_RESOURCE_PREBUILD_STATE")
+        state["prebuilding"] = True
+        setattr(
+            meta_cache_owner,
+            "_selector_log_f_r2_tiled_resource_prebuild_key",
+            key,
+        )
+        missing = report.slot_count - len(slots)
+
+    try:
+        new_slots = tuple(
+            _allocate_tiled_resource_slot(
+                device=device,
+                n_capacity=report.num_rows_capacity,
+                h_capacity=report.num_query_heads_capacity,
+                k_capacity=report.logical_k_capacity,
+            )
+            for _ in range(missing)
+        )
+    except BaseException:
+        with _PROCESS_TILED_RESOURCE_CACHE_CONDITION:
+            state["prebuilding"] = False
+            setattr(
+                meta_cache_owner,
+                "_selector_log_f_r2_tiled_resource_prebuild_key",
+                None,
+            )
+            _PROCESS_TILED_RESOURCE_CACHE_CONDITION.notify_all()
+        raise
+
+    with _PROCESS_TILED_RESOURCE_CACHE_CONDITION:
+        if cache.get(key) is not state or len(state["slots"]) + missing != report.slot_count:
+            state["prebuilding"] = False
+            setattr(
+                meta_cache_owner,
+                "_selector_log_f_r2_tiled_resource_prebuild_key",
+                None,
+            )
+            _PROCESS_TILED_RESOURCE_CACHE_CONDITION.notify_all()
+            raise RuntimeError("E_SELECTOR_LOG_F_TILED_RESOURCE_PREBUILD_RACE")
+        state["slots"].extend(new_slots)
+        state["sealed_slot_count"] = report.slot_count
+        state["prebuilding"] = False
+        setattr(
+            meta_cache_owner,
+            "_selector_log_f_r2_tiled_resource_seal",
+            {"key": key, "report": report},
+        )
+        setattr(
+            meta_cache_owner,
+            "_selector_log_f_r2_tiled_resource_prebuild_key",
+            None,
+        )
+        _PROCESS_TILED_RESOURCE_CACHE_CONDITION.notify_all()
+    return report
+
+
+def _acquire_tiled_resource_slot(
+    *,
+    cache_owner: Optional[object],
+    device: torch.device,
+    stream: torch.cuda.Stream,
+    num_rows: int,
+    num_query_heads: int,
+    logical_k_max: int,
+) -> tuple[dict[str, Any], int, int, int]:
+    """Load and reserve reusable tiled storage before any job is claimed."""
+
+    from utils import selector_log_s_ext
+
+    # Compilation, binary loading and all capacity allocations are intentionally
+    # outside lifecycle locks.  An unavailable optimized owner is a deployment
+    # error, never a reason to mutate a job and then fall back.
+    selector_log_s_ext._require_ext(force=True)
+    actual_rows = int(num_rows)
+    actual_heads = int(num_query_heads)
+    actual_logical_k = int(logical_k_max)
+    if actual_rows <= 0:
+        raise ValueError("tiled row count must be positive")
+    if actual_heads <= 0:
+        raise ValueError("tiled head capacity must be positive")
+    if actual_logical_k <= 0:
+        raise ValueError("tiled logical K must be positive")
+    requested_prefix = (
+        -1 if device.index is None else int(device.index),
+        int(stream.cuda_stream),
+    )
+    with _PROCESS_TILED_RESOURCE_CACHE_CONDITION:
+        cache = _tiled_resource_cache_for_owner_locked(cache_owner)
+        seal = (
+            None
+            if cache_owner is None
+            else getattr(
+                cache_owner, "_selector_log_f_r2_tiled_resource_seal", None
+            )
+        )
+        prebuild_key = (
+            None
+            if cache_owner is None
+            else getattr(
+                cache_owner,
+                "_selector_log_f_r2_tiled_resource_prebuild_key",
+                None,
+            )
+        )
+        if seal is not None:
+            if not isinstance(seal, dict):
+                raise RuntimeError("E_SELECTOR_LOG_F_TILED_RESOURCE_SEAL_DRIFT")
+            report = seal.get("report")
+            key = seal.get("key")
+            if (
+                not isinstance(report, TiledCapturePostprocessResourceReport)
+                or not isinstance(key, tuple)
+                or len(key) != 5
+            ):
+                raise RuntimeError("E_SELECTOR_LOG_F_TILED_RESOURCE_SEAL_DRIFT")
+            n_capacity = report.num_rows_capacity
+            h_capacity = report.num_query_heads_capacity
+            k_capacity = report.logical_k_capacity
+        elif prebuild_key is not None:
+            if not isinstance(prebuild_key, tuple) or len(prebuild_key) != 5:
+                raise RuntimeError("E_SELECTOR_LOG_F_TILED_RESOURCE_SEAL_DRIFT")
+            key = prebuild_key
+            n_capacity, h_capacity, k_capacity = (
+                int(key[2]),
+                int(key[3]),
+                int(key[4]),
+            )
+        else:
+            n_capacity = _tiled_n_capacity(actual_rows)
+            h_capacity = actual_heads
+            k_capacity = _tiled_k_capacity(actual_logical_k)
+            key = _tiled_resource_key(
+                device=device,
+                stream=stream,
+                n_capacity=n_capacity,
+                h_capacity=h_capacity,
+                k_capacity=k_capacity,
+            )
+        if tuple(key[:2]) != requested_prefix:
+            raise RuntimeError(
+                "E_SELECTOR_LOG_F_TILED_RESOURCE_SEALED_KEY_MISMATCH"
+            )
+        if (
+            actual_rows > n_capacity
+            or actual_heads > h_capacity
+            or actual_logical_k > k_capacity
+        ):
+            raise RuntimeError(
+                "E_SELECTOR_LOG_F_TILED_RESOURCE_SEALED_CAPACITY_EXCEEDED"
+            )
+        state = cache.get(key)
+        if state is None:
+            if prebuild_key is not None:
+                raise RuntimeError("E_SELECTOR_LOG_F_TILED_RESOURCE_SLOT_MISSING")
+            state = {"slots": [], "next": 0}
+            cache[key] = state
+        if not isinstance(state, dict) or not isinstance(state.get("slots"), list):
+            raise RuntimeError("E_SELECTOR_LOG_F_TILED_RESOURCE_STATE_DRIFT")
+        while bool(state.get("prebuilding", False)):
+            _PROCESS_TILED_RESOURCE_CACHE_CONDITION.wait()
+        if cache_owner is not None:
+            seal = getattr(
+                cache_owner, "_selector_log_f_r2_tiled_resource_seal", seal
+            )
+        sealed_slot_count = state.get("sealed_slot_count")
+        if seal is not None:
+            report = seal.get("report")
+            if (
+                not isinstance(report, TiledCapturePostprocessResourceReport)
+                or int(sealed_slot_count or -1) != report.slot_count
+                or len(state["slots"]) != report.slot_count
+            ):
+                raise RuntimeError("E_SELECTOR_LOG_F_TILED_RESOURCE_SLOT_MISSING")
+            slot_limit = report.slot_count
+        else:
+            if sealed_slot_count is not None:
+                raise RuntimeError("E_SELECTOR_LOG_F_TILED_RESOURCE_SEAL_DRIFT")
+            slot_limit = _LOG_F_R2_TILED_RESOURCE_RING_DEPTH
+        slots = state["slots"]
+        slot: dict[str, Any] | None = None
+        while slot is None:
+            start = int(state.get("next", 0)) % slot_limit
+            for offset in range(len(slots)):
+                candidate_index = (start + offset) % len(slots)
+                candidate = slots[candidate_index]
+                if bool(candidate.get("reserved", False)):
+                    continue
+                # Device metadata/workspace are stream-owned and this cache key
+                # pins one stream, so enqueue order is the WAR dependency.  Do
+                # not host-wait for the prior four-stage completion.
+                slot = candidate
+                state["next"] = candidate_index + 1
+                break
+            if slot is not None:
+                break
+            if len(slots) >= slot_limit:
+                _PROCESS_TILED_RESOURCE_CACHE_CONDITION.wait()
+                continue
+            # Sealed pools reach this branch only on state corruption, caught
+            # above.  Unsealed/debug owners retain the bounded lazy behavior.
+            slot = _allocate_tiled_resource_slot(
+                device=device,
+                n_capacity=n_capacity,
+                h_capacity=h_capacity,
+                k_capacity=k_capacity,
+            )
+            slots.append(slot)
+            state["next"] = len(slots)
+        slot["reserved"] = True
+        meta_copy_event = slot.get("meta_copy_event")
+        meta_copy_recorded = bool(slot.get("meta_copy_recorded", False))
+    if (
+        meta_copy_recorded
+        and meta_copy_event is not None
+        and not bool(meta_copy_event.query())
+    ):
+        # CPU may rewrite pinned staging only after its previous H2D DMA.  This
+        # event is recorded before the four compute kernels, so the rare host
+        # wait is bounded by metadata copy rather than full cohort completion.
+        meta_copy_event.synchronize()
+    return slot, n_capacity, h_capacity, k_capacity
+
+
+def _stage_tiled_meta_rows(
+    slot: dict[str, Any],
+    *,
+    meta_i32_rows: Sequence[Sequence[int]],
+    meta_i64_rows: Sequence[Sequence[int]],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Bulk-stage one combined cohort into its exclusively reserved slot."""
+
+    row_count = len(meta_i32_rows)
+    if row_count <= 0 or len(meta_i64_rows) != row_count:
+        raise ValueError("tiled metadata rows must be non-empty and aligned")
+    cpu_i32 = slot["cpu_i32"]
+    cpu_i64 = slot["cpu_i64"]
+    gpu_i32 = slot["gpu_i32"]
+    gpu_i64 = slot["gpu_i64"]
+    if row_count > int(cpu_i32.shape[0]) or row_count > int(cpu_i64.shape[0]):
+        raise RuntimeError("E_SELECTOR_LOG_F_TILED_META_CAPACITY_DRIFT")
+    cpu_i32[:row_count].copy_(torch.tensor(meta_i32_rows, dtype=torch.int32))
+    cpu_i64[:row_count].copy_(torch.tensor(meta_i64_rows, dtype=torch.int64))
+    req_meta_i32 = gpu_i32[:row_count]
+    req_meta_i64 = gpu_i64[:row_count]
+    req_meta_i32.copy_(cpu_i32[:row_count], non_blocking=True)
+    req_meta_i64.copy_(cpu_i64[:row_count], non_blocking=True)
+    meta_copy_event = slot.get("meta_copy_event")
+    if meta_copy_event is None:
+        raise RuntimeError("E_SELECTOR_LOG_F_TILED_META_EVENT_MISSING")
+    meta_copy_event.record(torch.cuda.current_stream(device=gpu_i32.device))
+    slot["meta_copy_recorded"] = True
+    return req_meta_i32, req_meta_i64
+
+
+def _mark_tiled_resource_complete(
+    slot: dict[str, Any],
+    *,
+    stream: torch.cuda.Stream,
+) -> torch.cuda.Event:
+    event = torch.cuda.Event(enable_timing=False)
+    event.record(stream)
+    with _PROCESS_TILED_RESOURCE_CACHE_CONDITION:
+        if not bool(slot.get("reserved", False)):
+            raise RuntimeError("E_SELECTOR_LOG_F_TILED_SLOT_NOT_RESERVED")
+        slot["completion_event"] = event
+        slot["reserved"] = False
+        _PROCESS_TILED_RESOURCE_CACHE_CONDITION.notify_all()
+    return event
 
 
 def postprocess_prefill_capture_scores(
@@ -283,6 +1632,7 @@ def postprocess_prefill_capture_scores(
     alpha: float,
     debug_epoch: Optional[int] = None,
     debug_layer_index: Optional[int] = None,
+    proof_job_key: Optional[Sequence[int]] = None,
 ) -> None:
     _validate_prefill_postprocess_inputs(
         scratch_capture_scores=scratch_capture_scores,
@@ -320,138 +1670,231 @@ def postprocess_prefill_capture_scores(
     decode_gt1_rows = []
     lastn1_rows: list[tuple[int, int, int, torch.Tensor, torch.Tensor]] = []
     gt1_prefill_rows: list[tuple[int, int, int, int]] = []
+    prefill_capture_rows_seen: set[int] = set()
+    refresh_capture_rows_seen: set[int] = set()
 
-    producer_rows_tuple = (
-        tuple(int(v) for v in producer_rows_cpu)
-        if producer_rows_cpu is not None
-        else tuple()
+    cpu_truth = (
+        producer_rows_cpu,
+        row_capture_last_n_cpu,
+        row_is_prefill_producer_cpu,
+        seqused_k_cpu,
+        active_capture_row_by_batch_row_cpu,
     )
-    if producer_rows_tuple and len(producer_rows_tuple) != int(producer_rows_i32.numel()):
-        raise ValueError("producer_rows_cpu must align with producer_rows_i32")
-    row_capture_last_n_tuple = (
-        tuple(max(0, int(v)) for v in row_capture_last_n_cpu)
-        if row_capture_last_n_cpu is not None
-        else tuple()
+    if any(values is None for values in cpu_truth):
+        _selector_log_f_contract_error(
+            "CPU_AUTHORITY",
+            "producer rows, row counts, phase flags, K values, and capture rows "
+            "must be supplied by the CPU authority",
+        )
+    producer_rows_tuple = tuple(
+        int(v) for v in _canonical_cpu_values("producer_rows_cpu", producer_rows_cpu)
     )
-    row_is_prefill_tuple = (
-        tuple(bool(v) for v in row_is_prefill_producer_cpu)
-        if row_is_prefill_producer_cpu is not None
-        else tuple()
+    row_capture_last_n_tuple = tuple(
+        int(v)
+        for v in _canonical_cpu_values(
+            "row_capture_last_n_cpu", row_capture_last_n_cpu
+        )
     )
-    seqused_k_tuple = (
-        tuple(max(0, int(v)) for v in seqused_k_cpu)
-        if seqused_k_cpu is not None
-        else tuple()
+    row_is_prefill_tuple = tuple(
+        bool(v)
+        for v in _canonical_cpu_values(
+            "row_is_prefill_producer_cpu",
+            row_is_prefill_producer_cpu,
+            as_bool=True,
+        )
     )
-    active_capture_row_tuple = (
-        tuple(int(v) for v in active_capture_row_by_batch_row_cpu)
-        if active_capture_row_by_batch_row_cpu is not None
-        else tuple()
+    seqused_k_tuple = tuple(
+        int(v) for v in _canonical_cpu_values("seqused_k_cpu", seqused_k_cpu)
     )
+    active_capture_row_tuple = tuple(
+        int(v)
+        for v in _canonical_cpu_values(
+            "active_capture_row_by_batch_row_cpu",
+            active_capture_row_by_batch_row_cpu,
+        )
+    )
+    if prefill_out_kv_len_per_capture_row_cpu is not None:
+        prefill_out_kv_len_per_capture_row_cpu = tuple(
+            int(v)
+            for v in _canonical_cpu_values(
+                "prefill_out_kv_len_per_capture_row_cpu",
+                prefill_out_kv_len_per_capture_row_cpu,
+            )
+        )
+    if refresh_out_kv_len_per_capture_row_cpu is not None:
+        refresh_out_kv_len_per_capture_row_cpu = tuple(
+            int(v)
+            for v in _canonical_cpu_values(
+                "refresh_out_kv_len_per_capture_row_cpu",
+                refresh_out_kv_len_per_capture_row_cpu,
+            )
+        )
+    if len(producer_rows_tuple) != int(producer_rows_i32.numel()):
+        _selector_log_f_contract_error(
+            "CPU_AUTHORITY_SHAPE",
+            "producer_rows_cpu must align exactly with producer_rows_i32",
+        )
+    for name, values in (
+        ("row_capture_last_n_cpu", row_capture_last_n_tuple),
+        ("row_is_prefill_producer_cpu", row_is_prefill_tuple),
+        ("seqused_k_cpu", seqused_k_tuple),
+        ("active_capture_row_by_batch_row_cpu", active_capture_row_tuple),
+    ):
+        if len(values) != batch_size:
+            _selector_log_f_contract_error(
+                "CPU_AUTHORITY_SHAPE",
+                f"{name} must align exactly with batch size",
+            )
+    if len(set(producer_rows_tuple)) != len(producer_rows_tuple):
+        _selector_log_f_contract_error(
+            "CPU_AUTHORITY_VALUE",
+            "producer_rows_cpu must not contain duplicate rows",
+        )
+    if any(value < 0 for value in row_capture_last_n_tuple):
+        _selector_log_f_contract_error(
+            "CPU_AUTHORITY_VALUE",
+            "row_capture_last_n_cpu must be non-negative",
+        )
+    if any(value < 0 for value in seqused_k_tuple):
+        _selector_log_f_contract_error(
+            "CPU_AUTHORITY_VALUE",
+            "seqused_k_cpu must be non-negative",
+        )
     skip_postprocess_rows = (
-        frozenset(int(v) for v in skip_postprocess_rows_cpu)
+        frozenset(
+            int(v)
+            for v in _canonical_cpu_values(
+                "skip_postprocess_rows_cpu", skip_postprocess_rows_cpu
+            )
+        )
         if skip_postprocess_rows_cpu is not None
         else frozenset()
     )
     # [CHUNKED-CAPTURE-ACCUMULATE 2026-07-06] per-row 跨片累计元数据
     # （-1/缺省=非跨片行走原路径）。跨片行必须走 gt1 reduce（accumulate
     # 位路由），含 last_n==1 的尾片——lastn1 裸拷贝的常数平移破坏合并。
+    if (row_capture_accum_prev_rows_cpu is None) != (
+        row_capture_accum_prev_capacity_cpu is None
+    ):
+        _selector_log_f_contract_error(
+            "ACCUM_AUTHORITY",
+            "accumulation row and capacity truth must be supplied together",
+        )
     accum_prev_rows_tuple = (
-        tuple(int(v) for v in row_capture_accum_prev_rows_cpu)
+        tuple(
+            int(v)
+            for v in _canonical_cpu_values(
+                "row_capture_accum_prev_rows_cpu",
+                row_capture_accum_prev_rows_cpu,
+            )
+        )
         if row_capture_accum_prev_rows_cpu is not None
-        else tuple()
+        else (-1,) * batch_size
     )
     accum_prev_capacity_tuple = (
-        tuple(int(v) for v in row_capture_accum_prev_capacity_cpu)
+        tuple(
+            int(v)
+            for v in _canonical_cpu_values(
+                "row_capture_accum_prev_capacity_cpu",
+                row_capture_accum_prev_capacity_cpu,
+            )
+        )
         if row_capture_accum_prev_capacity_cpu is not None
-        else tuple()
+        else (0,) * batch_size
     )
+    if len(accum_prev_rows_tuple) != batch_size or len(
+        accum_prev_capacity_tuple
+    ) != batch_size:
+        _selector_log_f_contract_error(
+            "ACCUM_AUTHORITY",
+            "accumulation CPU truth must align exactly with batch size",
+        )
 
     def _accum_prev_rows_for(batch_row: int) -> int:
-        if batch_row < len(accum_prev_rows_tuple):
-            return int(accum_prev_rows_tuple[batch_row])
-        return -1
+        return int(accum_prev_rows_tuple[batch_row])
 
     def _accum_prev_capacity_for(batch_row: int) -> int:
-        if batch_row < len(accum_prev_capacity_tuple):
-            return max(0, int(accum_prev_capacity_tuple[batch_row]))
-        return 0
-    has_cpu_row_truth = (
-        bool(producer_rows_tuple)
-        and len(row_capture_last_n_tuple) >= batch_size
-        and len(row_is_prefill_tuple) >= batch_size
-        and len(seqused_k_tuple) >= batch_size
-        and len(active_capture_row_tuple) >= batch_size
-    )
-    producer_rows_iter = (
-        producer_rows_tuple if has_cpu_row_truth else tuple(int(v) for v in producer_rows_i32.tolist())
-    )
+        return int(accum_prev_capacity_tuple[batch_row])
 
-    for scratch_row, batch_row_i32 in enumerate(producer_rows_iter):
+    for scratch_row, batch_row_i32 in enumerate(producer_rows_tuple):
         batch_row = int(batch_row_i32)
+        if batch_row < 0 or batch_row >= batch_size:
+            _selector_log_f_contract_error(
+                "CPU_AUTHORITY_VALUE",
+                "producer_rows_cpu contains an out-of-range batch row",
+            )
         if batch_row in skip_postprocess_rows:
             continue
-        if batch_row < 0 or batch_row >= batch_size:
-            raise ValueError("producer_rows_i32 contains out-of-range batch row")
-        if has_cpu_row_truth:
-            last_n = int(row_capture_last_n_tuple[batch_row])
-            kv_len = int(seqused_k_tuple[batch_row])
-            is_prefill_producer = bool(row_is_prefill_tuple[batch_row])
-            capture_row = int(active_capture_row_tuple[batch_row])
-            if is_prefill_producer:
-                if prefill_out_capture_scores is None or prefill_out_log_f_denoms is None:
-                    raise ValueError("prefill producer rows require prefill output tensors")
-                out_capture_scores = prefill_out_capture_scores
-                out_log_f_denoms = prefill_out_log_f_denoms
-                out_kv_len_per_capture_row_cpu = prefill_out_kv_len_per_capture_row_cpu
-                out_kv_len_per_capture_row_i32 = prefill_out_kv_len_per_capture_row_i32
-            else:
-                if refresh_out_capture_scores is None or refresh_out_log_f_denoms is None:
-                    raise ValueError("decode producer rows require refresh output tensors")
-                out_capture_scores = refresh_out_capture_scores
-                out_log_f_denoms = refresh_out_log_f_denoms
-                out_kv_len_per_capture_row_cpu = refresh_out_kv_len_per_capture_row_cpu
-                out_kv_len_per_capture_row_i32 = refresh_out_kv_len_per_capture_row_i32
-            if capture_row < 0:
-                raise ValueError("producer row is missing active capture row mapping")
+        last_n = int(row_capture_last_n_tuple[batch_row])
+        kv_len = int(seqused_k_tuple[batch_row])
+        is_prefill_producer = bool(row_is_prefill_tuple[batch_row])
+        capture_row = int(active_capture_row_tuple[batch_row])
+        if is_prefill_producer:
+            if prefill_out_capture_scores is None or prefill_out_log_f_denoms is None:
+                _selector_log_f_contract_error(
+                    "OUTPUT",
+                    "prefill producer rows require prefill output tensors",
+                )
+            out_capture_scores = prefill_out_capture_scores
+            out_log_f_denoms = prefill_out_log_f_denoms
+            out_kv_len_per_capture_row_cpu = prefill_out_kv_len_per_capture_row_cpu
         else:
-            last_n = int(row_capture_last_n_i32[batch_row].item())
-            kv_len = int(seqused_k[batch_row].item())
-            is_prefill_producer = bool(row_is_prefill_producer[batch_row].item())
-            capture_row, out_capture_scores, out_log_f_denoms = _select_phase_outputs(
-                batch_row=batch_row,
-                row_is_prefill_producer=row_is_prefill_producer,
-                active_capture_row_by_batch_row_i32=active_capture_row_by_batch_row_i32,
-                prefill_out_capture_scores=prefill_out_capture_scores,
-                prefill_out_log_f_denoms=prefill_out_log_f_denoms,
-                refresh_out_capture_scores=refresh_out_capture_scores,
-                refresh_out_log_f_denoms=refresh_out_log_f_denoms,
+            if refresh_out_capture_scores is None or refresh_out_log_f_denoms is None:
+                _selector_log_f_contract_error(
+                    "OUTPUT",
+                    "decode producer rows require refresh output tensors",
+                )
+            out_capture_scores = refresh_out_capture_scores
+            out_log_f_denoms = refresh_out_log_f_denoms
+            out_kv_len_per_capture_row_cpu = refresh_out_kv_len_per_capture_row_cpu
+        if capture_row < 0:
+            _selector_log_f_contract_error(
+                "CPU_AUTHORITY_VALUE",
+                "producer row is missing its active capture row",
             )
-            out_kv_len_per_capture_row_cpu = None
-            out_kv_len_per_capture_row_i32 = (
-                prefill_out_kv_len_per_capture_row_i32
-                if is_prefill_producer
-                else refresh_out_kv_len_per_capture_row_i32
+        if out_kv_len_per_capture_row_cpu is None:
+            _selector_log_f_contract_error(
+                "CPU_AUTHORITY",
+                "phase output K values must be supplied by the CPU authority",
+            )
+        if capture_row >= len(out_kv_len_per_capture_row_cpu):
+            _selector_log_f_contract_error(
+                "CPU_AUTHORITY_SHAPE",
+                "phase output K truth does not cover the active capture row",
+            )
+        if capture_row >= int(out_capture_scores.shape[0]) or capture_row >= int(
+            out_log_f_denoms.shape[0]
+        ):
+            _selector_log_f_contract_error(
+                "OUTPUT_CAPACITY",
+                "active capture row exceeds output tensor capacity",
+            )
+        if int(out_kv_len_per_capture_row_cpu[capture_row]) < 0:
+            _selector_log_f_contract_error(
+                "CPU_AUTHORITY_VALUE",
+                "phase output K values must be non-negative",
             )
         if kv_len <= 0 or last_n <= 0:
             continue
-        effective_kv_len = (
-            _resolve_phase_output_kv_len_cpu(
-                kv_len=kv_len,
-                capture_row=capture_row,
-                out_capture_scores=out_capture_scores,
-                out_kv_len_per_capture_row_cpu=out_kv_len_per_capture_row_cpu,
-            )
-            if has_cpu_row_truth and out_kv_len_per_capture_row_cpu is not None
-            else _resolve_phase_output_kv_len(
-                kv_len=kv_len,
-                capture_row=capture_row,
-                out_capture_scores=out_capture_scores,
-                out_kv_len_per_capture_row_i32=out_kv_len_per_capture_row_i32,
-            )
+        effective_kv_len = _resolve_phase_output_kv_len_cpu(
+            kv_len=kv_len,
+            capture_row=capture_row,
+            out_capture_scores=out_capture_scores,
+            out_kv_len_per_capture_row_cpu=out_kv_len_per_capture_row_cpu,
         )
         if effective_kv_len <= 0:
             continue
+        capture_rows_seen = (
+            prefill_capture_rows_seen
+            if is_prefill_producer
+            else refresh_capture_rows_seen
+        )
+        if capture_row in capture_rows_seen:
+            _selector_log_f_contract_error(
+                "OUTPUT_SEQ_OVERLAP",
+                "one phase cannot schedule multiple writers for one capture row",
+            )
+        capture_rows_seen.add(capture_row)
         row_is_accum = bool(is_prefill_producer) and _accum_prev_rows_for(batch_row) >= 0
         if last_n == 1 and not row_is_accum:
             lastn1_rows.append(
@@ -549,117 +1992,234 @@ def postprocess_prefill_capture_scores(
 
     scratch_head_stride = int(scratch_capture_scores.stride(1))
     scratch_row_stride = int(scratch_capture_scores.stride(2))
-    can_batch_gt1 = (
-        scratch_capture_scores.is_contiguous()
-        and prefill_out_capture_scores.is_contiguous()
-        and prefill_out_log_f_denoms.stride(-1) == 1
-        and prefill_out_capture_scores.dtype in (torch.float16, torch.float32)
-    )
-    if can_batch_gt1:
-        meta_i32_rows: list[list[int]] = []
-        meta_i64_rows: list[list[int]] = []
-        for scratch_row, batch_row, capture_row, effective_kv_len in gt1_prefill_rows:
-            last_n = (
-                int(row_capture_last_n_tuple[batch_row])
-                if has_cpu_row_truth and len(row_capture_last_n_tuple) > batch_row
-                else int(row_capture_last_n_i32[batch_row].item())
-            )
-            # FIX: clamp the reduce's per-seq kv to the captured scratch/out kv width.
-            # scratch_capture_scores is graph-frozen at capture-time max_capture_k; a long
-            # not-yet-compacted prefill-capture row at replay has effective_kv_len far past
-            # it. The capture store already clamps to this width, so rows beyond it were
-            # never written; reduce_log_f_pre_scratch must read the same bound or it walks
-            # off the frozen scratch (cuda-gdb: OOB read in reduce_log_f_pre_scratch_kernel).
-            # [CHUNKED-CAPTURE-ACCUMULATE 2026-07-06] 跨片行置 flags bit4 并携带
-            # cols 8/9=(前片累计行数, 前片 reduce kv 宽)；kernel 从 out 反解前片
-            # sum-form 做计数加权 LSE 合并。非跨片行 cols 8/9=0 且不置位——kernel
-            # 不读新列，数值路径逐位不变（meta 恒 10 列保 staging ring 键稳定）。
-            accum_prev = _accum_prev_rows_for(int(batch_row))
-            flags = 8 | (16 if accum_prev >= 0 else 0)
-            meta_i32_rows.append(
-                [
-                    int(effective_kv_len),
-                    scratch_head_stride,
-                    int(last_n),
-                    0,
-                    int(effective_kv_len),
-                    int(flags),
-                    int(prefill_out_capture_scores.stride(1)),
-                    scratch_row_stride,
-                    max(0, int(accum_prev)),
-                    _accum_prev_capacity_for(int(batch_row)) if accum_prev >= 0 else 0,
-                ]
-            )
-            meta_i64_rows.append(
-                [
-                    0,
-                    int(scratch_capture_scores[int(scratch_row)].data_ptr()),
-                    int(prefill_out_capture_scores[int(capture_row)].data_ptr()),
-                    int(prefill_out_log_f_denoms[int(capture_row)].data_ptr()),
-                ]
-            )
-
-        def _stage_gt1_meta() -> tuple[torch.Tensor, torch.Tensor]:
-            return (
-                _stage_meta_rows(
-                    meta_i32_rows,
-                    dtype=torch.int32,
-                    device=device,
-                    cache_owner=meta_cache_owner,
-                    cache_name="gt1_i32",
-                ),
-                _stage_meta_rows(
-                    meta_i64_rows,
-                    dtype=torch.int64,
-                    device=device,
-                    cache_owner=meta_cache_owner,
-                    cache_name="gt1_i64",
-                ),
-            )
-
-        gt1_metadata = {
-            "epoch": -1 if debug_epoch is None else int(debug_epoch),
-            "layer": -1 if debug_layer_index is None else int(debug_layer_index),
-            "row_count": len(meta_i32_rows),
-            "num_query_heads": int(scratch_capture_scores.shape[1]),
-            "effective_kv_len_max": max(
-                (int(row[0]) for row in meta_i32_rows),
-                default=0,
-            ),
-            "last_n_max": max(
-                (int(row[2]) for row in meta_i32_rows),
-                default=0,
-            ),
-            "log_f_out_fp32": bool(prefill_out_capture_scores.dtype == torch.float32),
-            "alpha": float(alpha),
-        }
-        req_meta_i32, req_meta_i64 = _profiled_postprocess_call(
-            label="capture_postprocess_meta_gt1",
-            metadata=gt1_metadata,
-            call=_stage_gt1_meta,
+    meta_i32_rows: list[list[int]] = []
+    meta_i64_rows: list[list[int]] = []
+    for scratch_row, batch_row, capture_row, effective_kv_len in gt1_prefill_rows:
+        last_n = int(row_capture_last_n_tuple[batch_row])
+        # The capture store clamps to the same CPU-authored effective K, so the
+        # reducer never reads beyond graph-frozen scratch storage.
+        accum_prev = _accum_prev_rows_for(int(batch_row))
+        flags = 8 | (16 if accum_prev >= 0 else 0)
+        meta_i32_rows.append(
+            [
+                int(effective_kv_len),
+                scratch_head_stride,
+                last_n,
+                0,
+                int(effective_kv_len),
+                int(flags),
+                int(prefill_out_capture_scores.stride(1)),
+                scratch_row_stride,
+                max(0, int(accum_prev)),
+                _accum_prev_capacity_for(int(batch_row)) if accum_prev >= 0 else 0,
+            ]
+        )
+        meta_i64_rows.append(
+            [
+                0,
+                int(scratch_capture_scores[int(scratch_row)].data_ptr()),
+                int(prefill_out_capture_scores[int(capture_row)].data_ptr()),
+                int(prefill_out_log_f_denoms[int(capture_row)].data_ptr()),
+            ]
         )
 
-        def _reduce_gt1() -> None:
-            selector_log_s_ext.reduce_log_f_pre_scratch_cuda(
+    admission = _LogFReduceAdmission(
+        meta_i32_rows=tuple(tuple(row) for row in meta_i32_rows),
+        scratch_row_indices=tuple(
+            int(scratch_row) for scratch_row, _, _, _ in gt1_prefill_rows
+        ),
+        output_row_indices=tuple(
+            int(capture_row) for _, _, capture_row, _ in gt1_prefill_rows
+        ),
+        scratch=_tensor_contract(scratch_capture_scores),
+        output=_tensor_contract(prefill_out_capture_scores),
+        denom=_tensor_contract(prefill_out_log_f_denoms),
+        alpha=float(alpha),
+        capability=tuple(int(v) for v in torch.cuda.get_device_capability(device)),
+        cpu_authority_validated=True,
+        local_same_device=bool(
+            scratch_capture_scores.device
+            == prefill_out_capture_scores.device
+            == prefill_out_log_f_denoms.device
+        ),
+    )
+    dispatch = _resolve_log_f_reduce_dispatch(admission)
+    reduce_route = dispatch.route
+    resident_k_bucket = dispatch.resident_k_bucket
+
+    event_epoch = -1 if debug_epoch is None else int(debug_epoch)
+    event_layer = -1 if debug_layer_index is None else int(debug_layer_index)
+    event_handle_id = _LOG_F_DIRECT_EVENT_SENTINEL
+    event_handle_generation = _LOG_F_DIRECT_EVENT_SENTINEL
+    if proof_job_key is not None:
+        if len(proof_job_key) != 3:
+            _selector_log_f_contract_error(
+                "JOB_KEY",
+                "deferred proof job key must be (handle, generation, layer)",
+            )
+        event_handle_id, event_handle_generation, event_layer = (
+            int(value) for value in proof_job_key
+        )
+        if event_handle_id < 0 or event_handle_generation < 0:
+            _selector_log_f_contract_error(
+                "JOB_KEY",
+                "deferred proof handle and generation must be non-negative",
+            )
+    def _stage_gt1_meta() -> tuple[torch.Tensor, torch.Tensor]:
+        return (
+            _stage_meta_rows(
+                meta_i32_rows,
+                dtype=torch.int32,
+                device=device,
+                cache_owner=meta_cache_owner,
+                cache_name="gt1_i32",
+            ),
+            _stage_meta_rows(
+                meta_i64_rows,
+                dtype=torch.int64,
+                device=device,
+                cache_owner=meta_cache_owner,
+                cache_name="gt1_i64",
+            ),
+        )
+
+    gt1_metadata = {
+        "epoch": event_epoch,
+        "layer": event_layer,
+        "row_count": len(meta_i32_rows),
+        "num_query_heads": int(scratch_capture_scores.shape[1]),
+        "effective_kv_len_max": max(int(row[0]) for row in meta_i32_rows),
+        "last_n_max": max(int(row[2]) for row in meta_i32_rows),
+        "log_f_out_fp32": bool(prefill_out_capture_scores.dtype == torch.float32),
+        "alpha": float(alpha),
+        "reduce_route": reduce_route,
+        "dispatch_reason": dispatch.reason,
+        "resident_k_bucket": resident_k_bucket,
+        "admission_identity": dispatch.admission_identity,
+    }
+    tiled_slot: Optional[dict[str, Any]] = None
+    tiled_capacities: Optional[tuple[int, int, int]] = None
+    if reduce_route == _LOG_F_R2_TILED_ROUTE:
+        tiled_stream = torch.cuda.current_stream(device=device)
+        tiled_slot, n_capacity, h_capacity, k_capacity = (
+            _acquire_tiled_resource_slot(
+                cache_owner=meta_cache_owner,
+                device=device,
+                stream=tiled_stream,
+                num_rows=len(meta_i32_rows),
+                num_query_heads=int(scratch_capture_scores.shape[1]),
+                logical_k_max=max(int(row[0]) for row in meta_i32_rows),
+            )
+        )
+        tiled_capacities = (n_capacity, h_capacity, k_capacity)
+        direct_plan = _TiledJobPlan(
+            job=None,
+            meta_i32_rows=tuple(tuple(row) for row in meta_i32_rows),
+            scratch_row_indices=admission.scratch_row_indices,
+            output_row_indices=admission.output_row_indices,
+            scratch=scratch_capture_scores,
+            output=prefill_out_capture_scores,
+            denom=prefill_out_log_f_denoms,
+            dispatch=dispatch,
+            job_key=(-1, -1, -1),
+            event_epoch=event_epoch,
+            num_query_heads=int(scratch_capture_scores.shape[1]),
+            logical_k_max=max(int(row[0]) for row in meta_i32_rows),
+            capability=tuple(int(value) for value in admission.capability),
+        )
+        try:
+            _validate_tiled_cohort_aliases(
+                (direct_plan,), workspace=tiled_slot["workspace"]
+            )
+        except BaseException:
+            _mark_tiled_resource_complete(tiled_slot, stream=tiled_stream)
+            raise
+
+        def _stage_gt1_meta() -> tuple[torch.Tensor, torch.Tensor]:
+            assert tiled_slot is not None
+            try:
+                return _stage_tiled_meta_rows(
+                    tiled_slot,
+                    meta_i32_rows=meta_i32_rows,
+                    meta_i64_rows=meta_i64_rows,
+                )
+            except BaseException:
+                _mark_tiled_resource_complete(
+                    tiled_slot,
+                    stream=torch.cuda.current_stream(device=device),
+                )
+                raise
+
+    req_meta_i32, req_meta_i64 = _profiled_postprocess_call(
+        label="capture_postprocess_meta_gt1",
+        metadata=gt1_metadata,
+        call=_stage_gt1_meta,
+    )
+
+    def _reduce_gt1() -> None:
+        if resident_k_bucket is not None:
+            selector_log_s_ext.reduce_log_f_pre_scratch_r2_alpha0p5_fp16_resident_cuda(
                 req_meta_i32=req_meta_i32,
                 req_meta_i64=req_meta_i64,
                 num_seqs=len(meta_i32_rows),
                 num_query_heads=int(scratch_capture_scores.shape[1]),
-                scratch_in_fp16=scratch_capture_scores.dtype == torch.float16,
-                log_f_out_fp32=prefill_out_capture_scores.dtype == torch.float32,
-                alpha=float(alpha),
+                logical_k_bucket=resident_k_bucket,
             )
+            return
+        if reduce_route == _LOG_F_R2_TILED_ROUTE:
+            assert tiled_slot is not None and tiled_capacities is not None
+            n_capacity, h_capacity, k_capacity = tiled_capacities
+            workspace = tiled_slot["workspace"]
+            current_stream = torch.cuda.current_stream(device=device)
+            try:
+                for tensor in (req_meta_i32, req_meta_i64, workspace):
+                    tensor.record_stream(current_stream)
+                selector_log_s_ext.reduce_log_f_pre_scratch_r2_alpha0p5_fp16_tiled_cuda(
+                    req_meta_i32=req_meta_i32,
+                    req_meta_i64=req_meta_i64,
+                    workspace=workspace,
+                    num_seqs=len(meta_i32_rows),
+                    num_query_heads=int(scratch_capture_scores.shape[1]),
+                    num_seqs_capacity=n_capacity,
+                    num_query_heads_capacity=h_capacity,
+                    logical_k_capacity=k_capacity,
+                )
+            except BaseException:
+                _mark_tiled_resource_complete(tiled_slot, stream=current_stream)
+                raise
+            _mark_tiled_resource_complete(tiled_slot, stream=current_stream)
+            return
+        selector_log_s_ext.reduce_log_f_pre_scratch_cuda(
+            req_meta_i32=req_meta_i32,
+            req_meta_i64=req_meta_i64,
+            num_seqs=len(meta_i32_rows),
+            num_query_heads=int(scratch_capture_scores.shape[1]),
+            scratch_in_fp16=scratch_capture_scores.dtype == torch.float16,
+            log_f_out_fp32=prefill_out_capture_scores.dtype == torch.float32,
+            alpha=float(alpha),
+        )
 
-        _profiled_postprocess_call(
-            label="capture_postprocess_reduce_gt1",
-            metadata=gt1_metadata,
-            call=_reduce_gt1,
-        )
-    else:
-        raise RuntimeError(
-            "production gt1 capture postprocess requires batched reduce; "
-            "scalar fallback is diagnostic-only"
-        )
+    _profiled_postprocess_call(
+        label="capture_postprocess_reduce_gt1",
+        metadata=gt1_metadata,
+        call=_reduce_gt1,
+    )
+    if reduce_route == _LOG_F_R2_TILED_ROUTE:
+        global _PROCESS_TILED_DIRECT_COUNT
+        global _PROCESS_TILED_KERNEL_LAUNCH_COUNT
+
+        _PROCESS_TILED_DIRECT_COUNT += 1
+        _PROCESS_TILED_KERNEL_LAUNCH_COUNT += 4
+    _record_log_f_reduce_route(
+        meta_cache_owner,
+        reduce_route,
+        dispatch_reason=dispatch.reason,
+        admission_identity=dispatch.admission_identity,
+        event_epoch=event_epoch,
+        event_layer=event_layer,
+        event_handle_id=event_handle_id,
+        event_handle_generation=event_handle_generation,
+    )
 
 
 def run_prefill_capture_postprocess_if_needed(
@@ -743,30 +2303,879 @@ def _record_capture_postprocess_tensor_on_current_stream(tensor: object) -> None
             raise
 
 
-def _wait_capture_postprocess_completion_event_if_needed(job: Any) -> bool:
+def _capture_postprocess_consumer_stream_identity(
+    stream: object,
+    *,
+    scratch: object,
+) -> tuple[str, int, int]:
+    """Return a stable local target for one stream-ordered completion wait."""
+
+    device_index = -1
+    if isinstance(scratch, torch.Tensor) and scratch.device.type == "cuda":
+        device_index = -1 if scratch.device.index is None else int(scratch.device.index)
+    raw_stream = getattr(stream, "cuda_stream", None)
+    if isinstance(raw_stream, int) and not isinstance(raw_stream, bool):
+        return ("cuda_stream", device_index, int(raw_stream))
+    return ("stream_object", device_index, id(stream))
+
+
+def _wait_capture_postprocess_completion_event_if_needed(
+    job: Any,
+    *,
+    waited_event_targets: Optional[dict[int, tuple[str, int, int]]] = None,
+) -> bool:
     event = getattr(job, "completion_event", None)
-    if event is None or bool(getattr(job, "waited_completion_event", False)):
+    if event is None:
+        if bool(getattr(job, "completed", False)):
+            _selector_log_f_contract_error(
+                "COMPLETION_EVENT",
+                "completed deferred job is missing its stream completion event",
+            )
         return False
     scratch = getattr(job, "scratch_capture_scores", None)
     if isinstance(scratch, torch.Tensor) and scratch.device.type == "cuda":
         stream = torch.cuda.current_stream(device=scratch.device)
     else:
         stream = torch.cuda.current_stream()
+    target = _capture_postprocess_consumer_stream_identity(
+        stream,
+        scratch=scratch,
+    )
+    if waited_event_targets is not None:
+        event_identity = id(event)
+        previous_target = waited_event_targets.get(event_identity)
+        if previous_target is not None:
+            if previous_target != target:
+                _selector_log_f_contract_error(
+                    "COMPLETION_TARGET",
+                    "one shared completion event cannot be deduplicated across "
+                    f"different consumer streams: first={previous_target!r}, "
+                    f"current={target!r}",
+                )
+            return False
+    # Event waits belong to the consuming stream, not to the job.  The optional
+    # registry coalesces only one sequence invocation on one proven target;
+    # another selector/flush stream receives a fresh registry and its own RAW
+    # edge without host synchronization.
     stream.wait_event(event)
-    setattr(job, "waited_completion_event", True)
+    if waited_event_targets is not None:
+        waited_event_targets[id(event)] = target
     return True
+
+
+def _record_capture_postprocess_job_tensors(
+    job: Any,
+    *,
+    scratch: torch.Tensor,
+    prefill_out_capture: object,
+    prefill_out_denoms: object,
+) -> None:
+    for tensor in (
+        scratch,
+        getattr(job, "producer_rows_i32", None),
+        getattr(job, "row_capture_last_n_i32", None),
+        getattr(job, "row_is_prefill_producer", None),
+        getattr(job, "seqused_k", None),
+        getattr(job, "active_capture_row_by_batch_row_i32", None),
+        prefill_out_capture,
+        prefill_out_denoms,
+        getattr(job, "refresh_out_capture_scores", None),
+        getattr(job, "refresh_out_log_f_denoms", None),
+        getattr(job, "prefill_out_kv_len_per_capture_row_i32", None),
+        getattr(job, "refresh_out_kv_len_per_capture_row_i32", None),
+    ):
+        _record_capture_postprocess_tensor_on_current_stream(tensor)
+
+
+def _normalized_deferred_job_key(job: Any) -> tuple[int, int, int]:
+    raw_key = getattr(job, "job_key", None)
+    if not isinstance(raw_key, tuple) or len(raw_key) != 3 or any(
+        isinstance(value, (bool, torch.Tensor)) for value in raw_key
+    ):
+        _selector_log_f_contract_error(
+            "JOB_KEY",
+            "deferred job key must be an immutable (handle, generation, layer) tuple",
+        )
+    try:
+        key = tuple(int(value) for value in raw_key)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise RuntimeError(
+            "E_SELECTOR_LOG_F_JOB_KEY: deferred job key contains invalid values"
+        ) from exc
+    if any(value < 0 for value in key):
+        _selector_log_f_contract_error(
+            "JOB_KEY",
+            "deferred handle, generation, and global layer must be non-negative",
+        )
+    return key  # type: ignore[return-value]
+
+
+def _validate_payload_job_identity(payload: object, job: Any) -> tuple[int, int, int]:
+    """Bind payload ownership to the immutable deferred job generation."""
+
+    job_key = _normalized_deferred_job_key(job)
+    payload_handle = getattr(payload, "capture_handle_id", None)
+    payload_generation = getattr(payload, "capture_handle_generation", None)
+    payload_epoch = getattr(payload, "capture_epoch", None)
+    if any(
+        isinstance(value, (bool, torch.Tensor))
+        for value in (payload_handle, payload_generation, payload_epoch)
+    ):
+        _selector_log_f_contract_error(
+            "PAYLOAD_IDENTITY",
+            "payload handle, generation, and epoch must be host integers",
+        )
+    try:
+        handle = int(payload_handle)
+        generation = int(payload_generation)
+        epoch = int(payload_epoch)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise RuntimeError(
+            "E_SELECTOR_LOG_F_PAYLOAD_IDENTITY: invalid payload identity values"
+        ) from exc
+    state = getattr(payload, "state", None)
+    global_layer = getattr(state, "layer_index", None)
+    if isinstance(global_layer, (bool, torch.Tensor)):
+        _selector_log_f_contract_error(
+            "PAYLOAD_IDENTITY",
+            "payload state global layer must be a host integer",
+        )
+    try:
+        global_layer = int(global_layer)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise RuntimeError(
+            "E_SELECTOR_LOG_F_PAYLOAD_IDENTITY: invalid payload state global layer"
+        ) from exc
+    expected_epoch = int(getattr(job, "debug_epoch", -1))
+    actual = (handle, generation, global_layer)
+    if actual != job_key or epoch != expected_epoch:
+        _selector_log_f_contract_error(
+            "PAYLOAD_IDENTITY",
+            "payload ownership does not match deferred job identity: "
+            f"payload={actual!r},epoch={epoch};job={job_key!r},epoch={expected_epoch}",
+        )
+    return job_key
+
+
+def _build_tiled_job_plan(job: Any) -> Optional[_TiledJobPlan]:
+    """Return a tiled plan only when the complete valid job has no other work."""
+
+    if job is None or bool(getattr(job, "completed", False)):
+        return None
+    if bool(getattr(job, "launched", False)):
+        _selector_log_f_contract_error(
+            "JOB_LIFECYCLE",
+            "deferred job is already launched but not completed",
+        )
+    scratch = getattr(job, "scratch_capture_scores", None)
+    output = getattr(job, "prefill_out_capture_scores", None)
+    denom = getattr(job, "prefill_out_log_f_denoms", None)
+    if not isinstance(scratch, torch.Tensor):
+        _selector_log_f_contract_error("SCRATCH", "deferred job is missing scratch")
+    if not isinstance(output, torch.Tensor) or not isinstance(denom, torch.Tensor):
+        # This may be a valid refresh-only/last-n=1 job.  The normal owner below
+        # performs its complete semantic validation; it is not a tiled candidate.
+        return None
+    _validate_prefill_postprocess_inputs(
+        scratch_capture_scores=scratch,
+        producer_rows_i32=getattr(job, "producer_rows_i32"),
+        row_capture_last_n_i32=getattr(job, "row_capture_last_n_i32"),
+        row_is_prefill_producer=getattr(job, "row_is_prefill_producer"),
+        seqused_k=getattr(job, "seqused_k"),
+        active_capture_row_by_batch_row_i32=getattr(
+            job, "active_capture_row_by_batch_row_i32"
+        ),
+        prefill_out_capture_scores=output,
+        prefill_out_log_f_denoms=denom,
+        refresh_out_capture_scores=getattr(job, "refresh_out_capture_scores", None),
+        refresh_out_log_f_denoms=getattr(job, "refresh_out_log_f_denoms", None),
+    )
+    batch_size = int(getattr(job, "row_capture_last_n_i32").numel())
+    producer_rows = tuple(
+        int(value)
+        for value in _canonical_cpu_values(
+            "producer_rows_cpu", getattr(job, "producer_rows_cpu", None)
+        )
+    )
+    last_n_by_row = tuple(
+        int(value)
+        for value in _canonical_cpu_values(
+            "row_capture_last_n_cpu",
+            getattr(job, "row_capture_last_n_cpu", None),
+        )
+    )
+    prefill_by_row = tuple(
+        bool(value)
+        for value in _canonical_cpu_values(
+            "row_is_prefill_producer_cpu",
+            getattr(job, "row_is_prefill_producer_cpu", None),
+            as_bool=True,
+        )
+    )
+    seqused_k_by_row = tuple(
+        int(value)
+        for value in _canonical_cpu_values(
+            "seqused_k_cpu", getattr(job, "seqused_k_cpu", None)
+        )
+    )
+    capture_row_by_row = tuple(
+        int(value)
+        for value in _canonical_cpu_values(
+            "active_capture_row_by_batch_row_cpu",
+            getattr(job, "active_capture_row_by_batch_row_cpu", None),
+        )
+    )
+    if len(producer_rows) != int(getattr(job, "producer_rows_i32").numel()):
+        _selector_log_f_contract_error(
+            "CPU_AUTHORITY_SHAPE",
+            "producer row truth must align with scratch metadata",
+        )
+    if len(set(producer_rows)) != len(producer_rows):
+        _selector_log_f_contract_error(
+            "CPU_AUTHORITY_VALUE", "producer rows must be unique"
+        )
+    for name, values in (
+        ("row_capture_last_n_cpu", last_n_by_row),
+        ("row_is_prefill_producer_cpu", prefill_by_row),
+        ("seqused_k_cpu", seqused_k_by_row),
+        ("active_capture_row_by_batch_row_cpu", capture_row_by_row),
+    ):
+        if len(values) != batch_size:
+            _selector_log_f_contract_error(
+                "CPU_AUTHORITY_SHAPE", f"{name} must align with batch size"
+            )
+    if any(value < 0 for value in last_n_by_row) or any(
+        value < 0 for value in seqused_k_by_row
+    ):
+        _selector_log_f_contract_error(
+            "CPU_AUTHORITY_VALUE", "row counts and K values must be non-negative"
+        )
+    skipped = frozenset(
+        int(value)
+        for value in _canonical_cpu_values(
+            "skip_postprocess_rows_cpu",
+            getattr(job, "skip_postprocess_rows_cpu", tuple()),
+        )
+    )
+    raw_accum_rows = getattr(job, "row_capture_accum_prev_rows_cpu", None)
+    raw_accum_capacity = getattr(job, "row_capture_accum_prev_capacity_cpu", None)
+    if (raw_accum_rows is None) != (raw_accum_capacity is None):
+        _selector_log_f_contract_error(
+            "ACCUM_AUTHORITY", "accumulation truth must be supplied together"
+        )
+    accum_rows = (
+        tuple(
+            int(value)
+            for value in _canonical_cpu_values(
+                "row_capture_accum_prev_rows_cpu", raw_accum_rows
+            )
+        )
+        if raw_accum_rows is not None
+        else (-1,) * batch_size
+    )
+    accum_capacity = (
+        tuple(
+            int(value)
+            for value in _canonical_cpu_values(
+                "row_capture_accum_prev_capacity_cpu", raw_accum_capacity
+            )
+        )
+        if raw_accum_capacity is not None
+        else (0,) * batch_size
+    )
+    if len(accum_rows) != batch_size or len(accum_capacity) != batch_size:
+        _selector_log_f_contract_error(
+            "ACCUM_AUTHORITY", "accumulation truth must align with batch size"
+        )
+    output_k = tuple(
+        int(value)
+        for value in _canonical_cpu_values(
+            "prefill_out_kv_len_per_capture_row_cpu",
+            getattr(job, "prefill_out_kv_len_per_capture_row_cpu", None),
+        )
+    )
+
+    meta_i32_rows: list[tuple[int, ...]] = []
+    scratch_rows: list[int] = []
+    output_rows: list[int] = []
+    has_non_tiled_work = str(getattr(job, "direct_capture_phase", "")) == "prefill"
+    for scratch_row, batch_row in enumerate(producer_rows):
+        if batch_row < 0 or batch_row >= batch_size:
+            _selector_log_f_contract_error(
+                "CPU_AUTHORITY_VALUE", "producer row is outside batch capacity"
+            )
+        if batch_row in skipped:
+            continue
+        last_n = int(last_n_by_row[batch_row])
+        logical_k = int(seqused_k_by_row[batch_row])
+        if last_n <= 0 or logical_k <= 0:
+            continue
+        if not bool(prefill_by_row[batch_row]):
+            if last_n > 1:
+                _selector_log_f_contract_error(
+                    "ROW_COUNT", "decode producer rows must have last_n == 1"
+                )
+            has_non_tiled_work = True
+            continue
+        capture_row = int(capture_row_by_row[batch_row])
+        if capture_row < 0 or capture_row >= len(output_k):
+            _selector_log_f_contract_error(
+                "CPU_AUTHORITY_SHAPE",
+                "prefill output K truth does not cover capture row",
+            )
+        if int(output_k[capture_row]) < 0:
+            _selector_log_f_contract_error(
+                "CPU_AUTHORITY_VALUE", "prefill output K must be non-negative"
+            )
+        effective_k = _resolve_phase_output_kv_len_cpu(
+            kv_len=logical_k,
+            capture_row=capture_row,
+            out_capture_scores=output,
+            out_kv_len_per_capture_row_cpu=output_k,
+        )
+        if effective_k <= 0:
+            continue
+        accum_prev = int(accum_rows[batch_row])
+        flags = 8 | (16 if accum_prev >= 0 else 0)
+        meta_i32_rows.append(
+            (
+                effective_k,
+                int(scratch.stride(1)),
+                last_n,
+                0,
+                effective_k,
+                flags,
+                int(output.stride(1)),
+                int(scratch.stride(2)),
+                max(0, accum_prev),
+                int(accum_capacity[batch_row]) if accum_prev >= 0 else 0,
+            )
+        )
+        scratch_rows.append(scratch_row)
+        output_rows.append(capture_row)
+        if last_n != 2 and not (flags == 24 and last_n == 1):
+            has_non_tiled_work = True
+    if not meta_i32_rows:
+        return None
+    admission = _LogFReduceAdmission(
+        meta_i32_rows=tuple(meta_i32_rows),
+        scratch_row_indices=tuple(scratch_rows),
+        output_row_indices=tuple(output_rows),
+        scratch=_tensor_contract(scratch),
+        output=_tensor_contract(output),
+        denom=_tensor_contract(denom),
+        alpha=float(getattr(job, "alpha", 0.0) or 0.0),
+        capability=tuple(
+            int(value) for value in torch.cuda.get_device_capability(scratch.device)
+        ),
+        cpu_authority_validated=True,
+        local_same_device=bool(scratch.device == output.device == denom.device),
+    )
+    dispatch = _resolve_log_f_reduce_dispatch(admission)
+    if has_non_tiled_work or dispatch.route != _LOG_F_R2_TILED_ROUTE:
+        return None
+    job_key = _normalized_deferred_job_key(job)
+    return _TiledJobPlan(
+        job=job,
+        meta_i32_rows=tuple(meta_i32_rows),
+        scratch_row_indices=tuple(scratch_rows),
+        output_row_indices=tuple(output_rows),
+        scratch=scratch,
+        output=output,
+        denom=denom,
+        dispatch=dispatch,
+        job_key=job_key,
+        event_epoch=int(getattr(job, "debug_epoch", -1)),
+        num_query_heads=int(scratch.shape[1]),
+        logical_k_max=max(int(row[0]) for row in meta_i32_rows),
+        capability=tuple(int(value) for value in admission.capability),
+    )
+
+
+def _revalidate_tiled_job_plan_locked(plan: _TiledJobPlan) -> _TiledJobPlan:
+    """Recheck only lifecycle and retargetable state while its job lock is held."""
+
+    job = plan.job
+    if bool(getattr(job, "completed", False)) or bool(
+        getattr(job, "launched", False)
+    ):
+        _selector_log_f_contract_error(
+            "TILED_REVALIDATION", "job lifecycle changed before cohort claim"
+        )
+    if _normalized_deferred_job_key(job) != plan.job_key:
+        _selector_log_f_contract_error(
+            "TILED_REVALIDATION", "job identity changed before cohort claim"
+        )
+    scratch = getattr(job, "scratch_capture_scores", None)
+    if scratch is not plan.scratch:
+        _selector_log_f_contract_error(
+            "TILED_REVALIDATION", "scratch ownership changed before cohort claim"
+        )
+    output = getattr(job, "prefill_out_capture_scores", None)
+    denom = getattr(job, "prefill_out_log_f_denoms", None)
+    if not isinstance(output, torch.Tensor) or not isinstance(denom, torch.Tensor):
+        _selector_log_f_contract_error(
+            "TILED_REVALIDATION", "retargeted outputs are missing"
+        )
+    if output is plan.output and denom is plan.denom:
+        return plan
+
+    retargeted_meta = tuple(
+        (*row[:6], int(output.stride(1)), *row[7:])
+        for row in plan.meta_i32_rows
+    )
+    admission = _LogFReduceAdmission(
+        meta_i32_rows=retargeted_meta,
+        scratch_row_indices=plan.scratch_row_indices,
+        output_row_indices=plan.output_row_indices,
+        scratch=_tensor_contract(plan.scratch),
+        output=_tensor_contract(output),
+        denom=_tensor_contract(denom),
+        alpha=float(getattr(job, "alpha", 0.0) or 0.0),
+        capability=plan.capability,
+        cpu_authority_validated=True,
+        local_same_device=bool(
+            plan.scratch.device == output.device == denom.device
+        ),
+    )
+    dispatch = _resolve_log_f_reduce_dispatch(admission)
+    if dispatch.route != _LOG_F_R2_TILED_ROUTE:
+        _selector_log_f_contract_error(
+            "TILED_REVALIDATION",
+            f"retargeted outputs changed dispatch to {dispatch.route}",
+        )
+    return _TiledJobPlan(
+        job=job,
+        meta_i32_rows=retargeted_meta,
+        scratch_row_indices=plan.scratch_row_indices,
+        output_row_indices=plan.output_row_indices,
+        scratch=plan.scratch,
+        output=output,
+        denom=denom,
+        dispatch=dispatch,
+        job_key=plan.job_key,
+        event_epoch=plan.event_epoch,
+        num_query_heads=plan.num_query_heads,
+        logical_k_max=plan.logical_k_max,
+        capability=plan.capability,
+    )
+
+
+def _tiled_plan_pointer_rows(plan: _TiledJobPlan) -> tuple[tuple[int, ...], ...]:
+    return tuple(
+        (
+            0,
+            int(plan.scratch[scratch_row].data_ptr()),
+            int(plan.output[output_row].data_ptr()),
+            int(plan.denom[output_row].data_ptr()),
+        )
+        for scratch_row, output_row in zip(
+            plan.scratch_row_indices,
+            plan.output_row_indices,
+            strict=True,
+        )
+    )
+
+
+def _touched_interval(
+    *,
+    tensor: torch.Tensor,
+    base_ptr: int,
+    max_element_offset: int,
+    label: str,
+) -> _TouchedByteInterval:
+    max_element_offset = int(max_element_offset)
+    if max_element_offset < 0:
+        raise ValueError("touched interval extent must be non-negative")
+    begin = int(base_ptr)
+    end = begin + (max_element_offset + 1) * int(tensor.element_size())
+    return _TouchedByteInterval(
+        device=tensor.device,
+        begin=begin,
+        end=end,
+        label=label,
+    )
+
+
+def _tiled_plan_touched_intervals(
+    plan: _TiledJobPlan,
+    *,
+    job_index: int,
+) -> tuple[tuple[_TouchedByteInterval, ...], tuple[_TouchedByteInterval, ...]]:
+    reads: list[_TouchedByteInterval] = []
+    writes: list[_TouchedByteInterval] = []
+    heads = int(plan.num_query_heads)
+    for row_index, (meta, scratch_row, output_row) in enumerate(
+        zip(
+            plan.meta_i32_rows,
+            plan.scratch_row_indices,
+            plan.output_row_indices,
+            strict=True,
+        )
+    ):
+        logical_k = int(meta[0])
+        last_n = int(meta[2])
+        reads.append(
+            _touched_interval(
+                tensor=plan.scratch,
+                base_ptr=int(plan.scratch[scratch_row].data_ptr()),
+                max_element_offset=(heads - 1) * int(meta[1])
+                + (last_n - 1) * int(meta[7])
+                + logical_k
+                - 1,
+                label=f"job{job_index}:row{row_index}:scratch",
+            )
+        )
+        writes.append(
+            _touched_interval(
+                tensor=plan.output,
+                base_ptr=int(plan.output[output_row].data_ptr()),
+                max_element_offset=(heads - 1) * int(meta[6]) + logical_k - 1,
+                label=f"job{job_index}:row{row_index}:output",
+            )
+        )
+        writes.append(
+            _touched_interval(
+                tensor=plan.denom,
+                base_ptr=int(plan.denom[output_row].data_ptr()),
+                max_element_offset=heads - 1,
+                label=f"job{job_index}:row{row_index}:denom",
+            )
+        )
+    return tuple(reads), tuple(writes)
+
+
+def _byte_intervals_overlap(
+    left: _TouchedByteInterval,
+    right: _TouchedByteInterval,
+) -> bool:
+    return bool(
+        left.device == right.device
+        and left.begin < right.end
+        and right.begin < left.end
+    )
+
+
+def _interval_device_key(interval: _TouchedByteInterval) -> tuple[str, int]:
+    return (
+        str(interval.device.type),
+        -1 if interval.device.index is None else int(interval.device.index),
+    )
+
+
+def _first_touched_interval_overlap(
+    left_intervals: Sequence[_TouchedByteInterval],
+    right_intervals: Optional[Sequence[_TouchedByteInterval]] = None,
+) -> Optional[tuple[_TouchedByteInterval, _TouchedByteInterval]]:
+    """Address-sorted overlap proof in O(M log M), without quadratic pairs."""
+
+    if right_intervals is None:
+        ordered = sorted(
+            left_intervals,
+            key=lambda interval: (
+                _interval_device_key(interval),
+                interval.begin,
+                interval.end,
+            ),
+        )
+        active: Optional[_TouchedByteInterval] = None
+        for current in ordered:
+            if active is None or _interval_device_key(active) != _interval_device_key(
+                current
+            ):
+                active = current
+                continue
+            if _byte_intervals_overlap(active, current):
+                return active, current
+            if current.end > active.end:
+                active = current
+        return None
+
+    left = sorted(
+        left_intervals,
+        key=lambda interval: (
+            _interval_device_key(interval),
+            interval.begin,
+            interval.end,
+        ),
+    )
+    right = sorted(
+        right_intervals,
+        key=lambda interval: (
+            _interval_device_key(interval),
+            interval.begin,
+            interval.end,
+        ),
+    )
+    left_index = 0
+    right_index = 0
+    while left_index < len(left) and right_index < len(right):
+        left_interval = left[left_index]
+        right_interval = right[right_index]
+        left_device = _interval_device_key(left_interval)
+        right_device = _interval_device_key(right_interval)
+        if left_device < right_device:
+            left_index += 1
+            continue
+        if right_device < left_device:
+            right_index += 1
+            continue
+        if _byte_intervals_overlap(left_interval, right_interval):
+            return left_interval, right_interval
+        if left_interval.end <= right_interval.begin:
+            left_index += 1
+        else:
+            right_index += 1
+    return None
+
+
+def _validate_tiled_cohort_aliases(
+    plans: Sequence[_TiledJobPlan],
+    *,
+    workspace: torch.Tensor,
+) -> None:
+    all_reads: list[_TouchedByteInterval] = []
+    all_writes: list[_TouchedByteInterval] = []
+    for job_index, plan in enumerate(plans):
+        reads, writes = _tiled_plan_touched_intervals(plan, job_index=job_index)
+        all_reads.extend(reads)
+        all_writes.extend(writes)
+    write_alias = _first_touched_interval_overlap(all_writes)
+    if write_alias is not None:
+        left, right = write_alias
+        _selector_log_f_contract_error(
+            "TILED_WRITE_ALIAS", f"{left.label} overlaps {right.label}"
+        )
+    read_write_alias = _first_touched_interval_overlap(all_writes, all_reads)
+    if read_write_alias is not None:
+        write, read = read_write_alias
+        _selector_log_f_contract_error(
+            "TILED_READ_WRITE_ALIAS", f"{write.label} overlaps {read.label}"
+        )
+    workspace_interval = _touched_interval(
+        tensor=workspace,
+        base_ptr=int(workspace.data_ptr()),
+        max_element_offset=int(workspace.numel()) - 1,
+        label="tiled_workspace",
+    )
+    workspace_alias = _first_touched_interval_overlap(
+        (*all_reads, *all_writes), (workspace_interval,)
+    )
+    if workspace_alias is not None:
+        interval, _workspace = workspace_alias
+        _selector_log_f_contract_error(
+            "TILED_WORKSPACE_ALIAS",
+            f"{interval.label} overlaps tiled workspace",
+        )
+
+
+def _reject_tiled_cohort(code: str, detail: str) -> None:
+    global _PROCESS_TILED_ADMISSION_FAILURE_COUNT
+
+    _PROCESS_TILED_ADMISSION_FAILURE_COUNT += 1
+    raise RuntimeError(f"E_SELECTOR_LOG_F_TILED_{code}: {detail}")
+
+
+def _run_tiled_capture_postprocess_job_cohort(
+    jobs: Sequence[Any],
+    *,
+    meta_cache_owner: Optional[object],
+    initial_plans: Optional[Sequence[_TiledJobPlan]] = None,
+) -> int:
+    """Claim one compatible job sequence and submit one four-kernel cohort."""
+
+    global _PROCESS_TILED_COHORT_COUNT
+    global _PROCESS_TILED_JOB_COUNT
+    global _PROCESS_TILED_KERNEL_LAUNCH_COUNT
+
+    jobs = tuple(jobs)
+    if not jobs:
+        return 0
+    raw_initial_plans: tuple[Optional[_TiledJobPlan], ...]
+    if initial_plans is None:
+        raw_initial_plans = tuple(_build_tiled_job_plan(job) for job in jobs)
+    else:
+        supplied_plans = tuple(initial_plans)
+        if len(supplied_plans) != len(jobs) or any(
+            plan.job is not job
+            for plan, job in zip(supplied_plans, jobs, strict=True)
+        ):
+            _reject_tiled_cohort(
+                "PLAN_OWNER", "preplanned tiled jobs do not match the cohort"
+            )
+        raw_initial_plans = supplied_plans
+    if any(plan is None for plan in raw_initial_plans):
+        _reject_tiled_cohort(
+            "INELIGIBLE", "cohort entrypoint requires only live tiled jobs"
+        )
+    plans = tuple(plan for plan in raw_initial_plans if plan is not None)
+    devices = {plan.scratch.device for plan in plans}
+    head_counts = {plan.num_query_heads for plan in plans}
+    if len(devices) != 1 or len(head_counts) != 1:
+        _reject_tiled_cohort(
+            "INCOMPATIBLE", "jobs must share one device and local head count"
+        )
+    device = plans[0].scratch.device
+    stream = torch.cuda.current_stream(device=device)
+    total_rows = sum(len(plan.meta_i32_rows) for plan in plans)
+    slot, n_capacity, h_capacity, k_capacity = _acquire_tiled_resource_slot(
+        cache_owner=meta_cache_owner,
+        device=device,
+        stream=stream,
+        num_rows=total_rows,
+        num_query_heads=plans[0].num_query_heads,
+        logical_k_max=max(plan.logical_k_max for plan in plans),
+    )
+    resource_published = False
+    try:
+        for job in jobs:
+            ready_event = getattr(job, "ready_event", None)
+            if ready_event is None:
+                _reject_tiled_cohort("READY_EVENT", "eligible job is missing ready event")
+            stream.wait_event(ready_event)
+            setattr(job, "waited_ready_event", True)
+
+        locks: list[Any] = []
+        for job in jobs:
+            lock = getattr(job, "lifecycle_lock", None)
+            if lock is None or not callable(getattr(lock, "acquire", None)):
+                _reject_tiled_cohort(
+                    "LIFECYCLE_LOCK", "eligible job is missing lifecycle lock"
+                )
+            if all(lock is not existing for existing in locks):
+                locks.append(lock)
+        locks.sort(key=id)
+        for lock in locks:
+            lock.acquire()
+        try:
+            locked_plans = tuple(
+                _revalidate_tiled_job_plan_locked(plan) for plan in plans
+            )
+            if any(
+                plan.job_key != initial.job_key
+                or plan.num_query_heads != plans[0].num_query_heads
+                or plan.scratch.device != device
+                for plan, initial in zip(locked_plans, plans, strict=True)
+            ):
+                _reject_tiled_cohort(
+                    "REVALIDATION", "job identity, device, or head contract changed"
+                )
+            _validate_tiled_cohort_aliases(
+                locked_plans, workspace=slot["workspace"]
+            )
+            locked_meta_i64_rows = tuple(
+                row
+                for plan in locked_plans
+                for row in _tiled_plan_pointer_rows(plan)
+            )
+            tape_events = tuple(
+                getattr(job, "tape_stack_evt", None) for job in jobs
+            )
+            for job in jobs:
+                setattr(job, "launched", True)
+        finally:
+            for lock in reversed(locks):
+                lock.release()
+
+        meta_i32_rows = tuple(
+            row for plan in locked_plans for row in plan.meta_i32_rows
+        )
+        req_meta_i32, req_meta_i64 = _stage_tiled_meta_rows(
+            slot,
+            meta_i32_rows=meta_i32_rows,
+            meta_i64_rows=locked_meta_i64_rows,
+        )
+        waited_tape_events: set[int] = set()
+        for job, tape_event in zip(jobs, tape_events, strict=True):
+            if tape_event is not None and id(tape_event) not in waited_tape_events:
+                stream.wait_event(tape_event)
+                waited_tape_events.add(id(tape_event))
+            setattr(job, "tape_stack_evt", None)
+        for plan in locked_plans:
+            _record_capture_postprocess_job_tensors(
+                plan.job,
+                scratch=plan.scratch,
+                prefill_out_capture=plan.output,
+                prefill_out_denoms=plan.denom,
+            )
+        workspace = slot["workspace"]
+        for tensor in (req_meta_i32, req_meta_i64, workspace):
+            tensor.record_stream(stream)
+
+        from utils import selector_log_s_ext
+
+        reasons = selector_log_s_ext.log_f_r2_tiled_contract_reasons(
+            req_meta_i32=req_meta_i32,
+            req_meta_i64=req_meta_i64,
+            workspace=workspace,
+            num_seqs=total_rows,
+            num_query_heads=plans[0].num_query_heads,
+            num_seqs_capacity=n_capacity,
+            num_query_heads_capacity=h_capacity,
+            logical_k_capacity=k_capacity,
+        )
+        if reasons:
+            _reject_tiled_cohort("ABI", ",".join(reasons))
+        selector_log_s_ext.reduce_log_f_pre_scratch_r2_alpha0p5_fp16_tiled_cuda(
+            req_meta_i32=req_meta_i32,
+            req_meta_i64=req_meta_i64,
+            workspace=workspace,
+            num_seqs=total_rows,
+            num_query_heads=plans[0].num_query_heads,
+            num_seqs_capacity=n_capacity,
+            num_query_heads_capacity=h_capacity,
+            logical_k_capacity=k_capacity,
+        )
+        completion_event = _mark_tiled_resource_complete(slot, stream=stream)
+        resource_published = True
+        _PROCESS_TILED_COHORT_COUNT += 1
+        _PROCESS_TILED_JOB_COUNT += len(jobs)
+        _PROCESS_TILED_KERNEL_LAUNCH_COUNT += 4
+        for plan in locked_plans:
+            _record_log_f_reduce_route(
+                meta_cache_owner,
+                _LOG_F_R2_TILED_ROUTE,
+                dispatch_reason=plan.dispatch.reason,
+                admission_identity=plan.dispatch.admission_identity,
+                event_epoch=plan.event_epoch,
+                event_layer=plan.job_key[2],
+                event_handle_id=plan.job_key[0],
+                event_handle_generation=plan.job_key[1],
+            )
+        for lock in locks:
+            lock.acquire()
+        try:
+            for job in jobs:
+                setattr(job, "completion_event", completion_event)
+                setattr(job, "ran_postprocess", True)
+                setattr(job, "completed", True)
+        finally:
+            for lock in reversed(locks):
+                lock.release()
+        return len(jobs)
+    finally:
+        if not resource_published:
+            # Fence any metadata copy or partial launch before making this slot
+            # reusable, then preserve the original fail-closed exception.
+            _mark_tiled_resource_complete(slot, stream=stream)
 
 
 def run_capture_postprocess_job_if_needed(
     job: Any,
     *,
     meta_cache_owner: Optional[object],
+    completion_wait_targets: Optional[
+        dict[int, tuple[str, int, int]]
+    ] = None,
 ) -> bool:
     """Run one deferred capture postprocess job on the current CUDA stream."""
     if job is None:
         return False
     if bool(getattr(job, "completed", False)):
-        _wait_capture_postprocess_completion_event_if_needed(job)
+        _wait_capture_postprocess_completion_event_if_needed(
+            job,
+            waited_event_targets=completion_wait_targets,
+        )
         return False
     scratch = getattr(job, "scratch_capture_scores", None)
     if not isinstance(scratch, torch.Tensor):
@@ -783,34 +3192,43 @@ def run_capture_postprocess_job_if_needed(
     if _lifecycle_lock is not None:
         _lifecycle_lock.acquire()
     try:
-        setattr(job, "launched", True)
-        tape_stack_evt = getattr(job, "tape_stack_evt", None)
-        prefill_out_capture_local = getattr(job, "prefill_out_capture_scores", None)
-        prefill_out_denoms_local = getattr(job, "prefill_out_log_f_denoms", None)
+        if bool(getattr(job, "completed", False)):
+            completed_while_waiting = True
+            tape_stack_evt = None
+            prefill_out_capture_local = None
+            prefill_out_denoms_local = None
+        else:
+            completed_while_waiting = False
+            if bool(getattr(job, "launched", False)):
+                _selector_log_f_contract_error(
+                    "JOB_LIFECYCLE",
+                    "deferred job is already launched but has no completion event",
+                )
+            setattr(job, "launched", True)
+            tape_stack_evt = getattr(job, "tape_stack_evt", None)
+            prefill_out_capture_local = getattr(job, "prefill_out_capture_scores", None)
+            prefill_out_denoms_local = getattr(job, "prefill_out_log_f_denoms", None)
     finally:
         if _lifecycle_lock is not None:
             _lifecycle_lock.release()
+    if completed_while_waiting:
+        _wait_capture_postprocess_completion_event_if_needed(
+            job,
+            waited_event_targets=completion_wait_targets,
+        )
+        return False
     # job 输出已被 retarget 到 flush 的私有 tape 时,必须排在 tape 的 baseline
     # stack(提交流)之后写,否则会被 stack 的 arena 旧值覆盖(WAW)。GPU 侧
     # no-op 若 stack 已完成,零热路径开销。
     if tape_stack_evt is not None:
         torch.cuda.current_stream(device=scratch.device).wait_event(tape_stack_evt)
         setattr(job, "tape_stack_evt", None)
-    for tensor in (
-        scratch,
-        getattr(job, "producer_rows_i32", None),
-        getattr(job, "row_capture_last_n_i32", None),
-        getattr(job, "row_is_prefill_producer", None),
-        getattr(job, "seqused_k", None),
-        getattr(job, "active_capture_row_by_batch_row_i32", None),
-        prefill_out_capture_local,
-        prefill_out_denoms_local,
-        getattr(job, "refresh_out_capture_scores", None),
-        getattr(job, "refresh_out_log_f_denoms", None),
-        getattr(job, "prefill_out_kv_len_per_capture_row_i32", None),
-        getattr(job, "refresh_out_kv_len_per_capture_row_i32", None),
-    ):
-        _record_capture_postprocess_tensor_on_current_stream(tensor)
+    _record_capture_postprocess_job_tensors(
+        job,
+        scratch=scratch,
+        prefill_out_capture=prefill_out_capture_local,
+        prefill_out_denoms=prefill_out_denoms_local,
+    )
     ran = run_prefill_capture_postprocess_if_needed(
         direct_capture_phase=str(getattr(job, "direct_capture_phase", "")),
         scratch_capture_scores=scratch,
@@ -860,10 +3278,112 @@ def run_capture_postprocess_job_if_needed(
         alpha=float(getattr(job, "alpha", 0.0) or 0.0),
         debug_epoch=int(getattr(job, "debug_epoch", -1)),
         debug_layer_index=int(getattr(job, "debug_layer_index", -1)),
+        proof_job_key=getattr(job, "job_key", None),
     )
-    setattr(job, "ran_postprocess", bool(ran))
-    setattr(job, "completed", True)
+    completion_event = torch.cuda.Event(enable_timing=False)
+    completion_event.record(torch.cuda.current_stream(device=scratch.device))
+    if _lifecycle_lock is not None:
+        _lifecycle_lock.acquire()
+    try:
+        setattr(job, "completion_event", completion_event)
+        setattr(job, "ran_postprocess", bool(ran))
+        setattr(job, "completed", True)
+    finally:
+        if _lifecycle_lock is not None:
+            _lifecycle_lock.release()
     return bool(ran)
+
+
+def run_tiled_capture_postprocess_job_cohort(
+    jobs: Sequence[Any],
+    *,
+    meta_cache_owner: Optional[object],
+) -> int:
+    """Strict bounded-owner API: one all-tiled sequence, exactly four kernels."""
+
+    _reject_retired_selector_log_f_tp8_exact_env()
+    jobs = tuple(jobs or tuple())
+    if not jobs:
+        return 0
+    if any(job is None for job in jobs):
+        _selector_log_f_contract_error(
+            "TILED_COHORT", "strict cohort must not contain missing jobs"
+        )
+    object_ids = tuple(id(job) for job in jobs)
+    if len(set(object_ids)) != len(object_ids):
+        _selector_log_f_contract_error(
+            "TILED_COHORT", "strict cohort jobs must be distinct objects"
+        )
+    keys = tuple(_normalized_deferred_job_key(job) for job in jobs)
+    if len(set(keys)) != len(keys):
+        _selector_log_f_contract_error(
+            "JOB_KEY_ALIAS", "strict cohort jobs must have distinct identities"
+        )
+    return _run_tiled_capture_postprocess_job_cohort(
+        jobs,
+        meta_cache_owner=meta_cache_owner,
+    )
+
+
+def run_capture_postprocess_job_sequence(
+    jobs: Sequence[Any],
+    *,
+    meta_cache_owner: Optional[object],
+) -> int:
+    """Run an ordered job sequence, coalescing maximal compatible tiled runs."""
+
+    _reject_retired_selector_log_f_tp8_exact_env()
+    unique_jobs: list[Any] = []
+    seen_objects: set[int] = set()
+    owner_by_key: dict[tuple[int, int, int], Any] = {}
+    for job in tuple(jobs or tuple()):
+        if job is None:
+            continue
+        object_id = id(job)
+        if object_id in seen_objects:
+            continue
+        seen_objects.add(object_id)
+        key = _normalized_deferred_job_key(job)
+        previous = owner_by_key.get(key)
+        if previous is not None and previous is not job:
+            _selector_log_f_contract_error(
+                "JOB_KEY_ALIAS",
+                f"distinct deferred jobs claim the same identity {key!r}",
+            )
+        owner_by_key[key] = job
+        unique_jobs.append(job)
+
+    plans = tuple(_build_tiled_job_plan(job) for job in unique_jobs)
+    completion_wait_targets: dict[int, tuple[str, int, int]] = {}
+    ran_count = 0
+    index = 0
+    while index < len(unique_jobs):
+        plan = plans[index]
+        if plan is None:
+            if run_capture_postprocess_job_if_needed(
+                unique_jobs[index],
+                meta_cache_owner=meta_cache_owner,
+                completion_wait_targets=completion_wait_targets,
+            ):
+                ran_count += 1
+            index += 1
+            continue
+        end = index + 1
+        while end < len(unique_jobs):
+            candidate = plans[end]
+            if candidate is None or (
+                candidate.scratch.device != plan.scratch.device
+                or candidate.num_query_heads != plan.num_query_heads
+            ):
+                break
+            end += 1
+        ran_count += _run_tiled_capture_postprocess_job_cohort(
+            unique_jobs[index:end],
+            meta_cache_owner=meta_cache_owner,
+            initial_plans=plans[index:end],
+        )
+        index = end
+    return int(ran_count)
 
 
 def run_capture_postprocess_jobs_for_payloads(
@@ -871,20 +3391,30 @@ def run_capture_postprocess_jobs_for_payloads(
     *,
     meta_cache_owner: Optional[object],
 ) -> int:
-    """Run unique deferred capture postprocess jobs referenced by payloads."""
-    ran_count = 0
-    seen: set[int] = set()
+    """Validate payload ownership, deduplicate jobs, then run their sequence."""
+
+    _reject_retired_selector_log_f_tp8_exact_env()
+    jobs: list[Any] = []
+    seen_objects: set[int] = set()
+    owner_by_key: dict[tuple[int, int, int], Any] = {}
     for payload in tuple(payloads or tuple()):
         job = getattr(payload, "capture_postprocess_job", None)
         if job is None:
             continue
-        job_id = id(job)
-        if job_id in seen:
+        key = _validate_payload_job_identity(payload, job)
+        previous = owner_by_key.get(key)
+        if previous is not None and previous is not job:
+            _selector_log_f_contract_error(
+                "JOB_KEY_ALIAS",
+                f"distinct deferred jobs claim the same identity {key!r}",
+            )
+        owner_by_key[key] = job
+        object_id = id(job)
+        if object_id in seen_objects:
             continue
-        seen.add(job_id)
-        if run_capture_postprocess_job_if_needed(
-            job,
-            meta_cache_owner=meta_cache_owner,
-        ):
-            ran_count += 1
-    return int(ran_count)
+        seen_objects.add(object_id)
+        jobs.append(job)
+    return run_capture_postprocess_job_sequence(
+        jobs,
+        meta_cache_owner=meta_cache_owner,
+    )

@@ -1363,7 +1363,7 @@ class SelectorComputeMixin:
         )
         if need_realloc:
             cap = need if buf is None else max(need, int(buf.numel()))
-            if buf is not None:
+            if buf is not None and buf.is_cuda:
                 # [SELECTED-STABLE-REALLOC-UAF-FIX 2026-07-07] 容量增长弃旧
                 # storage 前对全部潜在消费流 record_stream:在飞 deferred writer
                 # (graph replay 烤旧 data_ptr / eager launch args 持旧引用)与
@@ -1409,46 +1409,41 @@ class SelectorComputeMixin:
         order; non_blocking does not reorder within a stream). This records an
         event AFTER those copies as a defensive guard mirroring the
         pointer-publish ready-event ordering — drained by
-        ``_wait_writer_input_ready`` before replay. Fail-open: any error (no
-        CUDA, capturing) leaves the latch unset and is ignored downstream.
+        ``_wait_writer_input_ready`` before replay. CUDA state/event failures
+        propagate; only non-CUDA and an enclosing graph capture are intentional
+        no-event states.
         """
-        try:
-            dev = torch.device(device)
-            if dev.type != "cuda":
-                self._selector_writer_input_ready_event = None
-                return
-            if bool(torch.cuda.is_current_stream_capturing()):
-                # Never record an event while capturing the writer/decode graph.
-                self._selector_writer_input_ready_event = None
-                return
-            ev = self._selector_writer_input_ready_event
-            if ev is None:
-                ev = torch.cuda.Event(enable_timing=False)
-                self._selector_writer_input_ready_event = ev
-            ev.record(torch.cuda.current_stream(device=dev))
-        except Exception:
+        dev = torch.device(device)
+        if dev.type != "cuda":
             self._selector_writer_input_ready_event = None
+            return
+        if bool(torch.cuda.is_current_stream_capturing()):
+            # Never record an event while capturing the writer/decode graph.
+            self._selector_writer_input_ready_event = None
+            return
+        ev = self._selector_writer_input_ready_event
+        if ev is None:
+            ev = torch.cuda.Event(enable_timing=False)
+            self._selector_writer_input_ready_event = ev
+        ev.record(torch.cuda.current_stream(device=dev))
 
     def _wait_writer_input_ready(self, *, device: torch.device) -> None:
         """#9-KEY v3: drain the writer-input ready latch before graph replay.
 
         Same-stream this is a strict no-op (the event marks a position already
         passed on this stream). It only adds a real dependency if a future
-        refactor issues the copies on a different stream. Fail-open: never
-        raises, never waits while capturing.
+        refactor issues the copies on a different stream. It intentionally does
+        not wait while capturing; all other CUDA ordering failures propagate.
         """
-        try:
-            ev = self._selector_writer_input_ready_event
-            if ev is None:
-                return
-            dev = torch.device(device)
-            if dev.type != "cuda":
-                return
-            if bool(torch.cuda.is_current_stream_capturing()):
-                return
-            torch.cuda.current_stream(device=dev).wait_event(ev)
-        except Exception:
+        ev = self._selector_writer_input_ready_event
+        if ev is None:
             return
+        dev = torch.device(device)
+        if dev.type != "cuda":
+            return
+        if bool(torch.cuda.is_current_stream_capturing()):
+            return
+        torch.cuda.current_stream(device=dev).wait_event(ev)
 
     def _ensure_selector_capture_scores_buffer(
         self,
@@ -1772,28 +1767,6 @@ class SelectorComputeMixin:
             )
         return False
 
-    def _selector_topk_graph_bypass_latch(self) -> None:
-        """[G4 2026-07-11] Latch permanent bypass, draining the current stream
-        BEFORE dropping the state dict: a replay of a *different* key may still
-        be in flight on this stream, and dropping the last references to the
-        graphs+mempool lets the pool's blocks be freed and reused by other
-        streams while that replay still writes them (theoretical UAF). All
-        latch arms are cold (replay/capture failure, thrash verdict) so the
-        sync costs nothing in steady state. The sync itself is guarded: on a
-        sticky CUDA context error it would raise too, but the latch must still
-        land so the dispatcher keeps falling back to eager.
-        """
-        import torch as _torch
-
-        try:
-            _torch.cuda.current_stream().synchronize()
-        except Exception:
-            _log.warning(
-                "selector topk graph: bypass-latch stream sync failed",
-                exc_info=True,
-            )
-        self._selector_topk_graph_state = {"bypass": True}
-
     def _selector_topk_graph_dispatch(
         self,
         *,
@@ -1807,8 +1780,9 @@ class SelectorComputeMixin:
         selected_indices tensor (a view of the stable selected_indices_out buffer
         when that cache is on). On a replay hit we re-run the captured graph
         (which writes into the SAME stable buffer) and return the return view we
-        cached at capture time. Fail-OPEN: any error discards the graph, runs
-        eager, latches a permanent bypass.
+        cached at capture time. Capture/replay failures propagate; silently
+        switching to eager would hide a broken graph contract and remote
+        performance collapse.
 
         ``key_fields`` MUST already encode every consumed data_ptr + shape so any
         regime change (override realloc, kbucket clamp-fallback, slice pad,
@@ -1820,8 +1794,6 @@ class SelectorComputeMixin:
         if not self._selector_topk_graph_stable_active():
             return eager_fn()
         state = self._selector_topk_graph_state
-        if isinstance(state, dict) and bool(state.get("bypass")):
-            return eager_fn()
         key = tuple(int(v) for v in key_fields)
         graphs = state.get("graphs") if isinstance(state, dict) else None
         entry = graphs.get(key) if isinstance(graphs, dict) else None
@@ -1830,22 +1802,14 @@ class SelectorComputeMixin:
         # eviction 恒为 clear-all+thrash 联判——population16 后合法稳态
         # key 全集 12<16,清库臂本身罕至。)
         if entry is not None and not ptr_rebuild_miss:
-            try:
-                entry["graph"].replay()
-                # Real replay counter (graph-agnostic): proof the captured graph
-                # replayed, independent of the cached graph object's own .replay
-                # (mirrors the writer track's "graph_replay" count).
-                self._selector_topk_graph_replay_count = (
-                    int(getattr(self, "_selector_topk_graph_replay_count", 0)) + 1
-                )
-                return entry["result"]
-            except Exception:
-                _log.warning(
-                    "selector topk graph replay failed; bypassing capture",
-                    exc_info=True,
-                )
-                self._selector_topk_graph_bypass_latch()
-                return eager_fn()
+            entry["graph"].replay()
+            # Real replay counter (graph-agnostic): proof the captured graph
+            # replayed, independent of the cached graph object's own .replay
+            # (mirrors the writer track's "graph_replay" count).
+            self._selector_topk_graph_replay_count = (
+                int(getattr(self, "_selector_topk_graph_replay_count", 0)) + 1
+            )
+            return entry["result"]
         # Cold / new-key / ptr-rebuild step: run eager NOW (also the recapture
         # step). Only (re)capture when no pointer rebuild happened this step.
         # [C'-FORENSIC 2026-07-11] cold-arm eager vs capture 段分解仪器(detail
@@ -1872,14 +1836,7 @@ class SelectorComputeMixin:
             if isinstance(graphs, dict):
                 graphs.pop(key, None)
             return result
-        try:
-            self._capture_selector_topk_graph(eager_fn=eager_fn, key=key)
-        except Exception:
-            _log.warning(
-                "selector topk graph capture failed; bypassing capture",
-                exc_info=True,
-            )
-            self._selector_topk_graph_bypass_latch()
+        self._capture_selector_topk_graph(eager_fn=eager_fn, key=key)
         return result
 
     def _capture_selector_topk_graph(
@@ -1900,15 +1857,9 @@ class SelectorComputeMixin:
         """
         import torch as _torch
 
-        try:
-            if bool(_torch.cuda.is_current_stream_capturing()):
-                # Already capturing the outer decode graph -> do NOT nest.
-                return
-        except Exception:
-            _log.warning(
-                "selector topk graph: failed to query outer capture state; skip",
-                exc_info=True,
-            )
+        if bool(_torch.cuda.is_current_stream_capturing()):
+            # Already capturing the outer decode graph -> do NOT nest. The eager
+            # selector launch issued by the caller belongs to that outer graph.
             return
         state = self._selector_topk_graph_state
         mempool = None
@@ -1935,8 +1886,8 @@ class SelectorComputeMixin:
         # finally capture_end(缺了=全进程卡 capturing 态)③闭包卫生(eager_fn
         # 无 host 标量物化,生产捕获已实证)。capture_error_mode=thread_local
         # =审查判定书 G3(消 TP>1 NCCL watchdog×global 捕获模式竞态)。失败
-        # 毒化(pool/RNG 卡捕获态)为 torch 2.10 固有且 CM 同样中招,处置照旧
-        # =外层 except→bypass latch(fail-open 回 eager)。
+        # 毒化(pool/RNG 卡捕获态)为 torch 2.10 固有且 CM 同样中招；异常直接
+        # 上抛，禁止切回 eager 掩盖损坏的 graph 状态。
         # [C'-FORENSIC 2026-07-11] capture 段整程计时(begin..end 含记录重放
         # +实例化;detail 门下零税)——与 dispatch 冷臂 sel_cold_eager_us 一起
         # 分解冷 key 峰。
@@ -1963,7 +1914,7 @@ class SelectorComputeMixin:
             ) + 1.0
         key_t = tuple(int(v) for v in key)
         if not isinstance(state, dict) or not isinstance(state.get("graphs"), dict):
-            state = {"graphs": {}, "mempool": mempool, "bypass": False}
+            state = {"graphs": {}, "mempool": mempool}
             self._selector_topk_graph_state = state
         state["mempool"] = mempool
         graphs_map = state["graphs"]
@@ -2000,7 +1951,7 @@ class SelectorComputeMixin:
             except OSError:
                 pass
         if self._selector_topk_graph_record_recapture():
-            self._selector_topk_graph_bypass_latch()
+            raise RuntimeError("E_SFI_SELECTOR_GRAPH_UNBOUNDED_KEY_CHURN")
 
     def _get_selector_layer_index_tensor(
         self,

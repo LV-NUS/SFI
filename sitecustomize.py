@@ -288,6 +288,9 @@ if _ledger_dir:
         ) from exc
 
 site_log_enabled = os.environ.get("VLLM_SPARSE_SITE_LOG", "0") == "1"
+site_log_path = os.environ.get(
+    "VLLM_SPARSE_SITE_LOG_PATH", "/tmp/vllm_sparse_site.log"
+)
 fa4_dense_gateway_requested = (
     os.environ.get("VLLM_SPARSE_FA4_DENSE_GATEWAY") == "1"
     and os.environ.get("VLLM_FLASH_ATTN_VERSION") == "4"
@@ -317,13 +320,13 @@ try:
     )
     dense_route_probe_summary = install_dense_fa3_route_trace_probe_patch()
     if site_log_enabled and vendored_probe_summary.get("applied"):
-        with open("/tmp/vllm_sparse_site.log", "a", encoding="utf-8") as _log:
+        with open(site_log_path, "a", encoding="utf-8") as _log:
             _log.write(
                 "sitecustomize installed vendored flash-attn probe patch, "
                 f"PID={os.getpid()}, summary={vendored_probe_summary}\n"
             )
     if site_log_enabled and dense_route_probe_summary.get("applied"):
-        with open("/tmp/vllm_sparse_site.log", "a", encoding="utf-8") as _log:
+        with open(site_log_path, "a", encoding="utf-8") as _log:
             _log.write(
                 "sitecustomize installed dense fa3 route trace probe, "
                 f"PID={os.getpid()}, summary={dense_route_probe_summary}\n"
@@ -338,14 +341,14 @@ try:
 
         install_fa4_dense_fallback_gateway()
         if site_log_enabled:
-            with open("/tmp/vllm_sparse_site.log", "a", encoding="utf-8") as _log:
+            with open(site_log_path, "a", encoding="utf-8") as _log:
                 _log.write(
                     "sitecustomize installed fa4 dense fallback gateway, "
                     f"PID={os.getpid()}\n"
                 )
 except Exception as exc:
     if site_log_enabled:
-        with open("/tmp/vllm_sparse_site.log", "a", encoding="utf-8") as _log:
+        with open(site_log_path, "a", encoding="utf-8") as _log:
             _log.write(
                 "sitecustomize vendored flash-attn probe patch failed, "
                 f"PID={os.getpid()}, error={exc}\n"
@@ -460,14 +463,14 @@ if os.environ.get("VLLM_NATIVE_FULLGRAPH_REPLAY_CUDA_EVENT_LOG"):
             _sfi_native_cgw_call._sfi_native_cgw_event_patch = True
             CUDAGraphWrapper.__call__ = _sfi_native_cgw_call
             if site_log_enabled:
-                with open("/tmp/vllm_sparse_site.log", "a", encoding="utf-8") as _log:
+                with open(site_log_path, "a", encoding="utf-8") as _log:
                     _log.write(
                         "sitecustomize installed native CUDAGraphWrapper replay diagnostic, "
                         f"PID={os.getpid()}\n"
                     )
     except Exception as exc:
         if site_log_enabled:
-            with open("/tmp/vllm_sparse_site.log", "a", encoding="utf-8") as _log:
+            with open(site_log_path, "a", encoding="utf-8") as _log:
                 _log.write(
                     "sitecustomize native CUDAGraphWrapper replay diagnostic failed, "
                     f"PID={os.getpid()}, error={exc}\n"
@@ -1031,14 +1034,14 @@ if os.environ.get("VLLM_EXECUTOR_RPC_TIMING_LOG"):
             _sfi_mpe.WorkerProc.worker_busy_loop = _sfi_timed_worker_busy_loop
 
         if site_log_enabled:
-            with open("/tmp/vllm_sparse_site.log", "a", encoding="utf-8") as _log:
+            with open(site_log_path, "a", encoding="utf-8") as _log:
                 _log.write(
                     "sitecustomize installed executor RPC timing diagnostic, "
                     f"PID={os.getpid()}\n"
                 )
     except Exception as exc:
         if site_log_enabled:
-            with open("/tmp/vllm_sparse_site.log", "a", encoding="utf-8") as _log:
+            with open(site_log_path, "a", encoding="utf-8") as _log:
                 _log.write(
                     "sitecustomize executor RPC timing diagnostic failed, "
                     f"PID={os.getpid()}, error={exc}\n"
@@ -1261,14 +1264,14 @@ if os.environ.get("VLLM_EXECUTOR_RPC_TIMING_LOG"):
             _sfi_uni.UniProcExecutor.collective_rpc = _sfi_timed_uniproc_collective_rpc
 
         if site_log_enabled:
-            with open("/tmp/vllm_sparse_site.log", "a", encoding="utf-8") as _log:
+            with open(site_log_path, "a", encoding="utf-8") as _log:
                 _log.write(
                     "sitecustomize installed uniproc executor timing diagnostic, "
                     f"PID={os.getpid()}\n"
                 )
     except Exception as exc:
         if site_log_enabled:
-            with open("/tmp/vllm_sparse_site.log", "a", encoding="utf-8") as _log:
+            with open(site_log_path, "a", encoding="utf-8") as _log:
                 _log.write(
                     "sitecustomize uniproc executor timing diagnostic failed, "
                     f"PID={os.getpid()}, error={exc}\n"
@@ -1471,14 +1474,14 @@ if os.environ.get("VLLM_GPU_EXECUTE_PHASE_TIMING_LOG"):
             _sfi_gmr.GPUModelRunner.execute_model = _sfi_timed_gpu_execute_model
 
         if site_log_enabled:
-            with open("/tmp/vllm_sparse_site.log", "a", encoding="utf-8") as _log:
+            with open(site_log_path, "a", encoding="utf-8") as _log:
                 _log.write(
                     "sitecustomize installed GPUModelRunner execute_model phase timing diagnostic, "
                     f"PID={os.getpid()}\n"
                 )
     except Exception as exc:
         if site_log_enabled:
-            with open("/tmp/vllm_sparse_site.log", "a", encoding="utf-8") as _log:
+            with open(site_log_path, "a", encoding="utf-8") as _log:
                 _log.write(
                     "sitecustomize GPUModelRunner execute_model phase timing diagnostic failed, "
                     f"PID={os.getpid()}, error={exc}\n"
@@ -1547,14 +1550,14 @@ if os.environ.get("VLLM_GPU_EXECUTE_PHASE_TIMING_LOG"):
             _sfi_timed_synchronize_input_prep._sfi_gpu_sync_phase_patch = True
             _sfi_sync_gmr.GPUModelRunner.synchronize_input_prep = _sfi_timed_synchronize_input_prep
             if site_log_enabled:
-                with open("/tmp/vllm_sparse_site.log", "a", encoding="utf-8") as _log:
+                with open(site_log_path, "a", encoding="utf-8") as _log:
                     _log.write(
                         "sitecustomize installed synchronize_input_prep phase timing diagnostic, "
                         f"PID={os.getpid()}\n"
                     )
     except Exception as exc:
         if site_log_enabled:
-            with open("/tmp/vllm_sparse_site.log", "a", encoding="utf-8") as _log:
+            with open(site_log_path, "a", encoding="utf-8") as _log:
                 _log.write(
                     "sitecustomize synchronize_input_prep phase timing diagnostic failed, "
                     f"PID={os.getpid()}, error={exc}\n"
@@ -1563,15 +1566,30 @@ if os.environ.get("VLLM_GPU_EXECUTE_PHASE_TIMING_LOG"):
             f"sitecustomize synchronize_input_prep phase timing diagnostic failed: {exc}"
         ) from exc
 
+# Exact TP8 postflight reads scheduler-owned BlockPool state through vLLM's
+# existing named utility transport. Install the project-owned method in every
+# EngineCore process, including the dense arm; no vLLM source is modified.
+if os.environ.get("SFI_RUNNER_TIER", "") == "tp8x64k":
+    try:
+        from patches.page_kv_residency import (
+            install_engine_core_block_pool_state_utility,
+        )
+
+        install_engine_core_block_pool_state_utility()
+    except Exception as exc:
+        raise SystemExit(
+            f"sitecustomize EngineCore BlockPool proof utility failed: {exc}"
+        ) from exc
+
 if "VLLM_SPARSE_CONTROLLER_JSON" in os.environ:
     if site_log_enabled:
-        with open("/tmp/vllm_sparse_site.log", "a", encoding="utf-8") as _log:
+        with open(site_log_path, "a", encoding="utf-8") as _log:
             _log.write(f"sitecustomize installing vllm sparse patch, PID={os.getpid()}\n")
     try:
         from patches.vllm_sparse_patch import ensure_vllm_sparse_patch_from_env
         controller = ensure_vllm_sparse_patch_from_env()
         if site_log_enabled:
-            with open("/tmp/vllm_sparse_site.log", "a", encoding="utf-8") as _log:
+            with open(site_log_path, "a", encoding="utf-8") as _log:
                 vllm_mod = sys.modules.get("vllm")
                 vllm_file = getattr(vllm_mod, "__file__", None)
                 sys_path_head = ",".join(str(p) for p in sys.path[:5])
@@ -1581,11 +1599,11 @@ if "VLLM_SPARSE_CONTROLLER_JSON" in os.environ:
                 )
     except Exception as e:
         if site_log_enabled:
-            with open("/tmp/vllm_sparse_site.log", "a", encoding="utf-8") as _log:
+            with open(site_log_path, "a", encoding="utf-8") as _log:
                 _log.write(f"  patch FAILED: {e}, PID={os.getpid()}\n")
         import traceback
         if site_log_enabled:
-            with open("/tmp/vllm_sparse_site.log", "a", encoding="utf-8") as _log:
+            with open(site_log_path, "a", encoding="utf-8") as _log:
                 _log.write(traceback.format_exc())
         raise SystemExit(f"sitecustomize sparse patch failed: {e}") from e
 
@@ -1606,7 +1624,7 @@ if os.environ.get("VLLM_FORCE_DETERMINISTIC") == "1":
         os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")
     except Exception as exc:  # pragma: no cover - best-effort debug hook
         if site_log_enabled:
-            with open("/tmp/vllm_sparse_site.log", "a", encoding="utf-8") as _log:
+            with open(site_log_path, "a", encoding="utf-8") as _log:
                 _log.write(f"sitecustomize deterministic setup failed: {exc}\n")
 
 # ---------------------------------------------------------------------------

@@ -11,6 +11,7 @@ import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from statistics import median
+from types import ModuleType
 from typing import Callable
 
 import torch
@@ -231,6 +232,7 @@ class ResolverKernelOnlyRecord:
     raw_native_kernel_us: float
     vs_raw_native_overhead_pct: float
     speed_raw_pair_status: str
+    speed_raw_pair_error: str
     speed_raw_baseline_name: str
     speed_raw_shadow_name: str
     speed_raw_pinned_num_splits: int
@@ -284,6 +286,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--output", required=True)
     parser.add_argument("--summary-output")
+    parser.add_argument(
+        "--extension-path",
+        default="",
+        help=(
+            "Absolute path to the exact _vllm_fa3_C candidate under test. "
+            "It is loaded before the vendored Python bridge and is also used "
+            "for artifact path/SHA reporting, so a clean build can be gated "
+            "without overwriting the production extension."
+        ),
+    )
     parser.add_argument("--warmup", type=int, default=50)
     parser.add_argument("--iters", "--repeat", dest="iters", type=int, default=1000)
     parser.add_argument("--inner-iters", type=int, default=20)
@@ -317,6 +329,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--hard-fail-overhead-pct", type=float, default=2.0)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--batch-sizes", default="")
+    parser.add_argument("--num-q-heads", type=int, default=32)
+    parser.add_argument("--num-kv-heads", type=int, default=8)
     parser.add_argument("--kv-len", type=int, default=8192)
     parser.add_argument("--kv-lens", default="")
     parser.add_argument("--selected-pages", type=int, default=16)
@@ -343,6 +357,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--hard-fail-overhead-pct must be >= 0")
     if args.batch_size < 2:
         parser.error("--batch-size must be >= 2 for selected/native row-consume proof rows")
+    if args.num_q_heads <= 0 or args.num_kv_heads <= 0:
+        parser.error("--num-q-heads and --num-kv-heads must be > 0")
+    if args.num_q_heads % args.num_kv_heads != 0:
+        parser.error("--num-q-heads must be divisible by --num-kv-heads")
     if args.kv_len <= 0 or args.kv_len % KERNEL_ONLY_TMA_PAGE_SIZE != 0:
         parser.error("--kv-len must be a positive multiple of 128")
     if (
@@ -386,6 +404,43 @@ def _json_sanitize(value):
     if isinstance(value, (list, tuple)):
         return [_json_sanitize(item) for item in value]
     return value
+
+
+def _load_extension_override(extension_path: str) -> str:
+    """Load and identity-pin an isolated FA3 candidate.
+
+    The vendored bridge imports a Python extension module by package name,
+    while clean build verification must not install over that package's live
+    binary.  Load the candidate's TORCH_LIBRARY registrations directly and
+    provide a module marker for the bridge's import probe.  Refuse an already
+    loaded binary with a different identity instead of silently benchmarking
+    whichever extension won import order.
+    """
+    path = Path(extension_path).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"FA3 extension candidate does not exist: {path}")
+    if "_vllm_fa3_C" not in path.name or path.suffix != ".so":
+        raise ValueError(f"not an _vllm_fa3_C shared object: {path}")
+
+    module_names = (
+        "vllm_flash_attn._vllm_fa3_C",
+        "vllm.vllm_flash_attn._vllm_fa3_C",
+    )
+    for module_name in module_names:
+        loaded = sys.modules.get(module_name)
+        loaded_path = getattr(loaded, "__file__", "") if loaded is not None else ""
+        if loaded_path and Path(str(loaded_path)).resolve() != path:
+            raise RuntimeError(
+                "refusing FA3 extension identity conflict: "
+                f"{module_name} already points to {loaded_path}, requested {path}"
+            )
+
+    torch.ops.load_library(str(path))
+    marker = ModuleType(module_names[0])
+    marker.__file__ = str(path)
+    marker.__package__ = "vllm_flash_attn"
+    sys.modules.setdefault(module_names[0], marker)
+    return str(path)
 
 
 def record_to_jsonable(record: ResolverKernelOnlyRecord) -> dict[str, object]:
@@ -475,8 +530,8 @@ def _make_shape(args: argparse.Namespace) -> BenchShape:
         kv_len=int(args.kv_len),
         selected_ratio=float(args.selected_pages) / float(args.kv_len // KERNEL_ONLY_NON_TMA_PAGE_SIZE),
         page_size=KERNEL_ONLY_NON_TMA_PAGE_SIZE,
-        num_q_heads=32,
-        num_kv_heads=8,
+        num_q_heads=int(args.num_q_heads),
+        num_kv_heads=int(args.num_kv_heads),
         head_dim=128,
         dtype=torch.bfloat16,
         device="cuda",
@@ -491,8 +546,8 @@ def _make_tma_shape(args: argparse.Namespace) -> BenchShape:
         kv_len=int(args.kv_len),
         selected_ratio=float(args.selected_pages) / float(args.kv_len // KERNEL_ONLY_TMA_PAGE_SIZE),
         page_size=KERNEL_ONLY_TMA_PAGE_SIZE,
-        num_q_heads=32,
-        num_kv_heads=8,
+        num_q_heads=int(args.num_q_heads),
+        num_kv_heads=int(args.num_kv_heads),
         head_dim=128,
         dtype=torch.bfloat16,
         device="cuda",
@@ -960,6 +1015,34 @@ def _split_signature(state: dict[str, object]) -> tuple[object, ...]:
     )
 
 
+def _output_and_lse_bitwise_equal(
+    *,
+    actual_out: torch.Tensor,
+    expected_out: torch.Tensor,
+    actual_lse: torch.Tensor,
+    expected_lse: torch.Tensor,
+) -> bool:
+    """Exact replay identity, including signed zero and NaN payload bits.
+
+    This is intentionally stricter than the case-vs-reference correctness
+    oracle.  Replaying the same launch with the exact same scheduler metadata
+    must not change either output tensor by even one bit; otherwise the replay
+    cannot certify a shared reduction envelope.
+    """
+
+    def tensor_bits_equal(actual: torch.Tensor, expected: torch.Tensor) -> bool:
+        if actual.dtype != expected.dtype or actual.shape != expected.shape:
+            return False
+        actual_bytes = actual.contiguous().view(torch.uint8)
+        expected_bytes = expected.contiguous().view(torch.uint8)
+        return bool(torch.equal(actual_bytes, expected_bytes))
+
+    return tensor_bits_equal(actual_out, expected_out) and tensor_bits_equal(
+        actual_lse,
+        expected_lse,
+    )
+
+
 def _split_match_status(
     *,
     reference: dict[str, object],
@@ -1019,6 +1102,7 @@ _SPEED_PAIR_MATCHED_STATUSES = (
 )
 _SPEED_PAIR_SKIPPED = "split_mismatch_skipped"
 _SPEED_PAIR_UNTIMED = "untimed"
+_SPEED_PAIR_ERROR = "shadow_pair_error"
 # S0-a saturation margin: inflates num_sm inside the (untimed) metadata prep
 # only, so the legacy heuristic saturates and the explicit num_splits cap
 # pins the dynamic split exactly (dyn == min(saturated, cap) == cap).
@@ -1139,7 +1223,10 @@ def _pinned_raw_native_runner(
     return runner
 
 
-_MIXED_PAGE_DIRECT_OP_ARGC = 58
+# Fail closed if the direct-op ABI changes.  A source contract derives the
+# expected value from _run_mixed_page_direct_op's call site so this fingerprint
+# cannot silently drift again.
+_MIXED_PAGE_DIRECT_OP_ARGC = 59
 _MIXED_PAGE_SCHEDULER_METADATA_ARG_INDEX = 16
 
 
@@ -1150,7 +1237,7 @@ def _injected_metadata_case_runner(
 ) -> Callable[[], tuple[torch.Tensor, torch.Tensor]]:
     """Shadow leg: the UNMODIFIED case runner, with the pinned scheduler
     metadata injected at the fwd_mixed_page launch site via a scoped op shim
-    (the 58-arg direct-op ABI and every case closure stay byte-identical).
+    (the 59-arg direct-op ABI and every case closure stay byte-identical).
     With metadata supplied the mixed launch skips its in-launch prepare
     (flash_api.cpp skip_scheduler_metadata_computation), so the timed region
     is the fwd kernel only - the production K6 replay form.  num_splits is
@@ -1168,7 +1255,8 @@ def _injected_metadata_case_runner(
         def shim(*args, **kwargs):
             if kwargs or len(args) != _MIXED_PAGE_DIRECT_OP_ARGC:
                 raise RuntimeError(
-                    "fwd_mixed_page shim expects the 58-positional-arg direct-op form"
+                    "fwd_mixed_page shim expects the "
+                    f"{_MIXED_PAGE_DIRECT_OP_ARGC}-positional-arg direct-op form"
                 )
             if args[_MIXED_PAGE_SCHEDULER_METADATA_ARG_INDEX] is not None:
                 raise RuntimeError(
@@ -1297,7 +1385,8 @@ def run_kernel_only(args: argparse.Namespace) -> list[ResolverKernelOnlyRecord]:
         seqused_k: torch.Tensor,
         max_seqlen_k: int,
         *,
-        num_splits: int = 0,
+        num_splits: int | None = 0,
+        scheduler_metadata: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         ref_batch = int(ref_case.shape.batch_size)
         ref_num_kv_heads = int(ref_case.shape.num_kv_heads)
@@ -1327,13 +1416,23 @@ def run_kernel_only(args: argparse.Namespace) -> list[ResolverKernelOnlyRecord]:
             device=ref_case.q.device,
             dtype=torch.int32,
         ).reshape(ref_batch, width)
+        if scheduler_metadata is not None:
+            return _run_native_direct_op(
+                bridge,
+                materialized_case,
+                page_table=ref_page_table,
+                seqused_k=seqused_k,
+                max_seqlen_k=max_seqlen_k,
+                scheduler_metadata=scheduler_metadata,
+                num_splits=num_splits,
+            )
         return _run_native_reference(
             bridge,
             materialized_case,
             page_table=ref_page_table,
             seqused_k=seqused_k,
             max_seqlen_k=max_seqlen_k,
-            num_splits=int(num_splits),
+            num_splits=0 if num_splits is None else int(num_splits),
         )
 
     head_out, head_lse = materialized_reference_for_head_table(
@@ -2175,37 +2274,85 @@ def run_kernel_only(args: argparse.Namespace) -> list[ResolverKernelOnlyRecord]:
         tma_two_segment_out,
         tma_two_segment_lse,
     )
-    # [ORACLE-SAMESPLIT 2026-07-12] Same-split oracle relaunch closures. The
-    # cached references above run in stock auto-split form; a mixed case whose
-    # resolved split differs from its reference's re-launches the reference
-    # with the case's split (cap semantics) so the fp32 combine order matches.
-    # Keyed by the cached tensor's identity so the case->reference mapping
-    # below stays the single source of truth. Every relaunch is verified by
-    # launch-state readback; an unproven pin falls back to the cached auto
-    # reference and reports itself in oracle_split_status (never a silent
-    # green).
+    # [ORACLE-SAME-ENVELOPE 2026-07-13] A dynamic split count alone is not the
+    # scheduler contract.  In particular, auto static=9/dynamic=5 and explicit
+    # static=5/dynamic=5 can produce a different reduction envelope and differ
+    # by one BF16 ulp.  Build pinned metadata out of band, then replay both the
+    # case and its native reference with that exact tensor while leaving the
+    # forward launches in auto mode.  The readback must match the complete
+    # split signature (requested/static/dynamic/batch), and the stock case must
+    # be bitwise-equal to its metadata replay.  An unproven pin stays a loud
+    # fallback; no tolerance is widened.
+    #
+    # Keying by cached tensor identity keeps reference_by_case as the only
+    # case-to-reference source of truth.
     def _native_ref_runner(ref_case, ref_page_table, ref_seqused_k, ref_max_seqlen_k):
-        def _run(num_splits: int) -> tuple[torch.Tensor, torch.Tensor]:
-            return _run_native_reference(
+        def _run(
+            num_splits: int,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None] | None:
+            if int(num_splits) < 2:
+                ref_out, ref_lse = _run_native_reference(
+                    bridge,
+                    ref_case,
+                    page_table=ref_page_table,
+                    seqused_k=ref_seqused_k,
+                    max_seqlen_k=ref_max_seqlen_k,
+                    num_splits=int(num_splits),
+                )
+                return ref_out, ref_lse, None
+            pinned_metadata = _pinned_scheduler_metadata(
+                bridge,
+                ref_case,
+                seqused_k=ref_seqused_k,
+                max_seqlen_k=ref_max_seqlen_k,
+                num_splits=int(num_splits),
+            )
+            if pinned_metadata is None:
+                return None
+            ref_out, ref_lse = _run_native_direct_op(
                 bridge,
                 ref_case,
                 page_table=ref_page_table,
                 seqused_k=ref_seqused_k,
                 max_seqlen_k=ref_max_seqlen_k,
-                num_splits=int(num_splits),
+                scheduler_metadata=pinned_metadata,
+                num_splits=None,
             )
+            return ref_out, ref_lse, pinned_metadata
 
         return _run
 
     def _materialized_ref_runner(ref_case, ref_page_table, ref_seqused_k, ref_max_seqlen_k):
-        def _run(num_splits: int) -> tuple[torch.Tensor, torch.Tensor]:
-            return materialized_reference_for_head_table(
+        def _run(
+            num_splits: int,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None] | None:
+            if int(num_splits) < 2:
+                ref_out, ref_lse = materialized_reference_for_head_table(
+                    ref_case,
+                    ref_page_table,
+                    ref_seqused_k,
+                    ref_max_seqlen_k,
+                    num_splits=int(num_splits),
+                )
+                return ref_out, ref_lse, None
+            pinned_metadata = _pinned_scheduler_metadata(
+                bridge,
+                ref_case,
+                seqused_k=ref_seqused_k,
+                max_seqlen_k=ref_max_seqlen_k,
+                num_splits=int(num_splits),
+            )
+            if pinned_metadata is None:
+                return None
+            ref_out, ref_lse = materialized_reference_for_head_table(
                 ref_case,
                 ref_page_table,
                 ref_seqused_k,
                 ref_max_seqlen_k,
-                num_splits=int(num_splits),
+                num_splits=None,
+                scheduler_metadata=pinned_metadata,
             )
+            return ref_out, ref_lse, pinned_metadata
 
         return _run
 
@@ -2224,10 +2371,13 @@ def run_kernel_only(args: argparse.Namespace) -> list[ResolverKernelOnlyRecord]:
     }
 
     def _relaunch_reference_same_split(runner, pin_num_splits: int):
-        ref_out, ref_lse = runner(int(pin_num_splits))
+        result = runner(int(pin_num_splits))
+        if result is None:
+            return None
+        ref_out, ref_lse, pinned_metadata = result
         torch.cuda.synchronize()
         state = bridge.interface_module.fwd_last_launch_debug_state(ref_out)
-        return ref_out, ref_lse, state
+        return ref_out, ref_lse, state, pinned_metadata
 
     split_reference_case = "kind0_native_non_tma_page64"
     correctness: dict[str, tuple[bool, float]] = {}
@@ -2281,15 +2431,45 @@ def run_kernel_only(args: argparse.Namespace) -> list[ResolverKernelOnlyRecord]:
                 case_split = _effective_num_splits(launch_states[name])
                 same_split_runner = reference_runner_by_ref_id.get(id(ref_out))
                 if same_split_runner is not None and case_split is not None:
-                    pinned_out, pinned_lse, pinned_state = _relaunch_reference_same_split(
+                    relaunch = _relaunch_reference_same_split(
                         same_split_runner, case_split
                     )
-                    if _effective_num_splits(pinned_state) == int(case_split):
-                        ref_out, ref_lse = pinned_out, pinned_lse
-                        oracle_split_status[name] = "same_split"
-                        oracle_reference_num_splits[name] = int(case_split)
-                    else:
+                    if relaunch is None:
                         oracle_split_status[name] = "split_mismatch_fallback"
+                    else:
+                        pinned_out, pinned_lse, pinned_state, pinned_metadata = relaunch
+                        same_envelope = (
+                            _split_signature(pinned_state)
+                            == _split_signature(launch_states[name])
+                        )
+                        metadata_replay_ok = True
+                        if pinned_metadata is not None:
+                            replay_out, replay_lse = _injected_metadata_case_runner(
+                                runners[name],
+                                pinned_metadata=pinned_metadata,
+                            )()
+                            torch.cuda.synchronize()
+                            replay_state = bridge.interface_module.fwd_last_launch_debug_state(
+                                replay_out
+                            )
+                            metadata_replay_ok = bool(
+                                _split_signature(replay_state)
+                                == _split_signature(launch_states[name])
+                                and _output_and_lse_bitwise_equal(
+                                    actual_out=out,
+                                    expected_out=replay_out,
+                                    actual_lse=lse,
+                                    expected_lse=replay_lse,
+                                )
+                            )
+                        if same_envelope and metadata_replay_ok:
+                            ref_out, ref_lse = pinned_out, pinned_lse
+                            oracle_split_status[name] = "same_split"
+                            oracle_reference_num_splits[name] = int(case_split)
+                        elif not metadata_replay_ok:
+                            oracle_split_status[name] = "metadata_replay_mismatch_fallback"
+                        else:
+                            oracle_split_status[name] = "split_mismatch_fallback"
                 correctness[name] = _assert_close_and_diff(
                     actual_out=out,
                     expected_out=ref_out,
@@ -2326,10 +2506,12 @@ def run_kernel_only(args: argparse.Namespace) -> list[ResolverKernelOnlyRecord]:
         "kind4_page_mutation_negative_non_tma",
     }
     speed_pair_status: dict[str, str] = {}
+    speed_pair_errors: dict[str, str] = {}
     speed_pair_baseline: dict[str, str] = {}
     speed_pair_shadow: dict[str, str] = {}
     speed_pair_pinned_splits: dict[str, int] = {}
     pinned_metadata_by_key: dict[tuple[str, int], torch.Tensor | None] = {}
+    pinned_probe_errors_by_key: dict[tuple[str, int], str] = {}
     pinned_runners: dict[str, Callable[[], tuple[torch.Tensor, torch.Tensor]]] = {}
     pinned_launch_states: dict[str, dict[str, object]] = {}
 
@@ -2395,6 +2577,10 @@ def run_kernel_only(args: argparse.Namespace) -> list[ResolverKernelOnlyRecord]:
                 max_seqlen_k=ref_seqlen,
                 num_splits=int(case_effective),
             )
+        if meta_key in pinned_probe_errors_by_key:
+            speed_pair_status[name] = _SPEED_PAIR_ERROR
+            speed_pair_errors[name] = pinned_probe_errors_by_key[meta_key]
+            return
         pinned_meta = pinned_metadata_by_key[meta_key]
         if pinned_meta is None:
             speed_pair_status[name] = _SPEED_PAIR_SKIPPED
@@ -2413,8 +2599,13 @@ def run_kernel_only(args: argparse.Namespace) -> list[ResolverKernelOnlyRecord]:
                 pin_runner()
                 torch.cuda.synchronize()
                 pin_state = bridge.interface_module.fwd_last_launch_debug_state(ref_case.q)
-            except Exception:
-                pin_state = {}
+            except Exception as exc:
+                reason = f"pinned_raw_probe: {type(exc).__name__}: {exc}"
+                pinned_probe_errors_by_key[meta_key] = reason
+                pinned_metadata_by_key[meta_key] = None
+                speed_pair_status[name] = _SPEED_PAIR_ERROR
+                speed_pair_errors[name] = reason
+                return
             if _effective_num_splits(pin_state) != int(case_effective):
                 # Pin not proven at launch: poison this tier so every case on
                 # it reports an honest skip instead of a fake-matched gate.
@@ -2433,8 +2624,11 @@ def run_kernel_only(args: argparse.Namespace) -> list[ResolverKernelOnlyRecord]:
                 shadow_runner()
                 torch.cuda.synchronize()
                 shadow_state = bridge.interface_module.fwd_last_launch_debug_state(ref_case.q)
-            except Exception:
-                shadow_state = {}
+            except Exception as exc:
+                reason = f"injected_shadow_probe: {type(exc).__name__}: {exc}"
+                speed_pair_status[name] = _SPEED_PAIR_ERROR
+                speed_pair_errors[name] = reason
+                return
             if _effective_num_splits(shadow_state) != int(case_effective):
                 speed_pair_status[name] = _SPEED_PAIR_SKIPPED
                 return
@@ -2497,7 +2691,8 @@ def run_kernel_only(args: argparse.Namespace) -> list[ResolverKernelOnlyRecord]:
             except Exception:  # pragma: no cover - exercised only on H100 runtime failures
                 timings[name] = math.inf
 
-    extension_path = _extension_path()
+    extension_override = str(getattr(args, "extension_path", "") or "")
+    extension_path = extension_override or _extension_path()
     gpu_end_util, gpu_end_memory = _gpu_state()
     sm_arch = _sm_arch()
     split_reference = launch_states[split_reference_case]
@@ -2657,6 +2852,8 @@ def run_kernel_only(args: argparse.Namespace) -> list[ResolverKernelOnlyRecord]:
             if retired_fail_closed
             else "runtime_fail"
             if name in runtime_errors
+            else "speed_pair_error"
+            if name in speed_pair_errors
             else "tma_route_fail"
             if is_tma_positive and not tma_route_pass
             else "negative_pass"
@@ -2711,6 +2908,8 @@ def run_kernel_only(args: argparse.Namespace) -> list[ResolverKernelOnlyRecord]:
                 source_status=(
                     tma_predicate_reject_reasons[name]
                     if is_tma_predicate_reject
+                    else speed_pair_errors[name]
+                    if name in speed_pair_errors
                     else "runtime"
                     if name not in runtime_errors
                     else runtime_errors[name]
@@ -2744,6 +2943,7 @@ def run_kernel_only(args: argparse.Namespace) -> list[ResolverKernelOnlyRecord]:
                 raw_native_kernel_us=float(raw_native_us),
                 vs_raw_native_overhead_pct=float(vs_raw_native_pct),
                 speed_raw_pair_status=str(pair_status),
+                speed_raw_pair_error=str(speed_pair_errors.get(name, "")),
                 speed_raw_baseline_name=str(pair_baseline_name),
                 speed_raw_shadow_name=str(pair_shadow_name),
                 speed_raw_pinned_num_splits=int(pair_pinned_splits),
@@ -2928,6 +3128,11 @@ def _summary(
         if _speed_gate_scoped(record)
         and record.speed_raw_pair_status not in _SPEED_PAIR_MATCHED_STATUSES
     ]
+    speed_pair_errors = {
+        _record_label(record): record.speed_raw_pair_error
+        for record in records
+        if record.speed_raw_pair_error
+    }
     # A filtered correctness run may legitimately contain no production RRP
     # case.  Once an RRP case is in scope, however, an all-skipped shadow-pair
     # population is an inconclusive speed verdict, not a green gate.  Keep the
@@ -3025,6 +3230,7 @@ def _summary(
             and not expected_reject_failures
             and not tma_route_failures
             and not speed_gate_failures
+            and not speed_pair_errors
             and resolved_speed_evidence_complete
         ),
         "fairness_passed": all(record.fairness_passed for record in records),
@@ -3034,6 +3240,7 @@ def _summary(
         "tma_route_failures": tma_route_failures,
         "speed_gate_failures": speed_gate_failures,
         "speed_pair_skipped": speed_pair_skipped,
+        "speed_pair_errors": speed_pair_errors,
         "resolved_speed_evidence_required": resolved_speed_evidence_required,
         "resolved_speed_evidence_present": resolved_speed_evidence_present,
         "resolved_speed_evidence_missing": resolved_speed_evidence_missing,
@@ -3041,6 +3248,7 @@ def _summary(
         "speed_pair_statuses": {
             _record_label(record): {
                 "status": record.speed_raw_pair_status,
+                "error": record.speed_raw_pair_error,
                 "baseline": record.speed_raw_baseline_name,
                 "shadow": record.speed_raw_shadow_name,
                 "pinned_num_splits": record.speed_raw_pinned_num_splits,
@@ -3110,6 +3318,8 @@ def write_summary(output: Path, summary: dict[str, object]) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if str(args.extension_path):
+        args.extension_path = _load_extension_override(str(args.extension_path))
     force_num_splits = int(getattr(args, "force_num_splits", -1))
     if force_num_splits not in (-1, 0, 1):
         raise SystemExit(

@@ -34,12 +34,91 @@ _RESOLVED_ROW_PTR_READY_EVENT_ATTR = "mixed_page_resolver_replay_ready_event"
 _RESOLVED_ROW_PTR_READY_EVENT_GENERATION_ATTR = (
     "mixed_page_resolver_replay_ready_event_generation"
 )
-_RESOLVED_ROW_PTR_READY_EVENT_WAITED_ATTR = (
-    "mixed_page_resolver_replay_ready_event_waited_generation"
-)
 _RESOLVED_ROW_PTR_READY_EVENT_STREAM_ATTR = (
     "mixed_page_resolver_replay_ready_event_stream"
 )
+_RESOLVED_ROW_PTR_SAME_STREAM_ORDERED_ATTR = (
+    "mixed_page_resolver_replay_same_stream_ordered"
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedRowPtrReadyState:
+    """Validated writer-to-replay publication state.
+
+    ``generation == -1`` is reserved for an unpublished arena.  Every replay
+    publication has a non-negative generation and exactly one ordering proof:
+    an event, or a proven same-stream edge.
+    """
+
+    event: object | None
+    generation: int
+    ready_stream_id: int
+    same_stream_ordered: bool
+    published: bool
+
+
+def validate_resolved_row_ptr_ready_state(
+    *,
+    event: object | None,
+    generation: object,
+    ready_stream: object,
+    same_stream_ordered: object,
+    require_published: bool,
+    context: str,
+) -> ResolvedRowPtrReadyState:
+    """Validate the single RRP generation/event contract used by replay paths."""
+
+    # These values cross an async ownership boundary.  Silent coercion (for
+    # example, ``True -> 1`` or ``3.5 -> 3``) can alias a real generation or
+    # stream and incorrectly admit replay, so the publication contract uses
+    # exact Python integers only.
+    if type(generation) is not int:
+        raise RuntimeError(f"{context} has malformed ready-event state")
+    if ready_stream is None:
+        ready_stream_i = -1
+    elif type(ready_stream) is int:
+        ready_stream_i = ready_stream
+    else:
+        raise RuntimeError(f"{context} has malformed ready-event state")
+    generation_i = generation
+    if not isinstance(same_stream_ordered, bool):
+        raise RuntimeError(f"{context} has malformed same-stream ordering state")
+    ordered = same_stream_ordered
+    if event is not None and ordered:
+        raise RuntimeError(
+            f"{context} cannot publish both a ready event and same-stream ordering"
+        )
+    published = event is not None or ordered
+    if not published:
+        if generation_i != -1 or ready_stream_i != -1:
+            raise RuntimeError(
+                f"{context} has an unpublished ready state with published generation metadata"
+            )
+        if require_published:
+            raise RuntimeError(f"{context} is not replay-ready")
+        return ResolvedRowPtrReadyState(
+            event=None,
+            generation=-1,
+            ready_stream_id=-1,
+            same_stream_ordered=False,
+            published=False,
+        )
+    if generation_i < 0:
+        raise RuntimeError(
+            f"{context} requires a non-negative ready-event generation"
+        )
+    if ordered and ready_stream_i < 0:
+        raise RuntimeError(
+            f"{context} requires a raw CUDA stream for same-stream ordering"
+        )
+    return ResolvedRowPtrReadyState(
+        event=event,
+        generation=generation_i,
+        ready_stream_id=ready_stream_i,
+        same_stream_ordered=ordered,
+        published=True,
+    )
 
 
 def _build_row_mode_distribution(row_modes: object) -> dict[str, int]:
@@ -112,25 +191,6 @@ def _cuda_stream_identity(stream: object | None) -> int:
     return int(id(stream))
 
 
-def _mark_ready_event_generation_waited(
-    holders: tuple[object | None, ...],
-    *,
-    event: object,
-    generation: int,
-) -> None:
-    for holder in holders:
-        if holder is None:
-            continue
-        if getattr(holder, _RESOLVED_ROW_PTR_READY_EVENT_ATTR, None) is not event:
-            continue
-        if (
-            int(getattr(holder, _RESOLVED_ROW_PTR_READY_EVENT_GENERATION_ATTR, -1))
-            != int(generation)
-        ):
-            continue
-        setattr(holder, _RESOLVED_ROW_PTR_READY_EVENT_WAITED_ATTR, generation)
-
-
 def wait_mixed_page_resolver_ready_events_for_forward_context(
     forward_context: object,
     *,
@@ -140,7 +200,59 @@ def wait_mixed_page_resolver_ready_events_for_forward_context(
     attn_metadata = getattr(forward_context, "attn_metadata", None)
     wait_count = 0
     wait_stream = stream
+    wait_stream_id = -1
+    raw_stream_identity_available = False
+    stream_identity_resolved = False
     seen: set[tuple[int, int]] = set()
+
+    def _resolve_wait_stream_identity() -> tuple[int, bool]:
+        nonlocal wait_stream
+        nonlocal wait_stream_id
+        nonlocal raw_stream_identity_available
+        nonlocal stream_identity_resolved
+        if stream_identity_resolved:
+            return wait_stream_id, raw_stream_identity_available
+        stream_identity_resolved = True
+        if wait_stream is not None:
+            raw = getattr(wait_stream, "cuda_stream", None)
+            if raw is not None:
+                try:
+                    wait_stream_id = int(raw)
+                    raw_stream_identity_available = True
+                    return wait_stream_id, True
+                except (TypeError, ValueError):
+                    pass
+            wait_stream_id = _cuda_stream_identity(wait_stream)
+            return wait_stream_id, False
+        import torch
+
+        try:
+            get_current_raw_stream = getattr(
+                getattr(torch, "_C", None),
+                "_cuda_getCurrentRawStream",
+                None,
+            )
+            current_device = getattr(torch.cuda, "current_device", None)
+            if callable(get_current_raw_stream) and callable(current_device):
+                wait_stream_id = int(
+                    get_current_raw_stream(int(current_device()))
+                )
+                raw_stream_identity_available = True
+                return wait_stream_id, True
+        except Exception:
+            pass
+        wait_stream = torch.cuda.current_stream()
+        raw = getattr(wait_stream, "cuda_stream", None)
+        if raw is not None:
+            try:
+                wait_stream_id = int(raw)
+                raw_stream_identity_available = True
+                return wait_stream_id, True
+            except (TypeError, ValueError):
+                pass
+        wait_stream_id = _cuda_stream_identity(wait_stream)
+        return wait_stream_id, False
+
     for metadata in iter_attention_metadata(attn_metadata):
         holders = (
             metadata,
@@ -150,48 +262,58 @@ def wait_mixed_page_resolver_ready_events_for_forward_context(
         for holder in holders:
             if holder is None:
                 continue
-            event = getattr(holder, _RESOLVED_ROW_PTR_READY_EVENT_ATTR, None)
-            if event is None:
-                continue
-            generation = int(
-                getattr(holder, _RESOLVED_ROW_PTR_READY_EVENT_GENERATION_ATTR, -1)
+            ready_state = validate_resolved_row_ptr_ready_state(
+                event=getattr(holder, _RESOLVED_ROW_PTR_READY_EVENT_ATTR, None),
+                generation=getattr(
+                    holder, _RESOLVED_ROW_PTR_READY_EVENT_GENERATION_ATTR, -1
+                ),
+                ready_stream=getattr(
+                    holder, _RESOLVED_ROW_PTR_READY_EVENT_STREAM_ATTR, -1
+                ),
+                same_stream_ordered=getattr(
+                    holder, _RESOLVED_ROW_PTR_SAME_STREAM_ORDERED_ATTR, False
+                ),
+                require_published=False,
+                context="mixed-page CUDA graph replay RRP metadata",
             )
+            if not ready_state.published:
+                continue
+            event = ready_state.event
+            generation = ready_state.generation
+            ready_stream_id = ready_state.ready_stream_id
+            same_stream_ordered = ready_state.same_stream_ordered
+            if event is None and same_stream_ordered:
+                current_stream_id, identity_proven = _resolve_wait_stream_identity()
+                if (
+                    not identity_proven
+                    or ready_stream_id != current_stream_id
+                ):
+                    raise RuntimeError(
+                        "mixed-page CUDA graph replay cannot consume same-stream "
+                        "ordered RRP metadata without an equal proven raw CUDA stream"
+                    )
+                continue
             wait_key = (id(event), generation)
-            if generation < 0 or wait_key in seen:
+            if wait_key in seen:
                 continue
-            waited_generation = int(
-                getattr(holder, _RESOLVED_ROW_PTR_READY_EVENT_WAITED_ATTR, -1)
-            )
-            if generation <= waited_generation:
+            current_stream_id, identity_proven = _resolve_wait_stream_identity()
+            if (
+                identity_proven
+                and ready_stream_id >= 0
+                and ready_stream_id == current_stream_id
+            ):
+                seen.add(wait_key)
                 continue
             if wait_stream is None:
                 import torch
 
                 wait_stream = torch.cuda.current_stream()
-            wait_stream_id = _cuda_stream_identity(wait_stream)
-            ready_stream_raw = getattr(
-                holder, _RESOLVED_ROW_PTR_READY_EVENT_STREAM_ATTR, -1
-            )
-            ready_stream_id = -1 if ready_stream_raw is None else int(ready_stream_raw)
-            if ready_stream_id >= 0 and ready_stream_id == wait_stream_id:
-                _mark_ready_event_generation_waited(
-                    holders,
-                    event=event,
-                    generation=generation,
-                )
-                seen.add(wait_key)
-                continue
             wait_event = getattr(wait_stream, "wait_event", None)
             if not callable(wait_event):
                 raise RuntimeError(
                     "mixed-page CUDA graph replay requires a stream with wait_event"
                 )
             wait_event(event)
-            _mark_ready_event_generation_waited(
-                holders,
-                event=event,
-                generation=generation,
-            )
             seen.add(wait_key)
             wait_count += 1
     previous_total = int(

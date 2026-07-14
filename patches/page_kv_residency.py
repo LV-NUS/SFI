@@ -97,6 +97,7 @@ _PATCHED_ATTR = "_sfi_compact_block_pool_patched"
 _ORIGINALS_ATTR = "_sfi_compact_block_pool_originals"
 _EMPTY_RESERVED_IDS: frozenset[int] = frozenset()
 _LEASE_BY_CONFIG_ID: dict[int, tuple[Any, CompactPageLease]] = {}
+ENGINE_CORE_BLOCK_POOL_STATE_UTILITY = "sfi_compact_page_block_pool_state"
 
 
 def _require_positive_int(value: Any, name: str) -> int:
@@ -299,6 +300,140 @@ def _reserved_ids(block_pool: Any) -> frozenset[int]:
     normalized = frozenset(int(block_id) for block_id in ids)
     setattr(block_pool, _RESERVED_IDS_ATTR, normalized)
     return normalized
+
+
+def _free_block_ids(block_pool: Any) -> tuple[int, ...]:
+    """Snapshot the native vLLM 0.19 free queue without mutating it."""
+    queue = getattr(block_pool, "free_block_queue")
+    head = getattr(queue, "fake_free_list_head", None)
+    tail = getattr(queue, "fake_free_list_tail", None)
+    if head is not None and tail is not None:
+        cursor = getattr(head, "next_free_block", None)
+        result: list[int] = []
+        seen: set[int] = set()
+        limit = int(getattr(block_pool, "num_gpu_blocks")) + 1
+        while cursor is not tail:
+            if cursor is None or len(result) >= limit:
+                raise RuntimeError("invalid native KV free-block linked list")
+            block_id = _block_id(cursor)
+            if block_id in seen:
+                raise RuntimeError("cycle in native KV free-block linked list")
+            seen.add(block_id)
+            result.append(block_id)
+            cursor = getattr(cursor, "next_free_block", None)
+        if len(result) != int(getattr(queue, "num_free_blocks")):
+            raise RuntimeError(
+                "native KV free-block count does not match linked list"
+            )
+        return tuple(result)
+    ids = getattr(queue, "ids", None)
+    if callable(ids):
+        return tuple(int(block_id) for block_id in ids())
+    raise RuntimeError("unsupported KV free-block queue shape")
+
+
+def _compact_lease_state(lease: Any) -> Optional[dict[str, Any]]:
+    if lease is None:
+        return None
+    if not isinstance(lease, CompactPageLease):
+        raise RuntimeError(
+            "EngineCore compact lease has unexpected type: "
+            f"{type(lease).__name__}"
+        )
+    return {
+        "kv_cache_group_id": int(lease.kv_cache_group_id),
+        "reserved_manager_block_ids": list(
+            lease.reserved_manager_block_ids
+        ),
+        "reserve_epoch": int(lease.reserve_epoch),
+        "manager_block_size": int(lease.manager_block_size),
+        "kernel_page_size": int(lease.kernel_page_size),
+        "compact_blocks_per_slot": int(lease.compact_blocks_per_slot),
+        "max_live_sparse_slots": int(lease.max_live_sparse_slots),
+    }
+
+
+def snapshot_compact_page_block_pool_state(engine_core: Any) -> dict[str, Any]:
+    """Return actual scheduler BlockPool ownership, not a transported manifest."""
+    scheduler = getattr(engine_core, "scheduler", None)
+    manager = getattr(scheduler, "kv_cache_manager", None)
+    block_pool = getattr(manager, "block_pool", None)
+    if manager is None or block_pool is None:
+        raise RuntimeError("EngineCore KVCacheManager/BlockPool unavailable")
+
+    num_gpu_blocks = int(getattr(block_pool, "num_gpu_blocks"))
+    blocks = list(getattr(block_pool, "blocks"))
+    if len(blocks) != num_gpu_blocks:
+        raise RuntimeError(
+            "EngineCore BlockPool blocks length does not match num_gpu_blocks"
+        )
+    free_ids = _free_block_ids(block_pool)
+    free_id_set = set(free_ids)
+    reserved_ids = tuple(sorted(_reserved_ids(block_pool)))
+    reserved_states = []
+    for block_id in reserved_ids:
+        if block_id < 0 or block_id >= num_gpu_blocks:
+            raise RuntimeError(
+                f"EngineCore reserved block id out of range: {block_id}"
+            )
+        block = blocks[block_id]
+        reserved_states.append(
+            {
+                "block_id": block_id,
+                "ref_cnt": int(getattr(block, "ref_cnt", 0)),
+                "is_null": bool(getattr(block, "is_null", False)),
+                "in_free_queue": block_id in free_id_set,
+            }
+        )
+    null_block = getattr(block_pool, "null_block", None)
+    null_block_id = _block_id(null_block) if null_block is not None else -1
+    manager_lease = getattr(manager, _LEASE_ATTR, None)
+    pool_lease = getattr(block_pool, _LEASE_ATTR, None)
+    return {
+        "schema": "sfi.engine_core_block_pool_state.v1",
+        "engine_core_class": type(engine_core).__name__,
+        "scheduler_class": type(scheduler).__name__,
+        "kv_cache_manager_class": type(manager).__name__,
+        "block_pool_class": type(block_pool).__name__,
+        "num_gpu_blocks": num_gpu_blocks,
+        "num_free_blocks": len(free_ids),
+        "free_queue_reported_count": int(
+            getattr(block_pool.free_block_queue, "num_free_blocks")
+        ),
+        "null_block_id": null_block_id,
+        "null_block_is_null": bool(getattr(null_block, "is_null", False)),
+        "null_block_in_free_queue": null_block_id in free_id_set,
+        "reserved_block_ids": list(reserved_ids),
+        "reserved_block_count": len(reserved_ids),
+        "reserved_ids_tail_contiguous": reserved_ids
+        == tuple(range(num_gpu_blocks - len(reserved_ids), num_gpu_blocks)),
+        "reserved_blocks": reserved_states,
+        "reserved_ids_in_free_queue": sorted(
+            set(reserved_ids).intersection(free_id_set)
+        ),
+        "manager_lease": _compact_lease_state(manager_lease),
+        "pool_lease": _compact_lease_state(pool_lease),
+        "manager_pool_lease_same_object": manager_lease is pool_lease,
+    }
+
+
+def install_engine_core_block_pool_state_utility() -> None:
+    """Install one named exact-run utility on vLLM EngineCore."""
+    from vllm.v1.engine.core import EngineCore
+
+    existing = getattr(EngineCore, ENGINE_CORE_BLOCK_POOL_STATE_UTILITY, None)
+    if existing is not None:
+        if getattr(existing, "_sfi_engine_core_block_pool_state", False):
+            return
+        raise RuntimeError(
+            f"EngineCore utility name collision: {ENGINE_CORE_BLOCK_POOL_STATE_UTILITY}"
+        )
+
+    def _state(self: Any) -> dict[str, Any]:
+        return snapshot_compact_page_block_pool_state(self)
+
+    _state._sfi_engine_core_block_pool_state = True  # type: ignore[attr-defined]
+    setattr(EngineCore, ENGINE_CORE_BLOCK_POOL_STATE_UTILITY, _state)
 
 
 def _is_reserved_block(block_pool: Any, block: Any) -> bool:

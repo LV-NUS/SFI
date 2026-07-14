@@ -112,6 +112,24 @@ class ProfileMixin:
         self._sentence_trigger_admission_dropped_finished_total: int = 0
         self._refresh_coalesce_skipped_existing_pending_total: int = 0
 
+    def _selector_log_f_reduce_route_snapshot(self) -> dict[str, object]:
+        """Return the existing postprocess route counters as JSON-safe data."""
+        raw_counts = getattr(self, "_selector_log_f_reduce_route_counts", None)
+        counts = (
+            {
+                str(route): int(count)
+                for route, count in sorted(raw_counts.items())
+            }
+            if isinstance(raw_counts, dict)
+            else {}
+        )
+        return {
+            "last_route": str(
+                getattr(self, "_selector_log_f_reduce_last_route", "none")
+            ),
+            "counts": counts,
+        }
+
     # ------------------------------------------------------------------
     # Step profiling
     # ------------------------------------------------------------------
@@ -342,6 +360,7 @@ class ProfileMixin:
         if not should_log:
             self._step_profile_logged_epoch = epoch
             return
+        selector_log_f_route = self._selector_log_f_reduce_route_snapshot()
         rec = {
             "pid": int(os.getpid()),
             "step": self.step_context_epoch,
@@ -400,6 +419,10 @@ class ProfileMixin:
                     0,
                 )
             ),
+            "selector_log_f_reduce_last_route": selector_log_f_route[
+                "last_route"
+            ],
+            "selector_log_f_reduce_route_counts": selector_log_f_route["counts"],
             "layer_group_enabled": bool(self._refresh_layer_group_enabled),
             "layer_group_active": self._refresh_layer_group_active,
         }
@@ -598,6 +621,7 @@ class ProfileMixin:
         if callable(drain_async_gpu_events):
             drain_async_gpu_events()
 
+        selector_log_f_route = self._selector_log_f_reduce_route_snapshot()
         record = {
             "pid": int(os.getpid()),
             # ctrl_step：用于在 benchmark 内严格区分 warmup 与测量阶段（避免 warmup 的 pending flush 污染统计）。
@@ -650,6 +674,10 @@ class ProfileMixin:
                     0,
                 )
             ),
+            "selector_log_f_reduce_last_route": selector_log_f_route[
+                "last_route"
+            ],
+            "selector_log_f_reduce_route_counts": selector_log_f_route["counts"],
             "prefill_selector_runs": int(pending.prefill_selector_runs),
             "prefill_rebuild_runs": int(pending.prefill_rebuild_runs),
             "prefill_cpu_us": float(pending.prefill_cpu_us),

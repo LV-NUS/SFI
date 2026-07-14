@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import subprocess
@@ -51,16 +52,26 @@ from benchmarks.bench_sm80_mixed_page_full_cudagraph_phase1 import (
     _sparse_controller_payload,
     _tail,
 )
-from benchmarks.scheduler_contract import resolve_benchmark_max_num_seqs
+from benchmarks.scheduler_contract import (
+    CHUNKED_PREFILL_MODES,
+    DEFAULT_MAX_NUM_BATCHED_TOKENS,
+    DEFAULT_MAX_SEQ_LEN_TO_CAPTURE,
+    requested_scheduler_graph_contract,
+    resolve_benchmark_max_num_seqs,
+    scheduler_graph_runtime_contract_from_metrics,
+    validate_scheduler_graph_args,
+)
 from utils.selector_cache_identity import selector_cache_abi_key_for_python
 from benchmarks.sm80_run_pair import (
     ALLOWED_TRACE_ENV_KEYS,
     LEGACY_MIDDLE_NATIVE_CANONICAL_KEY,
     RouteProofResult,
+    SPEED_CHILD_PAIRING_IDENTITY_ENV_KEYS,
     STAGE_A_SOURCE_COUNTER_SCHEMA_VERSION,
     _stage_a_source_counter_missing_fields,
     build_pairing_digest,
     build_config_digest,
+    classify_speed_child_env_key,
     validate_shared_route_proof,
 )
 from benchmarks.sm80_refresh_workload_plan import (
@@ -68,6 +79,14 @@ from benchmarks.sm80_refresh_workload_plan import (
     build_workload_plan_from_route_events,
     load_workload_plan,
     workload_plan_digest,
+)
+from scripts.check_tp8_arm_teardown import (
+    ARM_TOKEN_ENV,
+    arm_token_sha256,
+    capture_baseline as capture_tp8_process_baseline,
+    capture_teardown as capture_tp8_arm_teardown,
+    derive_arm_token,
+    write_evidence as write_tp8_process_evidence,
 )
 
 
@@ -81,13 +100,7 @@ DEFERRED_BRIDGE_ENV_KEYS = (
     "VLLM_SPARSE_BOOTSTRAP_BRIDGE_GRAPH_POLICY",
     "VLLM_SPARSE_DEFERRED_PRODUCER_GROUPS_PER_STEP",
 )
-SPEED_CHILD_ROUTE_TRACE_ENV = "VLLM_SPARSE_SPEED_CHILD_ROUTE_TRACE"
 SELECTOR_PIPELINE_ARTIFACT_PREFIX = "SFI_SELECTOR_PIPELINE_ARTIFACT="
-
-
-def _env_truthy_value(value: object) -> bool:
-    raw = str(value or "").strip().lower()
-    return raw not in {"", "0", "false", "no", "off"}
 
 
 SELECTOR_PIPELINE_CPU_PROFILE_ENV_KEYS = (
@@ -100,6 +113,7 @@ SELECTOR_PIPELINE_CPU_PROFILE_ENV_KEYS = (
 )
 DEFERRED_BRIDGE_GRAPH_POLICIES = ("evict_recapture_once",)
 GT1_SELECTOR_TORCH_EXTENSIONS_ROOT = _REPO_ROOT / "tmp" / "torch_extensions"
+DEFAULT_GT1_SELECTOR_PREWARM_TIMEOUT_S = 600
 BS2_LONG_CAP128_PRESET = "bs2long-cap128"
 BS2_LONG_CAP128_PROMPT = "benchmarks/needle_prompt_two_parts.txt"
 BS2_LONG_CAP128_BATCH_SIZE = 2
@@ -384,6 +398,43 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--max-num-batched-tokens",
+        type=int,
+        default=DEFAULT_MAX_NUM_BATCHED_TOKENS,
+        help="Shared scheduler token budget forwarded to every child.",
+    )
+    parser.add_argument(
+        "--kv-cache-memory-bytes",
+        type=int,
+        default=0,
+        help="Shared per-rank KV cache allocation forwarded to every child.",
+    )
+    parser.add_argument(
+        "--chunked-prefill",
+        choices=CHUNKED_PREFILL_MODES,
+        default="enabled",
+        help="Shared chunked-prefill policy forwarded to every child.",
+    )
+    parser.add_argument(
+        "--max-seq-len-to-capture",
+        type=int,
+        default=DEFAULT_MAX_SEQ_LEN_TO_CAPTURE,
+        help=(
+            "Cross-version graph capture length identity. Newer vLLM V1 "
+            "releases report this as unsupported rather than silently using "
+            "a sparse/dense-specific default."
+        ),
+    )
+    parser.add_argument(
+        "--scheduling-mode",
+        choices=("auto", "async", "sync"),
+        default="auto",
+        help=(
+            "Engine scheduling policy forwarded identically to dense and "
+            "sparse speed children."
+        ),
+    )
+    parser.add_argument(
         "--split-context-prompts",
         action="store_true",
         help="Pass each Context: segment as a separate request to the sparse/dense runners.",
@@ -622,7 +673,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if args.batch_size <= 0:
         parser.error("--batch-size must be > 0")
     try:
-        _effective_max_num_seqs(args)
+        validate_scheduler_graph_args(args)
     except ValueError as exc:
         parser.error(str(exc))
     if args.timeout_s <= 0:
@@ -1113,7 +1164,7 @@ def _apply_gt1_full_cudagraph_refresh_env(
     )
 
 
-def _selector_extension_prewarm_timeout_s(args: argparse.Namespace) -> int:
+def _selector_extension_prewarm_timeout_s(_args: argparse.Namespace) -> int:
     raw = os.environ.get("VLLM_SPARSE_GT1_SELECTOR_PREWARM_TIMEOUT_S", "").strip()
     if raw:
         try:
@@ -1122,7 +1173,26 @@ def _selector_extension_prewarm_timeout_s(args: argparse.Namespace) -> int:
             parsed = 0
         if parsed > 0:
             return parsed
-    return max(300, int(getattr(args, "timeout_s", 0) or 0))
+    # Extension compilation has a separate failure domain from the vLLM run.
+    # Reusing the one-hour benchmark timeout made a stale Torch FileBaton lock
+    # look like a silent startup hang.  Ten minutes still leaves ample room for
+    # a cold build while bounding races that appear after the lock preflight.
+    return DEFAULT_GT1_SELECTOR_PREWARM_TIMEOUT_S
+
+
+def _selector_extension_cache_locks(torch_extensions_dir: str) -> tuple[Path, ...]:
+    """Return Torch extension FileBaton locks without mutating shared state."""
+    root = Path(torch_extensions_dir)
+    if not root.is_dir():
+        return ()
+    locks = []
+    for child in root.iterdir():
+        if not child.is_dir():
+            continue
+        lock = child / "lock"
+        if lock.exists() or lock.is_symlink():
+            locks.append(lock)
+    return tuple(sorted(locks, key=lambda path: str(path)))
 
 
 def _prewarm_gt1_selector_extensions(
@@ -1174,6 +1244,21 @@ def _prewarm_gt1_selector_extensions(
         "VLLM_SPARSE_FA3_ROUTE_TRACE_LOG",
     ):
         prewarm_env.pop(key, None)
+    cache_locks = _selector_extension_cache_locks(torch_extensions_dir)
+    if cache_locks:
+        lock_list = ", ".join(str(path) for path in cache_locks)
+        return Phase1CommandResult(
+            command=command,
+            returncode=73,
+            stdout="",
+            stderr=(
+                "E_SFI_SELECTOR_CACHE_LOCK_PRESENT: refusing to wait on Torch "
+                f"extension cache lock(s): {lock_list}. A lock may be active or "
+                "stale; coordinate the compiler owner or choose a fresh absolute "
+                "TORCH_EXTENSIONS_DIR. The runner never deletes shared cache locks."
+            ),
+            timed_out=False,
+        )
     return _run_command(
         command,
         env=prewarm_env,
@@ -1354,6 +1439,9 @@ def _build_phase2_command(
         metrics_path=metrics_path,
         outputs_path=outputs_path,
     )
+    _append_scheduler_graph_child_args(command, args)
+    command.extend(["--scheduling-mode", str(args.scheduling_mode)])
+    command.append("--collect-cudagraph-runtime-proof")
     _append_deferred_bridge_child_args(command, args)
     command.extend(
         [
@@ -1364,6 +1452,31 @@ def _build_phase2_command(
         ]
     )
     return command
+
+
+def _append_scheduler_graph_child_args(
+    command: list[str],
+    args: argparse.Namespace,
+) -> None:
+    contract = requested_scheduler_graph_contract(args)
+    max_num_batched_tokens = contract["max_num_batched_tokens"]
+    if max_num_batched_tokens is not None:
+        command.extend(
+            ["--max-num-batched-tokens", str(max_num_batched_tokens)]
+        )
+    kv_cache_memory_bytes = contract["kv_cache_memory_bytes"]
+    if kv_cache_memory_bytes is not None:
+        command.extend(
+            ["--kv-cache-memory-bytes", str(kv_cache_memory_bytes)]
+        )
+    command.extend(
+        [
+            "--chunked-prefill",
+            str(contract["chunked_prefill"]),
+            "--max-seq-len-to-capture",
+            str(contract["max_seq_len_to_capture"]),
+        ]
+    )
 
 
 def _append_deferred_bridge_child_args(
@@ -1402,6 +1515,8 @@ def _build_sparse_speed_command(
         metrics_path=metrics_path,
         outputs_path=outputs_path,
     )
+    _append_scheduler_graph_child_args(command, args)
+    command.extend(["--scheduling-mode", str(args.scheduling_mode)])
     _append_deferred_bridge_child_args(command, args)
     return command
 
@@ -1440,6 +1555,16 @@ def _build_no_eos_diagnostic_command(args: argparse.Namespace) -> list[str]:
         str(args.batch_size),
         "--max-num-seqs",
         str(_effective_max_num_seqs(args)),
+        "--max-num-batched-tokens",
+        str(int(args.max_num_batched_tokens)),
+        "--kv-cache-memory-bytes",
+        str(int(args.kv_cache_memory_bytes)),
+        "--chunked-prefill",
+        str(args.chunked_prefill),
+        "--max-seq-len-to-capture",
+        str(int(args.max_seq_len_to_capture)),
+        "--scheduling-mode",
+        str(args.scheduling_mode),
         "--gpu-mem-util",
         str(args.gpu_mem_util),
         "--timeout-s",
@@ -1491,11 +1616,217 @@ def _default_gate_d_dense_reference_outputs_path(output: Path) -> Path:
     return output.with_name(output.stem + "_dense_reference_outputs.json")
 
 
-def _is_gate_d_trace_profile_key(key: str) -> bool:
-    upper = str(key).upper()
-    return upper.startswith("VLLM_") and any(
-        marker in upper for marker in ("TRACE", "PROFILE", "PROFILER", "TIMELINE")
+_TP8_EXACT_ARM_ORDER = (
+    "sparse_speed",
+    "dense_reference",
+    "sparse_diagnostic",
+)
+_TP8_EXACT_SETUP_ARM_ORDER = ("selector_prewarm",)
+
+
+def _default_tp8_process_baseline_path(output: Path) -> Path:
+    return output.with_name(output.stem + "_tp8_process_baseline.json")
+
+
+def _default_tp8_arm_teardown_path(output: Path, arm_tag: str) -> Path:
+    return output.with_name(output.stem + f"_tp8_{arm_tag}_teardown.json")
+
+
+def _tp8_exact_pair_required(args: argparse.Namespace) -> bool:
+    return (
+        os.environ.get("SFI_RUNNER_TIER", "") == "tp8x64k"
+        and str(args.mode) == "sparse"
     )
+
+
+def _tp8_selected_gpu_indices(args: argparse.Namespace) -> list[int]:
+    fields = str(args.cuda_visible_devices).split(",")
+    if len(fields) != 8 or any(not field.isdigit() for field in fields):
+        raise ValueError(
+            "exact TP8 lifecycle requires exactly eight integer GPU IDs"
+        )
+    gpu_ids = [int(field) for field in fields]
+    if len(set(gpu_ids)) != 8:
+        raise ValueError("exact TP8 lifecycle GPU IDs must be unique")
+    return gpu_ids
+
+
+def _start_tp8_exact_lifecycle(
+    args: argparse.Namespace,
+    *,
+    output_path: Path,
+) -> dict[str, Any]:
+    gpu_ids = _tp8_selected_gpu_indices(args)
+    run_nonce = str(getattr(args, "run_nonce", "") or "")
+    if not run_nonce:
+        raise ValueError("exact TP8 lifecycle requires a non-empty run nonce")
+    baseline_path = _default_tp8_process_baseline_path(output_path)
+    evidence, baseline_reasons = capture_tp8_process_baseline(gpu_ids)
+    write_tp8_process_evidence(baseline_path, evidence)
+    return {
+        "gpu_ids": gpu_ids,
+        "baseline_path": baseline_path,
+        "baseline_sha256": _file_sha256(baseline_path),
+        "baseline_evidence": evidence,
+        "baseline_reasons": list(baseline_reasons),
+        "run_nonce": run_nonce,
+        "setup_records": [],
+        "arm_records": [],
+        "gate_reasons": [
+            f"baseline:{reason}" for reason in baseline_reasons
+        ],
+    }
+
+
+def _tp8_exact_arm_env(
+    env: dict[str, str],
+    state: dict[str, Any],
+    arm_tag: str,
+) -> tuple[dict[str, str], str]:
+    arm_token = derive_arm_token(str(state["run_nonce"]), arm_tag)
+    arm_env = dict(env)
+    arm_env[ARM_TOKEN_ENV] = arm_token
+    return arm_env, arm_token
+
+
+def _redact_tp8_arm_token_result(
+    result: Phase1CommandResult,
+    arm_token: str,
+) -> Phase1CommandResult:
+    """Keep arm ownership secrets out of persisted stdout/stderr tails."""
+    if not arm_token:
+        return result
+    return replace(
+        result,
+        stdout=result.stdout.replace(arm_token, "[tp8-arm-token-redacted]"),
+        stderr=result.stderr.replace(arm_token, "[tp8-arm-token-redacted]"),
+    )
+
+
+def _finish_tp8_exact_arm(
+    state: dict[str, Any],
+    *,
+    output_path: Path,
+    arm_tag: str,
+    result: Phase1CommandResult,
+    arm_token: str,
+    setup: bool = False,
+) -> bool:
+    records_key = "setup_records" if setup else "arm_records"
+    expected_order = _TP8_EXACT_SETUP_ARM_ORDER if setup else _TP8_EXACT_ARM_ORDER
+    arm_records = state[records_key]
+    if len(arm_records) >= len(expected_order):
+        raise ValueError(f"exact TP8 {records_key} already complete")
+    expected_arm = expected_order[len(arm_records)]
+    if arm_tag != expected_arm:
+        raise ValueError(
+            f"exact TP8 arm order mismatch: expected {expected_arm}, got {arm_tag}"
+        )
+    if arm_token != derive_arm_token(str(state["run_nonce"]), arm_tag):
+        raise ValueError(f"exact TP8 arm token mismatch for {arm_tag}")
+    health_reasons: list[str] = []
+    if result.returncode != 0:
+        health_reasons.append(f"returncode_nonzero:{result.returncode}")
+    if result.timed_out:
+        health_reasons.append("timed_out")
+    fatal_error_detected = _command_output_has_fatal_error(result)
+    if fatal_error_detected:
+        health_reasons.append("fatal_child_output")
+    child_session_id = result.child_session_id
+    if (
+        child_session_id is not None
+        and (
+            isinstance(child_session_id, bool)
+            or not isinstance(child_session_id, int)
+            or child_session_id <= 0
+        )
+    ):
+        health_reasons.append("child_session_id_invalid")
+        child_session_id = None
+    elif child_session_id is None and result.returncode == 0:
+        health_reasons.append("child_session_id_missing")
+    teardown_path = _default_tp8_arm_teardown_path(output_path, arm_tag)
+    evidence, teardown_reasons = capture_tp8_arm_teardown(
+        state["gpu_ids"],
+        baseline_path=state["baseline_path"],
+        arm_tag=arm_tag,
+        child_session_id=child_session_id,
+        arm_token=arm_token,
+    )
+    write_tp8_process_evidence(teardown_path, evidence)
+    passed = not health_reasons and not teardown_reasons
+    record = {
+        "arm_tag": arm_tag,
+        "result_returncode": int(result.returncode),
+        "result_timed_out": bool(result.timed_out),
+        "fatal_error_detected": fatal_error_detected,
+        "health_reasons": health_reasons,
+        "child_session_id": child_session_id,
+        "arm_token_sha256": arm_token_sha256(arm_token),
+        "teardown_path": str(teardown_path.resolve(strict=False)),
+        "teardown_sha256": _file_sha256(teardown_path),
+        "teardown_evidence": evidence,
+        "teardown_reasons": list(teardown_reasons),
+        "passed": passed,
+    }
+    arm_records.append(record)
+    state["gate_reasons"].extend(
+        f"{arm_tag}:health:{reason}" for reason in health_reasons
+    )
+    state["gate_reasons"].extend(
+        f"{arm_tag}:teardown:{reason}" for reason in teardown_reasons
+    )
+    return passed
+
+
+def _apply_tp8_exact_lifecycle_payload(
+    payload: dict[str, Any],
+    state: dict[str, Any] | None,
+) -> None:
+    if state is None:
+        return
+    setup_execution_order = [
+        record["arm_tag"] for record in state["setup_records"]
+    ]
+    setup_complete = setup_execution_order == list(_TP8_EXACT_SETUP_ARM_ORDER)
+    execution_order = [record["arm_tag"] for record in state["arm_records"]]
+    complete = execution_order == list(_TP8_EXACT_ARM_ORDER)
+    reasons = list(state["gate_reasons"])
+    if not setup_complete:
+        reasons.append("setup_arm_sequence_incomplete")
+    if not complete:
+        reasons.append("arm_sequence_incomplete")
+    passed = setup_complete and complete and not reasons
+    payload.update(
+        {
+            "tp8_arm_lifecycle_required": True,
+            "tp8_arm_lifecycle_expected_order": list(_TP8_EXACT_ARM_ORDER),
+            "tp8_arm_lifecycle_execution_order": execution_order,
+            "tp8_arm_lifecycle_setup_expected_order": list(
+                _TP8_EXACT_SETUP_ARM_ORDER
+            ),
+            "tp8_arm_lifecycle_setup_execution_order": setup_execution_order,
+            "tp8_arm_lifecycle_baseline": {
+                "path": str(state["baseline_path"].resolve(strict=False)),
+                "sha256": state["baseline_sha256"],
+                "evidence": state["baseline_evidence"],
+            },
+            "tp8_arm_lifecycle_setup_records": state["setup_records"],
+            "tp8_arm_lifecycle_records": state["arm_records"],
+            "tp8_arm_lifecycle_gate_passed": passed,
+            "tp8_arm_lifecycle_gate_reasons": reasons,
+        }
+    )
+    if not passed:
+        payload["gate_passed"] = False
+        payload["production_gate_passed"] = False
+
+
+def _is_gate_d_trace_profile_key(key: str) -> bool:
+    # Historical helper/artifact name retained for result-schema stability;
+    # the shared classifier now covers every timed-child observer and
+    # experimental ablation, not only trace/profile keys.
+    return classify_speed_child_env_key(key) is not None
 
 
 def _clear_gate_d_trace_profile_env(env: dict[str, str]) -> None:
@@ -1652,9 +1983,7 @@ def _gate_d_backend_label(args: argparse.Namespace) -> str:
 def _resolve_gate_d_backend_artifact(args: argparse.Namespace) -> Path | None:
     if _gate_d_backend(args) == BACKEND_FA4_SM100:
         return (
-            _REPO_ROOT
-            / "third_party_upstreams"
-            / "vllm-project-flash-attention"
+            Path(str(args.fa3_upstream_root)).expanduser()
             / "flash_attn"
             / "cute"
             / "interface.py"
@@ -1689,6 +2018,52 @@ def _run_provenance_payload(
 ) -> dict[str, Any]:
     git_head = _run_text_command(["git", "rev-parse", "HEAD"], timeout_s=5.0)
     git_status = _run_text_command(["git", "status", "--short"], timeout_s=5.0)
+    git_tracked_status = _run_text_command(
+        ["git", "status", "--short", "--untracked-files=no", "--", "."],
+        timeout_s=5.0,
+    )
+    build_identity_raw = str(
+        env.get("SFI_RUNNER_ATTENTION_BUILD_IDENTITY_JSON", "") or ""
+    )
+    try:
+        build_identity = json.loads(build_identity_raw) if build_identity_raw else {}
+    except (TypeError, ValueError, json.JSONDecodeError):
+        build_identity = {"invalid_json": build_identity_raw}
+
+    def _env_int(name: str) -> int | None:
+        raw = str(env.get(name, "") or "")
+        return int(raw) if raw.isdigit() else None
+
+    model_kv_contract = {
+        "schema": str(
+            env.get("SFI_RUNNER_MODEL_KV_CONTRACT_SCHEMA", "") or ""
+        ),
+        "model_config_path": str(
+            env.get("SFI_RUNNER_MODEL_CONFIG_PATH", "") or ""
+        ),
+        "model_config_sha256": str(
+            env.get("SFI_RUNNER_MODEL_CONFIG_SHA256", "") or ""
+        ),
+        "num_hidden_layers": _env_int("SFI_RUNNER_MODEL_NUM_HIDDEN_LAYERS"),
+        "num_key_value_heads": _env_int(
+            "SFI_RUNNER_MODEL_NUM_KEY_VALUE_HEADS"
+        ),
+        "head_dim": _env_int("SFI_RUNNER_MODEL_HEAD_DIM"),
+        "dtype": str(env.get("SFI_RUNNER_MODEL_KV_DTYPE", "") or ""),
+        "dtype_bytes": _env_int("SFI_RUNNER_MODEL_KV_DTYPE_BYTES"),
+        "total_bytes_per_token": _env_int(
+            "SFI_RUNNER_MODEL_KV_TOTAL_BYTES_PER_TOKEN"
+        ),
+        "per_rank_bytes_per_token_requested": _env_int(
+            "SFI_RUNNER_KV_TOKEN_BYTES_PER_RANK_REQUESTED"
+        ),
+        "per_rank_bytes_per_token_effective": _env_int(
+            "SFI_RUNNER_KV_TOKEN_BYTES_PER_RANK_EFFECTIVE"
+        ),
+        "override_present": str(
+            env.get("SFI_RUNNER_KV_TOKEN_BYTES_OVERRIDE_PRESENT", "") or ""
+        ),
+    }
     # Keep provenance on the same source of truth as the runtime. A hard-coded
     # fallback here mislabeled the promoted default-18 execution as chunk 14,
     # which in turn selected the wrong output anchor in postflight tooling.
@@ -1706,18 +2081,43 @@ def _run_provenance_payload(
         env.get("VLLM_SPARSE_REFRESH_REBUILD_MAX_DELAY_STEPS", "0") or "0"
     )
     refresh_rebuild_max_delay_steps_env = int(refresh_rebuild_max_delay_steps)
+    clean_metadata_effective = (
+        str(env.get("VLLM_SPARSE_CLEAN_METADATA", "1") or "1") == "1"
+    )
     return {
         "run_nonce": str(getattr(args, "run_nonce", "") or ""),
         "git_head": _first_stdout_line(git_head),
         "git_status_short": str(git_status.get("stdout", "") or ""),
         "git_head_command": git_head,
         "git_status_command": git_status,
+        "git_tracked_status_short": str(
+            git_tracked_status.get("stdout", "") or ""
+        ),
+        "git_tracked_status_command": git_tracked_status,
         "python": str(args.python),
         "preset": str(getattr(args, "preset", "") or ""),
         "model": str(args.model),
         "prompt": str(args.prompt),
+        "prompt_artifact": _file_provenance(
+            Path(str(args.prompt)).resolve(),
+            sha256=str(env.get("SFI_RUNNER_CORPUS_SHA256", "") or ""),
+        ),
+        "mode": str(args.mode),
         "batch_size": int(args.batch_size),
+        "tensor_parallel_size": int(
+            getattr(args, "tensor_parallel_size", 1) or 1
+        ),
+        "max_model_len": int(args.max_model_len),
         "max_num_seqs": _effective_max_num_seqs(args),
+        "max_num_batched_tokens": int(args.max_num_batched_tokens),
+        "chunked_prefill": str(args.chunked_prefill),
+        "max_seq_len_to_capture": int(args.max_seq_len_to_capture),
+        "scheduler_graph_contract_requested": requested_scheduler_graph_contract(
+            args
+        ),
+        "scheduling_mode_requested": str(
+            getattr(args, "scheduling_mode", "auto") or "auto"
+        ),
         "warmup": int(args.warmup),
         "output_len": _effective_max_new_tokens(args),
         "max_new_tokens": _effective_max_new_tokens(args),
@@ -1756,6 +2156,7 @@ def _run_provenance_payload(
         "prefill_last_n_query": max(0, int(getattr(args, "prefill_last_n", 16))),
         "capture_chunk_effective": int(capture_chunk),
         "writer_token_tile_effective": int(writer_token_tile),
+        "clean_metadata_effective": bool(clean_metadata_effective),
         "refresh_stream_priority_effective": int(refresh_stream_priority),
         "refresh_rebuild_max_delay_steps_env": int(
             refresh_rebuild_max_delay_steps_env
@@ -1806,14 +2207,130 @@ def _run_provenance_payload(
         "runner_gpu_lock_mode": str(
             env.get("SFI_RUNNER_GPU_LOCK_MODE", "") or ""
         ),
+        "runner_gpu_lock_scope": str(
+            env.get("SFI_RUNNER_GPU_LOCK_SCOPE", "") or ""
+        ),
         "runner_fa3_preflight_status": str(
             env.get("SFI_RUNNER_FA3_PREFLIGHT_STATUS", "") or ""
+        ),
+        "runner_attention_preflight_status": str(
+            env.get("SFI_RUNNER_ATTENTION_PREFLIGHT_STATUS", "") or ""
+        ),
+        "runner_attention_arch": str(
+            env.get("SFI_RUNNER_ATTENTION_ARCH", "") or ""
+        ),
+        "runner_attention_kernel": str(
+            env.get("SFI_RUNNER_ATTENTION_KERNEL", "") or ""
+        ),
+        "runner_attention_backend": str(
+            env.get("SFI_RUNNER_ATTENTION_BACKEND", "") or ""
+        ),
+        "runner_flash_attn_version": str(
+            env.get("SFI_RUNNER_FLASH_ATTN_VERSION", "") or ""
+        ),
+        "runner_attention_build_identity": build_identity,
+        "runner_expected_git_commit": str(
+            env.get("SFI_RUNNER_EXPECTED_GIT_COMMIT", "") or ""
+        ),
+        "runner_expected_model_config_sha256": str(
+            env.get("SFI_RUNNER_EXPECTED_MODEL_CONFIG_SHA256", "") or ""
+        ),
+        "runner_git_head": str(env.get("SFI_RUNNER_GIT_HEAD", "") or ""),
+        "runner_git_tracked_clean": str(
+            env.get("SFI_RUNNER_GIT_TRACKED_CLEAN", "") or ""
+        ),
+        "runner_code_scope": str(
+            env.get("SFI_RUNNER_CODE_SCOPE", "") or ""
+        ),
+        "runner_code_scope_untracked_status": str(
+            env.get("SFI_RUNNER_CODE_SCOPE_UNTRACKED_STATUS", "") or ""
+        ),
+        "runner_code_scope_untracked_clean": str(
+            env.get("SFI_RUNNER_CODE_SCOPE_UNTRACKED_CLEAN", "") or ""
+        ),
+        "runner_candidate_full_clean_at_pair_start": str(
+            env.get("SFI_RUNNER_CANDIDATE_FULL_CLEAN_AT_PAIR_START", "") or ""
+        ),
+        "runner_cuda_capabilities": str(
+            env.get("SFI_RUNNER_CUDA_CAPABILITIES", "") or ""
+        ),
+        "runner_gpu_total_memory_bytes": str(
+            env.get("SFI_RUNNER_GPU_TOTAL_MEMORY_BYTES", "") or ""
+        ),
+        "runner_gpu_free_memory_bytes": str(
+            env.get("SFI_RUNNER_GPU_FREE_MEMORY_BYTES", "") or ""
+        ),
+        "runner_gpu_physical_capacity_status": str(
+            env.get("SFI_RUNNER_GPU_PHYSICAL_CAPACITY_STATUS", "") or ""
         ),
         "runner_selector_cache_root": str(
             env.get("SFI_RUNNER_SELECTOR_CACHE_ROOT", "") or ""
         ),
+        "runner_model_kv_contract": model_kv_contract,
+        "runner_kv_token_bytes_per_rank_requested": model_kv_contract[
+            "per_rank_bytes_per_token_requested"
+        ],
+        "runner_kv_token_bytes_per_rank_effective": model_kv_contract[
+            "per_rank_bytes_per_token_effective"
+        ],
         "runner_corpus_token_status": str(
             env.get("SFI_RUNNER_CORPUS_TOKEN_STATUS", "") or ""
+        ),
+        "runner_corpus_path": str(
+            env.get("SFI_RUNNER_CORPUS_PATH", "") or ""
+        ),
+        "runner_corpus_sha256": str(
+            env.get("SFI_RUNNER_CORPUS_SHA256", "") or ""
+        ),
+        "runner_tier": str(env.get("SFI_RUNNER_TIER", "") or ""),
+        "runner_mode": str(env.get("SFI_RUNNER_MODE", "") or ""),
+        "runner_tensor_parallel_size": str(
+            env.get("SFI_RUNNER_TENSOR_PARALLEL_SIZE", "") or ""
+        ),
+        "runner_batch_size": str(
+            env.get("SFI_RUNNER_BATCH_SIZE", "") or ""
+        ),
+        "runner_context_tokens": str(
+            env.get("SFI_RUNNER_CONTEXT_TOKENS", "") or ""
+        ),
+        "runner_kv_cache_memory_bytes": str(
+            env.get("SFI_RUNNER_KV_CACHE_MEMORY_BYTES", "") or ""
+        ),
+        "runner_max_model_len": str(
+            env.get("SFI_RUNNER_MAX_MODEL_LEN", "") or ""
+        ),
+        "runner_max_new_tokens": str(
+            env.get("SFI_RUNNER_MAX_NEW_TOKENS", "") or ""
+        ),
+        "runner_max_num_seqs": str(
+            env.get("SFI_RUNNER_MAX_NUM_SEQS", "") or ""
+        ),
+        "runner_max_num_batched_tokens": str(
+            env.get("SFI_RUNNER_MAX_NUM_BATCHED_TOKENS", "") or ""
+        ),
+        "runner_chunked_prefill": str(
+            env.get("SFI_RUNNER_CHUNKED_PREFILL", "") or ""
+        ),
+        "runner_max_seq_len_to_capture": str(
+            env.get("SFI_RUNNER_MAX_SEQ_LEN_TO_CAPTURE", "") or ""
+        ),
+        "runner_refresh_interval": str(
+            env.get("SFI_RUNNER_REFRESH_INTERVAL", "") or ""
+        ),
+        "runner_compact_blocks_per_slot": str(
+            env.get("SFI_RUNNER_COMPACT_BLOCKS_PER_SLOT", "") or ""
+        ),
+        "runner_compact_dual_gen": str(
+            env.get("SFI_RUNNER_COMPACT_DUAL_GEN", "") or ""
+        ),
+        "runner_pytorch_alloc_conf": str(
+            env.get("SFI_RUNNER_PYTORCH_ALLOC_CONF", "") or ""
+        ),
+        "runner_pytorch_cuda_alloc_conf": str(
+            env.get("SFI_RUNNER_PYTORCH_CUDA_ALLOC_CONF", "") or ""
+        ),
+        "runner_custom_ar_disabled": str(
+            env.get("SFI_RUNNER_CUSTOM_AR_DISABLED", "") or ""
         ),
         "fa3_so": _file_provenance(
             _resolve_fa3_so_path(args),
@@ -1829,6 +2346,7 @@ def _build_gate_d_dense_command(
     *,
     metrics_path: Path,
     outputs_path: Path,
+    collect_cudagraph_runtime_proof: bool = False,
 ) -> list[str]:
     repo_root = _REPO_ROOT
     command = [
@@ -1844,6 +2362,8 @@ def _build_gate_d_dense_command(
         str(_effective_max_num_seqs(args)),
         "--max-new-tokens",
         str(_effective_max_new_tokens(args)),
+        "--scheduling-mode",
+        str(args.scheduling_mode),
         "--disable-cascade-attn",
         "--measure-decode-latency",
         "--decode-metrics-json",
@@ -1856,6 +2376,7 @@ def _build_gate_d_dense_command(
         "--gpu-mem-util",
         str(float(args.gpu_mem_util)),
     ]
+    _append_scheduler_graph_child_args(command, args)
     if int(getattr(args, "max_model_len", 0) or 0) > 0:
         command.extend(["--max-model-len", str(int(args.max_model_len))])
     if int(getattr(args, "tensor_parallel_size", 1) or 1) > 1:
@@ -1870,6 +2391,8 @@ def _build_gate_d_dense_command(
                 str(int(args.batch_size)),
             ]
         )
+    if collect_cudagraph_runtime_proof:
+        command.append("--collect-cudagraph-runtime-proof")
     if bool(getattr(args, "split_context_prompts", False)):
         command.append("--split-context-prompts")
     if bool(getattr(args, "respect_eos", False)):
@@ -2311,6 +2834,12 @@ def _gate_d_config(
         "iters_semantics": "legacy_alias_for_max_new_tokens",
         "batch_size": int(args.batch_size),
         "max_num_seqs": _effective_max_num_seqs(args),
+        "scheduler_graph_contract_requested": requested_scheduler_graph_contract(
+            args
+        ),
+        "scheduling_mode_requested": str(
+            getattr(args, "scheduling_mode", "auto") or "auto"
+        ),
         "warmup": int(args.warmup),
         "full_cuda_graph": bool(args.full_cuda_graph),
         "backend": _gate_d_backend(args),
@@ -2333,10 +2862,10 @@ def _gate_d_config(
                 "VLLM_SPARSE_ONE_SHOT_READY_CHUNK",
                 "",
             ),
-            "VLLM_SPARSE_REPLAY_REFRESH_PROGRESSIVE_CONSUME": env.get(
-                "VLLM_SPARSE_REPLAY_REFRESH_PROGRESSIVE_CONSUME",
-                "",
-            ),
+            **{
+                key: str(env.get(key, "") or "")
+                for key in SPEED_CHILD_PAIRING_IDENTITY_ENV_KEYS
+            },
             **{
                 key: str(env.get(key, "") or "")
                 for key in ALLOWED_TRACE_ENV_KEYS
@@ -2537,6 +3066,1325 @@ def _output_completion_gate(
     }
 
 
+def _speed_child_custom_all_reduce_provenance(
+    metrics: dict[str, Any],
+    *,
+    expected_batch_size: int | None = None,
+) -> dict[str, Any]:
+    """Extract the effective child decision and reject contradictory copies."""
+    run_config = metrics.get("run_config")
+    nested = run_config if isinstance(run_config, dict) else {}
+    policy_field_names = (
+        "custom_all_reduce_requested",
+        "custom_all_reduce_effective",
+        "custom_all_reduce_effective_reason",
+    )
+    runtime_field_names = (
+        "custom_all_reduce_runtime_proof_required",
+        "custom_all_reduce_runtime_proof_passed",
+        "custom_all_reduce_runtime_configured_effective",
+        "custom_all_reduce_runtime_tensor_parallel_size",
+        "custom_all_reduce_runtime_rank_count",
+        "custom_all_reduce_runtime_active_rank_count",
+        "custom_all_reduce_runtime_inactive_rank_count",
+        "custom_all_reduce_runtime_all_ranks_active",
+        "custom_all_reduce_runtime_rank_consistent",
+        "custom_all_reduce_runtime_preemptor_flashinfer_enabled",
+        "custom_all_reduce_runtime_preemptor_nccl_symm_mem_enabled",
+        "custom_all_reduce_runtime_required_num_tokens",
+        "custom_all_reduce_runtime_model_hidden_size",
+        "custom_all_reduce_runtime_model_dtype",
+        "custom_all_reduce_runtime_model_dtype_bytes",
+        "custom_all_reduce_runtime_required_payload_bytes",
+        "custom_all_reduce_runtime_all_ranks_payload_eligible",
+        "custom_all_reduce_runtime_records",
+    )
+    values: dict[str, Any] = {}
+    mismatches: list[str] = []
+    missing: list[str] = []
+    for field_name in (*policy_field_names, *runtime_field_names):
+        top_present = field_name in metrics
+        nested_present = field_name in nested
+        top_value = metrics.get(field_name)
+        nested_value = nested.get(field_name)
+        if top_present and nested_present and top_value != nested_value:
+            mismatches.append(field_name)
+        if top_present:
+            values[field_name] = top_value
+        elif nested_present:
+            values[field_name] = nested_value
+        else:
+            missing.append(field_name)
+    policy_mismatches = [
+        field_name
+        for field_name in mismatches
+        if field_name in policy_field_names
+    ]
+    if policy_mismatches:
+        return {
+            "custom_all_reduce_requested": "invalid",
+            "custom_all_reduce_effective": "invalid",
+            "custom_all_reduce_effective_reason": (
+                "metrics_run_config_mismatch:" + ",".join(policy_mismatches)
+            ),
+            "custom_all_reduce_runtime_proof_required": False,
+            "custom_all_reduce_runtime_proof_passed": False,
+            "custom_all_reduce_runtime_configured_effective": "invalid",
+            "custom_all_reduce_runtime_tensor_parallel_size": -1,
+            "custom_all_reduce_runtime_rank_count": -1,
+            "custom_all_reduce_runtime_active_rank_count": -1,
+            "custom_all_reduce_runtime_inactive_rank_count": -1,
+            "custom_all_reduce_runtime_all_ranks_active": False,
+            "custom_all_reduce_runtime_rank_consistent": False,
+            "custom_all_reduce_runtime_preemptor_flashinfer_enabled": False,
+            "custom_all_reduce_runtime_preemptor_nccl_symm_mem_enabled": False,
+            "custom_all_reduce_runtime_required_num_tokens": -1,
+            "custom_all_reduce_runtime_model_hidden_size": -1,
+            "custom_all_reduce_runtime_model_dtype": "",
+            "custom_all_reduce_runtime_model_dtype_bytes": -1,
+            "custom_all_reduce_runtime_required_payload_bytes": -1,
+            "custom_all_reduce_runtime_all_ranks_payload_eligible": False,
+            "custom_all_reduce_runtime_records": [],
+            "custom_all_reduce_runtime_proof_error": (
+                "metrics_run_config_mismatch:" + ",".join(mismatches)
+            ),
+        }
+    requested = str(values.get("custom_all_reduce_requested", "") or "")
+    effective = str(values.get("custom_all_reduce_effective", "") or "")
+    effective_reason = str(
+        values.get("custom_all_reduce_effective_reason", "") or ""
+    )
+    if effective not in {"enabled", "disabled", "not_applicable"}:
+        requested = requested or "unknown"
+        effective = "unknown"
+        effective_reason = (
+            effective_reason or "child_artifact_missing_effective_decision"
+        )
+
+    runtime_errors = [
+        f"metrics_run_config_mismatch:{field_name}"
+        for field_name in mismatches
+        if field_name in runtime_field_names
+    ]
+    runtime_errors.extend(
+        f"missing:{field_name}"
+        for field_name in missing
+        if field_name in runtime_field_names
+    )
+
+    def _strict_bool(field_name: str) -> bool:
+        value = values.get(field_name)
+        if not isinstance(value, bool):
+            runtime_errors.append(f"invalid_bool:{field_name}={value!r}")
+            return False
+        return value
+
+    def _strict_int(field_name: str) -> int:
+        value = values.get(field_name)
+        if isinstance(value, bool) or not isinstance(value, int):
+            runtime_errors.append(f"invalid_int:{field_name}={value!r}")
+            return -1
+        return int(value)
+
+    def _strict_str(field_name: str) -> str:
+        value = values.get(field_name)
+        if not isinstance(value, str) or not value:
+            runtime_errors.append(f"invalid_str:{field_name}={value!r}")
+            return ""
+        return value
+
+    runtime_required = _strict_bool(
+        "custom_all_reduce_runtime_proof_required"
+    )
+    runtime_passed_raw = _strict_bool(
+        "custom_all_reduce_runtime_proof_passed"
+    )
+    runtime_configured_effective = str(
+        values.get("custom_all_reduce_runtime_configured_effective", "") or ""
+    )
+    runtime_tp_size = _strict_int(
+        "custom_all_reduce_runtime_tensor_parallel_size"
+    )
+    runtime_rank_count = _strict_int(
+        "custom_all_reduce_runtime_rank_count"
+    )
+    runtime_active_count = _strict_int(
+        "custom_all_reduce_runtime_active_rank_count"
+    )
+    runtime_inactive_count = _strict_int(
+        "custom_all_reduce_runtime_inactive_rank_count"
+    )
+    runtime_all_active = _strict_bool(
+        "custom_all_reduce_runtime_all_ranks_active"
+    )
+    runtime_rank_consistent = _strict_bool(
+        "custom_all_reduce_runtime_rank_consistent"
+    )
+    runtime_flashinfer_preemptor = _strict_bool(
+        "custom_all_reduce_runtime_preemptor_flashinfer_enabled"
+    )
+    runtime_nccl_symm_mem_preemptor = _strict_bool(
+        "custom_all_reduce_runtime_preemptor_nccl_symm_mem_enabled"
+    )
+    runtime_required_num_tokens = _strict_int(
+        "custom_all_reduce_runtime_required_num_tokens"
+    )
+    runtime_model_hidden_size = _strict_int(
+        "custom_all_reduce_runtime_model_hidden_size"
+    )
+    runtime_model_dtype = _strict_str(
+        "custom_all_reduce_runtime_model_dtype"
+    )
+    runtime_model_dtype_bytes = _strict_int(
+        "custom_all_reduce_runtime_model_dtype_bytes"
+    )
+    runtime_required_payload_bytes = _strict_int(
+        "custom_all_reduce_runtime_required_payload_bytes"
+    )
+    runtime_all_payload_eligible = _strict_bool(
+        "custom_all_reduce_runtime_all_ranks_payload_eligible"
+    )
+    raw_records = values.get("custom_all_reduce_runtime_records")
+    runtime_records = raw_records if isinstance(raw_records, list) else []
+    if not isinstance(raw_records, list):
+        runtime_errors.append(
+            "invalid_list:custom_all_reduce_runtime_records="
+            f"{type(raw_records).__name__}"
+        )
+
+    if runtime_configured_effective != effective:
+        runtime_errors.append(
+            "configured_effective_mismatch:"
+            f"runtime={runtime_configured_effective!r}:policy={effective!r}"
+        )
+    if runtime_tp_size <= 0:
+        runtime_errors.append(f"invalid_tp_size:{runtime_tp_size}")
+    if runtime_required is not (runtime_tp_size > 1):
+        runtime_errors.append(
+            f"proof_required={runtime_required!r}:tp_size={runtime_tp_size}"
+        )
+    if runtime_rank_count != runtime_tp_size:
+        runtime_errors.append(
+            f"rank_count={runtime_rank_count}:tp_size={runtime_tp_size}"
+        )
+    if len(runtime_records) != runtime_tp_size:
+        runtime_errors.append(
+            f"record_count={len(runtime_records)}:tp_size={runtime_tp_size}"
+        )
+    if runtime_active_count + runtime_inactive_count != runtime_tp_size:
+        runtime_errors.append(
+            "active_inactive_count_mismatch:"
+            f"active={runtime_active_count}:inactive={runtime_inactive_count}:"
+            f"tp_size={runtime_tp_size}"
+        )
+    top_batch_size = metrics.get("batch_size")
+    child_batch_size = nested.get("batch_size")
+    if (
+        isinstance(top_batch_size, bool)
+        or not isinstance(top_batch_size, int)
+        or top_batch_size <= 0
+    ):
+        runtime_errors.append(
+            f"invalid_metrics_batch_size:{top_batch_size!r}"
+        )
+    if (
+        isinstance(child_batch_size, bool)
+        or not isinstance(child_batch_size, int)
+        or child_batch_size <= 0
+    ):
+        runtime_errors.append(f"invalid_run_config_batch_size:{child_batch_size!r}")
+    elif top_batch_size != child_batch_size:
+        runtime_errors.append(
+            "metrics_run_config_batch_size_mismatch:"
+            f"metrics={top_batch_size!r}:run_config={child_batch_size}"
+        )
+    if (
+        isinstance(child_batch_size, int)
+        and not isinstance(child_batch_size, bool)
+        and runtime_required_num_tokens != child_batch_size
+    ):
+        runtime_errors.append(
+            "required_num_tokens_batch_size_mismatch:"
+            f"required={runtime_required_num_tokens}:batch_size={child_batch_size}"
+        )
+    if (
+        expected_batch_size is not None
+        and runtime_required_num_tokens != expected_batch_size
+    ):
+        runtime_errors.append(
+            "required_num_tokens_parent_batch_size_mismatch:"
+            f"required={runtime_required_num_tokens}:"
+            f"parent_batch_size={expected_batch_size}"
+        )
+
+    dtype_bytes_by_name = {"bfloat16": 2, "float16": 2}
+    child_dtype = nested.get("dtype")
+    if not isinstance(child_dtype, str) or child_dtype not in dtype_bytes_by_name:
+        runtime_errors.append(f"invalid_run_config_dtype:{child_dtype!r}")
+        expected_runtime_dtype = ""
+        expected_dtype_bytes = -1
+    else:
+        expected_runtime_dtype = f"torch.{child_dtype}"
+        expected_dtype_bytes = dtype_bytes_by_name[child_dtype]
+    if runtime_model_dtype != expected_runtime_dtype:
+        runtime_errors.append(
+            "model_dtype_run_config_mismatch:"
+            f"runtime={runtime_model_dtype!r}:run_config={child_dtype!r}"
+        )
+    if runtime_model_dtype_bytes != expected_dtype_bytes:
+        runtime_errors.append(
+            "model_dtype_bytes_run_config_mismatch:"
+            f"runtime={runtime_model_dtype_bytes}:expected={expected_dtype_bytes}"
+        )
+    expected_payload_bytes = (
+        runtime_required_num_tokens
+        * runtime_model_hidden_size
+        * runtime_model_dtype_bytes
+    )
+    if (
+        runtime_required_num_tokens <= 0
+        or runtime_model_hidden_size <= 0
+        or runtime_model_dtype_bytes <= 0
+        or runtime_required_payload_bytes != expected_payload_bytes
+    ):
+        runtime_errors.append(
+            "required_payload_spec_mismatch:"
+            f"tokens={runtime_required_num_tokens}:"
+            f"hidden={runtime_model_hidden_size}:"
+            f"dtype={runtime_model_dtype!r}:"
+            f"dtype_bytes={runtime_model_dtype_bytes}:"
+            f"payload_bytes={runtime_required_payload_bytes}:"
+            f"expected={expected_payload_bytes}"
+        )
+
+    record_ranks: list[int] = []
+    record_active_count = 0
+    record_flashinfer_preemptor = False
+    record_nccl_symm_mem_preemptor = False
+    for index, record in enumerate(runtime_records):
+        if not isinstance(record, dict):
+            runtime_errors.append(
+                f"record[{index}]={type(record).__name__}:expected=dict"
+            )
+            continue
+        rank = record.get("tp_rank")
+        world_size = record.get("tp_world_size")
+        active = record.get("ca_comm_active")
+        ca_present = record.get("ca_comm_present")
+        ca_disabled = record.get("ca_comm_disabled")
+        ca_fully_connected = record.get("ca_comm_fully_connected")
+        ca_max_size = record.get("ca_comm_max_size")
+        record_required_num_tokens = record.get("required_num_tokens")
+        record_model_hidden_size = record.get("model_hidden_size")
+        record_model_dtype = record.get("model_dtype")
+        record_model_dtype_bytes = record.get("model_dtype_bytes")
+        record_payload_numel = record.get("required_payload_numel")
+        record_payload_bytes = record.get("required_payload_bytes")
+        record_payload_spec_error = record.get("required_payload_spec_error")
+        ca_capacity_eligible = record.get(
+            "ca_comm_capacity_covers_required_payload"
+        )
+        ca_dispatch_size_eligible = record.get(
+            "ca_comm_dispatch_size_eligible"
+        )
+        ca_should_custom_ar_callable = record.get(
+            "ca_comm_should_custom_ar_callable"
+        )
+        ca_synthetic_eligible = record.get(
+            "ca_comm_synthetic_should_custom_ar"
+        )
+        ca_synthetic_error = record.get(
+            "ca_comm_synthetic_should_custom_ar_error"
+        )
+        tri_state_fields = (
+            "ca_comm_capacity_covers_required_payload",
+            "ca_comm_dispatch_size_eligible",
+            "ca_comm_synthetic_should_custom_ar",
+        )
+        for field_name in tri_state_fields:
+            if field_name not in record:
+                runtime_errors.append(f"record[{index}] missing={field_name}")
+        config_disabled = record.get(
+            "parallel_config_disable_custom_all_reduce"
+        )
+        communicator_enabled = record.get(
+            "device_communicator_use_custom_allreduce"
+        )
+        flashinfer_configured = record.get(
+            "device_communicator_use_flashinfer_allreduce"
+        )
+        flashinfer_active = record.get("fi_ar_comm_active")
+        nccl_symm_mem_enabled = record.get("vllm_use_nccl_symm_mem")
+        if isinstance(rank, bool) or not isinstance(rank, int):
+            runtime_errors.append(f"record[{index}].tp_rank={rank!r}")
+            continue
+        record_ranks.append(int(rank))
+        if world_size != runtime_tp_size:
+            runtime_errors.append(
+                f"rank{rank}.tp_world_size={world_size!r}:"
+                f"expected={runtime_tp_size}"
+            )
+        if not isinstance(active, bool):
+            runtime_errors.append(f"rank{rank}.ca_comm_active={active!r}")
+            continue
+        if not isinstance(flashinfer_configured, bool) or not isinstance(
+            flashinfer_active, bool
+        ):
+            runtime_errors.append(
+                f"rank{rank}.flashinfer_state="
+                f"{flashinfer_configured!r},{flashinfer_active!r}"
+            )
+        else:
+            record_flashinfer_preemptor = bool(
+                record_flashinfer_preemptor
+                or flashinfer_configured
+                or flashinfer_active
+            )
+        if not isinstance(nccl_symm_mem_enabled, bool):
+            runtime_errors.append(
+                f"rank{rank}.vllm_use_nccl_symm_mem="
+                f"{nccl_symm_mem_enabled!r}"
+            )
+        else:
+            record_nccl_symm_mem_preemptor = bool(
+                record_nccl_symm_mem_preemptor or nccl_symm_mem_enabled
+            )
+        record_active_count += int(active)
+        expected_record_numel = (
+            runtime_required_num_tokens * runtime_model_hidden_size
+        )
+        record_spec = {
+            "required_num_tokens": (
+                record_required_num_tokens,
+                runtime_required_num_tokens,
+            ),
+            "model_hidden_size": (
+                record_model_hidden_size,
+                runtime_model_hidden_size,
+            ),
+            "model_dtype": (record_model_dtype, runtime_model_dtype),
+            "model_dtype_bytes": (
+                record_model_dtype_bytes,
+                runtime_model_dtype_bytes,
+            ),
+            "required_payload_numel": (
+                record_payload_numel,
+                expected_record_numel,
+            ),
+            "required_payload_bytes": (
+                record_payload_bytes,
+                runtime_required_payload_bytes,
+            ),
+        }
+        for field_name, (actual, expected) in record_spec.items():
+            if type(actual) is not type(expected) or actual != expected:
+                runtime_errors.append(
+                    f"rank{rank}.{field_name}={actual!r}:expected={expected!r}"
+                )
+        if record_payload_spec_error != "":
+            runtime_errors.append(
+                f"rank{rank}.required_payload_spec_error="
+                f"{record_payload_spec_error!r}"
+            )
+        if not isinstance(ca_should_custom_ar_callable, bool):
+            runtime_errors.append(
+                f"rank{rank}.ca_comm_should_custom_ar_callable="
+                f"{ca_should_custom_ar_callable!r}"
+            )
+        for field_name, value in (
+            (
+                "ca_comm_capacity_covers_required_payload",
+                ca_capacity_eligible,
+            ),
+            ("ca_comm_dispatch_size_eligible", ca_dispatch_size_eligible),
+            ("ca_comm_synthetic_should_custom_ar", ca_synthetic_eligible),
+        ):
+            if value is not None and not isinstance(value, bool):
+                runtime_errors.append(
+                    f"rank{rank}.{field_name}={value!r}:expected=bool|None"
+                )
+        if ca_synthetic_error != "":
+            runtime_errors.append(
+                f"rank{rank}.ca_comm_synthetic_should_custom_ar_error="
+                f"{ca_synthetic_error!r}"
+            )
+        if active is False and ca_synthetic_eligible is not None:
+            runtime_errors.append(
+                f"rank{rank}.ca_comm_synthetic_should_custom_ar="
+                f"{ca_synthetic_eligible!r}:expected=None_when_inactive"
+            )
+        if runtime_tp_size > 1 and effective in {"enabled", "disabled"}:
+            expected_active = effective == "enabled"
+            if active is not expected_active:
+                runtime_errors.append(
+                    f"rank{rank}.ca_comm_active={active!r}:"
+                    f"expected={expected_active!r}"
+                )
+            if config_disabled is not (not expected_active):
+                runtime_errors.append(
+                    f"rank{rank}.config_disabled={config_disabled!r}:"
+                    f"expected={not expected_active!r}"
+                )
+            if communicator_enabled is not expected_active:
+                runtime_errors.append(
+                    f"rank{rank}.communicator_enabled="
+                    f"{communicator_enabled!r}:expected={expected_active!r}"
+                )
+            if expected_active:
+                if ca_present is not True:
+                    runtime_errors.append(
+                        f"rank{rank}.ca_comm_present={ca_present!r}"
+                    )
+                if ca_disabled is not False:
+                    runtime_errors.append(
+                        f"rank{rank}.ca_comm_disabled={ca_disabled!r}"
+                    )
+                if not isinstance(ca_fully_connected, bool):
+                    runtime_errors.append(
+                        f"rank{rank}.ca_comm_fully_connected="
+                        f"{ca_fully_connected!r}"
+                    )
+                elif runtime_tp_size > 2 and not ca_fully_connected:
+                    runtime_errors.append(
+                        f"rank{rank}.ca_comm_fully_connected=false"
+                    )
+                if (
+                    isinstance(ca_max_size, bool)
+                    or not isinstance(ca_max_size, int)
+                    or ca_max_size <= 0
+                ):
+                    runtime_errors.append(
+                        f"rank{rank}.ca_comm_max_size={ca_max_size!r}"
+                    )
+                elif ca_max_size <= runtime_required_payload_bytes:
+                    runtime_errors.append(
+                        f"rank{rank}.ca_comm_max_size={ca_max_size}:"
+                        "must_exceed_required_payload_bytes="
+                        f"{runtime_required_payload_bytes}"
+                    )
+                if ca_capacity_eligible is not True:
+                    runtime_errors.append(
+                        f"rank{rank}.ca_comm_capacity_covers_required_payload="
+                        f"{ca_capacity_eligible!r}"
+                    )
+                if ca_dispatch_size_eligible is not True:
+                    runtime_errors.append(
+                        f"rank{rank}.ca_comm_dispatch_size_eligible="
+                        f"{ca_dispatch_size_eligible!r}"
+                    )
+                if ca_should_custom_ar_callable is not True:
+                    runtime_errors.append(
+                        f"rank{rank}.ca_comm_should_custom_ar_callable="
+                        f"{ca_should_custom_ar_callable!r}"
+                    )
+                if ca_synthetic_eligible is not True:
+                    runtime_errors.append(
+                        f"rank{rank}.ca_comm_synthetic_should_custom_ar="
+                        f"{ca_synthetic_eligible!r}"
+                    )
+    if sorted(record_ranks) != list(range(max(0, runtime_tp_size))):
+        runtime_errors.append(
+            f"tp_ranks={sorted(record_ranks)!r}:"
+            f"expected={list(range(max(0, runtime_tp_size)))!r}"
+        )
+    if record_active_count != runtime_active_count:
+        runtime_errors.append(
+            f"record_active_count={record_active_count}:"
+            f"declared={runtime_active_count}"
+        )
+    if record_flashinfer_preemptor is not runtime_flashinfer_preemptor:
+        runtime_errors.append(
+            "flashinfer_preemptor_mismatch:"
+            f"records={record_flashinfer_preemptor!r}:"
+            f"declared={runtime_flashinfer_preemptor!r}"
+        )
+    if record_nccl_symm_mem_preemptor is not runtime_nccl_symm_mem_preemptor:
+        runtime_errors.append(
+            "nccl_symm_mem_preemptor_mismatch:"
+            f"records={record_nccl_symm_mem_preemptor!r}:"
+            f"declared={runtime_nccl_symm_mem_preemptor!r}"
+        )
+    if effective == "enabled" and runtime_flashinfer_preemptor:
+        runtime_errors.append("flashinfer_preempts_custom_all_reduce")
+    if effective == "enabled" and runtime_nccl_symm_mem_preemptor:
+        runtime_errors.append("nccl_symm_mem_preempts_custom_all_reduce")
+    if runtime_all_active is not (
+        runtime_active_count == runtime_tp_size
+    ):
+        runtime_errors.append(
+            f"all_ranks_active={runtime_all_active!r}:"
+            f"active={runtime_active_count}:tp_size={runtime_tp_size}"
+        )
+    if not runtime_rank_consistent:
+        runtime_errors.append("rank_consistent=false")
+    if not runtime_passed_raw:
+        runtime_errors.append("child_runtime_proof_passed=false")
+    record_payload_eligible = bool(
+        runtime_records
+        and all(
+            isinstance(record, dict)
+            and record.get("ca_comm_synthetic_should_custom_ar") is True
+            for record in runtime_records
+        )
+    )
+    expected_all_payload_eligible = bool(
+        effective == "enabled" and record_payload_eligible
+    )
+    if runtime_all_payload_eligible is not expected_all_payload_eligible:
+        runtime_errors.append(
+            "all_ranks_payload_eligible_mismatch:"
+            f"declared={runtime_all_payload_eligible!r}:"
+            f"records={record_payload_eligible!r}:effective={effective!r}"
+        )
+
+    return {
+        "custom_all_reduce_requested": requested,
+        "custom_all_reduce_effective": effective,
+        "custom_all_reduce_effective_reason": effective_reason,
+        "custom_all_reduce_runtime_proof_required": runtime_required,
+        "custom_all_reduce_runtime_proof_passed": bool(
+            runtime_passed_raw and not runtime_errors
+        ),
+        "custom_all_reduce_runtime_configured_effective": (
+            runtime_configured_effective
+        ),
+        "custom_all_reduce_runtime_tensor_parallel_size": runtime_tp_size,
+        "custom_all_reduce_runtime_rank_count": runtime_rank_count,
+        "custom_all_reduce_runtime_active_rank_count": runtime_active_count,
+        "custom_all_reduce_runtime_inactive_rank_count": runtime_inactive_count,
+        "custom_all_reduce_runtime_all_ranks_active": runtime_all_active,
+        "custom_all_reduce_runtime_rank_consistent": bool(
+            runtime_rank_consistent and not runtime_errors
+        ),
+        "custom_all_reduce_runtime_preemptor_flashinfer_enabled": (
+            runtime_flashinfer_preemptor
+        ),
+        "custom_all_reduce_runtime_preemptor_nccl_symm_mem_enabled": (
+            runtime_nccl_symm_mem_preemptor
+        ),
+        "custom_all_reduce_runtime_required_num_tokens": (
+            runtime_required_num_tokens
+        ),
+        "custom_all_reduce_runtime_model_hidden_size": runtime_model_hidden_size,
+        "custom_all_reduce_runtime_model_dtype": runtime_model_dtype,
+        "custom_all_reduce_runtime_model_dtype_bytes": runtime_model_dtype_bytes,
+        "custom_all_reduce_runtime_required_payload_bytes": (
+            runtime_required_payload_bytes
+        ),
+        "custom_all_reduce_runtime_all_ranks_payload_eligible": (
+            runtime_all_payload_eligible
+        ),
+        "custom_all_reduce_runtime_records": runtime_records,
+        "custom_all_reduce_runtime_proof_error": ";".join(runtime_errors),
+    }
+
+
+def _speed_child_engine_scheduling_provenance(
+    metrics: dict[str, Any],
+) -> dict[str, Any]:
+    """Lift the child-instantiated scheduler state into the parent artifact."""
+    field_names = (
+        "engine_scheduling_mode_requested",
+        "engine_async_scheduling_configured",
+        "engine_async_scheduling_effective",
+    )
+    nested_raw = metrics.get("run_config")
+    nested = nested_raw if isinstance(nested_raw, dict) else {}
+    return {field_name: nested.get(field_name) for field_name in field_names}
+
+
+def _scheduler_graph_runtime_contract_reasons(
+    contract: dict[str, object],
+    *,
+    expected: dict[str, object],
+    child: str,
+) -> list[str]:
+    reasons: list[str] = []
+    exact_fields = {
+        "scheduler_graph_contract_schema": expected["schema"],
+        "engine_max_num_seqs_requested": expected["max_num_seqs"],
+        "engine_max_num_seqs_effective": expected["max_num_seqs"],
+        "engine_max_num_batched_tokens_requested": expected[
+            "max_num_batched_tokens"
+        ],
+        "engine_max_num_batched_tokens_effective": expected[
+            "max_num_batched_tokens"
+        ],
+        "engine_kv_cache_memory_bytes_requested": expected[
+            "kv_cache_memory_bytes"
+        ],
+        "engine_kv_cache_memory_bytes_effective": expected[
+            "kv_cache_memory_bytes"
+        ],
+        "engine_chunked_prefill_requested": expected["chunked_prefill"],
+        "engine_chunked_prefill_configured": (
+            None
+            if expected["chunked_prefill"] == "auto"
+            else expected["chunked_prefill"] == "enabled"
+        ),
+        "engine_chunked_prefill_effective": (
+            expected["chunked_prefill"] == "enabled"
+            if expected["chunked_prefill"] != "auto"
+            else contract.get("engine_chunked_prefill_effective")
+        ),
+        "engine_cudagraph_capture_sizes_requested": expected[
+            "cudagraph_capture_sizes"
+        ],
+        "engine_cudagraph_capture_sizes_effective": expected[
+            "cudagraph_capture_sizes"
+        ],
+        "engine_max_cudagraph_capture_size_effective": max(
+            expected["cudagraph_capture_sizes"], default=0
+        ),
+        "engine_decode_batch_cudagraph_covered": bool(
+            expected["full_cuda_graph"]
+        ),
+        "engine_full_cuda_graph_requested": expected["full_cuda_graph"],
+        "engine_full_cuda_graph_effective": expected["full_cuda_graph"],
+        "engine_max_seq_len_to_capture_requested": expected[
+            "max_seq_len_to_capture"
+        ],
+    }
+    for field, expected_value in exact_fields.items():
+        actual = contract.get(field)
+        if type(actual) is not type(expected_value) or actual != expected_value:
+            reasons.append(
+                f"{child}_scheduler_graph_contract_mismatch:"
+                f"{field}:actual={actual!r}:expected={expected_value!r}"
+            )
+    supported = contract.get("engine_max_seq_len_to_capture_supported")
+    effective = contract.get("engine_max_seq_len_to_capture_effective")
+    expected_sequence_control = (
+        "legacy_engine_arg" if supported is True else "not_applicable_v1"
+    )
+    if contract.get("engine_sequence_length_graph_control") != expected_sequence_control:
+        reasons.append(
+            f"{child}_scheduler_graph_contract_mismatch:"
+            "engine_sequence_length_graph_control:"
+            f"actual={contract.get('engine_sequence_length_graph_control')!r}:"
+            f"expected={expected_sequence_control!r}"
+        )
+    if type(supported) is not bool:
+        reasons.append(
+            f"{child}_scheduler_graph_contract_mismatch:"
+            "engine_max_seq_len_to_capture_supported_invalid"
+        )
+    elif supported:
+        expected_value = expected["max_seq_len_to_capture"]
+        if type(effective) is not int or effective != expected_value:
+            reasons.append(
+                f"{child}_scheduler_graph_contract_mismatch:"
+                "engine_max_seq_len_to_capture_effective:"
+                f"actual={effective!r}:expected={expected_value!r}"
+            )
+    elif effective is not None:
+        reasons.append(
+            f"{child}_scheduler_graph_contract_mismatch:"
+            "unsupported_max_seq_len_to_capture_claims_effective_value"
+        )
+    return reasons
+
+
+def _engine_runtime_pair_geometry(proof: dict[str, Any]) -> dict[str, Any]:
+    """Return the explicit arm-common physical state, never admission policy."""
+    geometry = proof.get("engine_runtime_physical_geometry")
+    return dict(geometry) if isinstance(geometry, dict) else {}
+
+
+def _apply_scheduler_graph_contract_payload(
+    payload: dict[str, Any],
+    args: argparse.Namespace,
+    *,
+    speed_metrics: dict[str, Any],
+    diagnostic_metrics: dict[str, Any] | None,
+    dense_reference_metrics: dict[str, Any] | None = None,
+) -> None:
+    expected = requested_scheduler_graph_contract(args)
+    children: dict[str, dict[str, object]] = {
+        "speed_child": scheduler_graph_runtime_contract_from_metrics(speed_metrics)
+    }
+    if diagnostic_metrics is not None:
+        children["diagnostic_child"] = (
+            scheduler_graph_runtime_contract_from_metrics(diagnostic_metrics)
+        )
+    if dense_reference_metrics is not None:
+        children["dense_reference_child"] = (
+            scheduler_graph_runtime_contract_from_metrics(dense_reference_metrics)
+        )
+
+    runtime_metrics: dict[str, dict[str, Any]] = {
+        "speed_child": speed_metrics,
+    }
+    if diagnostic_metrics is not None:
+        runtime_metrics["diagnostic_child"] = diagnostic_metrics
+    if dense_reference_metrics is not None:
+        runtime_metrics["dense_reference_child"] = dense_reference_metrics
+
+    runtime_proofs: dict[str, dict[str, Any]] = {}
+    for child, metrics in runtime_metrics.items():
+        nested_raw = metrics.get("run_config")
+        nested = nested_raw if isinstance(nested_raw, dict) else {}
+        proof = {
+            str(key): value
+            for source in (nested, metrics)
+            for key, value in source.items()
+            if str(key).startswith("engine_runtime_")
+        }
+        runtime_proofs[child] = proof
+        payload[f"{child}_engine_runtime_contract_proof"] = proof
+
+    diagnostic_graph_proof: dict[str, Any] = {}
+    if diagnostic_metrics is not None:
+        boundary_raw = diagnostic_metrics.get("boundary_diagnostics")
+        boundary = boundary_raw if isinstance(boundary_raw, dict) else {}
+        diagnostic_graph_proof = {
+            str(key): value
+            for key, value in boundary.items()
+            if str(key).startswith("cudagraph_runtime_observer_")
+        }
+    payload["diagnostic_child_cudagraph_runtime_proof"] = diagnostic_graph_proof
+
+    reasons: list[str] = []
+    for child, contract in children.items():
+        reasons.extend(
+            _scheduler_graph_runtime_contract_reasons(
+                contract,
+                expected=expected,
+                child=child,
+            )
+        )
+    contracts = list(children.values())
+    if len(contracts) > 1 and any(
+        contract != contracts[0] for contract in contracts[1:]
+    ):
+        reasons.append("scheduler_graph_child_contracts_diverged")
+
+    exact_runtime_required = (
+        os.environ.get("SFI_RUNNER_TIER", "") == "tp8x64k"
+    )
+    runtime_reasons: list[str] = []
+    if exact_runtime_required:
+        for child, proof in runtime_proofs.items():
+            if proof.get("engine_runtime_contract_proof_required") is not True:
+                runtime_reasons.append(f"{child}_runtime_proof_not_required")
+            if proof.get("engine_runtime_contract_proof_passed") is not True:
+                runtime_reasons.append(f"{child}_runtime_proof_not_green")
+            if proof.get("engine_runtime_graph_mode") != "FULL":
+                runtime_reasons.append(f"{child}_runtime_graph_not_full")
+            if proof.get("engine_runtime_graph_capture_sizes") != [int(args.batch_size)]:
+                runtime_reasons.append(f"{child}_runtime_capture_sizes_mismatch")
+            if proof.get("engine_runtime_graph_full_decode_key_present") is not True:
+                runtime_reasons.append(f"{child}_runtime_full_decode_key_missing")
+            if proof.get("engine_runtime_kv_capacity_covers_required_total") is not True:
+                runtime_reasons.append(f"{child}_runtime_kv_capacity_not_green")
+
+        if (
+            diagnostic_graph_proof.get(
+                "cudagraph_runtime_observer_all_decode_exact_full"
+            )
+            is not True
+        ):
+            runtime_reasons.append("diagnostic_runtime_graph_steps_not_exact_full")
+        if diagnostic_graph_proof.get(
+            "cudagraph_runtime_observer_missing_step_count"
+        ) != 0:
+            runtime_reasons.append("diagnostic_runtime_graph_steps_missing")
+
+        geometries = {
+            child: _engine_runtime_pair_geometry(proof)
+            for child, proof in runtime_proofs.items()
+        }
+        reference_geometry = geometries.get("speed_child")
+        for child, geometry in geometries.items():
+            if geometry != reference_geometry:
+                runtime_reasons.append(
+                    f"{child}_worker_runtime_geometry_diverged"
+                )
+        payload["engine_runtime_geometry"] = reference_geometry
+        payload["engine_runtime_geometry_digest"] = build_config_digest(
+            reference_geometry or {}
+        )
+    payload["engine_runtime_contract_match"] = not runtime_reasons
+    payload["engine_runtime_contract_reasons"] = runtime_reasons
+    if runtime_reasons:
+        reasons.extend(runtime_reasons)
+
+    payload["scheduler_graph_contract_expected"] = expected
+    payload.update(
+        {
+            f"{child}_scheduler_graph_contract": contract
+            for child, contract in children.items()
+        }
+    )
+    payload["scheduler_graph_contract_match"] = not reasons
+    payload["scheduler_graph_contract_reasons"] = reasons
+    provenance = payload.get("run_provenance")
+    if isinstance(provenance, dict):
+        provenance["scheduler_graph_contract_expected"] = expected
+        provenance["speed_child_scheduler_graph_contract"] = children[
+            "speed_child"
+        ]
+    if reasons:
+        payload["gate_passed"] = False
+        payload["production_gate_passed"] = False
+
+
+def _apply_sparse_dense_pair_speedup_payload(
+    payload: dict[str, Any],
+    args: argparse.Namespace,
+    *,
+    sparse_metrics: dict[str, Any],
+    dense_metrics: dict[str, Any] | None,
+    sparse_env: dict[str, str],
+    dense_env: dict[str, str] | None,
+) -> None:
+    """Promote the semantic dense reference into an adjacent timed pair arm."""
+    exact_required = os.environ.get("SFI_RUNNER_TIER", "") == "tp8x64k"
+    reasons: list[str] = []
+    provenance_raw = payload.get("run_provenance")
+    provenance = provenance_raw if isinstance(provenance_raw, dict) else {}
+    dense_metrics = dense_metrics if isinstance(dense_metrics, dict) else {}
+    dense_env = dense_env if isinstance(dense_env, dict) else {}
+    arm_runner_contract = {
+        "sparse": "run_sparse_only.py",
+        "dense": "run_dense_only.py",
+    }
+
+    def _runner_observed(metrics: dict[str, Any]) -> dict[str, Any]:
+        run_config = metrics.get("run_config")
+        nested = run_config if isinstance(run_config, dict) else {}
+        return {
+            "top_level": metrics.get("runner"),
+            "run_config": nested.get("runner"),
+        }
+
+    arm_runner_observed = {
+        "sparse": _runner_observed(sparse_metrics),
+        "dense": _runner_observed(dense_metrics),
+    }
+    arm_runner_contract_passed = all(
+        observed.get(location) == arm_runner_contract[arm]
+        for arm, observed in arm_runner_observed.items()
+        for location in ("top_level", "run_config")
+    )
+    if exact_required:
+        for arm, observed in arm_runner_observed.items():
+            for location in ("top_level", "run_config"):
+                if observed.get(location) != arm_runner_contract[arm]:
+                    reasons.append(
+                        f"sparse_dense_pair_{arm}_runner_mismatch:{location}"
+                    )
+
+    def _runtime_proof(metrics: dict[str, Any]) -> dict[str, Any]:
+        nested_raw = metrics.get("run_config")
+        nested = nested_raw if isinstance(nested_raw, dict) else {}
+        return {
+            str(key): value
+            for source in (nested, metrics)
+            for key, value in source.items()
+            if str(key).startswith("engine_runtime_")
+        }
+
+    def _custom_ar_geometry(metrics: dict[str, Any]) -> dict[str, Any]:
+        return _speed_child_custom_all_reduce_provenance(
+            metrics,
+            expected_batch_size=int(args.batch_size),
+        )
+
+    def _child_identity(metrics: dict[str, Any]) -> dict[str, Any]:
+        run_config = metrics.get("run_config")
+        if not isinstance(run_config, dict):
+            return {}
+        identity = run_config.get("benchmark_child_identity")
+        return dict(identity) if isinstance(identity, dict) else {}
+
+    model_kv_raw = provenance.get("runner_model_kv_contract")
+    model_kv = model_kv_raw if isinstance(model_kv_raw, dict) else {}
+    common_geometry = {
+        "schema": "sfi.sparse_dense_pair_geometry.v1",
+        "python": provenance.get("python"),
+        "git_head": provenance.get("git_head"),
+        "expected_git_commit": provenance.get("runner_expected_git_commit"),
+        "model": provenance.get("model"),
+        "model_config_sha256": model_kv.get("model_config_sha256"),
+        "corpus_sha256": provenance.get("runner_corpus_sha256"),
+        "tensor_parallel_size": provenance.get("tensor_parallel_size"),
+        "cuda_visible_devices": provenance.get("cuda_visible_devices_env"),
+        "cuda_capabilities": provenance.get("runner_cuda_capabilities"),
+        "batch_size": int(args.batch_size),
+        "context_tokens": provenance.get("runner_context_tokens"),
+        "max_new_tokens": _effective_max_new_tokens(args),
+        "max_model_len": int(args.max_model_len),
+        "attention_backend_artifact": provenance.get("backend_artifact"),
+        "attention_build_identity": provenance.get(
+            "runner_attention_build_identity"
+        ),
+        "gpu_lock_mode": provenance.get("runner_gpu_lock_mode"),
+        "gpu_lock_scope": provenance.get("runner_gpu_lock_scope"),
+    }
+    required_common_fields = {
+        "model_config_sha256",
+        "corpus_sha256",
+        "tensor_parallel_size",
+        "cuda_visible_devices",
+        "cuda_capabilities",
+        "batch_size",
+        "context_tokens",
+        "max_new_tokens",
+        "max_model_len",
+        "attention_backend_artifact",
+        "attention_build_identity",
+        "gpu_lock_mode",
+        "gpu_lock_scope",
+    }
+    if exact_required:
+        for field in sorted(required_common_fields):
+            value = common_geometry.get(field)
+            if value in (None, "", [], {}):
+                reasons.append(f"sparse_dense_pair_geometry_missing:{field}")
+    expected_child_identity = {
+        "schema": "sfi.benchmark_child_identity.v1",
+        "model_path": provenance.get("model"),
+        "model_config_path": model_kv.get("model_config_path"),
+        "model_config_sha256": model_kv.get("model_config_sha256"),
+        "parent_model_config_sha256": model_kv.get("model_config_sha256"),
+        "expected_model_config_sha256": provenance.get(
+            "runner_expected_model_config_sha256"
+        ),
+        "prompt_path": provenance.get("prompt"),
+        "corpus_sha256": provenance.get("runner_corpus_sha256"),
+        "expected_corpus_sha256": provenance.get("runner_corpus_sha256"),
+        "tensor_parallel_size": provenance.get("tensor_parallel_size"),
+        "cuda_visible_devices": provenance.get("cuda_visible_devices_env"),
+        "cuda_capabilities": provenance.get("runner_cuda_capabilities"),
+        "batch_size": int(args.batch_size),
+        "context_tokens": int(provenance.get("runner_context_tokens") or 0),
+        "max_new_tokens": _effective_max_new_tokens(args),
+        "max_model_len": int(args.max_model_len),
+        "runner_tier": provenance.get("runner_tier"),
+        "expected_git_commit": provenance.get("runner_expected_git_commit"),
+        "gpu_lock_mode": provenance.get("runner_gpu_lock_mode"),
+        "gpu_lock_scope": provenance.get("runner_gpu_lock_scope"),
+    }
+    sparse_child_identity = _child_identity(sparse_metrics)
+    dense_child_identity = _child_identity(dense_metrics)
+    # The backend name is an arm input, not physical pair geometry: sparse is
+    # intentionally routed through FLASH_ATTN while the native dense reference
+    # is intentionally routed through FLASH_ATTN_VLLM_V1.  Compare the shared
+    # child identity projection and gate each backend independently; retaining
+    # the two full records below keeps the audit lossless.
+    arm_invariant_child_identity_fields = (
+        "schema",
+        "model_path",
+        "model_config_path",
+        "model_config_sha256",
+        "parent_model_config_sha256",
+        "expected_model_config_sha256",
+        "prompt_path",
+        "corpus_sha256",
+        "expected_corpus_sha256",
+        "tensor_parallel_size",
+        "cuda_visible_devices",
+        "cuda_capabilities",
+        "batch_size",
+        "context_tokens",
+        "max_new_tokens",
+        "max_model_len",
+        "runner_tier",
+        "expected_git_commit",
+        "gpu_lock_mode",
+        "gpu_lock_scope",
+        "flash_attn_version",
+        "attention_build_identity_json",
+    )
+
+    def _arm_invariant_child_identity(
+        identity: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            field: identity.get(field)
+            for field in arm_invariant_child_identity_fields
+        }
+
+    sparse_child_identity_invariant = _arm_invariant_child_identity(
+        sparse_child_identity
+    )
+    dense_child_identity_invariant = _arm_invariant_child_identity(
+        dense_child_identity
+    )
+    arm_backend_contract = {
+        "sparse": "FLASH_ATTN",
+        "dense": "FLASH_ATTN_VLLM_V1",
+    }
+    arm_backend_contract_passed = all(
+        identity.get("attention_backend") == arm_backend_contract[arm]
+        for arm, identity in (
+            ("sparse", sparse_child_identity),
+            ("dense", dense_child_identity),
+        )
+    )
+    if exact_required:
+        for arm, identity in (
+            ("sparse", sparse_child_identity),
+            ("dense", dense_child_identity),
+        ):
+            for field, expected in expected_child_identity.items():
+                if identity.get(field) != expected:
+                    reasons.append(
+                        f"sparse_dense_pair_{arm}_child_identity_mismatch:"
+                        f"{field}"
+                    )
+            expected_backend = arm_backend_contract[arm]
+            if identity.get("attention_backend") != expected_backend:
+                reasons.append(
+                    f"sparse_dense_pair_{arm}_attention_backend_mismatch"
+                )
+            if identity.get("flash_attn_version") != provenance.get(
+                "runner_flash_attn_version"
+            ):
+                reasons.append(
+                    f"sparse_dense_pair_{arm}_flash_attn_version_mismatch"
+                )
+            build_identity_raw = identity.get("attention_build_identity_json")
+            try:
+                build_identity = json.loads(build_identity_raw)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                build_identity = None
+            if build_identity != provenance.get("runner_attention_build_identity"):
+                reasons.append(
+                    f"sparse_dense_pair_{arm}_attention_build_identity_mismatch"
+                )
+        if provenance.get("runner_gpu_lock_mode") != "exclusive":
+            reasons.append("sparse_dense_pair_gpu_lock_not_exclusive")
+        if provenance.get("runner_gpu_lock_scope") != "pair":
+            reasons.append("sparse_dense_pair_gpu_lock_scope_not_pair")
+    sparse_worker_geometry = _engine_runtime_pair_geometry(
+        _runtime_proof(sparse_metrics)
+    )
+    dense_worker_geometry = _engine_runtime_pair_geometry(
+        _runtime_proof(dense_metrics)
+    )
+    sparse_custom_ar_geometry = _custom_ar_geometry(sparse_metrics)
+    dense_custom_ar_geometry = _custom_ar_geometry(dense_metrics)
+    if exact_required:
+        for arm, custom_ar in (
+            ("sparse", sparse_custom_ar_geometry),
+            ("dense", dense_custom_ar_geometry),
+        ):
+            if custom_ar.get("custom_all_reduce_runtime_proof_required") is not True:
+                reasons.append(f"sparse_dense_pair_{arm}_custom_ar_not_required")
+            if custom_ar.get("custom_all_reduce_runtime_proof_passed") is not True:
+                reasons.append(f"sparse_dense_pair_{arm}_custom_ar_not_green")
+            if custom_ar.get("custom_all_reduce_runtime_proof_error") != "":
+                reasons.append(f"sparse_dense_pair_{arm}_custom_ar_error")
+        expected_capabilities = str(
+            provenance.get("runner_cuda_capabilities", "") or ""
+        ).split(",")
+        for arm, worker_geometry in (
+            ("sparse", sparse_worker_geometry),
+            ("dense", dense_worker_geometry),
+        ):
+            rank_records = worker_geometry.get("rank_records")
+            if not isinstance(rank_records, list) or len(rank_records) != len(
+                expected_capabilities
+            ):
+                reasons.append(
+                    f"sparse_dense_pair_{arm}_cuda_rank_records_mismatch"
+                )
+                continue
+            for rank, record in enumerate(rank_records):
+                device = (
+                    record.get("cuda_device_runtime")
+                    if isinstance(record, dict)
+                    else None
+                )
+                if (
+                    not isinstance(device, dict)
+                    or device.get("current_device") != rank
+                    or device.get("capability") != expected_capabilities[rank]
+                ):
+                    reasons.append(
+                        f"sparse_dense_pair_{arm}_cuda_runtime_mismatch:"
+                        f"rank={rank}"
+                    )
+    sparse_geometry = {
+        **common_geometry,
+        "child_identity": sparse_child_identity_invariant,
+        "scheduler": payload.get("speed_child_scheduler_graph_contract"),
+        "worker_runtime": sparse_worker_geometry,
+        "custom_all_reduce": sparse_custom_ar_geometry,
+    }
+    dense_geometry = {
+        **common_geometry,
+        "child_identity": dense_child_identity_invariant,
+        "scheduler": payload.get("dense_reference_child_scheduler_graph_contract"),
+        "worker_runtime": dense_worker_geometry,
+        "custom_all_reduce": dense_custom_ar_geometry,
+    }
+    sparse_digest = build_config_digest(sparse_geometry)
+    dense_digest = build_config_digest(dense_geometry)
+    geometry_match = sparse_geometry == dense_geometry
+    if exact_required and not geometry_match:
+        reasons.append("sparse_dense_pair_geometry_mismatch")
+
+    sparse_observer_env = _gate_d_trace_profile_env(sparse_env)
+    dense_observer_env = _gate_d_trace_profile_env(dense_env)
+    sparse_boundary_raw = sparse_metrics.get("boundary_diagnostics")
+    sparse_boundary = (
+        sparse_boundary_raw if isinstance(sparse_boundary_raw, dict) else {}
+    )
+    dense_boundary_raw = dense_metrics.get("boundary_diagnostics")
+    dense_boundary = (
+        dense_boundary_raw if isinstance(dense_boundary_raw, dict) else {}
+    )
+    observer_free = bool(
+        not sparse_observer_env
+        and not dense_observer_env
+        and sparse_boundary.get("cudagraph_runtime_observer_enabled") is not True
+        and dense_boundary.get("cudagraph_runtime_observer_enabled") is not True
+    )
+    if exact_required and not observer_free:
+        reasons.append("sparse_dense_timed_pair_not_observer_free")
+
+    for arm, arm_metrics in (
+        ("sparse", sparse_metrics),
+        ("dense", dense_metrics),
+    ):
+        boundary_raw = arm_metrics.get("boundary_diagnostics")
+        boundary = boundary_raw if isinstance(boundary_raw, dict) else {}
+        if exact_required:
+            exact_boundary = {
+                "all_decode_entered": True,
+                "all_decode_partial_batch_steps": 0,
+                "all_decode_zero_token_steps": 0,
+                "all_decode_fallback_used": False,
+            }
+            for field, expected in exact_boundary.items():
+                if boundary.get(field) != expected:
+                    reasons.append(
+                        f"sparse_dense_pair_{arm}_{field}_mismatch"
+                    )
+            full_steps = boundary.get("all_decode_full_batch_steps")
+            if type(full_steps) is not int or full_steps <= 0:
+                reasons.append(
+                    f"sparse_dense_pair_{arm}_all_decode_full_steps_missing"
+                )
+
+    def _positive_metric(metrics: dict[str, Any], key: str) -> float | None:
+        value = _as_float(metrics.get(key), float("nan"))
+        return value if math.isfinite(value) and value > 0.0 else None
+
+    def _ratio(numerator: float | None, denominator: float | None) -> float | None:
+        if numerator is None or denominator is None:
+            return None
+        return numerator / denominator
+
+    sparse_elapsed = _positive_metric(sparse_metrics, "elapsed_s")
+    dense_elapsed = _positive_metric(dense_metrics, "elapsed_s")
+    sparse_total_tps = _positive_metric(sparse_metrics, "tok_per_s")
+    dense_total_tps = _positive_metric(dense_metrics, "tok_per_s")
+    sparse_decode_tps = _positive_metric(sparse_metrics, "decode_tok_per_s")
+    dense_decode_tps = _positive_metric(dense_metrics, "decode_tok_per_s")
+    sparse_all_decode_tps = _positive_metric(
+        sparse_metrics, "all_decode_tok_per_s"
+    )
+    dense_all_decode_tps = _positive_metric(dense_metrics, "all_decode_tok_per_s")
+
+    total_wall_speedup = _ratio(dense_elapsed, sparse_elapsed)
+    decode_speedup = _ratio(sparse_decode_tps, dense_decode_tps)
+    total_token_speedup = _ratio(sparse_total_tps, dense_total_tps)
+    all_decode_speedup = _ratio(sparse_all_decode_tps, dense_all_decode_tps)
+    ratios = {
+        "total_wall_speedup": total_wall_speedup,
+        "total_token_speedup": total_token_speedup,
+        "decode_speedup": decode_speedup,
+        "all_decode_speedup": all_decode_speedup,
+    }
+    for name, ratio in ratios.items():
+        if exact_required and (
+            ratio is None or not math.isfinite(ratio) or ratio <= 1.0
+        ):
+            reasons.append(f"{name}_not_above_one")
+
+    for field in ("out_tokens", "decode_tokens", "all_decode_tokens"):
+        if exact_required and sparse_metrics.get(field) != dense_metrics.get(field):
+            reasons.append(f"sparse_dense_{field}_mismatch")
+
+    payload.update(
+        {
+            "sparse_dense_pair_required": exact_required,
+            "sparse_dense_pair_execution_order": (
+                "sparse_speed,dense_reference,sparse_diagnostic"
+            ),
+            "sparse_dense_pair_scope": (
+                "same_parent_same_gpu_lock_adjacent_observer_free_engine_loop"
+            ),
+            "sparse_dense_pair_total_wall_scope": (
+                "measurement_engine_loop_prefill_plus_decode_excludes_engine_init"
+            ),
+            "sparse_dense_pair_sparse_observer_env": sparse_observer_env,
+            "sparse_dense_pair_dense_observer_env": dense_observer_env,
+            "sparse_dense_pair_observer_free": observer_free,
+            "sparse_dense_pair_child_identity_scope": (
+                "arm_invariant_projection"
+            ),
+            "sparse_dense_pair_arm_backend_contract": arm_backend_contract,
+            "sparse_dense_pair_arm_backend_contract_passed": (
+                arm_backend_contract_passed
+            ),
+            "sparse_dense_pair_arm_runner_contract": arm_runner_contract,
+            "sparse_dense_pair_arm_runner_observed": arm_runner_observed,
+            "sparse_dense_pair_arm_runner_contract_passed": (
+                arm_runner_contract_passed
+            ),
+            "sparse_dense_pair_sparse_child_identity": sparse_child_identity,
+            "sparse_dense_pair_dense_child_identity": dense_child_identity,
+            "sparse_dense_pair_sparse_geometry_digest": sparse_digest,
+            "sparse_dense_pair_dense_geometry_digest": dense_digest,
+            "sparse_dense_pair_geometry_match": geometry_match,
+            "sparse_dense_pair_sparse_geometry": sparse_geometry,
+            "sparse_dense_pair_dense_geometry": dense_geometry,
+            "sparse_dense_pair_sparse_elapsed_s": sparse_elapsed,
+            "sparse_dense_pair_dense_elapsed_s": dense_elapsed,
+            "sparse_dense_pair_sparse_total_tps": sparse_total_tps,
+            "sparse_dense_pair_dense_total_tps": dense_total_tps,
+            "sparse_dense_pair_sparse_decode_tps": sparse_decode_tps,
+            "sparse_dense_pair_dense_decode_tps": dense_decode_tps,
+            "sparse_dense_pair_sparse_all_decode_tps": sparse_all_decode_tps,
+            "sparse_dense_pair_dense_all_decode_tps": dense_all_decode_tps,
+            **ratios,
+            "sparse_dense_pair_speedup_gate_passed": not reasons,
+            "sparse_dense_pair_speedup_gate_reasons": reasons,
+            "sparse_dense_pair_arm_modes": {
+                "sparse": "sparse",
+                "dense": "dense",
+            },
+            "sparse_dense_pair_controller_identities": {
+                "sparse": {
+                    "mode": "sparse",
+                    "controller_json": sparse_env.get(
+                        "VLLM_SPARSE_CONTROLLER_JSON", ""
+                    ),
+                },
+                "dense": {
+                    "mode": "dense",
+                    "controller_json": dense_env.get(
+                        "VLLM_SPARSE_CONTROLLER_JSON", ""
+                    ),
+                },
+            },
+            "sparse_dense_pair_claim": (
+                "sparse_engine_loop_e2e_and_decode_speedup"
+                if exact_required and not reasons
+                else "arm_health_only"
+            ),
+        }
+    )
+    if exact_required and reasons:
+        payload["gate_passed"] = False
+        payload["production_gate_passed"] = False
+
+
 def _gate_d_payload(
     args: argparse.Namespace,
     *,
@@ -2566,6 +4414,22 @@ def _gate_d_payload(
 ) -> dict[str, Any]:
     route_summary = route_summary or {}
     producer_route_summary = producer_route_summary or route_summary
+    custom_all_reduce_provenance = _speed_child_custom_all_reduce_provenance(
+        metrics,
+        expected_batch_size=int(getattr(args, "batch_size", 1) or 1),
+    )
+    engine_scheduling_provenance = _speed_child_engine_scheduling_provenance(
+        metrics
+    )
+    speed_child_engine_scheduling = {
+        f"speed_child_{field_name}": value
+        for field_name, value in engine_scheduling_provenance.items()
+    }
+    speed_child_custom_all_reduce_runtime = {
+        f"speed_child_{field_name}": value
+        for field_name, value in custom_all_reduce_provenance.items()
+        if field_name.startswith("custom_all_reduce_runtime_")
+    }
 
     def _route_summary_proof_value(key: str, default: Any = None) -> Any:
         if key in producer_route_summary:
@@ -2793,6 +4657,42 @@ def _gate_d_payload(
     sparse_native_lifecycle_required = False
     sparse_native_lifecycle_gate_reasons: list[str] = []
     steady_records = _steady_prefill_profile_records(refresh_profile)
+    tensor_parallel_size = max(
+        1,
+        int(getattr(args, "tensor_parallel_size", 1) or 1),
+    )
+    custom_all_reduce_runtime_gate_passed = bool(
+        tensor_parallel_size <= 1
+        or (
+            custom_all_reduce_provenance.get(
+                "custom_all_reduce_runtime_proof_passed"
+            )
+            is True
+            and int(
+                custom_all_reduce_provenance.get(
+                    "custom_all_reduce_runtime_tensor_parallel_size",
+                    -1,
+                )
+            )
+            == tensor_parallel_size
+        )
+    )
+    requested_scheduling_mode = str(
+        getattr(args, "scheduling_mode", "auto") or "auto"
+    )
+    engine_scheduling_matches = bool(
+        requested_scheduling_mode == "auto"
+        or engine_scheduling_provenance
+        == {
+            "engine_scheduling_mode_requested": requested_scheduling_mode,
+            "engine_async_scheduling_configured": (
+                requested_scheduling_mode == "async"
+            ),
+            "engine_async_scheduling_effective": (
+                requested_scheduling_mode == "async"
+            ),
+        }
+    )
     production_gate_passed = bool(
         result.returncode == 0
         and not bool(result.timed_out)
@@ -2804,6 +4704,8 @@ def _gate_d_payload(
         and bool(output_length_gate["passed"])
         and not semantic_gate_reasons
         and not sparse_native_lifecycle_gate_reasons
+        and custom_all_reduce_runtime_gate_passed
+        and engine_scheduling_matches
     )
 
     def _metric_or_route(key: str, default: Any = None) -> Any:
@@ -2997,6 +4899,44 @@ def _gate_d_payload(
         # 被 prefill 交错段稀释（8×32k 实测占墙钟 81%），此指标反映真实 decode 吞吐。
         "all_decode_tps": _decode_metric(metrics, "all_decode_tok_per_s"),
         "all_decode_elapsed_s": _decode_metric(metrics, "all_decode_elapsed_s"),
+        "all_decode_entered": bool(
+            (metrics.get("boundary_diagnostics") or {}).get(
+                "all_decode_entered", False
+            )
+            if isinstance(metrics.get("boundary_diagnostics"), dict)
+            else False
+        ),
+        "all_decode_full_batch_steps": _as_int(
+            (metrics.get("boundary_diagnostics") or {}).get(
+                "all_decode_full_batch_steps", -1
+            )
+            if isinstance(metrics.get("boundary_diagnostics"), dict)
+            else -1,
+            -1,
+        ),
+        "all_decode_partial_batch_steps": _as_int(
+            (metrics.get("boundary_diagnostics") or {}).get(
+                "all_decode_partial_batch_steps", -1
+            )
+            if isinstance(metrics.get("boundary_diagnostics"), dict)
+            else -1,
+            -1,
+        ),
+        "all_decode_zero_token_steps": _as_int(
+            (metrics.get("boundary_diagnostics") or {}).get(
+                "all_decode_zero_token_steps", -1
+            )
+            if isinstance(metrics.get("boundary_diagnostics"), dict)
+            else -1,
+            -1,
+        ),
+        "all_decode_fallback_used": bool(
+            (metrics.get("boundary_diagnostics") or {}).get(
+                "all_decode_fallback_used", True
+            )
+            if isinstance(metrics.get("boundary_diagnostics"), dict)
+            else True
+        ),
         "vllm_reported_tps": _decode_metric(metrics, "tok_per_s"),
         "elapsed_s": _decode_metric(metrics, "elapsed_s"),
         "decode_elapsed_s": _decode_metric(metrics, "decode_elapsed_s"),
@@ -3094,6 +5034,22 @@ def _gate_d_payload(
         "speed_child_route_proof_passed": speed_child_route_proof_passed,
         "speed_child_route_proof_reasons": list(
             speed_child_route_counter_proof.get("reasons", [])
+        ),
+        **speed_child_engine_scheduling,
+        "speed_child_custom_all_reduce_requested": (
+            custom_all_reduce_provenance["custom_all_reduce_requested"]
+        ),
+        "speed_child_custom_all_reduce_effective": (
+            custom_all_reduce_provenance["custom_all_reduce_effective"]
+        ),
+        "speed_child_custom_all_reduce_effective_reason": (
+            custom_all_reduce_provenance[
+                "custom_all_reduce_effective_reason"
+            ]
+        ),
+        **speed_child_custom_all_reduce_runtime,
+        "speed_child_custom_all_reduce_runtime_gate_passed": (
+            custom_all_reduce_runtime_gate_passed
         ),
         "producer_graph_roi_proof": producer_graph_roi_proof,
         "producer_graph_roi_gate_passed": bool(
@@ -3195,6 +5151,30 @@ def _gate_d_payload(
     payload.update(_falsification_steady_summary(refresh_profile))
     payload["deadline_v2_attribution"] = deadline_v2_attribution
     if run_provenance is not None:
+        run_provenance.update(
+            {
+                "speed_child_custom_all_reduce_requested": (
+                    custom_all_reduce_provenance[
+                        "custom_all_reduce_requested"
+                    ]
+                ),
+                "speed_child_custom_all_reduce_effective": (
+                    custom_all_reduce_provenance[
+                        "custom_all_reduce_effective"
+                    ]
+                ),
+                "speed_child_custom_all_reduce_effective_reason": (
+                    custom_all_reduce_provenance[
+                        "custom_all_reduce_effective_reason"
+                    ]
+                ),
+                **speed_child_custom_all_reduce_runtime,
+                "speed_child_custom_all_reduce_runtime_gate_passed": (
+                    custom_all_reduce_runtime_gate_passed
+                ),
+                **speed_child_engine_scheduling,
+            }
+        )
         payload["run_provenance"] = run_provenance
     if speed_env is not None:
         speed_config = _gate_d_config(
@@ -3225,6 +5205,13 @@ def _gate_d_payload(
             payload["speed_diagnostic_pairing_match"] = bool(
                 payload["speed_pairing_digest"] == payload["diagnostic_pairing_digest"]
             )
+    payload["speed_diagnostic_pairing_required"] = diagnostic_env is not None
+    if (
+        diagnostic_env is not None
+        and payload.get("speed_diagnostic_pairing_match") is not True
+    ):
+        payload["gate_passed"] = False
+        payload["production_gate_passed"] = False
     if diag_result is not None:
         payload["diagnostic_command"] = diag_result.command
         payload["diagnostic_returncode"] = int(diag_result.returncode)
@@ -3274,6 +5261,7 @@ def _run_gate_d_mode(args: argparse.Namespace) -> int:
             args,
             metrics_path=diag_metrics_path,
             outputs_path=diag_outputs_path,
+            collect_cudagraph_runtime_proof=True,
         )
         diagnostic_env = _build_gate_d_dense_env(
             args,
@@ -3318,6 +5306,12 @@ def _run_gate_d_mode(args: argparse.Namespace) -> int:
                 gpu_after=gpu_after,
             ),
         )
+        _apply_scheduler_graph_contract_payload(
+            payload,
+            args,
+            speed_metrics=metrics,
+            diagnostic_metrics=_read_json(diag_metrics_path),
+        )
         output_path.write_text(
             json.dumps(payload, ensure_ascii=True, indent=2, allow_nan=False),
             encoding="utf-8",
@@ -3354,12 +5348,12 @@ def _run_gate_d_mode(args: argparse.Namespace) -> int:
     if one_shot_timeline_path is not None:
         one_shot_timeline_path.parent.mkdir(parents=True, exist_ok=True)
         one_shot_timeline_path.write_text("", encoding="utf-8")
+    # Full-form throughput proof comes from the rank-local mmap/RPC counters.
+    # Only the explicitly directional verdict-only diagnostic keeps the legacy
+    # speed-child JSONL observer because it has no independent diagnostic child.
     speed_route_trace_path = (
         _default_gate_d_speed_route_path(output_path)
-        if (
-            _env_truthy_value(os.environ.get(SPEED_CHILD_ROUTE_TRACE_ENV))
-            or bool(args.verdict_only)
-        )
+        if bool(args.verdict_only)
         else None
     )
     if speed_route_trace_path is not None:
@@ -3386,17 +5380,67 @@ def _run_gate_d_mode(args: argparse.Namespace) -> int:
             full_cudagraph_hook_profile_path
         )
     gpu_before = _gpu_snapshot("pre", cuda_visible_devices=str(args.cuda_visible_devices))
-    selector_prewarm_result = _prewarm_gt1_selector_extensions(
-        args,
-        env=speed_env,
-    )
-    if (
+    tp8_lifecycle_state: dict[str, Any] | None = None
+    selector_prewarm_result: Phase1CommandResult | None = None
+    selector_prewarm_green = True
+    if _tp8_exact_pair_required(args):
+        # Establish a stable idle owner boundary before the setup process can
+        # initialize CUDA or spawn extension/compiler workers.
+        tp8_lifecycle_state = _start_tp8_exact_lifecycle(
+            args,
+            output_path=output_path,
+        )
+        selector_prewarm_green = not tp8_lifecycle_state["baseline_reasons"]
+        if selector_prewarm_green:
+            prewarm_env, prewarm_token = _tp8_exact_arm_env(
+                speed_env,
+                tp8_lifecycle_state,
+                "selector_prewarm",
+            )
+            selector_prewarm_result = _prewarm_gt1_selector_extensions(
+                args,
+                env=prewarm_env,
+            )
+            if selector_prewarm_result is None:
+                selector_prewarm_green = False
+                tp8_lifecycle_state["gate_reasons"].append(
+                    "selector_prewarm:health:not_launched"
+                )
+            else:
+                # Teardown is mandatory even when prewarm itself fails.
+                selector_prewarm_green = _finish_tp8_exact_arm(
+                    tp8_lifecycle_state,
+                    output_path=output_path,
+                    arm_tag="selector_prewarm",
+                    result=selector_prewarm_result,
+                    arm_token=prewarm_token,
+                    setup=True,
+                )
+                selector_prewarm_result = _redact_tp8_arm_token_result(
+                    selector_prewarm_result,
+                    prewarm_token,
+                )
+    else:
+        selector_prewarm_result = _prewarm_gt1_selector_extensions(
+            args,
+            env=speed_env,
+        )
+
+    selector_prewarm_failed = bool(
         selector_prewarm_result is not None
         and (
             selector_prewarm_result.returncode != 0
             or bool(selector_prewarm_result.timed_out)
         )
-    ):
+    )
+    if selector_prewarm_failed or not selector_prewarm_green:
+        failure_result = selector_prewarm_result or Phase1CommandResult(
+            command=[],
+            returncode=GATE_FAILURE_EXIT_CODE,
+            stdout="",
+            stderr="exact TP8 idle baseline rejected before selector prewarm",
+            timed_out=False,
+        )
         gpu_after = _gpu_snapshot(
             "post",
             cuda_visible_devices=str(args.cuda_visible_devices),
@@ -3404,7 +5448,7 @@ def _run_gate_d_mode(args: argparse.Namespace) -> int:
         payload = _gate_d_payload(
             args,
             mode="sparse",
-            result=selector_prewarm_result,
+            result=failure_result,
             metrics_path=metrics_path,
             outputs_path=outputs_path,
             metrics={},
@@ -3427,16 +5471,100 @@ def _run_gate_d_mode(args: argparse.Namespace) -> int:
             ),
         )
         _apply_selector_extension_prewarm_payload(payload, selector_prewarm_result)
+        _apply_tp8_exact_lifecycle_payload(payload, tp8_lifecycle_state)
         output_path.write_text(
             json.dumps(payload, ensure_ascii=True, indent=2, allow_nan=False),
             encoding="utf-8",
         )
+        if args.summary_output:
+            summary_path = Path(args.summary_output)
+            summary_path.parent.mkdir(parents=True, exist_ok=True)
+            summary_path.write_text(
+                json.dumps(payload, ensure_ascii=True, indent=2, allow_nan=False),
+                encoding="utf-8",
+            )
         return GATE_FAILURE_EXIT_CODE
+    speed_arm_env = speed_env
+    speed_arm_token = ""
+    if tp8_lifecycle_state is not None:
+        speed_arm_env, speed_arm_token = _tp8_exact_arm_env(
+            speed_env,
+            tp8_lifecycle_state,
+            "sparse_speed",
+        )
     speed_result = _run_command(
         speed_command,
-        env=speed_env,
+        env=speed_arm_env,
         timeout_s=int(args.timeout_s),
     )
+    speed_arm_green = True
+    if tp8_lifecycle_state is not None:
+        speed_arm_green = _finish_tp8_exact_arm(
+            tp8_lifecycle_state,
+            output_path=output_path,
+            arm_tag="sparse_speed",
+            result=speed_result,
+            arm_token=speed_arm_token,
+        )
+        speed_result = _redact_tp8_arm_token_result(
+            speed_result,
+            speed_arm_token,
+        )
+    # Keep the two observer-free timing arms adjacent under the same parent and
+    # GPU lock.  Diagnostic tracing runs only after both throughput samples so
+    # it cannot heat, allocate, or mutate state between sparse and dense.
+    reference_result: Phase1CommandResult | None = None
+    reference_semantic_diffs: list[dict[str, Any]] = []
+    reference_semantic_match: bool | None = None
+    reference_quality_reasons: list[str] = []
+    dense_reference_metrics_path: Path | None = None
+    dense_reference_outputs_path: Path | None = None
+    sparse_reference_outputs_path: Path | None = None
+    dense_reference_env: dict[str, str] | None = None
+    dense_arm_green = tp8_lifecycle_state is None
+    if (
+        bool(args.outputs_include_text)
+        and not bool(args.skip_dense_reference)
+        and speed_arm_green
+    ):
+        dense_reference_metrics_path = _default_gate_d_dense_reference_metrics_path(
+            output_path
+        )
+        dense_reference_outputs_path = _default_gate_d_dense_reference_outputs_path(
+            output_path
+        )
+        dense_reference_metrics_path.parent.mkdir(parents=True, exist_ok=True)
+        dense_reference_outputs_path.parent.mkdir(parents=True, exist_ok=True)
+        dense_reference_env = _build_gate_d_dense_env(args)
+        dense_arm_env = dense_reference_env
+        dense_arm_token = ""
+        if tp8_lifecycle_state is not None:
+            dense_arm_env, dense_arm_token = _tp8_exact_arm_env(
+                dense_reference_env,
+                tp8_lifecycle_state,
+                "dense_reference",
+            )
+        reference_result = _run_command(
+            _build_gate_d_dense_command(
+                args,
+                metrics_path=dense_reference_metrics_path,
+                outputs_path=dense_reference_outputs_path,
+            ),
+            env=dense_arm_env,
+            timeout_s=int(args.timeout_s),
+        )
+        if tp8_lifecycle_state is not None:
+            dense_arm_green = _finish_tp8_exact_arm(
+                tp8_lifecycle_state,
+                output_path=output_path,
+                arm_tag="dense_reference",
+                result=reference_result,
+                arm_token=dense_arm_token,
+            )
+            reference_result = _redact_tp8_arm_token_result(
+                reference_result,
+                dense_arm_token,
+            )
     route_trace_path = _default_gate_d_route_path(output_path)
     refresh_profile_path = (
         Path(args.refresh_profile_output)
@@ -3458,7 +5586,7 @@ def _run_gate_d_mode(args: argparse.Namespace) -> int:
         # _read_refresh_profile or the manual counts readout. Manual counts
         # readout file in this mode is ``${TAG}_speed_route.jsonl``.
         refresh_profile_path.write_text("", encoding="utf-8")
-    else:
+    elif tp8_lifecycle_state is None or dense_arm_green:
         full_cudagraph_hook_profile_path.parent.mkdir(parents=True, exist_ok=True)
         full_cudagraph_hook_profile_path.write_text("", encoding="utf-8")
         diag_command = _build_phase2_command(
@@ -3472,6 +5600,8 @@ def _run_gate_d_mode(args: argparse.Namespace) -> int:
             route_trace_path=route_trace_path,
             one_shot_timeline_path=one_shot_timeline_path,
         )
+        diagnostic_arm_env = diagnostic_env
+        diagnostic_arm_token = ""
         diagnostic_env["VLLM_SPARSE_FULL_CUDAGRAPH_HOOK_PROFILE_LOG"] = str(
             full_cudagraph_hook_profile_path
         )
@@ -3497,36 +5627,36 @@ def _run_gate_d_mode(args: argparse.Namespace) -> int:
                 parents=True, exist_ok=True
             )
             selector_pipeline_cpu_profile_path.write_text("", encoding="utf-8")
+        if tp8_lifecycle_state is not None:
+            diagnostic_arm_env, diagnostic_arm_token = _tp8_exact_arm_env(
+                diagnostic_env,
+                tp8_lifecycle_state,
+                "sparse_diagnostic",
+            )
         diag_result = _run_command(
             diag_command,
-            env=diagnostic_env,
+            env=diagnostic_arm_env,
             timeout_s=int(args.timeout_s),
         )
-    reference_result: Phase1CommandResult | None = None
-    reference_semantic_diffs: list[dict[str, Any]] = []
-    reference_semantic_match: bool | None = None
-    reference_quality_reasons: list[str] = []
-    dense_reference_metrics_path: Path | None = None
-    dense_reference_outputs_path: Path | None = None
-    sparse_reference_outputs_path: Path | None = None
-    if bool(args.outputs_include_text) and not bool(args.skip_dense_reference):
-        dense_reference_metrics_path = _default_gate_d_dense_reference_metrics_path(
-            output_path
-        )
-        dense_reference_outputs_path = _default_gate_d_dense_reference_outputs_path(
-            output_path
-        )
-        dense_reference_metrics_path.parent.mkdir(parents=True, exist_ok=True)
-        dense_reference_outputs_path.parent.mkdir(parents=True, exist_ok=True)
-        reference_result = _run_command(
-            _build_gate_d_dense_command(
-                args,
-                metrics_path=dense_reference_metrics_path,
-                outputs_path=dense_reference_outputs_path,
-            ),
-            env=_build_gate_d_dense_env(args),
-            timeout_s=int(args.timeout_s),
-        )
+        if tp8_lifecycle_state is not None:
+            _finish_tp8_exact_arm(
+                tp8_lifecycle_state,
+                output_path=output_path,
+                arm_tag="sparse_diagnostic",
+                result=diag_result,
+                arm_token=diagnostic_arm_token,
+            )
+            diag_result = _redact_tp8_arm_token_result(
+                diag_result,
+                diagnostic_arm_token,
+            )
+    if (
+        bool(args.outputs_include_text)
+        and not bool(args.skip_dense_reference)
+        and reference_result is not None
+    ):
+        assert dense_reference_metrics_path is not None
+        assert dense_reference_outputs_path is not None
         sparse_reference_outputs_path = _semantic_sparse_outputs_path(
             args,
             speed_outputs_path=outputs_path,
@@ -3732,7 +5862,11 @@ def _run_gate_d_mode(args: argparse.Namespace) -> int:
         payload["reference_sparse_outputs_path"] = (
             str(sparse_reference_outputs_path) if sparse_reference_outputs_path else ""
         )
-        payload["reference_scope"] = "semantic_text_match_and_output_quality"
+        payload["reference_scope"] = (
+            "semantic_text_match_output_quality_and_paired_throughput"
+            if os.environ.get("SFI_RUNNER_TIER", "") == "tp8x64k"
+            else "semantic_text_match_and_output_quality"
+        )
         payload["reference_semantic_diffs"] = reference_semantic_diffs
         payload["reference_quality_reasons"] = reference_quality_reasons
     elif dense_reference_skipped:
@@ -3756,6 +5890,30 @@ def _run_gate_d_mode(args: argparse.Namespace) -> int:
         if reference_gate_reasons and not dense_reference_skipped:
             payload["gate_passed"] = False
             payload["production_gate_passed"] = False
+    diagnostic_metrics = (
+        _read_json(diag_metrics_path) if diag_result is not None else None
+    )
+    dense_reference_metrics = (
+        _read_json(dense_reference_metrics_path)
+        if dense_reference_metrics_path is not None
+        else None
+    )
+    _apply_scheduler_graph_contract_payload(
+        payload,
+        args,
+        speed_metrics=metrics,
+        diagnostic_metrics=diagnostic_metrics,
+        dense_reference_metrics=dense_reference_metrics,
+    )
+    _apply_sparse_dense_pair_speedup_payload(
+        payload,
+        args,
+        sparse_metrics=metrics,
+        dense_metrics=dense_reference_metrics,
+        sparse_env=speed_env,
+        dense_env=dense_reference_env,
+    )
+    _apply_tp8_exact_lifecycle_payload(payload, tp8_lifecycle_state)
     output_path.write_text(
         json.dumps(payload, ensure_ascii=True, indent=2, allow_nan=False),
         encoding="utf-8",
@@ -4177,9 +6335,24 @@ def _full_cudagraph_hook_profile_summary(
         if str(record.get("event", "") or "")
         == "mixed_page_full_cudagraph_wrapper_call"
     ]
+    model_forward_refresh_records = [
+        record
+        for record in records
+        if str(record.get("event", "") or "")
+        == "mixed_page_full_cudagraph_model_forward_refresh"
+    ]
+    # New runs have one generation-wide producer record at model-forward
+    # completion.  Keep old wrapper-owned profiles readable, but never mix the
+    # two ownership models in one summary: once owner records are present they
+    # are the sole source of producer counts and stage timings.
+    producer_records = (
+        model_forward_refresh_records
+        if model_forward_refresh_records
+        else wrapper_records
+    )
     post_replay_records = [
         record
-        for record in wrapper_records
+        for record in producer_records
         if _as_int(record.get("post_replay_refresh_payloads"), 0) > 0
     ]
     reason_counts: dict[str, int] = {}
@@ -4209,11 +6382,7 @@ def _full_cudagraph_hook_profile_summary(
         for record in post_replay_records
         if _as_float(record.get("refresh_us"), -1.0) >= 0.0
     ]
-    post_call_us_values = [
-        _as_float(record.get("post_call_us"), -1.0)
-        for record in post_replay_records
-        if _as_float(record.get("post_call_us"), -1.0) >= 0.0
-    ]
+    post_call_us_values = _profile_float_values(wrapper_records, "post_call_us")
     pre_consume_drain_us_values = [
         _as_float(record.get("pre_consume_pending_rebuild_drain_us"), -1.0)
         for record in wrapper_records
@@ -4386,15 +6555,18 @@ def _full_cudagraph_hook_profile_summary(
     return {
         "record_count": int(len(records)),
         "wrapper_call_count": int(len(wrapper_records)),
+        "model_forward_refresh_call_count": int(
+            len(model_forward_refresh_records)
+        ),
         "post_replay_refresh_call_count": int(len(post_replay_records)),
         "post_replay_refresh_payloads_total": int(
             sum(
                 max(0, _as_int(record.get("post_replay_refresh_payloads"), 0))
-                for record in wrapper_records
+                for record in producer_records
             )
         ),
         "refresh_called_count": int(
-            sum(1 for record in wrapper_records if bool(record.get("refresh_called")))
+            sum(1 for record in producer_records if bool(record.get("refresh_called")))
         ),
         "refresh_us_avg": _avg(refresh_us_values),
         "refresh_us_max": max(refresh_us_values, default=-1.0),

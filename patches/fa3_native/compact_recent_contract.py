@@ -704,8 +704,8 @@ def validate_compact_recent_support_matrix(cfg: CompactRecentLaunchConfig) -> No
         raise ValueError("compact_recent v1 requires cp_world_size == 1")
     if int(cfg.num_splits) < 0:
         raise ValueError("compact_recent v1 requires num_splits >= 0")
-    if int(cfg.num_splits) > 256:
-        raise ValueError("compact_recent v1 requires num_splits <= 256")
+    if int(cfg.num_splits) > 255:
+        raise ValueError("compact_recent v1 requires num_splits <= 255")
     if cfg.q_v is not None or cfg.s_aux is not None:
         raise ValueError("compact_recent v1 does not support q_v or s_aux")
     if any(x is not None for x in (cfg.q_descale, cfg.k_descale, cfg.v_descale)):

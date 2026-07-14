@@ -31,6 +31,11 @@ import threading
 import torch
 
 from patches.cpu_gpu_staging import cached_sequence_to_device
+from patches.fa3_native.capture_ownership import (
+    CAPTURE_OWNERSHIP_POLICY_SCHEMA,
+    CHUNK_COHORT,
+    CaptureOwnershipPlan,
+)
 from patches.fa3_native.row_plan import MixedPageRowPlan
 from patches.sparse_types import CaptureForwardSideOutputs, StepCaptureLayout
 
@@ -821,6 +826,42 @@ def prepare_capture_forward_side_outputs(
         scratch_storage_shape,
         scratch_cache_extra_key,
     )
+    chunk_cohort_cache_required = False
+    if scratch_cache_owner is not None:
+        ownership_plan = getattr(
+            scratch_cache_owner, "_capture_ownership_plan", None
+        )
+        if ownership_plan is not None:
+            if (
+                not isinstance(ownership_plan, CaptureOwnershipPlan)
+                or ownership_plan.schema != CAPTURE_OWNERSHIP_POLICY_SCHEMA
+            ):
+                raise RuntimeError(
+                    "E_SFI_CAPTURE_OWNERSHIP_CACHE_MISS: invalid stamped "
+                    "capture ownership plan"
+                )
+            if ownership_plan.mode == CHUNK_COHORT:
+                chunk_cohort_cache_required = True
+                expected_extra_key = (
+                    "defer_postprocess_chunk",
+                    int(ownership_plan.cohort_size),
+                    int(ownership_plan.selected_depth),
+                )
+                expected_shape = (
+                    int(ownership_plan.selected_depth),
+                    int(ownership_plan.rows_cap),
+                    int(ownership_plan.heads_per_rank),
+                    int(ownership_plan.last_n),
+                    int(ownership_plan.aligned_k),
+                )
+                if (
+                    scratch_cache_extra_key != expected_extra_key
+                    or scratch_storage_shape != expected_shape
+                ):
+                    raise RuntimeError(
+                        "E_SFI_CAPTURE_OWNERSHIP_CACHE_MISS: live scratch "
+                        "key/shape does not match the stamped chunk cohort"
+                    )
     scratch_storage = None
     if scratch_cache_owner is not None:
         cached_key = getattr(scratch_cache_owner, "_fa3_capture_scratch_cache_key", None)
@@ -840,6 +881,11 @@ def prepare_capture_forward_side_outputs(
             scratch_storage = cached_tensor
     scratch_cache_hit = scratch_storage is not None
     if scratch_storage is None:
+        if chunk_cohort_cache_required:
+            raise RuntimeError(
+                "E_SFI_CAPTURE_OWNERSHIP_CACHE_MISS: stamped chunk cohort "
+                "requires an exact prebuilt scratch cache hit"
+            )
         # The native capture store runs after FA masking and postprocess reads
         # only producer rows within [last_n, effective_kv_len]. Reusing an
         # uninitialized scratch buffer avoids per-layer allocator/fill work; the

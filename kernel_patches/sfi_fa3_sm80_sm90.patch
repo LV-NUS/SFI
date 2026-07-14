@@ -1,5 +1,5 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 88c334b..a1ae354 100644
+index 88c334b..65f2e9b 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -6,6 +6,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
@@ -10,7 +10,7 @@ index 88c334b..a1ae354 100644
  
  # CUDA by default, can be overridden by using -DVLLM_TARGET_DEVICE=... (used by setup.py)
  set(VLLM_TARGET_DEVICE "cuda" CACHE STRING "Target device backend for vLLM")
-@@ -178,6 +179,13 @@ endif ()
+@@ -178,6 +179,38 @@ endif ()
  
  # FA3 requires CUDA 12.0 or later
  if (FA3_ENABLED AND ${CMAKE_CUDA_COMPILER_VERSION} GREATER_EQUAL 12.0)
@@ -19,12 +19,37 @@ index 88c334b..a1ae354 100644
 +    file(GLOB FA3_FP16_GEN_SRCS_SM80
 +        "hopper/instantiations/flash_fwd_hdim*_fp16*_sm80.cu")
 +    set(FA3_HALF_GEN_SRCS_SM80 ${FA3_BF16_GEN_SRCS_SM80} ${FA3_FP16_GEN_SRCS_SM80})
++    # Release-effective SM80 surface: Qwen3 uses BF16, hdim=128, no softcap.
++    # Compile definitions prune dispatch branches, but they do not remove
++    # source files from a CMake target; feeding the broad GLOB above to Ninja
++    # still compiles 120 generated SM80 TUs. Keep the broad list for builds
++    # that also carry the documented SM90/general fallback, and make the
++    # SM80-only release target explicit and fail-closed.
++    set(FA3_SM80_RELEASE_GEN_SRCS
++        hopper/instantiations/flash_fwd_hdim128_bf16_sm80.cu
++        hopper/instantiations/flash_fwd_hdim128_bf16_split_sm80.cu
++        hopper/instantiations/flash_fwd_hdim128_bf16_paged_sm80.cu
++        hopper/instantiations/flash_fwd_hdim128_bf16_paged_split_sm80.cu)
++    list(LENGTH FA3_SM80_RELEASE_GEN_SRCS FA3_SM80_RELEASE_GEN_SRCS_COUNT)
++    if (NOT FA3_SM80_RELEASE_GEN_SRCS_COUNT EQUAL 4)
++        message(FATAL_ERROR
++            "SM80 release source contract requires exactly four BF16 hdim128 TUs")
++    endif()
++    foreach(FA3_SM80_RELEASE_SRC IN LISTS FA3_SM80_RELEASE_GEN_SRCS)
++        if (NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${FA3_SM80_RELEASE_SRC}")
++            message(FATAL_ERROR "Missing SM80 release source: ${FA3_SM80_RELEASE_SRC}")
++        endif()
++        if (FA3_SM80_RELEASE_SRC MATCHES "fp16|softcap")
++            message(FATAL_ERROR
++                "SM80 release source must be BF16 and non-softcap: ${FA3_SM80_RELEASE_SRC}")
++        endif()
++    endforeach()
 +    # [COMPACT-RECENT-REMOVED 2026-07-02] flash_fwd_hdim128_bf16_sm80_compact_recent.cu deleted.
 +
      # BF16 source files
      file(GLOB FA3_BF16_GEN_SRCS
          "hopper/instantiations/flash_fwd_hdim64_bf16_*packgqa_sm90.cu"
-@@ -249,22 +257,48 @@ if (FA3_ENABLED AND ${CMAKE_CUDA_COMPILER_VERSION} GREATER_EQUAL 12.0)
+@@ -249,22 +282,58 @@ if (FA3_ENABLED AND ${CMAKE_CUDA_COMPILER_VERSION} GREATER_EQUAL 12.0)
          "hopper/instantiations/flash_fwd_hdim192_128_e4m3*_sm90.cu")
      list(APPEND FA3_FP8_GEN_SRCS ${FA3_FP8_GEN_SRCS_})
  
@@ -44,6 +69,7 @@ index 88c334b..a1ae354 100644
      if (VLLM_GPU_LANG STREQUAL "CUDA")
 -        cuda_archs_loose_intersection(FA3_ARCHS "9.0a;" "${CUDA_ARCHS}")
 -        message(STATUS "FA3_ARCHS: ${FA3_ARCHS}")
+-
 +        cuda_archs_loose_intersection(FA3_SM80_ARCHS "8.0;8.6;8.9" "${CUDA_ARCHS}")
 +        cuda_archs_loose_intersection(FA3_SM90_ARCHS "9.0a;" "${CUDA_ARCHS}")
 +        message(STATUS "FA3_SM80_ARCHS: ${FA3_SM80_ARCHS}")
@@ -51,6 +77,11 @@ index 88c334b..a1ae354 100644
 +        set(FA3_COMMON_ARCHS ${FA3_SM80_ARCHS})
 +        if (FA3_SM90_ARCHS)
 +            list(APPEND FA3_COMMON_ARCHS ${FA3_SM90_ARCHS})
++        endif()
++        if (NOT FA3_SM90_ARCHS)
++            set(FA3_GEN_SRCS ${FA3_SM80_RELEASE_GEN_SRCS})
++            message(STATUS
++                "FA3 SM80 release source contract: ${FA3_SM80_RELEASE_GEN_SRCS_COUNT} generated TUs")
 +        endif()
 +        if (FA3_SM90_ARCHS)
 +            list(APPEND FA3_GEN_SRCS ${FA3_BF16_GEN_SRCS} ${FA3_FP16_GEN_SRCS} ${FA3_FP8_GEN_SRCS})
@@ -63,26 +94,31 @@ index 88c334b..a1ae354 100644
 +            set(FA3_GEN_SRCS ${FA3_SM90_MIXED_PAGE_FAST_GEN_SRCS})
 +            set(FA3_COMMON_ARCHS "${FA3_SM90_ARCHS}")
 +        endif() # FA3_SM90_MIXED_PAGE_FAST_BUILD
- 
++
++        if (FA3_SM90_ARCHS)
++            set(FA3_SM80_GENCODE_SRCS ${FA3_HALF_GEN_SRCS_SM80})
++        else()
++            set(FA3_SM80_GENCODE_SRCS ${FA3_SM80_RELEASE_GEN_SRCS})
++        endif()
          set_gencode_flags_for_srcs(
 -            SRCS "${FA3_GEN_SRCS}"
 -            CUDA_ARCHS "${FA3_ARCHS}")
-+            SRCS "${FA3_HALF_GEN_SRCS_SM80}"
++            SRCS "${FA3_SM80_GENCODE_SRCS}"
 +            CUDA_ARCHS "${FA3_SM80_ARCHS}")
-+        set_gencode_flags_for_srcs(
-+            SRCS "${FA3_BF16_GEN_SRCS};${FA3_FP16_GEN_SRCS};${FA3_FP8_GEN_SRCS}"
-+            CUDA_ARCHS "${FA3_SM90_ARCHS}")
          set_gencode_flags_for_srcs(
 -            SRCS 
 -                hopper/flash_fwd_combine.cu
 -                hopper/flash_prepare_scheduler.cu
 -            CUDA_ARCHS "${FA3_ARCHS}")
++            SRCS "${FA3_BF16_GEN_SRCS};${FA3_FP16_GEN_SRCS};${FA3_FP8_GEN_SRCS}"
++            CUDA_ARCHS "${FA3_SM90_ARCHS}")
++        set_gencode_flags_for_srcs(
 +            SRCS "${FA3_COMMON_CUDA_SRCS}"
 +            CUDA_ARCHS "${FA3_COMMON_ARCHS}")
      endif()
  
      define_gpu_extension_target(
-@@ -272,8 +306,7 @@ if (FA3_ENABLED AND ${CMAKE_CUDA_COMPILER_VERSION} GREATER_EQUAL 12.0)
+@@ -272,8 +341,7 @@ if (FA3_ENABLED AND ${CMAKE_CUDA_COMPILER_VERSION} GREATER_EQUAL 12.0)
          DESTINATION vllm_flash_attn
          LANGUAGE ${VLLM_GPU_LANG}
          SOURCES
@@ -92,7 +128,7 @@ index 88c334b..a1ae354 100644
              hopper/flash_api.cpp
              hopper/flash_api_torch_lib.cpp
              ${FA3_GEN_SRCS}
-@@ -287,8 +320,7 @@ if (FA3_ENABLED AND ${CMAKE_CUDA_COMPILER_VERSION} GREATER_EQUAL 12.0)
+@@ -287,8 +355,7 @@ if (FA3_ENABLED AND ${CMAKE_CUDA_COMPILER_VERSION} GREATER_EQUAL 12.0)
          csrc/common
          csrc/cutlass/include)
  
@@ -102,7 +138,7 @@ index 88c334b..a1ae354 100644
          FLASHATTENTION_DISABLE_BACKWARD
          FLASHATTENTION_DISABLE_DROPOUT
          # FLASHATTENTION_DISABLE_ALIBI
-@@ -299,12 +331,55 @@ if (FA3_ENABLED AND ${CMAKE_CUDA_COMPILER_VERSION} GREATER_EQUAL 12.0)
+@@ -299,12 +366,59 @@ if (FA3_ENABLED AND ${CMAKE_CUDA_COMPILER_VERSION} GREATER_EQUAL 12.0)
          FLASHATTENTION_VARLEN_ONLY # Custom flag to save on binary size
          FLASHATTENTION_PACKGQA_ONLY # Custom flag to save on binary size
          FLASHATTENTION_DISABLE_CLUSTER # disabled for varlen in any case
@@ -137,6 +173,10 @@ index 88c334b..a1ae354 100644
 +        list(APPEND FA3_TARGET_COMPILE_DEFINITIONS
 +            FLASHATTENTION_DISABLE_SM90
 +            FLASHATTENTION_DISABLE_FP8
++            # The SM80-only release source list above deliberately omits FP16;
++            # keep the public dispatch fail-closed instead of leaving unresolved
++            # template references or pretending FP16 is supported.
++            FLASHATTENTION_DISABLE_FP16
 +        )
 +    endif()
 +    if (FA3_SM90_MIXED_PAGE_FAST_BUILD)
@@ -492,7 +532,7 @@ index e5c6d62..a19a32a 100644
  void run_mha_bwd_(Flash_bwd_params &params, cudaStream_t stream);
  template <typename T, typename Tpartial, int kBlockK>
 diff --git a/hopper/flash_api.cpp b/hopper/flash_api.cpp
-index 9e0baff..01ebaab 100644
+index 9e0baff..1415c56 100644
 --- a/hopper/flash_api.cpp
 +++ b/hopper/flash_api.cpp
 @@ -7,6 +7,12 @@
@@ -508,7 +548,15 @@ index 9e0baff..01ebaab 100644
  
  #include <cutlass/numeric_types.h>
  
-@@ -61,12 +67,206 @@ namespace pybind11::detail {
+@@ -15,6 +21,7 @@
+ #include "tile_size.h"
+ #include "heuristics.h"
+ #include "cuda_check.h"
++#include "scheduler_num_splits.h"
+ 
+ // Copied from https://github.com/pytorch/pytorch/commit/7931eee5c5ebcdf468bff4d308510b03355cd909
+ // This is so that we can pass in torch.dtype as a parameter to the function.
+@@ -61,12 +68,206 @@ namespace pybind11::detail {
  
  #define PREPARE_VARLEN_MAX_BATCHES_1CTA 992
  
@@ -715,7 +763,7 @@ index 9e0baff..01ebaab 100644
  void set_params_fprop(Flash_fwd_params &params,
                        // sizes
                        const size_t b,
-@@ -97,6 +297,53 @@ void set_params_fprop(Flash_fwd_params &params,
+@@ -97,6 +298,53 @@ void set_params_fprop(Flash_fwd_params &params,
  
      // Reset the parameters
      params = {};
@@ -769,7 +817,7 @@ index 9e0baff..01ebaab 100644
  
      params.is_bf16 = q.dtype() == torch::kBFloat16;
      params.is_e4m3 = q.dtype() == torch::kFloat8_e4m3fn;
-@@ -173,8 +420,9 @@ void set_params_fprop(Flash_fwd_params &params,
+@@ -173,8 +421,9 @@ void set_params_fprop(Flash_fwd_params &params,
      params.window_size_left = window_size_left;
      params.window_size_right = window_size_right;
  
@@ -781,7 +829,7 @@ index 9e0baff..01ebaab 100644
  
      #ifdef FLASHATTENTION_DISABLE_LOCAL
          TORCH_CHECK(!params.is_local, "This flash attention build does not support local attention.");
-@@ -269,6 +517,10 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
+@@ -269,6 +518,10 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
      //     run_mha_fwd_<cutlass::half_t, kHeadSize>(params, stream);
      // });
      TORCH_CHECK(params.num_splits >= 1);
@@ -792,7 +840,7 @@ index 9e0baff..01ebaab 100644
      ARCH_SWITCH(params.arch, Arch, [&] {
          SPLIT_SWITCH(params.num_splits > 1, Split, [&] {
              PAGEDKV_SWITCH(params.page_table && !params.pagedkv_tma, PagedKVNonTMA, [&] {
-@@ -431,6 +683,38 @@ void run_mha_fwd_combine(Flash_fwd_params &params, cudaStream_t stream, bool ena
+@@ -431,6 +684,38 @@ void run_mha_fwd_combine(Flash_fwd_params &params, cudaStream_t stream, bool ena
      #endif
  }
  
@@ -831,7 +879,7 @@ index 9e0baff..01ebaab 100644
  inline bool get_pagedkv_tma(Flash_fwd_params const& params) {
      // disable for local since we move k_ptr to start of sliding window by m_block
      if (params.arch < 90 || !params.page_table || params.leftpad_k || params.knew_ptr || params.is_local) { return false; }
-@@ -438,9 +722,10 @@ inline bool get_pagedkv_tma(Flash_fwd_params const& params) {
+@@ -438,9 +723,10 @@ inline bool get_pagedkv_tma(Flash_fwd_params const& params) {
      auto kBlockMN_kernel_args_sm90 = tile_size_fwd_sm90(params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, false /*paged_kv_non_TMA*/, params.softcap > 0.f, use_one_mma_wg(params));
      int const kBlockM = std::get<0>(kBlockMN_kernel_args_sm90);
      int const kBlockN = std::get<1>(kBlockMN_kernel_args_sm90);
@@ -843,29 +891,105 @@ index 9e0baff..01ebaab 100644
  }
  
  inline bool get_pack_gqa(Flash_fwd_params const& params) {
-@@ -574,7 +859,8 @@ mha_fwd_get_scheduler_metadata(
+@@ -502,6 +788,26 @@ inline int get_num_splits(Flash_fwd_params const& params) {
+     #endif
+ }
+ 
++inline int resolve_forward_scheduler_num_splits(
++        Flash_fwd_params const& params,
++        int requested_num_splits) {
++    TORCH_CHECK(
++        requested_num_splits >= 0,
++        "FA3 forward num_splits must be 0 (auto) or a positive integer; got ",
++        requested_num_splits);
++    int const resolved_num_splits = requested_num_splits == 0
++        ? get_num_splits(params)
++        : requested_num_splits;
++    TORCH_CHECK(
++        flash::is_valid_resolved_forward_scheduler_num_splits(
++            resolved_num_splits),
++        "FA3 forward scheduler num_splits must resolve to [1, ",
++        flash::kMaxForwardSchedulerNumSplits,
++        "]; requested=", requested_num_splits,
++        ", resolved=", resolved_num_splits);
++    return resolved_num_splits;
++}
++
+ inline int get_max_headdim() {
+     #ifndef FLASHATTENTION_DISABLE_HDIM256
+     return 256;
+@@ -574,15 +880,39 @@ mha_fwd_get_scheduler_metadata(
          bool has_softcap,
          int num_splits,
          std::optional<bool> pack_gqa_,
 -        int const sm_margin
 +        int const sm_margin,
-+        bool prefill_active_worklist
++        bool prefill_active_worklist,
++        int64_t page_resolver_kind
          ) {
  
      TORCH_CHECK(qkv_dtype == at::ScalarType::Half || qkv_dtype == at::ScalarType::BFloat16 || qkv_dtype == at::ScalarType::Float8_e4m3fn,
-@@ -622,8 +908,9 @@ mha_fwd_get_scheduler_metadata(
+                 "FlashAttention only supports fp16, bf16, and fp8_e4m3 data type");
+     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
++    // The K6 producer owns one dynamic split decision per batch row. Enforce
++    // that layout here instead of letting data_ptr<int>() reinterpret a wrong
++    // dtype or a per-head carrier. Python performs the same check before its
++    // cache lookup; this C++ boundary also protects direct ABI callers.
++    TORCH_CHECK(
++        seqused_k.dtype() == torch::kInt32,
++        "scheduler metadata seqused_k must have dtype torch.int32");
++    CHECK_DEVICE(seqused_k);
++    CHECK_CONTIGUOUS(seqused_k);
++    CHECK_SHAPE(seqused_k, batch_size);
+ 
+     // Reset the parameters
+     Flash_fwd_params params{};
++    TORCH_CHECK(
++        page_resolver_kind == int64_t(PageResolverKind::Native)
++            || page_resolver_kind == int64_t(PageResolverKind::ResolvedRowPtr),
++        "scheduler metadata page_resolver_kind must be 0 (Native) or 4 (ResolvedRowPtr); got ",
++        page_resolver_kind);
++    // This producer dereferences seqused_k on every replay. For
++    // ResolvedRowPtr, the caller must bind it to the canonical graph-live
++    // visible-length carrier consumed by the RRP forward kernel; the explicit
++    // kind then selects the matching prepare/split policy. The Python K6
++    // caller enforces pointer identity before entering this ABI.
++    params.page_resolver_kind =
++        static_cast<PageResolverKind>(int(page_resolver_kind));
+     params.is_bf16 = qkv_dtype == at::ScalarType::BFloat16;
+     params.is_e4m3 = qkv_dtype == at::ScalarType::Float8_e4m3fn;
+     params.b = batch_size;
+@@ -622,8 +952,18 @@ mha_fwd_get_scheduler_metadata(
      if (window_size_left >= 0 && window_size_right < 0) { window_size_right = max_seqlen_q - 1; }
      params.window_size_left = window_size_left;
      params.window_size_right = window_size_right;
 -    params.arch = at::cuda::getCurrentDeviceProperties()->major * 10 + at::cuda::getCurrentDeviceProperties()->minor;
 -    params.num_sm = at::cuda::getCurrentDeviceProperties()->multiProcessorCount - sm_margin;
++    // Scheduler geometry and all allocations must be attributed to the device
++    // that owns seqused_k, not to whichever device happened to be current on
++    // this host thread before the metadata call.
++    auto device_guard = make_cuda_guard_from_tensor(seqused_k);
 +    auto const *dprops_arch = at::cuda::getCurrentDeviceProperties();
 +    params.arch = dprops_arch->major * 10 + dprops_arch->minor;
++    TORCH_CHECK(
++        params.page_resolver_kind != PageResolverKind::ResolvedRowPtr
++            || params.arch < 90,
++        "ResolvedRowPtr scheduler metadata without resolver carriers is "
++        "supported only on SM8x K6 launches");
 +    params.num_sm = dprops_arch->multiProcessorCount - sm_margin;
      params.softcap = has_softcap ? 1.0f : 0.0f;
  
      params.page_size = page_size.has_value() ? page_size.value() : 1;
-@@ -644,6 +931,10 @@ mha_fwd_get_scheduler_metadata(
+@@ -635,7 +975,7 @@ mha_fwd_get_scheduler_metadata(
+     params.num_splits_dynamic_ptr = reinterpret_cast<int*>(1);
+ 
+     params.pagedkv_tma = get_pagedkv_tma(params);
+-    params.num_splits = num_splits <= 0 ? get_num_splits(params) : num_splits;
++    params.num_splits = resolve_forward_scheduler_num_splits(params, num_splits);
+     params.pack_gqa = pack_gqa_.has_value() ? pack_gqa_.value() : get_pack_gqa(params);
+     // Always enable PackGQA for Split
+     params.pack_gqa |= params.num_splits > 1;
+@@ -644,30 +984,30 @@ mha_fwd_get_scheduler_metadata(
      params.pack_gqa |= params.d == params.dv;
      #endif
  
@@ -876,7 +1000,14 @@ index 9e0baff..01ebaab 100644
      bool const use_dynamic_split = params.b <= PREPARE_VARLEN_MAX_BATCHES_1CTA && params.num_splits > 1;
  
      bool is_varlen = true;
-@@ -658,16 +949,16 @@ mha_fwd_get_scheduler_metadata(
+ 
+-    // Otherwise the kernel will be launched from cuda:0 device
+-    // Cast to char to avoid compiler warning about narrowing
+-    auto device_guard = make_cuda_guard_from_tensor(seqused_k);
+-
+     auto opts = seqused_k.options();
+     // This needs to be set after get_num_splits
+     at::Tensor tile_count_semaphore;  // Contains the semaphore and optionally num_splits_dynamic
      bool const scheduler_needs_semaphore = params.arch >= 90 || params.num_splits > 1;
      auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
      // params.varlen_sort_batches = !params.is_local; // Use this value for Sort in scheduler template
@@ -898,7 +1029,7 @@ index 9e0baff..01ebaab 100644
          int tile_count_semaphore_offset = b_rounded * num_prepare_batch_vectors;
          // printf("(Metadata) num prepare batch vectors = %d.\n", num_prepare_batch_vectors);
          tile_count_semaphore = torch::empty(
-@@ -677,8 +968,9 @@ mha_fwd_get_scheduler_metadata(
+@@ -677,8 +1017,9 @@ mha_fwd_get_scheduler_metadata(
          params.prepare_seqlen_q_ptr =  use_prepare_varlen ? tile_count_semaphore.data_ptr<int>() : nullptr;
          params.num_splits_dynamic_ptr = use_prepare_varlen && use_dynamic_split ? tile_count_semaphore.data_ptr<int>() + b_rounded : nullptr;
          params.varlen_batch_idx_ptr =  use_prepare_varlen && params.varlen_sort_batches ? tile_count_semaphore.data_ptr<int>() + sort_offset : nullptr;
@@ -910,7 +1041,7 @@ index 9e0baff..01ebaab 100644
          if (scheduler_needs_semaphore) {
              if (!use_prepare_varlen) { tile_count_semaphore.zero_(); }  // If varlen we'll manually do the zero-ing
              params.tile_count_semaphore = tile_count_semaphore.data_ptr<int>() + tile_count_semaphore_offset;
-@@ -693,7 +985,16 @@ mha_fwd_get_scheduler_metadata(
+@@ -693,7 +1034,16 @@ mha_fwd_get_scheduler_metadata(
          int const kBlockM = params.arch >= 90 ? std::get<0>(kBlockMN_kernel_args_sm90) : std::get<0>(kBlockMN_kernel_args_sm8x);
          int const kBlockN = params.arch >= 90 ? std::get<1>(kBlockMN_kernel_args_sm90) : std::get<1>(kBlockMN_kernel_args_sm8x);
          auto stream = at::cuda::getCurrentCUDAStream().stream();
@@ -928,7 +1059,7 @@ index 9e0baff..01ebaab 100644
          CHECK_CUDA_KERNEL_LAUNCH();
      }
      return tile_count_semaphore;
-@@ -745,9 +1046,16 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
+@@ -745,9 +1095,16 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
          std::optional<const at::Tensor> &s_aux_, // (h)
          int const cp_world_size,  // context parallelism (cp) world size
          int const cp_rank,         // cp rank
@@ -948,7 +1079,7 @@ index 9e0baff..01ebaab 100644
      auto dprops = at::cuda::getCurrentDeviceProperties();
      bool is_sm8x = dprops->major >= 8;
      TORCH_CHECK(is_sm8x, "FlashAttention only supports Ampere GPUs or newer.");
-@@ -872,26 +1180,26 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
+@@ -872,26 +1229,26 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
      }
  
      if (seqused_q_.has_value()){
@@ -979,7 +1110,7 @@ index 9e0baff..01ebaab 100644
          TORCH_CHECK(leftpad_k.dtype() == torch::kInt32, "leftpad_k must have dtype int32");
          CHECK_DEVICE(leftpad_k); CHECK_CONTIGUOUS(leftpad_k);
          CHECK_SHAPE(leftpad_k, batch_size);
-@@ -937,13 +1245,29 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
+@@ -937,13 +1294,29 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
      auto device_guard = make_cuda_guard_from_tensor(q);
  
      at::Tensor softmax_lse;
@@ -1011,7 +1142,7 @@ index 9e0baff..01ebaab 100644
      set_params_fprop(params,
                       batch_size,
                       seqlen_q, seqlen_k,
-@@ -1025,13 +1349,48 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
+@@ -1025,13 +1398,48 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
          }
      }
  
@@ -1022,7 +1153,8 @@ index 9e0baff..01ebaab 100644
      params.num_splits_dynamic_ptr = !use_prepare_varlen ? nullptr : reinterpret_cast<int*>(1);
  
      params.pagedkv_tma = get_pagedkv_tma(params);
-     params.num_splits = num_splits <= 0 ? get_num_splits(params) : num_splits;
+-    params.num_splits = num_splits <= 0 ? get_num_splits(params) : num_splits;
++    params.num_splits = resolve_forward_scheduler_num_splits(params, num_splits);
 +    auto launch_tile_args_sm90 = tile_size_fwd_sm90(
 +        params.d_rounded,
 +        params.dv_rounded,
@@ -1061,7 +1193,7 @@ index 9e0baff..01ebaab 100644
      // printf("Num splits = %d.\n", params.num_splits);
      params.pack_gqa = pack_gqa_.has_value() ? pack_gqa_.value() : get_pack_gqa(params);
      // Always enable PackGQA for Split
-@@ -1040,9 +1399,17 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
+@@ -1040,9 +1448,17 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
      params.pack_gqa |= params.d == params.dv;
      #endif
  
@@ -1081,7 +1213,7 @@ index 9e0baff..01ebaab 100644
  
      // This needs to be set after get_num_splits
      at::Tensor tile_count_semaphore;  // Contains the semaphore and optionally num_splits_dynamic
-@@ -1051,22 +1418,33 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
+@@ -1051,22 +1467,33 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
          ? (((params.is_causal || params.is_local) && (params.num_splits == 1)) || is_varlen)
          : ((params.is_causal && !is_varlen) || (is_varlen && params.num_splits > 1));
      // params.varlen_sort_batches = !params.is_local; // Use this value for Sort in scheduler template
@@ -1123,7 +1255,7 @@ index 9e0baff..01ebaab 100644
              CHECK_DEVICE(scheduler_metadata);
              CHECK_SHAPE(scheduler_metadata, metadata_size);
              CHECK_CONTIGUOUS(scheduler_metadata);
-@@ -1079,14 +1457,41 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
+@@ -1079,14 +1506,41 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
              tile_count_semaphore.zero_();  // If varlen we'll manually do the zero-ing
          }
          // ORDER: {prepare_seqlen_q, num_splits_dynamic, varlen_batch_idx, num_nheads_in_l2}
@@ -1170,7 +1302,7 @@ index 9e0baff..01ebaab 100644
  
      if (q_v_.has_value()) {
          TORCH_CHECK(head_size <= 64, "q_v is only supported for head_size <= 64");
-@@ -1094,7 +1499,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
+@@ -1094,7 +1548,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
          TORCH_CHECK(q_type == at::ScalarType::Half || q_type == at::ScalarType::BFloat16,
                      "q_v is only supported for fp16 and bf16 data type");
          TORCH_CHECK(params.arch == 90, "q_v is only supported for Hopper GPUs");
@@ -1179,7 +1311,7 @@ index 9e0baff..01ebaab 100644
          TORCH_CHECK(q_v.dtype() == q_type, "q_v must have the same dtype as query");
          CHECK_DEVICE(q_v);
          TORCH_CHECK(q_v.stride(-1) == 1, "q_v tensor must have contiguous last dimension");
-@@ -1114,7 +1519,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
+@@ -1114,7 +1568,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
  
      if (rotary_cos_.has_value()) {
          TORCH_CHECK(k_new_.has_value(), "If rotary cos/sin are provided, new key / value to be appended to KV cache must also be provided");
@@ -1188,7 +1320,7 @@ index 9e0baff..01ebaab 100644
          CHECK_DEVICE(rotary_cos); CHECK_CONTIGUOUS(rotary_cos);
          params.rotary_dim = rotary_cos.size(1) * 2;
          TORCH_CHECK(params.rotary_dim <= head_size, "rotary_dim must be <= headdim");
-@@ -1127,7 +1532,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
+@@ -1127,7 +1581,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
          TORCH_CHECK(rotary_cos.scalar_type() == q_type, "rotary_cos must have the same dtype as query");
  
          TORCH_CHECK(rotary_sin_.has_value(), "If rotary cos is provided, rotary sin must also be provided");
@@ -1197,7 +1329,7 @@ index 9e0baff..01ebaab 100644
          CHECK_DEVICE(rotary_sin); CHECK_CONTIGUOUS(rotary_sin);
          CHECK_SHAPE(rotary_sin, seqlen_ro, params.rotary_dim / 2);
          TORCH_CHECK(rotary_sin.scalar_type() == q_type, "rotary_cos must have the same dtype as query");
-@@ -1135,7 +1540,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
+@@ -1135,7 +1589,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
          params.rotary_sin_ptr = rotary_sin.data_ptr();
          params.is_rotary_interleaved = is_rotary_interleaved;
          if (seqlens_rotary_.has_value()) {
@@ -1206,7 +1338,7 @@ index 9e0baff..01ebaab 100644
              CHECK_DEVICE(seqlens_rotary); CHECK_CONTIGUOUS(seqlens_rotary);
              TORCH_CHECK(seqlens_rotary.dtype() == torch::kInt32, "seqlens_rotary must have dtype torch.int32");
              CHECK_SHAPE(seqlens_rotary, batch_size);
-@@ -1146,38 +1551,35 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
+@@ -1146,38 +1600,32 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
      }
  
      if (kv_batch_idx_.has_value()) {
@@ -1241,9 +1373,6 @@ index 9e0baff..01ebaab 100644
 -        params.lseaccum_head_stride = softmax_lse_accum.stride(-2);
 +    int const partial_split_count = params.num_splits;
 +    if (partial_split_count > 1) {
-+        TORCH_CHECK(
-+            partial_split_count <= 256,
-+            "partial num_splits > 256 not supported");
 +        allocate_split_accum_tensors_like_dense(
 +            params,
 +            opts,
@@ -1265,7 +1394,7 @@ index 9e0baff..01ebaab 100644
              CHECK_DEVICE(q_descale);
              CHECK_SHAPE(q_descale, batch_size, num_heads_k);
              params.q_descale_ptr = q_descale.data_ptr<float>();
-@@ -1187,7 +1589,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
+@@ -1187,7 +1635,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
              params.q_descale_ptr = nullptr;
          }
          if (k_descale_.has_value()) {
@@ -1274,7 +1403,7 @@ index 9e0baff..01ebaab 100644
              CHECK_DEVICE(k_descale);
              CHECK_SHAPE(k_descale, batch_size, num_heads_k);
              params.k_descale_ptr = k_descale.data_ptr<float>();
-@@ -1197,7 +1599,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
+@@ -1197,7 +1645,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
              params.k_descale_ptr = nullptr;
          }
          if (v_descale_.has_value()) {
@@ -1283,7 +1412,7 @@ index 9e0baff..01ebaab 100644
              CHECK_DEVICE(v_descale);
              CHECK_SHAPE(v_descale, batch_size, num_heads_k);
              params.v_descale_ptr = v_descale.data_ptr<float>();
-@@ -1212,7 +1614,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
+@@ -1212,7 +1660,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
          TORCH_CHECK(params.arch == 90, "S aux is currently only supported for Hopper GPUs");
          TORCH_CHECK(num_heads <= 64, "We only support query heads <= 64 with S aux");
          TORCH_CHECK(head_size == head_size_v, "We don't support S aux with hdim != hdim_v");
@@ -1292,7 +1421,7 @@ index 9e0baff..01ebaab 100644
          TORCH_CHECK(s_aux.scalar_type() == at::ScalarType::BFloat16,
              "We only support bf16 dtype for S aux.");
          CHECK_DEVICE(s_aux);
-@@ -1255,11 +1657,25 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
+@@ -1255,11 +1703,25 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
  
      if (total_q > 0 && (total_k + params.total_knew) > 0 && num_heads_k > 0) {
          auto stream = at::cuda::getCurrentCUDAStream().stream();
@@ -1320,7 +1449,7 @@ index 9e0baff..01ebaab 100644
              }
              // Unless there's seqused_q, for the purpose of attn_combine, we can just treat it as batch=1
              // and seqlen = total_q, and don't need to dispatch to Varlen there.
-@@ -1271,11 +1687,12 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
+@@ -1271,11 +1733,12 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
              //     params.seqlen_q = total_q;
              // }
              // This will zero out the semaphore if needed
@@ -1334,7 +1463,7 @@ index 9e0baff..01ebaab 100644
      } else if (total_q > 0 && num_heads_k > 0) {
          // If seqlen_k == 0, then we have an empty tensor. We need to set the output to 0.
          out.zero_();
-@@ -1286,6 +1703,607 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
+@@ -1286,6 +1749,607 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
      return {out, softmax_lse, out_accum, softmax_lse_accum};
  }
  
@@ -1942,7 +2071,7 @@ index 9e0baff..01ebaab 100644
  void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {
      #ifndef FLASHATTENTION_DISABLE_BACKWARD
          // FP16_SWITCH(!params.is_bf16, [&] {
-@@ -1747,7 +2765,34 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+@@ -1747,7 +2811,35 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
      m.def("fwd", &mha_fwd, "Forward pass");
      m.def("bwd", &mha_bwd, "Backward pass");
      m.def("fwd_combine", &mha_combine, "Combine partial attention outputs");
@@ -1974,12 +2103,13 @@ index 9e0baff..01ebaab 100644
 +        pybind11::arg("num_splits"),
 +        pybind11::arg("pack_gqa_") = std::nullopt,
 +        pybind11::arg("sm_margin"),
-+        pybind11::arg("prefill_active_worklist") = false);
++        pybind11::arg("prefill_active_worklist") = false,
++        pybind11::arg("page_resolver_kind") = int64_t(PageResolverKind::Native));
  }
  
  #endif
 diff --git a/hopper/flash_api_torch_lib.cpp b/hopper/flash_api_torch_lib.cpp
-index 338c9d4..4237441 100644
+index 338c9d4..e8319ea 100644
 --- a/hopper/flash_api_torch_lib.cpp
 +++ b/hopper/flash_api_torch_lib.cpp
 @@ -55,9 +55,77 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
@@ -2061,13 +2191,14 @@ index 338c9d4..4237441 100644
  // Only applicable to the case where seqused_k (i.e. cache_seqlens) is available
  at::Tensor
  mha_fwd_get_scheduler_metadata(
-@@ -83,9 +151,14 @@ mha_fwd_get_scheduler_metadata(
+@@ -83,9 +151,15 @@ mha_fwd_get_scheduler_metadata(
          bool has_softcap,
          int num_splits,
          std::optional<bool> pack_gqa_,
 -        int const sm_margin
 +        int const sm_margin,
-+        bool prefill_active_worklist
++        bool prefill_active_worklist,
++        int64_t page_resolver_kind
  );
  
 +// [COMPACT-RECENT-STAGE-B 2026-07-03] compact_recent_debug_state_for_dispatch /
@@ -2077,7 +2208,7 @@ index 338c9d4..4237441 100644
  /**
   *  Torch Library Registration
   */
-@@ -126,9 +199,83 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
+@@ -126,9 +200,83 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
              "    Tensor?  s_aux,"
              "    int      cp_world_size,"
              "    int      cp_rank,"
@@ -2162,16 +2293,54 @@ index 338c9d4..4237441 100644
      ops.def("get_scheduler_metadata("
              "    int      batch_size,"
              "    int      max_seqlen_q,"
-@@ -152,7 +299,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
+@@ -152,7 +300,9 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
              "    bool     has_softcap,"
              "    int      num_splits,"
              "    bool?    pack_gqa,"
 -            "    int      sm_margin) -> Tensor");
 +            "    int      sm_margin,"
-+            "    bool     prefill_active_worklist=False) -> Tensor");
++            "    bool     prefill_active_worklist=False,"
++            "    int      page_resolver_kind=0) -> Tensor");
     ops.impl("get_scheduler_metadata", torch::kCUDA, 
          make_pytorch_shim(&mha_fwd_get_scheduler_metadata));
  }
+diff --git a/hopper/flash_attn_interface.py b/hopper/flash_attn_interface.py
+index 6f06f96..677991c 100644
+--- a/hopper/flash_attn_interface.py
++++ b/hopper/flash_attn_interface.py
+@@ -826,11 +826,18 @@ def get_scheduler_metadata(
+     num_splits=0,    # Can be tuned for speed
+     pack_gqa=None,   # Can be tuned for speed
+     sm_margin=0,     # Can be tuned if some SMs are used for communication
++    page_resolver_kind: int = 0,
+ ):
+     cache_seqlens = maybe_contiguous(cache_seqlens)
+     if headdim_v is None:
+         headdim_v = headdim
+-    scheduler_metadata = flash_attn_3_cuda.get_scheduler_metadata(
++    page_resolver_kind = int(page_resolver_kind)
++    if page_resolver_kind not in (0, 4):
++        raise ValueError(
++            "scheduler metadata page_resolver_kind must be 0 (Native) or "
++            f"4 (ResolvedRowPtr); got {page_resolver_kind}"
++        )
++    args = (
+         batch_size, max_seqlen_q, max_seqlen_k, num_heads_q, num_heads_kv, headdim, headdim_v,
+         qkv_dtype,
+         cache_seqlens,
+@@ -848,4 +855,12 @@ def get_scheduler_metadata(
+         pack_gqa,
+         sm_margin,
+     )
++    if page_resolver_kind == 0:
++        # Preserve compatibility with a pre-resolver-kind pybind extension
++        # only for the explicitly Native policy.
++        scheduler_metadata = flash_attn_3_cuda.get_scheduler_metadata(*args)
++    else:
++        scheduler_metadata = flash_attn_3_cuda.get_scheduler_metadata(
++            *args, page_resolver_kind=page_resolver_kind
++        )
+     return scheduler_metadata
 diff --git a/hopper/flash_fwd_combine_kernel.h b/hopper/flash_fwd_combine_kernel.h
 index cb3f6db..ec4849e 100644
 --- a/hopper/flash_fwd_combine_kernel.h
@@ -3000,16 +3169,17 @@ index e8db360..20c111a 100644
 +// retired from production on 2026-06-30 (mixed_page/RRP is the route). Recover
 +// from git history if a dedicated compact kernel is ever needed again.
 diff --git a/hopper/flash_prepare_scheduler.cu b/hopper/flash_prepare_scheduler.cu
-index bc0a51c..8c4158a 100644
+index bc0a51c..23d1ff6 100644
 --- a/hopper/flash_prepare_scheduler.cu
 +++ b/hopper/flash_prepare_scheduler.cu
-@@ -10,11 +10,151 @@
+@@ -10,11 +10,155 @@
  #include "cutlass/arch/grid_dependency_control.h"
  
  #include "flash.h"
 +#include "cuda_check.h"
  
  #include "static_switch.h"
++#include "scheduler_num_splits.h"
 +// [2026-07-11 SPLIT-ROOT Phase1] tile query for the non-split arm's kBlockN
 +// (the makespan argmin costs its s=1 arm under the tile the launch would use
 +// without splits; on SM80 that tile differs from the split tile).
@@ -3099,6 +3269,9 @@ index bc0a51c..8c4158a 100644
 +__host__ __device__ __forceinline__ int split_makespan_argmin(
 +        int total_ctas_single_split, int num_sm, int num_n_blocks_single,
 +        int num_n_blocks_split, int num_splits_static) {
++    // An all-inactive padded batch has no schedulable CTA.  Split=1 is the
++    // canonical inactive value and avoids entering the wave-level G divisor.
++    if (total_ctas_single_split <= 0) { return 1; }
 +    // S0-a validated wave depth (see the comment above).
 +    constexpr int kMaxValidatedWaves = 3;
 +    int const waves_one = (total_ctas_single_split + num_sm - 1) / num_sm;
@@ -3155,7 +3328,7 @@ index bc0a51c..8c4158a 100644
  // Sort in descending order
  template <typename T>
  struct PrepareSortOp
-@@ -39,6 +179,7 @@ struct PrepareSortOp<int4> {
+@@ -39,6 +183,7 @@ struct PrepareSortOp<int4> {
      }
  };
  
@@ -3163,7 +3336,7 @@ index bc0a51c..8c4158a 100644
  template <int NumWarps, bool Sort>
  __global__ void prepare_varlen_num_blocks_kernel(
          int seqlen_q_static, int seqlen_k_static, int seqlen_k_new_static,
-@@ -55,7 +196,9 @@ __global__ void prepare_varlen_num_blocks_kernel(
+@@ -55,7 +200,9 @@ __global__ void prepare_varlen_num_blocks_kernel(
          bool enable_pdl,
          bool is_causal,
          bool packgqa,
@@ -3174,7 +3347,7 @@ index bc0a51c..8c4158a 100644
  
      static constexpr int kNumBatchPerWarp = cutlass::NumThreadsPerWarp - 1;
      static constexpr int kSmemSize = 1;
-@@ -65,6 +208,9 @@ __global__ void prepare_varlen_num_blocks_kernel(
+@@ -65,6 +212,9 @@ __global__ void prepare_varlen_num_blocks_kernel(
      using BlockMergeSort = cub::BlockMergeSort<int4, BLOCK_DIM_X, ITEMS_PER_THREAD>;
  
      __shared__ int total_blocks_smem[kSmemSize];
@@ -3184,7 +3357,7 @@ index bc0a51c..8c4158a 100644
  
      // Allocate shared memory for BlockMergeSort operations
      __shared__ typename BlockMergeSort::TempStorage temp_storage;
-@@ -72,6 +218,7 @@ __global__ void prepare_varlen_num_blocks_kernel(
+@@ -72,6 +222,7 @@ __global__ void prepare_varlen_num_blocks_kernel(
      if (enable_pdl) { cutlass::arch::launch_dependent_grids(); }
  
      if (threadIdx.x < kSmemSize) { total_blocks_smem[threadIdx.x] = 0; }
@@ -3192,7 +3365,7 @@ index bc0a51c..8c4158a 100644
      __syncthreads();
  
      if (threadIdx.x == 0 && tile_count_semaphore) { *tile_count_semaphore = 0; }
-@@ -94,7 +241,11 @@ __global__ void prepare_varlen_num_blocks_kernel(
+@@ -94,7 +245,11 @@ __global__ void prepare_varlen_num_blocks_kernel(
              : cute::make_tuple(0, 0);
      };
  
@@ -3205,7 +3378,7 @@ index bc0a51c..8c4158a 100644
          int leftpad_k = batch_idx < num_batch && leftpad_k_ptr != nullptr ? leftpad_k_ptr[batch_idx] : 0;
          int seqlen;
          if (seqused_k) {
-@@ -115,9 +266,7 @@ __global__ void prepare_varlen_num_blocks_kernel(
+@@ -115,9 +270,7 @@ __global__ void prepare_varlen_num_blocks_kernel(
              seqlen_new = seqlen_k_new_static;
          }
          // if (threadIdx.x == 0) { printf("seqlen = %d, seqlen_new = %d, leftpad_k = %d\n", seqlen, seqlen_new, leftpad_k); }
@@ -3216,7 +3389,7 @@ index bc0a51c..8c4158a 100644
      };
  
      int warp_idx = threadIdx.x / cutlass::NumThreadsPerWarp;
-@@ -128,7 +277,10 @@ __global__ void prepare_varlen_num_blocks_kernel(
+@@ -128,7 +281,10 @@ __global__ void prepare_varlen_num_blocks_kernel(
      auto seqlen_q_info = get_num_m_blocks_and_seqlen(batch_idx);
      int num_m_blocks = cute::get<0>(seqlen_q_info);
      int seqlen_q = cute::get<1>(seqlen_q_info);
@@ -3228,7 +3401,7 @@ index bc0a51c..8c4158a 100644
  
      auto get_nheads_in_l2 = [&](int n_blocks) {
          int nheads_in_l2 = n_blocks * 16 <= max_kvblocks_in_l2 ? 16
-@@ -145,6 +297,32 @@ __global__ void prepare_varlen_num_blocks_kernel(
+@@ -145,6 +301,30 @@ __global__ void prepare_varlen_num_blocks_kernel(
          // set num splits for all batches to 1 (note that user expects num_splits_static to mean upper bound on splits)
          // for batch size > 992, we expect GPU occupancy to not be an issue except in degenerate cases (e.g., most are zero-length)
          num_splits_dynamic = 1;
@@ -3256,21 +3429,26 @@ index bc0a51c..8c4158a 100644
 +        num_splits_dynamic = split_makespan_argmin(
 +            total_ctas_single_split, num_sm, num_n_blocks_single,
 +            num_n_blocks, num_splits_static);
-+        // num_n_blocks per work tile for the batch
-+        num_n_blocks = cutlass::ceil_div(num_n_blocks, num_splits_dynamic);
      } else {
          int total_blocks = num_m_blocks * num_n_blocks;
          // Warp sum
-@@ -160,7 +338,7 @@ __global__ void prepare_varlen_num_blocks_kernel(
+@@ -159,10 +339,13 @@ __global__ void prepare_varlen_num_blocks_kernel(
+         int blocks_per_sm = static_cast<int>(ceilf(float(total_blocks) * 1.1f * float(num_head) / float(num_sm)));
          // blocks_per_sm = std::max(1, blocks_per_sm);  // 1 is the minimum number of blocks per SM
          num_splits_dynamic = std::max(std::min((num_n_blocks + blocks_per_sm - 1) / blocks_per_sm, num_splits_static), 1);
-         // num_n_blocks per work tile for the batch
+-        // num_n_blocks per work tile for the batch
 -        num_n_blocks = cutlass::ceil_div(num_n_blocks, num_splits_dynamic); 
-+        num_n_blocks = cutlass::ceil_div(num_n_blocks, num_splits_dynamic);
      }
  
++    num_splits_dynamic = require_valid_dynamic_forward_scheduler_num_splits(
++        num_splits_dynamic, num_splits_static, false /*allow_inactive_zero*/);
++    // num_n_blocks per work tile for the batch
++    num_n_blocks = cutlass::ceil_div(num_n_blocks, num_splits_dynamic);
++
      if constexpr (Sort) {
-@@ -209,8 +387,215 @@ __global__ void prepare_varlen_num_blocks_kernel(
+         if(lane == kNumBatchPerWarp || batch_idx >= num_batch) {
+             num_n_blocks = INT_MIN; // sort last
+@@ -209,10 +392,233 @@ __global__ void prepare_varlen_num_blocks_kernel(
      
  }
  
@@ -3442,8 +3620,10 @@ index bc0a51c..8c4158a 100644
 +                    min((num_n_blocks + blocks_per_sm - 1) / blocks_per_sm, num_splits_static),
 +                    1);
 +            }
-+            num_n_blocks = cutlass::ceil_div(num_n_blocks, num_splits_dynamic);
 +        }
++        num_splits_dynamic = require_valid_dynamic_forward_scheduler_num_splits(
++            num_splits_dynamic, num_splits_static, false /*allow_inactive_zero*/);
++        num_n_blocks = cutlass::ceil_div(num_n_blocks, num_splits_dynamic);
 +        prepare_seqlen_q_ptr[dst_batch] =
 +            seqlen_q * (packgqa ? qhead_per_khead : 1);
 +        if (num_splits_dynamic_ptr != nullptr) {
@@ -3483,18 +3663,34 @@ index bc0a51c..8c4158a 100644
 +    return std::get<1>(tile);
 +}
 +
++static void validate_forward_scheduler_metadata_producer_num_splits(
++        Flash_fwd_params const& params,
++        char const* producer_name) {
++    TORCH_CHECK(
++        flash::is_valid_resolved_forward_scheduler_num_splits(
++            params.num_splits),
++        producer_name,
++        " requires resolved FA3 forward num_splits in [1, ",
++        flash::kMaxForwardSchedulerNumSplits,
++        "]; got ", params.num_splits);
++}
++
  void prepare_varlen_num_blocks(Flash_fwd_params &params, cudaStream_t stream, bool packgqa,
                                 int blockM, int blockN, bool enable_pdl) {
++    validate_forward_scheduler_metadata_producer_num_splits(
++        params, "prepare_varlen_num_blocks");
      int qhead_per_khead = cutlass::ceil_div(params.h, params.h_k);
-@@ -227,6 +612,15 @@ void prepare_varlen_num_blocks(Flash_fwd_params &params, cudaStream_t stream, bo
+     int num_warps = cutlass::ceil_div(params.b, 31); // warp switch will cap this at 32
+     int num_ctas = cutlass::ceil_div(params.b, 31 * 32);
+@@ -227,6 +633,15 @@ void prepare_varlen_num_blocks(Flash_fwd_params &params, cudaStream_t stream, bo
      int const size_one_kvblock = blockN * (params.d + params.dv) * element_size;
      // printf("block size = %d, element size = %d, headdim = %d, headdim_v = %d, size 1 kblock = %d.\n", blockN, element_size, params.d, params.dv, size_one_kvblock);
      int const max_kvblocks_in_l2 = size_l2 / size_one_kvblock;
 +    // [2026-07-11 SPLIT-ROOT Phase1] mixed-resolver launches take the makespan
 +    // argmin split policy; Native (dense) launches keep the legacy formula
-+    // verbatim. Derived from params (already set at every call site, including
-+    // get_scheduler_metadata whose value-initialized params default to Native),
-+    // so no public signature changes.
++    // verbatim. Derived from params: the forward path sets the executed
++    // resolver and get_scheduler_metadata explicitly receives the consuming
++    // resolver kind, so the producer and consumer use one prepare policy.
 +    bool const is_mixed_resolver =
 +        params.page_resolver_kind != PageResolverKind::Native;
 +    cutlass::FastDivmod const blockn_single_divmod(
@@ -3502,7 +3698,7 @@ index bc0a51c..8c4158a 100644
      BOOL_SWITCH(params.varlen_sort_batches, Sort, [&] {
          NUM_WARP_SWITCH(num_warps, NumWarps, [&] {
              flash::prepare_varlen_num_blocks_kernel<NumWarps, Sort><<<num_ctas /*grid*/, 32 * NumWarps /*block*/, 0, stream>>>(
-@@ -244,7 +638,68 @@ void prepare_varlen_num_blocks(Flash_fwd_params &params, cudaStream_t stream, bo
+@@ -244,7 +659,70 @@ void prepare_varlen_num_blocks(Flash_fwd_params &params, cudaStream_t stream, bo
                  enable_pdl,
                  params.is_causal,
                  packgqa,
@@ -3523,6 +3719,8 @@ index bc0a51c..8c4158a 100644
 +        bool packgqa,
 +        int blockM,
 +        int blockN) {
++    validate_forward_scheduler_metadata_producer_num_splits(
++        params, "prepare_prefill_active_varlen_num_blocks");
 +    static constexpr int kPrefillActivePrepareMaxBatches1CTA =
 +        (cutlass::NumThreadsPerWarp - 1) * 32;
 +    TORCH_CHECK(
@@ -6379,6 +6577,67 @@ index 9ea59bc..dbed5d4 100644
  
 +
  } // namespace flash
+diff --git a/hopper/scheduler_num_splits.h b/hopper/scheduler_num_splits.h
+new file mode 100644
+index 0000000..a39651e
+--- /dev/null
++++ b/hopper/scheduler_num_splits.h
+@@ -0,0 +1,55 @@
++/******************************************************************************
++ * Copyright (c) 2024, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
++ ******************************************************************************/
++
++#pragma once
++
++#include <cutlass/cutlass.h>
++
++namespace flash {
++
++// VarlenDynamicPersistentTileScheduler packs num_splits into eight bits.
++// Keep this forward-scheduler limit separate from the standalone combine API,
++// whose independent reduction layout continues to support 256 partials.
++inline constexpr int kMaxForwardSchedulerNumSplits = (1 << 8) - 1;
++
++CUTLASS_HOST_DEVICE constexpr
++bool is_valid_resolved_forward_scheduler_num_splits(int num_splits) {
++    return num_splits >= 1 && num_splits <= kMaxForwardSchedulerNumSplits;
++}
++
++CUTLASS_HOST_DEVICE constexpr
++bool is_valid_dynamic_forward_scheduler_num_splits(
++        int num_splits_dynamic,
++        int num_splits_static,
++        bool allow_inactive_zero) {
++    // The compacted prefill active-worklist stores zero in unused metadata
++    // rows.  Every schedulable row, and every non-worklist row, must resolve
++    // to at least one split.
++    return is_valid_resolved_forward_scheduler_num_splits(num_splits_static)
++        && num_splits_dynamic >= 0
++        && num_splits_dynamic <= num_splits_static
++        && (num_splits_dynamic >= 1 || allow_inactive_zero);
++}
++
++// Caller-supplied scheduler metadata lives on the device, so host shape/dtype
++// checks cannot validate its values without a hot-path synchronization.  Check
++// the value at the point of use instead.  The unconditional trap is effective
++// in release builds (unlike assert under -DNDEBUG), preserves the original
++// value rather than clamping/falling back, and prevents invalid packed indices
++// from reaching the attention mainloop.
++CUTLASS_DEVICE
++int require_valid_dynamic_forward_scheduler_num_splits(
++        int num_splits_dynamic,
++        int num_splits_static,
++        bool allow_inactive_zero) {
++    if (!is_valid_dynamic_forward_scheduler_num_splits(
++            num_splits_dynamic, num_splits_static, allow_inactive_zero)) {
++#if defined(__CUDA_ARCH__)
++        asm volatile("trap;");
++#endif
++    }
++    return num_splits_dynamic;
++}
++
++} // namespace flash
 diff --git a/hopper/seqlen.h b/hopper/seqlen.h
 index c632216..f4c098d 100644
 --- a/hopper/seqlen.h
@@ -6699,10 +6958,18 @@ index 4d2f3de..46a3954 100644
    #define ARCH_SWITCH(ARCH, ARCH_NAME, ...)                                                      \
    [&] {                                                                                          \
 diff --git a/hopper/tile_scheduler.hpp b/hopper/tile_scheduler.hpp
-index 1109de2..dc69b36 100644
+index 1109de2..426e957 100644
 --- a/hopper/tile_scheduler.hpp
 +++ b/hopper/tile_scheduler.hpp
-@@ -29,6 +29,10 @@ struct TileSchedulerArguments {
+@@ -8,6 +8,7 @@
+ #include "cutlass/arch/barrier.h"
+ 
+ #include "named_barrier.hpp"
++#include "scheduler_num_splits.h"
+ #include "utils.h"
+ 
+ namespace flash {
+@@ -29,6 +30,10 @@ struct TileSchedulerArguments {
      int const* const varlen_batch_idx_ptr = nullptr;
      // int const* const num_n_blocks_ptr = nullptr;
      int const* const num_nheads_in_l2_ptr = nullptr;
@@ -6713,7 +6980,7 @@ index 1109de2..dc69b36 100644
      // CP (Context Parallelism) parameters
      int const cp_world_size = 1;
      int const cp_rank = 0;
-@@ -44,6 +48,13 @@ public:
+@@ -44,6 +49,13 @@ public:
      using SharedStorage = int;
  
      // Device side kernel params
@@ -6727,7 +6994,7 @@ index 1109de2..dc69b36 100644
      struct Params {
          int const num_blocks, num_head, num_batch, num_splits;
          int const qhead_per_khead;
-@@ -395,6 +406,10 @@ public:
+@@ -395,6 +407,10 @@ public:
          int const* const varlen_batch_idx_ptr;
          // int const* const num_n_blocks_ptr;
          int const* const num_nheads_in_l2_ptr;
@@ -6738,7 +7005,18 @@ index 1109de2..dc69b36 100644
      };
  
      static Params
-@@ -417,7 +432,11 @@ public:
+@@ -403,7 +419,9 @@ public:
+         // (args.num_splits * args.num_head) number of heads.
+         assert(args.tile_count_semaphore != nullptr);
+         assert(args.num_head < (1 << 16));  // We use the top 16 bits to store num_splits & split_idx
+-        assert(!Split || args.num_splits < (1 << 8)); // We use the top 8 bits to store num_splits
++        // Public forward entrypoints and metadata producers enforce this in
++        // release builds; retain the assert as a debug-only redundancy.
++        assert(!Split || is_valid_resolved_forward_scheduler_num_splits(args.num_splits));
+         // int const size_l2 = 50 * 1024 * 1024; // 50 MB
+         // int const size_one_kvblock = kBlockN * (args.headdim + args.headdim_v) * args.element_size;
+         // int max_kvblocks_in_l2 = size_l2 / size_one_kvblock;
+@@ -417,7 +435,11 @@ public:
                  args.prepare_seqlen_q_ptr,
                  args.varlen_batch_idx_ptr,
                  // aras.num_n_blocks_ptr,
@@ -6751,7 +7029,7 @@ index 1109de2..dc69b36 100644
      }
  
      static dim3
-@@ -439,8 +458,10 @@ public:
+@@ -439,8 +461,10 @@ public:
          cute::tuple<int32_t, int32_t, int32_t, int32_t>
          get_block_coord(Params const& params) const {
              auto get_actual_batch = [&](int virtual_batch) {
@@ -6764,7 +7042,52 @@ index 1109de2..dc69b36 100644
                  } else {
                      return virtual_batch;
                  }
-@@ -558,6 +579,22 @@ public:
+@@ -496,20 +520,31 @@ public:
+             }
+         };
+ 
+-        auto get_num_splits = [&] (int bidb_start) {
++        auto get_num_splits = [&] (int bidb_start, int num_m_blocks_for_lane) {
+             int batch_idx = lane + bidb_start;
+             bool is_valid = batch_idx < params.num_batch && lane < cutlass::NumThreadsPerWarp - 1;
+             if constexpr (!Split) {
+                 return is_valid ? 1 : 0;
+             } else if constexpr(Prepared) {
+-                return is_valid ? params.num_splits_dynamic_ptr[batch_idx] : 0;
++                return is_valid
++                    ? require_valid_dynamic_forward_scheduler_num_splits(
++                        params.num_splits_dynamic_ptr[batch_idx],
++                        params.nsplits_divmod.divisor,
++                        num_m_blocks_for_lane == 0
++                            && params.varlen_batch_idx_ptr != nullptr)
++                    : 0;
+             } else {
+-                return is_valid ? params.nsplits_divmod.divisor : 0;
++                return is_valid
++                    ? require_valid_dynamic_forward_scheduler_num_splits(
++                        params.nsplits_divmod.divisor,
++                        params.nsplits_divmod.divisor,
++                        false /*allow_inactive_zero*/)
++                    : 0;
+             }
+         };
+ 
+         int num_m_blocks = get_num_m_blocks(current_work.bidb);  // Different for each lane
+-        int num_splits = get_num_splits(current_work.bidb);
++        int num_splits = get_num_splits(current_work.bidb, num_m_blocks);
+         int num_split_m_blocks = !Split ? num_m_blocks : num_m_blocks * num_splits;
+         // Cumulative number of blocks for the next 31 batches
+         int num_m_blocks_cumulative = warp_prefix_sum(num_split_m_blocks);
+@@ -538,7 +573,7 @@ public:
+                 return {next_tile_idx, 0, 0, params.num_batch};
+             }
+             num_m_blocks = get_num_m_blocks(bidb);
+-            num_splits = get_num_splits(bidb);
++            num_splits = get_num_splits(bidb, num_m_blocks);
+             num_split_m_blocks = !Split ? num_m_blocks : num_m_blocks * num_splits;
+             num_m_blocks_cumulative = warp_prefix_sum(num_split_m_blocks);
+             m_blocks_in_group = __shfl_sync(0xffffffff, num_m_blocks_cumulative, cutlass::NumThreadsPerWarp - 1);
+@@ -558,6 +593,22 @@ public:
          group_start_tile += (batch_idx_in_group == 0 ? 0 : __shfl_sync(0xffffffff, num_m_blocks_cumulative, batch_idx_in_group - 1)) * params.num_head;
          int mh_block = next_tile_idx - group_start_tile;
          int block, bidh;
@@ -6787,7 +7110,7 @@ index 1109de2..dc69b36 100644
          if constexpr (LPT) {
              if (!Split || num_splits == 1) {
                  // NOTE: code for computing nheads_in_l2 directly left as reference
-@@ -585,9 +622,7 @@ public:
+@@ -585,9 +636,7 @@ public:
                  int bidh_residual = l2_mod - block * nheads_in_this_section;
                  bidh = section_idx * nheads_in_l2 + bidh_residual;
                  if constexpr(Split) {
@@ -6798,7 +7121,7 @@ index 1109de2..dc69b36 100644
                  }
              } else {
                  // NOTE: leave traverse heads first version for reference
-@@ -603,8 +638,7 @@ public:
+@@ -603,8 +652,7 @@ public:
                  if constexpr (Split) {
                      int bidh_actual = bidh / num_splits;
                      int split_idx = bidh - bidh_actual * num_splits;
@@ -6808,7 +7131,7 @@ index 1109de2..dc69b36 100644
                  }
              }
              block = num_m_blocks - 1 - block;
-@@ -617,13 +651,7 @@ public:
+@@ -617,13 +665,7 @@ public:
                  // TODO: idk why this gives wrong answer nondeterministically
                  // int bidh_actual, split_idx;
                  // split_idx = params.head_divmod.divmod(bidh_actual, bidh);
@@ -6911,7 +7234,7 @@ index d0c595d..a0e10a0 100644
 \ No newline at end of file
 +)
 diff --git a/vllm_flash_attn/flash_attn_interface.py b/vllm_flash_attn/flash_attn_interface.py
-index a61d0f9..7c7d012 100644
+index a61d0f9..9780e96 100644
 --- a/vllm_flash_attn/flash_attn_interface.py
 +++ b/vllm_flash_attn/flash_attn_interface.py
 @@ -1,5 +1,10 @@
@@ -7062,7 +7385,7 @@ index a61d0f9..7c7d012 100644
      return True, None
  
  def _is_fa4_supported(device = None) -> Tuple[bool, Optional[str]]:
-@@ -90,6 +175,1173 @@ def fa_version_unsupported_reason(fa_version: int, device = None) \
+@@ -90,6 +175,1211 @@ def fa_version_unsupported_reason(fa_version: int, device = None) \
  def maybe_contiguous(x):
      return x.contiguous() if x is not None and x.stride(-1) != 1 else x
  
@@ -8230,62 +8553,100 @@ index a61d0f9..7c7d012 100644
 +# _decode_compact_recent_* helper family deleted with their op.
 +
 +
-+_GET_SCHEDULER_METADATA_SUPPORTS_PREFILL_ACTIVE_WORKLIST: Optional[bool] = None
++_GET_SCHEDULER_METADATA_BASE_ARGUMENT_NAMES = (
++    "batch_size", "max_seqlen_q", "max_seqlen_k", "num_heads", "num_heads_k",
++    "headdim", "headdim_v", "qkv_dtype", "seqused_k", "cu_seqlens_q",
++    "cu_seqlens_k", "cu_seqlens_k_new", "seqused_q", "leftpad_k", "page_size",
++    "max_seqlen_k_new", "is_causal", "window_size_left", "window_size_right",
++    "has_softcap", "num_splits", "pack_gqa", "sm_margin",
++)
++_GET_SCHEDULER_METADATA_ARGUMENT_NAMES: Optional[Tuple[str, ...]] = None
++
++
++def _get_scheduler_metadata_argument_names() -> Tuple[str, ...]:
++    """Read the registered op schema before launch; safe inside CUDA capture."""
++    global _GET_SCHEDULER_METADATA_ARGUMENT_NAMES
++    if _GET_SCHEDULER_METADATA_ARGUMENT_NAMES is not None:
++        return _GET_SCHEDULER_METADATA_ARGUMENT_NAMES
++    op = torch.ops._vllm_fa3_C.get_scheduler_metadata
++    overload = getattr(op, "default", None)
++    schema = getattr(overload, "_schema", None)
++    schema_arguments = getattr(schema, "arguments", None)
++    if schema_arguments is None:
++        raise RuntimeError(
++            "get_scheduler_metadata ABI schema is unavailable; refusing "
++            "capture-time trial calls"
++        )
++    argument_names = tuple(str(argument.name) for argument in schema_arguments)
++    valid_schemas = (
++        _GET_SCHEDULER_METADATA_BASE_ARGUMENT_NAMES,
++        _GET_SCHEDULER_METADATA_BASE_ARGUMENT_NAMES
++        + ("prefill_active_worklist",),
++        _GET_SCHEDULER_METADATA_BASE_ARGUMENT_NAMES
++        + ("prefill_active_worklist", "page_resolver_kind"),
++    )
++    if argument_names not in valid_schemas:
++        raise RuntimeError(
++            "unsupported get_scheduler_metadata ABI schema: "
++            f"{argument_names!r}"
++        )
++    _GET_SCHEDULER_METADATA_ARGUMENT_NAMES = argument_names
++    return argument_names
 +
 +
  # NOTE only used in FA3
  def get_scheduler_metadata(
      batch_size, max_seqlen_q, max_seqlen_k, num_heads_q, num_heads_kv, headdim,
-@@ -107,11 +1359,14 @@ def get_scheduler_metadata(
+@@ -107,11 +1397,19 @@ def get_scheduler_metadata(
      num_splits=0,    # Can be tuned for speed
      pack_gqa=None,   # Can be tuned for speed
      sm_margin=0,     # Can be tuned if some SMs are used for communication
 +    prefill_active_worklist: bool = False,
++    page_resolver_kind: int = 0,
  ):
      cache_seqlens = maybe_contiguous(cache_seqlens)
      if headdim_v is None:
          headdim_v = headdim
 -    scheduler_metadata = torch.ops._vllm_fa3_C.get_scheduler_metadata(
-+    global _GET_SCHEDULER_METADATA_SUPPORTS_PREFILL_ACTIVE_WORKLIST
-+
++    page_resolver_kind = int(page_resolver_kind)
++    if page_resolver_kind not in (0, 4):
++        raise ValueError(
++            "scheduler metadata page_resolver_kind must be 0 (Native) or "
++            f"4 (ResolvedRowPtr); got {page_resolver_kind}"
++        )
 +    args = (
          batch_size, max_seqlen_q, max_seqlen_k, num_heads_q, num_heads_kv, headdim, headdim_v,
          qkv_dtype,
          cache_seqlens,
-@@ -129,6 +1384,32 @@ def get_scheduler_metadata(
+@@ -129,8 +1427,25 @@ def get_scheduler_metadata(
          pack_gqa,
          sm_margin,
      )
-+    if _GET_SCHEDULER_METADATA_SUPPORTS_PREFILL_ACTIVE_WORKLIST is False:
-+        if bool(prefill_active_worklist):
-+            raise RuntimeError(
-+                "prefill_active_worklist scheduler metadata requires a newer _vllm_fa3_C ABI"
-+            )
-+        scheduler_metadata = torch.ops._vllm_fa3_C.get_scheduler_metadata(*args)
-+    else:
-+        try:
-+            scheduler_metadata = torch.ops._vllm_fa3_C.get_scheduler_metadata(
-+                *args,
-+                bool(prefill_active_worklist),
-+            )
-+        except RuntimeError as exc:
-+            if (
-+                "get_scheduler_metadata() expected at most 23 argument(s) but received 24"
-+                not in str(exc)
-+            ):
-+                raise
-+            _GET_SCHEDULER_METADATA_SUPPORTS_PREFILL_ACTIVE_WORKLIST = False
-+            if bool(prefill_active_worklist):
-+                raise RuntimeError(
-+                    "prefill_active_worklist scheduler metadata requires a newer _vllm_fa3_C ABI"
-+                ) from exc
-+            scheduler_metadata = torch.ops._vllm_fa3_C.get_scheduler_metadata(*args)
-+        else:
-+            _GET_SCHEDULER_METADATA_SUPPORTS_PREFILL_ACTIVE_WORKLIST = True
+-
+-    return scheduler_metadata
++    argument_names = _get_scheduler_metadata_argument_names()
++    supports_prefill = "prefill_active_worklist" in argument_names
++    supports_page_resolver = "page_resolver_kind" in argument_names
++    if bool(prefill_active_worklist) and not supports_prefill:
++        raise RuntimeError(
++            "prefill_active_worklist scheduler metadata requires a newer "
++            "_vllm_fa3_C ABI"
++        )
++    if page_resolver_kind != 0 and not supports_page_resolver:
++        raise RuntimeError(
++            "ResolvedRowPtr scheduler metadata requires a newer "
++            "_vllm_fa3_C ABI with explicit page_resolver_kind"
++        )
++    call_args = list(args)
++    if supports_prefill:
++        call_args.append(bool(prefill_active_worklist))
++    if supports_page_resolver:
++        call_args.append(page_resolver_kind)
++    return torch.ops._vllm_fa3_C.get_scheduler_metadata(*call_args)
  
-     return scheduler_metadata
  
-@@ -276,7 +1557,7 @@ def flash_attn_varlen_func(
+ def flash_attn_varlen_func(
+@@ -276,7 +1591,7 @@ def flash_attn_varlen_func(
          )
      elif fa_version == 3:
          assert alibi_slopes is None, "Alibi is not supported in FA3"
@@ -8294,7 +8655,7 @@ index a61d0f9..7c7d012 100644
              q, k, v,
              None, None,       # k_new, v_new
              q_v,
-@@ -305,6 +1586,7 @@ def flash_attn_varlen_func(
+@@ -305,6 +1620,7 @@ def flash_attn_varlen_func(
              cp_rank,
              cp_tot_seqused_k,
          )

@@ -180,6 +180,10 @@ class Phase1CommandResult:
     stdout: str
     stderr: str
     timed_out: bool
+    # ``_run_command`` starts every child in a new session.  Retaining the
+    # session leader after wait() gives the TP8 teardown gate an exact owner
+    # boundary even when the leader exits before one of its workers.
+    child_session_id: int | None = None
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -692,6 +696,7 @@ def _run_command(
             stdout=stdout,
             stderr=stderr,
             timed_out=False,
+            child_session_id=int(proc.pid),
         )
     except subprocess.TimeoutExpired:
         _terminate_process_tree(proc, sig=signal.SIGTERM)
@@ -706,6 +711,7 @@ def _run_command(
             stdout=stdout,
             stderr=stderr,
             timed_out=True,
+            child_session_id=int(proc.pid),
         )
 
 

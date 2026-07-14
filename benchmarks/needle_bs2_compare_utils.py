@@ -14,21 +14,6 @@ from typing import Dict, List, Optional, Tuple
 _BOXED_TEXT_PATTERN = re.compile(r"\\boxed\{\\text\{([^{}]+)\}\}")
 _BOXED_PATTERN = re.compile(r"\\boxed\{([^{}]+)\}")
 _WORD_PATTERN = re.compile(r"\w+", re.UNICODE)
-_EQUIVALENT_ANSWER_KEY_SETS = (
-    frozenset(
-        {
-            "hungary",
-            "royal hungary",
-        }
-    ),
-    frozenset(
-        {
-            "university of california",
-            "university of california, san diego",
-            "university of california san diego",
-        }
-    ),
-)
 
 
 def _normalize_text(text: str) -> str:
@@ -49,14 +34,7 @@ def _answer_key(text: str) -> str:
 
 
 def _answer_keys_equivalent(left: str, right: str) -> bool:
-    left_key = _answer_key(left)
-    right_key = _answer_key(right)
-    if left_key == right_key:
-        return True
-    return any(
-        {left_key, right_key}.issubset(keys)
-        for keys in _EQUIVALENT_ANSWER_KEY_SETS
-    )
+    return _answer_key(left) == _answer_key(right)
 
 
 def _contains_answer_phrase(text: str, answer: str) -> bool:
@@ -68,7 +46,21 @@ def _contains_answer_phrase(text: str, answer: str) -> bool:
     if len(_WORD_PATTERN.findall(answer_key)) < 2:
         return _answer_key(text) == answer_key
     text_key = _answer_key(text)
-    return re.search(rf"(?<!\w){re.escape(answer_key)}(?!\w)", text_key) is not None
+    # A prose answer may precede the final answer with an explanation, but it
+    # must not extend the answer after the matched phrase.  This rejects a
+    # broad reference such as "University of California" against the more
+    # specific "University of California, San Diego" while still accepting
+    # "The answer is Royal Hungary.".  Only terminal punctuation/wrappers are
+    # ignored; trailing lexical content is never swallowed.
+    terminal_text_key = re.sub(
+        r'''(?:[.!?\u2026;:]+|["'\u201d\u2019)\]\}]+|\$+|`+)+$''',
+        "",
+        text_key,
+    ).rstrip()
+    return re.search(
+        rf"(?<!\w){re.escape(answer_key)}$",
+        terminal_text_key,
+    ) is not None
 
 
 def extract_boxed_answer(text: str) -> Optional[str]:
@@ -86,9 +78,7 @@ def semantic_match(ref_text: str, test_text: str) -> Tuple[bool, str, str, str]:
     test_boxed = extract_boxed_answer(test_text)
     if ref_boxed is not None and test_boxed is not None:
         return (
-            _answer_keys_equivalent(ref_boxed, test_boxed)
-            or _contains_answer_phrase(test_boxed, ref_boxed)
-            or _contains_answer_phrase(ref_boxed, test_boxed),
+            _answer_keys_equivalent(ref_boxed, test_boxed),
             "boxed_answer",
             ref_boxed,
             test_boxed,

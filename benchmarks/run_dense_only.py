@@ -7,6 +7,10 @@ import sys
 import time
 from pathlib import Path
 
+_REPO_IMPORT_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_IMPORT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_IMPORT_ROOT))
+
 try:
     from benchmarks.decode_latency_metrics import (
         decode_step_durations_us,
@@ -14,16 +18,34 @@ try:
         summarize_decode_metrics,
     )
     from benchmarks.decode_throughput_window import (
+        CUSTOM_ALL_REDUCE_RUNTIME_WORKER_EXTENSION,
+        CustomAllReduceDecision,
         DecodeWindowMeter,
+        EngineShutdownGuard,
+        collect_custom_all_reduce_runtime_proof,
+        collect_engine_core_block_pool_reservation_proof,
+        collect_engine_runtime_contract_proof,
+        benchmark_child_identity,
         count_new_tokens,
         pull_step_outputs_with_timing,
+        reset_cudagraph_runtime_observer,
+        resolve_custom_all_reduce_decision,
+        stop_cudagraph_runtime_observer,
+        summarize_cudagraph_runtime_observer,
     )
     from benchmarks.prompt_batch_io import (
         load_prompt_batch,
         maybe_apply_chat_template,
         output_payload_from_generation,
     )
-    from benchmarks.scheduler_contract import resolve_benchmark_max_num_seqs
+    from benchmarks.scheduler_contract import (
+        CHUNKED_PREFILL_MODES,
+        DEFAULT_MAX_SEQ_LEN_TO_CAPTURE,
+        resolve_benchmark_max_num_seqs,
+        scheduler_graph_engine_kwargs,
+        scheduler_graph_runtime_proof,
+        validate_scheduler_graph_args,
+    )
     from benchmarks.vllm_profiler_scope import (
         build_vllm_torch_profiler_config,
         maybe_start_vllm_torch_profile,
@@ -36,16 +58,34 @@ except ModuleNotFoundError:
         summarize_decode_metrics,
     )
     from decode_throughput_window import (  # type: ignore[no-redef]
+        CUSTOM_ALL_REDUCE_RUNTIME_WORKER_EXTENSION,
+        CustomAllReduceDecision,
         DecodeWindowMeter,
+        EngineShutdownGuard,
+        collect_custom_all_reduce_runtime_proof,
+        collect_engine_core_block_pool_reservation_proof,
+        collect_engine_runtime_contract_proof,
+        benchmark_child_identity,
         count_new_tokens,
         pull_step_outputs_with_timing,
+        reset_cudagraph_runtime_observer,
+        resolve_custom_all_reduce_decision,
+        stop_cudagraph_runtime_observer,
+        summarize_cudagraph_runtime_observer,
     )
     from prompt_batch_io import (  # type: ignore[no-redef]
         load_prompt_batch,
         maybe_apply_chat_template,
         output_payload_from_generation,
     )
-    from scheduler_contract import resolve_benchmark_max_num_seqs  # type: ignore[no-redef]
+    from scheduler_contract import (  # type: ignore[no-redef]
+        CHUNKED_PREFILL_MODES,
+        DEFAULT_MAX_SEQ_LEN_TO_CAPTURE,
+        resolve_benchmark_max_num_seqs,
+        scheduler_graph_engine_kwargs,
+        scheduler_graph_runtime_proof,
+        validate_scheduler_graph_args,
+    )
     from vllm_profiler_scope import (  # type: ignore[no-redef]
         build_vllm_torch_profiler_config,
         maybe_start_vllm_torch_profile,
@@ -120,18 +160,25 @@ def _full_cudagraph_compilation_config(
         config: dict[str, object] = {"cudagraph_mode": "FULL"}
     else:
         config = {"full_cuda_graph": True}
-
     if capture_sizes_raw:
-        sizes = [
-            int(x.strip())
-            for x in str(capture_sizes_raw).split(",")
-            if x.strip()
+        config["cudagraph_capture_sizes"] = [
+            int(value.strip())
+            for value in str(capture_sizes_raw).split(",")
+            if value.strip()
         ]
-        config["cudagraph_capture_sizes"] = sizes
     return config
 
 
-def _decode_run_config(args: argparse.Namespace, *, prompt_count: int) -> dict[str, object]:
+def _decode_run_config(
+    args: argparse.Namespace,
+    *,
+    prompt_count: int,
+    custom_all_reduce_decision: CustomAllReduceDecision,
+    custom_all_reduce_runtime_proof: dict[str, object],
+    engine_runtime_contract_proof: dict[str, object] | None = None,
+    engine_scheduling_proof: dict[str, object] | None = None,
+    child_identity: dict[str, object] | None = None,
+) -> dict[str, object]:
     return {
         "runner": "run_dense_only.py",
         "model": str(args.model),
@@ -154,6 +201,15 @@ def _decode_run_config(args: argparse.Namespace, *, prompt_count: int) -> dict[s
         "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
         "attention_backend": os.environ.get("VLLM_ATTENTION_BACKEND", ""),
         "flash_attn_version": os.environ.get("VLLM_FLASH_ATTN_VERSION", ""),
+        "benchmark_child_identity": (
+            dict(child_identity)
+            if isinstance(child_identity, dict)
+            else benchmark_child_identity(args)
+        ),
+        **(engine_scheduling_proof or {}),
+        **custom_all_reduce_decision.as_dict(),
+        **custom_all_reduce_runtime_proof,
+        **(engine_runtime_contract_proof or {}),
     }
 
 
@@ -173,7 +229,55 @@ def _effective_max_num_seqs(args: argparse.Namespace) -> int:
 
 
 def _scheduler_engine_kwargs(args: argparse.Namespace) -> dict[str, object]:
-    return {"max_num_seqs": _effective_max_num_seqs(args)}
+    return scheduler_graph_engine_kwargs(
+        args,
+        engine_args_accepts=_engine_args_accepts,
+    )
+
+
+def _requested_engine_scheduling_mode(args: argparse.Namespace) -> str:
+    mode = str(getattr(args, "scheduling_mode", "auto") or "auto")
+    if mode not in {"auto", "async", "sync"}:
+        raise RuntimeError(f"E_ENGINE_SCHEDULING_MODE: mode={mode!r}")
+    return mode
+
+
+def _engine_scheduling_kwargs(mode: str) -> dict[str, object]:
+    if mode == "auto":
+        return {}
+    if not _engine_args_accepts("async_scheduling"):
+        raise RuntimeError(
+            "E_ENGINE_SCHEDULING_UNSUPPORTED: explicit scheduling requires "
+            "EngineArgs.async_scheduling"
+        )
+    return {"async_scheduling": mode == "async"}
+
+
+def _engine_scheduling_runtime_proof(
+    engine: object,
+    *,
+    requested_mode: str,
+) -> dict[str, object]:
+    configured_async = None if requested_mode == "auto" else requested_mode == "async"
+    scheduler_config = getattr(engine, "llm_engine", None)
+    scheduler_config = getattr(scheduler_config, "vllm_config", None)
+    scheduler_config = getattr(scheduler_config, "scheduler_config", None)
+    effective_async = getattr(scheduler_config, "async_scheduling", None)
+    if type(effective_async) is not bool:
+        raise RuntimeError(
+            "E_ENGINE_SCHEDULING_PROOF_UNAVAILABLE: "
+            f"async_scheduling={effective_async!r}"
+        )
+    if configured_async is not None and effective_async is not configured_async:
+        raise RuntimeError(
+            "E_ENGINE_SCHEDULING_EFFECTIVE_MISMATCH: "
+            f"requested={requested_mode}:effective_async={effective_async!r}"
+        )
+    return {
+        "engine_scheduling_mode_requested": requested_mode,
+        "engine_async_scheduling_configured": configured_async,
+        "engine_async_scheduling_effective": effective_async,
+    }
 
 
 def _visible_gpus_all_have_nvlink() -> tuple[bool, str]:
@@ -238,6 +342,33 @@ def _visible_gpus_all_have_nvlink() -> tuple[bool, str]:
             pynvml.nvmlShutdown()
         except Exception:
             pass
+
+
+def _configure_dense_flash_attention(repo_root: Path) -> str:
+    """Select and install the dense FA backend before importing vLLM.
+
+    Worker processes inherit these values, while the explicit probe install
+    makes the parent runner independent of sitecustomize import timing.
+    """
+    requested_version = os.environ.get("VLLM_FLASH_ATTN_VERSION", "3")
+    if requested_version not in {"3", "4"}:
+        requested_version = "3"
+    os.environ["VLLM_ATTENTION_BACKEND"] = "FLASH_ATTN_VLLM_V1"
+    os.environ["VLLM_FLASH_ATTN_VERSION"] = requested_version
+    if requested_version == "4":
+        os.environ["VLLM_SPARSE_FA4_DENSE_GATEWAY"] = "1"
+    else:
+        os.environ.pop("VLLM_SPARSE_FA4_DENSE_GATEWAY", None)
+
+    from patches.fa3_native.install import install_vendored_flash_attn_probe_patch
+
+    summary = install_vendored_flash_attn_probe_patch(repo_root=repo_root)
+    if not bool(summary.get("applied")):
+        raise RuntimeError(
+            "E_DENSE_FLASH_ATTN_PROBE_NOT_APPLIED: "
+            f"version={requested_version!r} reason={summary.get('reason')!r}"
+        )
+    return requested_version
 
 
 def _install_dense_fa3_route_trace_probe() -> None:
@@ -377,17 +508,56 @@ def main() -> None:
         help="vLLM tensor_parallel_size (multi-GPU; pass matching --cuda-visible-devices).",
     )
     parser.add_argument(
+        "--scheduling-mode",
+        choices=("auto", "async", "sync"),
+        default="auto",
+        help=(
+            "Engine scheduling policy. Matched throughput runs pass async "
+            "explicitly so dense and sparse cannot diverge through defaults."
+        ),
+    )
+    parser.add_argument(
+        "--max-num-batched-tokens",
+        type=int,
+        default=0,
+        help="Explicit scheduler token budget (0 keeps the vLLM default).",
+    )
+    parser.add_argument(
+        "--kv-cache-memory-bytes",
+        type=int,
+        default=0,
+        help="Explicit per-rank KV cache allocation.",
+    )
+    parser.add_argument(
+        "--chunked-prefill",
+        choices=CHUNKED_PREFILL_MODES,
+        default="auto",
+        help="Explicit chunked-prefill policy for matched benchmark children.",
+    )
+    parser.add_argument(
         "--enable-custom-all-reduce",
         action="store_true",
         help=(
-            "Re-enable vLLM's custom all-reduce for TP>1 (NVLink boxes). Default "
-            "keeps it disabled: on PCIe-only topologies it crashes worker init "
-            "with 'custom_all_reduce.cuh ... invalid argument'."
+            "Force-enable vLLM's custom all-reduce for TP>1. The default "
+            "auto-probes NVLink and keeps it disabled on PCIe-only topologies, "
+            "where it can crash worker init."
         ),
     )
     parser.add_argument("--enforce-eager", action="store_true")
     parser.add_argument("--full-cuda-graph", action="store_true")
-    parser.add_argument("--max-seq-len-to-capture", type=int, default=16384)
+    parser.add_argument(
+        "--collect-cudagraph-runtime-proof",
+        action="store_true",
+        help=(
+            "Diagnostic-only: collect vLLM CUDAGraphStat in memory for the "
+            "measurement window. Timed speed children must leave this off."
+        ),
+    )
+    parser.add_argument(
+        "--max-seq-len-to-capture",
+        type=int,
+        default=DEFAULT_MAX_SEQ_LEN_TO_CAPTURE,
+    )
     parser.add_argument(
         "--cudagraph-capture-sizes",
         type=str,
@@ -398,29 +568,19 @@ def main() -> None:
     if int(args.batch_size) <= 0:
         parser.error("--batch-size must be > 0")
     try:
-        _effective_max_num_seqs(args)
+        validate_scheduler_graph_args(args)
     except ValueError as exc:
         parser.error(str(exc))
+    child_identity = benchmark_child_identity(args)
 
     repo_root = _setup_repo_imports()
+    # This must run before importing vLLM. The vendored probe changes the
+    # backend capability result consumed during FlashAttention construction.
+    requested_flash_attn_version = _configure_dense_flash_attention(repo_root)
     _install_transformers_register_shim()
-
     from vllm import LLM, SamplingParams  # pylint: disable=import-error
 
     _install_dense_fa3_route_trace_probe()
-
-    # Dense reference runs use the current FA3 route by default. Keep this
-    # explicit so stale shell env cannot reopen the retired Triton backend path,
-    # while allowing the SM100 parent runner to request FA4.
-    requested_flash_attn_version = os.environ.get("VLLM_FLASH_ATTN_VERSION", "3")
-    if requested_flash_attn_version not in {"3", "4"}:
-        requested_flash_attn_version = "3"
-    os.environ["VLLM_ATTENTION_BACKEND"] = "FLASH_ATTN_VLLM_V1"
-    os.environ["VLLM_FLASH_ATTN_VERSION"] = requested_flash_attn_version
-    if requested_flash_attn_version == "4":
-        os.environ["VLLM_SPARSE_FA4_DENSE_GATEWAY"] = "1"
-    else:
-        os.environ.pop("VLLM_SPARSE_FA4_DENSE_GATEWAY", None)
     _install_fa4_dense_fallback_gateway_if_requested()
 
     compilation_config = (
@@ -436,57 +596,113 @@ def main() -> None:
         "tensor_parallel_size": max(1, int(getattr(args, "tensor_parallel_size", 1) or 1)),
         "compilation_config": compilation_config,
         "disable_cascade_attn": bool(args.disable_cascade_attn),
+        "worker_extension_cls": CUSTOM_ALL_REDUCE_RUNTIME_WORKER_EXTENSION,
     }
+    if bool(args.collect_cudagraph_runtime_proof):
+        for field in ("cudagraph_metrics", "disable_log_stats"):
+            if not _engine_args_accepts(field):
+                raise RuntimeError(
+                    "E_CUDAGRAPH_RUNTIME_OBSERVER_UNSUPPORTED: " + field
+                )
+        engine_kwargs["cudagraph_metrics"] = True
+        engine_kwargs["disable_log_stats"] = False
     engine_kwargs.update(_scheduler_engine_kwargs(args))
-    if int(engine_kwargs["tensor_parallel_size"]) > 1 and (
-        os.environ.get("VLLM_SPARSE_FORCE_DISABLE_CUSTOM_AR", "") == "1"
-    ):
-        # [TP-CUSTOM-AR-ESCAPE] see run_sparse_only.py: operator override for
-        # boxes where custom AR + FULL cudagraph crashes despite NVLink probe
-        # OK. Mirrored on the dense side so A/B comparisons stay symmetric.
+    engine_scheduling_mode = _requested_engine_scheduling_mode(args)
+    engine_kwargs.update(_engine_scheduling_kwargs(engine_scheduling_mode))
+    custom_all_reduce_decision = resolve_custom_all_reduce_decision(
+        tensor_parallel_size=int(engine_kwargs["tensor_parallel_size"]),
+        force_disabled=(
+            os.environ.get("VLLM_SPARSE_FORCE_DISABLE_CUSTOM_AR", "") == "1"
+        ),
+        force_enabled=bool(getattr(args, "enable_custom_all_reduce", False)),
+        nvlink_probe=_visible_gpus_all_have_nvlink,
+    )
+    if custom_all_reduce_decision.effective == "disabled":
         engine_kwargs["disable_custom_all_reduce"] = True
+    if int(engine_kwargs["tensor_parallel_size"]) > 1:
         print(
-            "[run_dense_only] TP>1: custom all-reduce force-disabled via "
-            "VLLM_SPARSE_FORCE_DISABLE_CUSTOM_AR=1",
+            "[run_dense_only] TP>1: custom all-reduce "
+            f"effective={custom_all_reduce_decision.effective} "
+            f"requested={custom_all_reduce_decision.requested} "
+            f"reason={custom_all_reduce_decision.reason}",
             flush=True,
         )
-    elif int(engine_kwargs["tensor_parallel_size"]) > 1 and not bool(
-        getattr(args, "enable_custom_all_reduce", False)
-    ):
-        # [TP-CUSTOM-AR-PROBE] see run_sparse_only.py: enable custom all-reduce
-        # automatically on NVLink boxes, keep it disabled on PCIe-only ones.
-        _nvlink_ok, _nvlink_reason = _visible_gpus_all_have_nvlink()
-        if _nvlink_ok:
-            print(
-                "[run_dense_only] TP>1: %s; leaving vLLM custom all-reduce "
-                "enabled" % _nvlink_reason,
-                flush=True,
-            )
-        else:
-            engine_kwargs["disable_custom_all_reduce"] = True
-            print(
-                "[run_dense_only] TP>1: disabling vLLM custom all-reduce "
-                "(%s); pass --enable-custom-all-reduce to force it on"
-                % _nvlink_reason,
-                flush=True,
-            )
     if int(getattr(args, "max_model_len", 0) or 0) > 0:
         engine_kwargs["max_model_len"] = int(args.max_model_len)
-    # Shared-GPU workaround: fix KV cache size via env to skip vLLM memory profiling.
-    _kvb = os.environ.get("VLLM_KV_CACHE_MEMORY_BYTES")
-    if _kvb:
-        engine_kwargs["kv_cache_memory_bytes"] = int(_kvb)
     if _engine_args_accepts("attention_config"):
         engine_kwargs["attention_config"] = {
             "backend": "FLASH_ATTN",
             "flash_attn_version": int(requested_flash_attn_version),
         }
-    if _engine_args_accepts("max_seq_len_to_capture"):
-        engine_kwargs["max_seq_len_to_capture"] = int(args.max_seq_len_to_capture)
     profiler_config = build_vllm_torch_profiler_config(_engine_args_accepts)
     if profiler_config is not None:
         engine_kwargs["profiler_config"] = profiler_config
     engine = LLM(**engine_kwargs)
+    engine_shutdown = EngineShutdownGuard(engine)
+    engine_scheduling_proof = _engine_scheduling_runtime_proof(
+        engine,
+        requested_mode=engine_scheduling_mode,
+    )
+    engine_scheduling_proof.update(
+        scheduler_graph_runtime_proof(
+            engine,
+            args,
+            engine_args_accepts=_engine_args_accepts,
+        )
+    )
+    custom_all_reduce_runtime_proof = collect_custom_all_reduce_runtime_proof(
+        engine,
+        tensor_parallel_size=int(engine_kwargs["tensor_parallel_size"]),
+        decision=custom_all_reduce_decision,
+        required_num_tokens=int(args.batch_size),
+    )
+    exact_runtime_required = os.environ.get("SFI_RUNNER_TIER", "") == "tp8x64k"
+    context_tokens = int(os.environ.get("SFI_RUNNER_CONTEXT_TOKENS", "0") or 0)
+    expected_kv_bytes_per_token = int(
+        os.environ.get(
+            "SFI_RUNNER_KV_TOKEN_BYTES_PER_RANK_EFFECTIVE", "0"
+        )
+        or 0
+    )
+    if exact_runtime_required and (
+        context_tokens <= 0 or expected_kv_bytes_per_token <= 0
+    ):
+        raise RuntimeError(
+            "E_ENGINE_RUNTIME_CONTRACT_INPUT: exact runner KV/context identity missing"
+        )
+    engine_runtime_contract_proof = collect_engine_runtime_contract_proof(
+        engine,
+        tensor_parallel_size=int(engine_kwargs["tensor_parallel_size"]),
+        required_batch_size=int(args.batch_size),
+        required_tokens_per_request=(
+            context_tokens + int(args.max_new_tokens)
+            if exact_runtime_required
+            else 0
+        ),
+        compact_blocks_per_slot=0,
+        compact_generation_count=0,
+        expected_kv_bytes_per_token=expected_kv_bytes_per_token,
+        required=exact_runtime_required,
+    )
+    engine_runtime_contract_proof.update(
+        collect_engine_core_block_pool_reservation_proof(
+            engine,
+            engine_runtime_contract_proof=engine_runtime_contract_proof,
+            expected_compact_blocks_per_slot=0,
+            expected_compact_generation_count=0,
+            expected_batch_size=int(args.batch_size),
+            required=exact_runtime_required,
+        )
+    )
+    print(
+        "[run_dense_only] custom all-reduce worker-runtime proof "
+        f"active={custom_all_reduce_runtime_proof['custom_all_reduce_runtime_active_rank_count']}"
+        f"/{custom_all_reduce_runtime_proof['custom_all_reduce_runtime_rank_count']} "
+        f"configured={custom_all_reduce_decision.effective} "
+        f"required_payload_bytes="
+        f"{custom_all_reduce_runtime_proof['custom_all_reduce_runtime_required_payload_bytes']}",
+        flush=True,
+    )
     sp = SamplingParams(
         temperature=0.0,
         top_p=1.0,
@@ -621,9 +837,9 @@ def main() -> None:
                     first_emit_step_index = int(total_engine_steps)
                     first_emit_step_wall_s = float(step_wall_s)
                 out_tokens += step_new_tokens
-                decode_meter.observe(core_ts, step_new_tokens)
             elif first_emit_step_index < 0:
                 pre_first_emit_step_wall_s.append(float(step_wall_s))
+            decode_meter.observe(core_ts, step_new_tokens)
             total_engine_steps += 1
         t_total1 = time.perf_counter()
         decode_elapsed, decode_tokens, _decode_tps, decode_step_durations_s = decode_meter.finalize()
@@ -637,6 +853,10 @@ def main() -> None:
             "all_decode_tokens": int(ad_tokens),
             "all_decode_tok_per_s": float(ad_tps),
             "all_decode_steps": int(ad_steps),
+            **decode_meter.all_decode_contract(),
+            "_all_decode_start_step_index": (
+                decode_meter.all_decode_start_step_index
+            ),
             "process_pid": int(os.getpid()),
             "engine_core_step_log": str(
                 os.environ.get("VLLM_DECODE_ENGINE_CORE_STEP_LOG", "") or ""
@@ -690,6 +910,8 @@ def main() -> None:
     if bool(args.reset_prefix_cache):
         _reset_prefix_cache()
     if bool(args.measure_decode_latency):
+        if bool(args.collect_cudagraph_runtime_proof):
+            reset_cudagraph_runtime_observer(engine.llm_engine)
         profiling = maybe_start_vllm_torch_profile(engine)
         try:
             (
@@ -704,6 +926,23 @@ def main() -> None:
             ) = _generate_with_engine_step()
         finally:
             maybe_stop_vllm_torch_profile(engine, profiling)
+        if bool(args.collect_cudagraph_runtime_proof):
+            graph_records = stop_cudagraph_runtime_observer(engine.llm_engine)
+            all_decode_start_step_index = int(
+                boundary_diagnostics.pop("_all_decode_start_step_index", -1)
+            )
+            boundary_diagnostics.update(
+                summarize_cudagraph_runtime_observer(
+                    graph_records,
+                    all_decode_start_step_index=all_decode_start_step_index,
+                    expected_batch_size=int(args.batch_size),
+                    expected_total_engine_steps=int(
+                        boundary_diagnostics["total_engine_steps"]
+                    ),
+                )
+            )
+        else:
+            boundary_diagnostics.pop("_all_decode_start_step_index", None)
         tps = float(out_tokens) / elapsed if elapsed > 0 else float("nan")
         decode_tps = float(decode_tokens) / decode_elapsed if decode_elapsed > 0 else float("nan")
         decode_metrics = summarize_decode_metrics(
@@ -727,7 +966,17 @@ def main() -> None:
         )
         print(format_decode_metrics_line(decode_metrics), flush=True)
         if args.decode_metrics_json:
-            run_config = _decode_run_config(args, prompt_count=len(prompts))
+            run_config = _decode_run_config(
+                args,
+                prompt_count=len(prompts),
+                engine_scheduling_proof=engine_scheduling_proof,
+                custom_all_reduce_decision=custom_all_reduce_decision,
+                custom_all_reduce_runtime_proof=(
+                    custom_all_reduce_runtime_proof
+                ),
+                engine_runtime_contract_proof=engine_runtime_contract_proof,
+                child_identity=child_identity,
+            )
             metrics_payload = {
                 "elapsed_s": float(elapsed),
                 "process_pid": int(os.getpid()),
@@ -736,6 +985,9 @@ def main() -> None:
                 "max_new_tokens": run_config["max_new_tokens"],
                 "split_context_prompts": run_config["split_context_prompts"],
                 "respect_eos": run_config["respect_eos"],
+                **custom_all_reduce_decision.as_dict(),
+                **custom_all_reduce_runtime_proof,
+                **engine_runtime_contract_proof,
                 "run_config": run_config,
                 "out_tokens": int(out_tokens),
                 "tok_per_s": float(tps),
@@ -798,6 +1050,10 @@ def main() -> None:
                 json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True),
                 encoding="utf-8",
             )
+
+    # All arm artifacts are durable before teardown.  A failed shutdown must
+    # make this child non-green so a paired runner cannot start on stale workers.
+    engine_shutdown.close()
 
 
 if __name__ == "__main__":

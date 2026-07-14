@@ -259,9 +259,9 @@ def prepare_prefill_capture_payload_impl(
     if layout is None:
         raise RuntimeError("prefill capture plan set but capture layout missing")
     kv_needed = int(plan_max_kv)
-    # 性能关键：selector 的 Triton log_s 内部把 K 当作 tl.constexpr（静态展开），
-    # 若每步都传不同的 kv_needed，会导致 chunk0 频繁触发新的 K specialization 编译/缓存 miss。
-    # 可选用固定 K（layout.kv_max，已按 bucket 对齐）来减少编译抖动；多出的 padded 区间会被 bounds/mask 屏蔽。
+    # 性能关键：CUDA selector 的固定 K 让 graph/workspace 形态稳定，并使
+    # request-major cohort tape 的 request-local layer view 保持 contiguous。
+    # layout.kv_max 之外的 padding 只作为容量存在，row/token bounds 保证不可见。
     use_fixed_k = _selector_fixed_k_enabled()
     kv_slice = int(layout.kv_max) if use_fixed_k else int(kv_needed)
     capture_scores = layout.capture_scores[slot_in_chunk, : len(slot_list), :, :, :kv_slice]

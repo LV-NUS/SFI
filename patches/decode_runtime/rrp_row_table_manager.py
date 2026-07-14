@@ -125,6 +125,10 @@ class RrpUpdateResult:
     kind: RrpUpdateKind = RrpUpdateKind.HIT
     metadata_bind_required: bool = False
     update_kernel_count: int = 0
+    # Ownership receipt, deliberately separate from telemetry.  A graph-live
+    # write can be real even when its implementation does not report a kernel
+    # count (for example an incremental row-table publication).
+    graph_storage_mutated: bool = False
 
     @property
     def is_same_page_delta(self) -> bool:
@@ -141,9 +145,7 @@ def should_record_rrp_ready_event(
         return True
     if bool(metadata_bind_required):
         return True
-    if bool(update.full_bind) or bool(update.delta_rows):
-        return True
-    return int(update.update_kernel_count) > 0
+    return bool(update.graph_storage_mutated)
 
 
 class RrpRowTableManager:
@@ -215,6 +217,7 @@ class RrpRowTableManager:
                 full_bind=True,
                 kind=RrpUpdateKind.INITIAL_BIND,
                 metadata_bind_required=True,
+                graph_storage_mutated=True,
             )
 
         if signature != self._signature:
@@ -232,6 +235,7 @@ class RrpRowTableManager:
                 full_bind=True,
                 kind=RrpUpdateKind.SIGNATURE_CHANGED,
                 metadata_bind_required=True,
+                graph_storage_mutated=True,
             )
 
         previous_recent = self._recent_first_page_by_row or ()
@@ -263,10 +267,12 @@ class RrpRowTableManager:
                 delta_rows=delta_rows,
                 full_bind=False,
                 kind=RrpUpdateKind.PAGE_BOUNDARY_DELTA,
+                graph_storage_mutated=True,
             )
 
         if row_effective_k != self._row_effective_k_by_row:
-            update_kernel_count = self._seqused_update_kernel_count(arena)
+            graph_storage_mutated = self._seqused_device_mutation_submitted(arena)
+            update_kernel_count = int(graph_storage_mutated)
             if not self._try_increment_seqused_k(arena, row_effective_k):
                 self._write_seqused_k(
                     arena,
@@ -287,6 +293,7 @@ class RrpRowTableManager:
                 full_bind=False,
                 kind=RrpUpdateKind.SAME_PAGE_DELTA,
                 update_kernel_count=update_kernel_count,
+                graph_storage_mutated=graph_storage_mutated,
             )
 
         return RrpUpdateResult(
@@ -411,9 +418,10 @@ class RrpRowTableManager:
                 kind=RrpUpdateKind.HIT,
             )
         batch_target = self._arena_batch_seqused_write_target(arena)
-        update_kernel_count = self._seqused_update_kernel_count(
+        graph_storage_mutated = self._seqused_device_mutation_submitted(
             arena, batch_target
         )
+        update_kernel_count = int(graph_storage_mutated)
         if not self._try_increment_seqused_k(
             arena, row_effective_k, batch_target
         ):
@@ -426,6 +434,7 @@ class RrpRowTableManager:
             full_bind=False,
             kind=RrpUpdateKind.SAME_PAGE_DELTA,
             update_kernel_count=update_kernel_count,
+            graph_storage_mutated=graph_storage_mutated,
         )
 
     def update_from_descriptor_snapshot(
@@ -590,6 +599,7 @@ class RrpRowTableManager:
                 delta_rows=tuple(dirty_rows),
                 full_bind=False,
                 kind=RrpUpdateKind.PAGE_BOUNDARY_DELTA,
+                graph_storage_mutated=True,
             )
 
         update = self.try_apply_same_page_delta(arena, row_effective_k)
@@ -709,6 +719,7 @@ class RrpRowTableManager:
             delta_rows=tuple(dirty_rows),
             full_bind=False,
             kind=RrpUpdateKind.PAGE_BOUNDARY_DELTA,
+            graph_storage_mutated=bool(dirty_rows),
         )
 
 
@@ -860,18 +871,18 @@ class RrpRowTableManager:
         self._row_table_layout_by_row = row_table_layout
 
     @staticmethod
-    def _seqused_update_kernel_count(
+    def _seqused_device_mutation_submitted(
         arena: object,
         batch_target: torch.Tensor | None = None,
-    ) -> int:
+    ) -> bool:
         if batch_target is None:
             batch_target = RrpRowTableManager._arena_batch_seqused_write_target(arena)
         if isinstance(batch_target, torch.Tensor):
-            return 1 if batch_target.device.type == "cuda" else 0
+            return batch_target.device.type == "cuda"
         if RrpRowTableManager._uses_external_batch_seqused_source(arena):
-            return 0
+            return False
         seqused_k_i32 = getattr(arena, "seqused_k_i32")
-        return 1 if seqused_k_i32.device.type == "cuda" else 0
+        return seqused_k_i32.device.type == "cuda"
 
     @staticmethod
     def _arena_batch_seqused_write_target(arena: object) -> torch.Tensor | None:

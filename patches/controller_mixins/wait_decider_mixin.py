@@ -30,6 +30,7 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 import torch
 
 from patches.refresh_runtime.entry import run_refresh_step
+from patches.refresh_runtime import deferred_p0_shadow
 from patches.runtime_contracts import ExecutionBackendLedger
 from patches.sparse_constants import (
     _CAPTURE_CHUNK,
@@ -40,6 +41,14 @@ from patches.sparse_constants import (
 from patches.sparse_utils import _is_stream_capturing_or_raise
 
 _log = logging.getLogger(__name__)
+
+_DeferredProducerJobSnapshot = Tuple[Tuple[str, int, int, object], ...]
+_DeferredProducerLaunchIntent = Tuple[
+    int,
+    Tuple[str, ...],
+    bool,
+    _DeferredProducerJobSnapshot,
+]
 
 
 
@@ -151,6 +160,16 @@ class WaitDeciderMixin:
         self._one_shot_group_ready_compact_slots_cache_value: Tuple[int, ...] = (
             tuple()
         )
+        # Step-boundary code only stages immutable launch intents.  The sole
+        # execution owner is the post-model-forward hook, which atomically
+        # detaches and drains this queue after anchor kernels are submitted.
+        self._deferred_bootstrap_launch_intents: List[
+            _DeferredProducerLaunchIntent
+        ] = []
+        self._deferred_bootstrap_launch_intent_seen_epoch: int = -1
+        self._deferred_bootstrap_launch_intent_identities: Set[
+            Tuple[int, Tuple[str, ...], bool]
+        ] = set()
 
     # ------------------------------------------------------------------
     # Wait policy
@@ -369,6 +388,7 @@ class WaitDeciderMixin:
         *,
         tracking: object,
         job: object,
+        used_bridge_tokens: Optional[int] = None,
     ) -> int:
         payload_groups = tuple(getattr(job, "payload_groups", tuple()) or tuple())
         total_groups = len(payload_groups)
@@ -380,7 +400,12 @@ class WaitDeciderMixin:
             getattr(job, "bridge_max_tokens", getattr(tracking, "bridge_max_tokens", 0))
             or 0
         )
-        used_bridge_tokens = int(getattr(tracking, "bridge_token_count", 0) or 0)
+        if used_bridge_tokens is None:
+            used_bridge_tokens = int(
+                getattr(tracking, "bridge_token_count", 0) or 0
+            )
+        else:
+            used_bridge_tokens = int(used_bridge_tokens)
         remaining_bridge_steps = max(1, int(bridge_max_tokens) - int(used_bridge_tokens))
         return max(
             1,
@@ -391,9 +416,18 @@ class WaitDeciderMixin:
             ),
         )
 
-    def _adaptive_deferred_producer_groups_per_step(self) -> int:
+    def _adaptive_deferred_producer_groups_per_step(
+        self,
+        *,
+        bridge_token_count_by_request: Optional[Dict[str, int]] = None,
+    ) -> int:
         budget = 0
         for rid, tracking in list(self.request_states.items()):
+            if (
+                bridge_token_count_by_request is not None
+                and str(rid) not in bridge_token_count_by_request
+            ):
+                continue
             job = getattr(tracking, "deferred_producer_job", None)
             if job is None or bool(getattr(job, "completed", False)):
                 continue
@@ -407,6 +441,11 @@ class WaitDeciderMixin:
                     self._adaptive_deferred_producer_group_budget(
                         tracking=tracking,
                         job=job,
+                        used_bridge_tokens=(
+                            bridge_token_count_by_request.get(str(rid))
+                            if bridge_token_count_by_request is not None
+                            else None
+                        ),
                     )
                 ),
             )
@@ -418,6 +457,7 @@ class WaitDeciderMixin:
         tracking: object,
         job: object,
         requested_groups: int,
+        used_bridge_tokens: Optional[int] = None,
     ) -> int:
         payload_groups = tuple(getattr(job, "payload_groups", tuple()) or tuple())
         total_groups = len(payload_groups)
@@ -434,7 +474,12 @@ class WaitDeciderMixin:
             getattr(job, "bridge_max_tokens", getattr(tracking, "bridge_max_tokens", 0))
             or 0
         )
-        used_bridge_tokens = int(getattr(tracking, "bridge_token_count", 0) or 0)
+        if used_bridge_tokens is None:
+            used_bridge_tokens = int(
+                getattr(tracking, "bridge_token_count", 0) or 0
+            )
+        else:
+            used_bridge_tokens = int(used_bridge_tokens)
         if bridge_max_tokens > 1 and used_bridge_tokens < bridge_max_tokens - 1:
             # Keep the final publish event hidden until bridge positions are stable.
             requested = min(requested, max(0, remaining_groups - 1))
@@ -539,30 +584,214 @@ class WaitDeciderMixin:
         )
         return bool(completed)
 
-    def _launch_deferred_bootstrap_producer_jobs(
+    def _stage_deferred_bootstrap_producer_jobs(
         self,
         *,
         epoch: int,
         only_request_ids: Tuple[str, ...] = (),
         allow_same_epoch: bool = False,
     ) -> int:
+        """Stage one deterministic post-forward producer launch intent.
+
+        The bridge-token snapshot preserves the exact budget decision that the
+        former inline call observed.  Intent identity intentionally excludes
+        that snapshot: identical same-step prepare reentry is idempotent and
+        must not submit another producer group.
+        """
+        ep = int(epoch)
+        only_ids = tuple(dict.fromkeys(str(rid) for rid in only_request_ids))
+        identity = (ep, only_ids, bool(allow_same_epoch))
+        intents_obj = getattr(self, "_deferred_bootstrap_launch_intents", None)
+        if intents_obj is None:
+            intents_obj = []
+            self._deferred_bootstrap_launch_intents = intents_obj
+        if not isinstance(intents_obj, list):
+            raise RuntimeError("deferred producer launch intent queue is invalid")
+        for existing in intents_obj:
+            if int(existing[0]) != ep:
+                raise RuntimeError(
+                    "deferred producer launch intent epoch drift: "
+                    f"staged={int(existing[0])} current={ep}"
+                )
+        seen_epoch = int(
+            getattr(self, "_deferred_bootstrap_launch_intent_seen_epoch", -1)
+        )
+        seen_identities = getattr(
+            self,
+            "_deferred_bootstrap_launch_intent_identities",
+            None,
+        )
+        if seen_epoch != ep:
+            seen_identities = set()
+            self._deferred_bootstrap_launch_intent_seen_epoch = ep
+            self._deferred_bootstrap_launch_intent_identities = seen_identities
+        if not isinstance(seen_identities, set):
+            raise RuntimeError("deferred producer launch intent identity set is invalid")
+        if identity in seen_identities:
+            return 0
+        job_snapshot = tuple(
+            (
+                str(rid),
+                int(getattr(tracking, "bridge_token_count", 0) or 0),
+                int(getattr(job, "producer_job_epoch", -1)),
+                job,
+            )
+            for rid, tracking in self.request_states.items()
+            if (job := getattr(tracking, "deferred_producer_job", None)) is not None
+        )
+        intents_obj.append(
+            (ep, only_ids, bool(allow_same_epoch), job_snapshot)
+        )
+        seen_identities.add(identity)
+        return 1
+
+    def _fail_deferred_bootstrap_launch_intents(
+        self,
+        intents: Sequence[_DeferredProducerLaunchIntent],
+        *,
+        reason: str,
+    ) -> None:
+        """Retire staged work terminally; never replay it on another forward."""
+        for intent in tuple(intents):
+            ep = int(intent[0])
+            only_ids = set(str(rid) for rid in tuple(intent[1]))
+            for rid, _, job_epoch, staged_job in tuple(intent[3]):
+                if only_ids and str(rid) not in only_ids:
+                    continue
+                if bool(getattr(staged_job, "completed", False)):
+                    continue
+                if int(job_epoch) >= ep:
+                    continue
+                if not str(getattr(staged_job, "failure_reason", "") or ""):
+                    setattr(staged_job, "failure_reason", str(reason))
+
+    def _discard_staged_deferred_bootstrap_producer_jobs(
+        self,
+        *,
+        reason: str,
+    ) -> int:
+        intents = tuple(
+            getattr(self, "_deferred_bootstrap_launch_intents", tuple()) or tuple()
+        )
+        self._deferred_bootstrap_launch_intents = []
+        if intents:
+            self._fail_deferred_bootstrap_launch_intents(
+                intents,
+                reason=str(reason),
+            )
+        return len(intents)
+
+    def _drain_staged_deferred_bootstrap_producer_jobs(
+        self,
+        *,
+        epoch: int,
+    ) -> int:
+        """Atomically detach and execute this forward's staged launch intents."""
+        ep = int(epoch)
+        intents = tuple(
+            getattr(self, "_deferred_bootstrap_launch_intents", tuple()) or tuple()
+        )
+        self._deferred_bootstrap_launch_intents = []
+        if not intents:
+            return 0
+        drifted = tuple(intent for intent in intents if int(intent[0]) != ep)
+        if drifted:
+            reason = (
+                "deferred producer post-forward drain epoch drift: "
+                f"staged={tuple(int(intent[0]) for intent in intents)!r} current={ep}"
+            )
+            self._fail_deferred_bootstrap_launch_intents(intents, reason=reason)
+            raise RuntimeError(reason)
+        launched = 0
+        try:
+            for intent_epoch, only_ids, allow_same, job_snapshot in intents:
+                launched += self._launch_deferred_bootstrap_producer_jobs(
+                    epoch=int(intent_epoch),
+                    only_request_ids=tuple(only_ids),
+                    allow_same_epoch=bool(allow_same),
+                    deferred_job_snapshot=tuple(job_snapshot),
+                    enforce_staged_job_snapshot=True,
+                )
+        except Exception as exc:
+            self._fail_deferred_bootstrap_launch_intents(
+                intents,
+                reason=f"deferred producer post-forward drain failed: {exc}",
+            )
+            raise
+        return int(launched)
+
+    def _launch_deferred_bootstrap_producer_jobs(
+        self,
+        *,
+        epoch: int,
+        only_request_ids: Tuple[str, ...] = (),
+        allow_same_epoch: bool = False,
+        deferred_job_snapshot: _DeferredProducerJobSnapshot = (),
+        enforce_staged_job_snapshot: bool = False,
+    ) -> int:
         launched = 0
         only_ids = {str(rid) for rid in tuple(only_request_ids or tuple())}
+        staged_job_by_request = (
+            {
+                str(rid): (int(count), int(job_epoch), staged_job)
+                for rid, count, job_epoch, staged_job in deferred_job_snapshot
+            }
+            if enforce_staged_job_snapshot
+            else None
+        )
+        bridge_token_count_by_request = (
+            {
+                rid: int(snapshot[0])
+                for rid, snapshot in staged_job_by_request.items()
+            }
+            if staged_job_by_request is not None
+            else None
+        )
         groups_per_step = self._deferred_producer_groups_per_step()
         adaptive_budget = int(groups_per_step) < 0
         remaining_group_budget = (
-            self._adaptive_deferred_producer_groups_per_step()
+            self._adaptive_deferred_producer_groups_per_step(
+                bridge_token_count_by_request=bridge_token_count_by_request,
+            )
             if adaptive_budget
             else int(groups_per_step)
         )
+        shadow_token = None
+        if deferred_p0_shadow.DEFERRED_P0_SHADOW_ENABLED:
+            shadow_token = deferred_p0_shadow.begin_deferred_submit_shadow(
+                self,
+                epoch=int(epoch),
+                only_request_ids=tuple(only_request_ids or tuple()),
+                allow_same_epoch=bool(allow_same_epoch),
+                groups_per_step=int(groups_per_step),
+                remaining_group_budget=int(remaining_group_budget),
+            )
         for rid, tracking in list(self.request_states.items()):
             if (adaptive_budget or groups_per_step > 0) and remaining_group_budget <= 0:
                 break
             if only_ids and str(rid) not in only_ids:
                 continue
+            if (
+                staged_job_by_request is not None
+                and str(rid) not in staged_job_by_request
+            ):
+                continue
             job = getattr(tracking, "deferred_producer_job", None)
             if job is None:
                 continue
+            if staged_job_by_request is not None:
+                _, staged_job_epoch, staged_job = staged_job_by_request[str(rid)]
+                if (
+                    job is not staged_job
+                    or int(getattr(job, "producer_job_epoch", -1))
+                    != int(staged_job_epoch)
+                ):
+                    raise RuntimeError(
+                        "deferred producer staged job identity drift: "
+                        f"request_id={str(rid)!r} "
+                        f"staged_epoch={int(staged_job_epoch)} "
+                        f"current_epoch={int(getattr(job, 'producer_job_epoch', -1))}"
+                    )
             if bool(getattr(job, "completed", False)):
                 continue
             if (
@@ -594,25 +823,41 @@ class WaitDeciderMixin:
                 tracking=tracking,
                 job=job,
                 requested_groups=int(requested_group_budget),
+                used_bridge_tokens=(
+                    bridge_token_count_by_request.get(str(rid))
+                    if bridge_token_count_by_request is not None
+                    else None
+                ),
             )
             if safe_group_budget <= 0:
                 continue
-            self._run_and_record_deferred_bootstrap_producer_job(
+            launch_group_budget = (
+                int(safe_group_budget)
+                if (
+                    adaptive_budget
+                    or groups_per_step > 0
+                    or int(safe_group_budget) < int(remaining_groups)
+                )
+                else 0
+            )
+            completed = self._run_and_record_deferred_bootstrap_producer_job(
                 rid=str(rid),
                 tracking=tracking,
                 job=job,
                 epoch=int(epoch),
-                max_groups_per_call=(
-                    int(safe_group_budget)
-                    if (
-                        adaptive_budget
-                        or groups_per_step > 0
-                        or int(safe_group_budget) < int(remaining_groups)
-                    )
-                    else 0
-                ),
+                max_groups_per_call=int(launch_group_budget),
             )
             after_group_index = int(getattr(job, "next_payload_group_index", 0) or 0)
+            if shadow_token is not None:
+                deferred_p0_shadow.record_deferred_actual_submit(
+                    shadow_token,
+                    request_id=str(rid),
+                    job=job,
+                    before_group_index=int(before_group_index),
+                    after_group_index=int(after_group_index),
+                    max_groups_per_call=int(launch_group_budget),
+                    completed=bool(completed),
+                )
             if adaptive_budget or groups_per_step > 0:
                 submitted_groups = max(0, int(after_group_index) - int(before_group_index))
                 remaining_group_budget -= int(submitted_groups)
@@ -620,6 +865,8 @@ class WaitDeciderMixin:
                 getattr(job, "completed", False)
             ):
                 launched += 1
+        if shadow_token is not None:
+            deferred_p0_shadow.finish_deferred_submit_shadow(self, shadow_token)
         return launched
 
     def _bootstrap_pending_requires_global_wait(self) -> bool:
@@ -1718,5 +1965,3 @@ class WaitDeciderMixin:
 
 
     # ------------------------------------------------------------------
-
-
