@@ -39,7 +39,10 @@ from benchmarks.scheduler_contract import (
     SCHEDULER_GRAPH_CONTRACT_SCHEMA,
     SCHEDULER_GRAPH_RUNTIME_FIELDS,
 )
-from benchmarks.sm80_run_pair import build_config_digest
+from benchmarks.sm80_run_pair import (
+    VERDICT_ONLY_SPEED_PROOF_ENV_BINDINGS,
+    build_config_digest,
+)
 from scripts.check_tp8_arm_teardown import (
     ATTRIBUTION_SCOPE as TP8_ATTRIBUTION_SCOPE,
     arm_token_sha256,
@@ -2674,7 +2677,7 @@ def _harness_condition_reasons(
                         f"actual={provenance.get(field)!r}:expected={expected!r}"
                     )
         if provenance.get("runner_corpus_token_status") not in {
-            "cache_v2_exact",
+            "cache_exact",
             "generated_exact",
             "validated_exact",
         }:
@@ -2738,17 +2741,31 @@ def _harness_condition_reasons(
         reasons.append("speed_child_timed_out_or_missing")
     if summary.get("speed_child_fatal_error_detected") is not False:
         reasons.append("speed_child_fatal_error_detected")
-    speed_observer_env = summary.get("speed_trace_profile_env")
-    if not isinstance(speed_observer_env, dict):
-        reasons.append("speed_observer_env_missing_or_invalid")
-    elif speed_observer_env:
-        reasons.append("speed_observer_env_nonempty")
-    if summary.get("speed_trace_profile_env_empty") is not True:
-        reasons.append("speed_observer_env_not_proven_empty")
-
     verdict_only = summary.get("verdict_only") if mode == "sparse" else False
     if mode == "sparse" and verdict_only is not True and verdict_only is not False:
         reasons.append("verdict_only_state_missing_or_invalid")
+    speed_observer_env = summary.get("speed_trace_profile_env")
+    if verdict_only is True:
+        expected_speed_observer_env: dict[str, object] = {}
+        for env_key, summary_field in VERDICT_ONLY_SPEED_PROOF_ENV_BINDINGS:
+            proof_path = summary.get(summary_field)
+            if type(proof_path) is not str or not proof_path.strip():
+                reasons.append(
+                    "verdict_only_speed_observer_path_missing_or_invalid:"
+                    f"{summary_field}"
+                )
+            expected_speed_observer_env[env_key] = proof_path
+        if speed_observer_env != expected_speed_observer_env:
+            reasons.append("verdict_only_speed_observer_env_mismatch")
+        if summary.get("speed_trace_profile_env_empty") is not False:
+            reasons.append("verdict_only_speed_observer_env_empty_state_invalid")
+    else:
+        if not isinstance(speed_observer_env, dict):
+            reasons.append("speed_observer_env_missing_or_invalid")
+        elif speed_observer_env:
+            reasons.append("speed_observer_env_nonempty")
+        if summary.get("speed_trace_profile_env_empty") is not True:
+            reasons.append("speed_observer_env_not_proven_empty")
     diagnostic_fields_present = bool(
         "diagnostic_returncode" in summary or "diagnostic_timed_out" in summary
     )

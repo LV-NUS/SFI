@@ -878,7 +878,7 @@ else
     echo "FAIL: context corpus cache returned no readable path" >&2
     exit 66
   fi
-  SFI_RUNNER_CORPUS_TOKEN_STATUS="cache_v2_exact"
+  SFI_RUNNER_CORPUS_TOKEN_STATUS="cache_exact"
 fi
 export SFI_RUNNER_CORPUS_TOKEN_STATUS
 CORPUS_SHA256="$({

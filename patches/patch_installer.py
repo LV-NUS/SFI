@@ -4371,8 +4371,10 @@ def _prebuild_capture_buffers(runner, controller) -> None:
 
     # producer_rows_worst = the live scratch dim-1 (= len(producer_rows_cpu), the number
     # of prefill-capture rows in one forward) that the prebuilt slab must byte-match.
-    # The auto-early DEFER path is prefill-only (refresh_layout-is-None gate) so decode
-    # rows never appear here. Size against max_num_seqs -- the REAL forward-batch
+    # The legacy auto-early DEFER path is prefill-only. A stamped chunk cohort
+    # activates later at the semantic-work boundary and may own mixed layouts;
+    # max_num_seqs therefore remains the real worst-case row concurrency cap.
+    # Size against max_num_seqs -- the REAL forward-batch
     # concurrency cap: vLLM v1 0.19 sets max_num_running_reqs = max_num_seqs
     # (sched/scheduler.py:105) and does NOT consult max_num_partial_prefills in the
     # scheduling loop, so up to max_num_seqs prefills can share ONE forward -> live
@@ -12983,6 +12985,9 @@ def _run_capture_only_mixed_forward(
         getattr(step_ctx, "step_handle_generation", -1)
     )
     capture_epoch = int(getattr(step_authority, "epoch", -1))
+    capture_step_identity_token = int(
+        getattr(step_ctx, "step_identity_token", 0)
+    )
     prefill_layout = None
     prefill_slot_list = sorted(int(slot) for slot in prefill_slot_set)
     if prefill_slot_list:
@@ -13143,32 +13148,17 @@ def _run_capture_only_mixed_forward(
         ensure_refresh_stream(torch.device(query.device))
         return getattr(controller, "refresh_stream", None) is not None
 
-    auto_early_capture_postprocess_requested = _auto_early_capture_postprocess_requested()
+    # CHUNK_COHORT is an immutable structural plan, not a legacy last_n/layout
+    # heuristic.  Its execution owner is selected once after semantic work is
+    # known; do not let the old prefill-only auto gate infer it independently.
+    auto_early_capture_postprocess_requested = (
+        False
+        if _capture_ownership_mode_value == CHUNK_COHORT
+        else _auto_early_capture_postprocess_requested()
+    )
     if auto_early_capture_postprocess_requested:
         defer_capture_postprocess_requested = True
         early_capture_postprocess_requested = True
-    if _capture_ownership_mode_value == CHUNK_COHORT and not (
-        defer_capture_postprocess_requested
-        and early_capture_postprocess_requested
-    ):
-        raise RuntimeError(
-            "E_SFI_CAPTURE_COHORT_OWNER: stamped chunk cohort requires the "
-            "deferred early owner on every live capture step"
-        )
-    # Every reusable scratch owner (the per-G ring or chunk cohort) publishes reduce
-    # completion through the same RingWarFence. Pure defer and the legacy async arm
-    # have no such publication, so reject them before they can consume a reused slot.
-    if _capture_ring_fence_active and (
-        (defer_capture_postprocess_requested and not early_capture_postprocess_requested)
-        or async_capture_postprocess_requested
-    ):
-        raise RuntimeError(
-            "capture scratch reuse requires the early-reduce fence: "
-            "pure-defer (VLLM_SPARSE_DEFER_CAPTURE_POSTPROCESS=1 without "
-            "VLLM_SPARSE_EARLY_CAPTURE_POSTPROCESS=1) and VLLM_SPARSE_ASYNC_CAPTURE_"
-            "POSTPROCESS modes read reusable scratch without a WAR fence event; "
-            "enable EARLY=1 or use a ring_early ownership plan"
-        )
     # 262k OOM fix (last_n bucketing; symmetric with the EDIT-1 kv_max force-form):
     # round the DEFER capture-scratch last_n dim UP to the configured
     # prefill_last_n_query bucket so scratch_storage_shape[-2] is INVARIANT and the
@@ -13502,6 +13492,23 @@ def _run_capture_only_mixed_forward(
         )
 
     capture_postprocess_required = bool(_capture_postprocess_required())
+    # A stamped cohort owns postprocess jobs, not every attention call carrying
+    # a capture route bit. Chunked prefill legitimately emits metadata-not-ready
+    # calls (last_n==0) and direct last-n=1 calls with no postprocess work; those
+    # calls must create neither a deferred job nor a completion event. Conversely,
+    # a mixed prefill/refresh call with real scratch work must keep the immutable
+    # cohort owner even though the legacy prefill-only auto gate is ineligible.
+    # Resolve that distinction once from the semantic work predicate. This adds
+    # no CUDA work and is outside the steady decode path.
+    if (
+        _capture_ownership_mode_value == CHUNK_COHORT
+        and capture_postprocess_required
+        and not defer_capture_postprocess_requested
+        and not early_capture_postprocess_requested
+        and not async_capture_postprocess_requested
+    ):
+        defer_capture_postprocess_requested = True
+        early_capture_postprocess_requested = True
 
     def _run_capture_postprocess() -> bool:
         return run_prefill_capture_postprocess_if_needed(
@@ -13568,7 +13575,10 @@ def _run_capture_only_mixed_forward(
             return False
         if not capture_postprocess_required:
             return False
-        if refresh_layout is not None:
+        if (
+            refresh_layout is not None
+            and _capture_ownership_mode_value != CHUNK_COHORT
+        ):
             return False
         if not bool(getattr(getattr(controller, "config", None), "one_shot_bootstrap_only", False)):
             return False
@@ -13596,9 +13606,156 @@ def _run_capture_only_mixed_forward(
         ensure_refresh_stream(torch.device(query.device))
         return getattr(controller, "refresh_stream", None) is not None
 
-    if not capture_postprocess_required:
+    def _early_capture_postprocess_stream_available() -> bool:
+        async_refresh_enabled = getattr(controller, "_async_refresh_enabled", None)
+        if not callable(async_refresh_enabled) or not bool(async_refresh_enabled()):
+            return False
+        ensure_refresh_stream = getattr(controller, "_ensure_refresh_stream", None)
+        if not callable(ensure_refresh_stream):
+            return False
+        ensure_refresh_stream(torch.device(query.device))
+        return getattr(controller, "refresh_stream", None) is not None
+
+    _POSTPROCESS_OWNER_NONE = "none"
+    _POSTPROCESS_OWNER_DEFERRED_EARLY = "deferred_early"
+    _POSTPROCESS_OWNER_DEFERRED_LATE = "deferred_late"
+    _POSTPROCESS_OWNER_ASYNC = "async"
+    _POSTPROCESS_OWNER_INLINE = "inline"
+    _POSTPROCESS_OWNER_CHUNK_COHORT_EARLY = "chunk_cohort_early"
+
+    def _resolve_capture_postprocess_execution_owner() -> str:
+        """Freeze one postprocess owner; stamped cohorts never fall back."""
+        binding = getattr(
+            controller,
+            "_capture_postprocess_step_owner_binding",
+            None,
+        )
+        binding_identity_valid = bool(
+            capture_handle_id >= 0
+            and capture_handle_generation >= 0
+            and capture_epoch >= 0
+        )
+        binding_is_valid = bool(
+            isinstance(binding, tuple) and len(binding) == 7
+        )
+        if binding is not None and not binding_is_valid:
+            raise RuntimeError(
+                "E_SFI_CAPTURE_STEP_OWNER_DRIFT: invalid step owner binding"
+            )
+        binding_matches_logical_step = bool(
+            binding_identity_valid
+            and binding_is_valid
+            and int(binding[0]) == capture_handle_id
+            and int(binding[1]) == capture_handle_generation
+            and int(binding[2]) == capture_epoch
+            and int(binding[3]) == capture_step_identity_token
+        )
+        if binding_matches_logical_step:
+            if (
+                str(binding[4]) != _capture_ownership_mode_value
+                or str(binding[5]) != _capture_ownership_plan_signature
+            ):
+                raise RuntimeError(
+                    "E_SFI_CAPTURE_STEP_OWNER_DRIFT: ownership plan changed "
+                    "within one logical capture step"
+                )
+            bound_owner = str(binding[6])
+            bound_has_work = bound_owner != _POSTPROCESS_OWNER_NONE
+            if bound_has_work != bool(capture_postprocess_required):
+                raise RuntimeError(
+                    "E_SFI_CAPTURE_STEP_OWNER_DRIFT: postprocess semantic work "
+                    "changed across layers in one immutable capture step"
+                )
+            return bound_owner
+
+        def _bind_owner(resolved_owner: str) -> str:
+            if binding_identity_valid:
+                setattr(
+                    controller,
+                    "_capture_postprocess_step_owner_binding",
+                    (
+                        capture_handle_id,
+                        capture_handle_generation,
+                        capture_epoch,
+                        capture_step_identity_token,
+                        _capture_ownership_mode_value,
+                        _capture_ownership_plan_signature,
+                        resolved_owner,
+                    ),
+                )
+            return resolved_owner
+
+        if not capture_postprocess_required:
+            return _bind_owner(_POSTPROCESS_OWNER_NONE)
+
+        if _capture_ownership_mode_value == CHUNK_COHORT:
+            if not binding_identity_valid:
+                raise RuntimeError(
+                    "E_SFI_CAPTURE_COHORT_OWNER_UNAVAILABLE: stamped chunk "
+                    "cohort requires a valid logical step identity"
+                )
+            if (
+                not defer_capture_postprocess_requested
+                or not early_capture_postprocess_requested
+                or async_capture_postprocess_requested
+            ):
+                raise RuntimeError(
+                    "E_SFI_CAPTURE_COHORT_OWNER: stamped chunk cohort requires "
+                    "the deferred early owner for every live postprocess job"
+                )
+            if not _defer_capture_postprocess_available():
+                raise RuntimeError(
+                    "E_SFI_CAPTURE_COHORT_OWNER_UNAVAILABLE: stamped chunk "
+                    "cohort cannot execute its deferred early owner"
+                )
+            if getattr(controller, "refresh_stream", None) is None:
+                raise RuntimeError(
+                    "E_SFI_CAPTURE_COHORT_OWNER_UNAVAILABLE: stamped chunk "
+                    "cohort requires a pre-established refresh_stream"
+                )
+            return _bind_owner(_POSTPROCESS_OWNER_CHUNK_COHORT_EARLY)
+
+        # Every reusable scratch owner publishes reduce completion through the
+        # RingWarFence. Validate only live scratch work: no-work/direct steps
+        # must not be rejected by a structural plan they do not execute.
+        if _capture_ring_fence_active and (
+            (defer_capture_postprocess_requested and not early_capture_postprocess_requested)
+            or async_capture_postprocess_requested
+        ):
+            raise RuntimeError(
+                "capture scratch reuse requires the early-reduce fence: "
+                "pure-defer (VLLM_SPARSE_DEFER_CAPTURE_POSTPROCESS=1 without "
+                "VLLM_SPARSE_EARLY_CAPTURE_POSTPROCESS=1) and VLLM_SPARSE_ASYNC_CAPTURE_"
+                "POSTPROCESS modes read reusable scratch without a WAR fence event; "
+                "enable EARLY=1 or use a ring_early ownership plan"
+            )
+        if _defer_capture_postprocess_available():
+            if early_capture_postprocess_requested:
+                if not _early_capture_postprocess_stream_available():
+                    raise RuntimeError(
+                        "E_SFI_CAPTURE_POSTPROCESS_OWNER_UNAVAILABLE: deferred "
+                        "early owner requires async refresh_stream"
+                    )
+                return _bind_owner(_POSTPROCESS_OWNER_DEFERRED_EARLY)
+            return _bind_owner(_POSTPROCESS_OWNER_DEFERRED_LATE)
+        if _async_capture_postprocess_available():
+            return _bind_owner(_POSTPROCESS_OWNER_ASYNC)
+        return _bind_owner(_POSTPROCESS_OWNER_INLINE)
+
+    capture_postprocess_execution_owner = (
+        _resolve_capture_postprocess_execution_owner()
+    )
+
+    if capture_postprocess_execution_owner == _POSTPROCESS_OWNER_NONE:
         postprocess_ran = False
-    elif _defer_capture_postprocess_available():
+    elif (
+        capture_postprocess_execution_owner
+        == _POSTPROCESS_OWNER_DEFERRED_EARLY
+        or capture_postprocess_execution_owner
+        == _POSTPROCESS_OWNER_DEFERRED_LATE
+        or capture_postprocess_execution_owner
+        == _POSTPROCESS_OWNER_CHUNK_COHORT_EARLY
+    ):
         ready_event = torch.cuda.Event(enable_timing=False)
         ready_event.record(torch.cuda.current_stream(device=query.device))
         capture_postprocess_job = CapturePostprocessJob(
@@ -13671,25 +13828,21 @@ def _run_capture_only_mixed_forward(
             lifecycle_lock=threading.Lock(),
         )
         postprocess_ran = False
-        if early_capture_postprocess_requested:
-            async_refresh_enabled = getattr(controller, "_async_refresh_enabled", None)
-            ensure_refresh_stream = getattr(controller, "_ensure_refresh_stream", None)
-            if not callable(async_refresh_enabled) or not bool(async_refresh_enabled()):
-                raise RuntimeError(
-                    "VLLM_SPARSE_EARLY_CAPTURE_POSTPROCESS requires async refresh"
-                )
-            if not callable(ensure_refresh_stream):
-                raise RuntimeError(
-                    "VLLM_SPARSE_EARLY_CAPTURE_POSTPROCESS requires refresh stream setup"
-                )
-            ensure_refresh_stream(torch.device(query.device))
+        if (
+            capture_postprocess_execution_owner
+            != _POSTPROCESS_OWNER_DEFERRED_LATE
+        ):
             refresh_stream = getattr(controller, "refresh_stream", None)
             if refresh_stream is None:
                 raise RuntimeError(
-                    "VLLM_SPARSE_EARLY_CAPTURE_POSTPROCESS requires refresh_stream"
+                    "E_SFI_CAPTURE_POSTPROCESS_OWNER_UNAVAILABLE: frozen early "
+                    "owner requires refresh_stream"
                 )
 
-            if _capture_ownership_mode_value == CHUNK_COHORT:
+            if (
+                capture_postprocess_execution_owner
+                == _POSTPROCESS_OWNER_CHUNK_COHORT_EARLY
+            ):
                 coordinator = getattr(
                     controller, "_capture_cohort_coordinator", None
                 )
@@ -13763,12 +13916,12 @@ def _run_capture_only_mixed_forward(
                                 completion_event,
                                 postprocess_ran,
                             )
-    elif _async_capture_postprocess_available():
+    elif capture_postprocess_execution_owner == _POSTPROCESS_OWNER_ASYNC:
         refresh_stream = getattr(controller, "refresh_stream", None)
         if refresh_stream is None:
-            postprocess_ran = _profiled_capture_postprocess(
-                label="capture_postprocess",
-                async_mode=False,
+            raise RuntimeError(
+                "E_SFI_CAPTURE_ASYNC_OWNER_UNAVAILABLE: frozen async owner "
+                "requires refresh_stream"
             )
         else:
             main_stream = torch.cuda.current_stream(device=query.device)
@@ -13801,10 +13954,15 @@ def _run_capture_only_mixed_forward(
                     label="capture_postprocess_async",
                     async_mode=True,
                 )
-    else:
+    elif capture_postprocess_execution_owner == _POSTPROCESS_OWNER_INLINE:
         postprocess_ran = _profiled_capture_postprocess(
             label="capture_postprocess",
             async_mode=False,
+        )
+    else:
+        raise AssertionError(
+            "unhandled capture postprocess execution owner: "
+            f"{capture_postprocess_execution_owner}"
         )
 
     def _lastn1_scratch_view_for_rows(

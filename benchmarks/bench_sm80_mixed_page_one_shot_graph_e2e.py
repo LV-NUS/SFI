@@ -64,7 +64,9 @@ from benchmarks.scheduler_contract import (
 from utils.selector_cache_identity import selector_cache_abi_key_for_python
 from benchmarks.sm80_run_pair import (
     ALLOWED_TRACE_ENV_KEYS,
+    FULL_CUDAGRAPH_HOOK_PROFILE_ENV_KEY,
     LEGACY_MIDDLE_NATIVE_CANONICAL_KEY,
+    ROUTE_TRACE_ENV_KEY,
     RouteProofResult,
     SPEED_CHILD_PAIRING_IDENTITY_ENV_KEYS,
     STAGE_A_SOURCE_COUNTER_SCHEMA_VERSION,
@@ -1240,7 +1242,7 @@ def _prewarm_gt1_selector_extensions(
         "VLLM_ATTENTION_BACKEND",
         "VLLM_FLASH_ATTN_VERSION",
         "VLLM_SPARSE_CONTROLLER_JSON",
-        "VLLM_SPARSE_FA3_ROUTE_TRACE_LOG",
+        ROUTE_TRACE_ENV_KEY,
     ):
         prewarm_env.pop(key, None)
     cache_locks = _selector_extension_cache_locks(torch_extensions_dir)
@@ -2417,7 +2419,7 @@ def _build_gate_d_dense_env(
     _apply_gate_d_backend_env(args, env)
     env["VLLM_ATTENTION_BACKEND"] = "FLASH_ATTN_VLLM_V1"
     if route_trace_path is not None:
-        env["VLLM_SPARSE_FA3_ROUTE_TRACE_LOG"] = str(route_trace_path)
+        env[ROUTE_TRACE_ENV_KEY] = str(route_trace_path)
     return env
 
 
@@ -2452,7 +2454,7 @@ def _build_gate_d_sparse_env(
     if workload_plan_replay:
         env[WORKLOAD_PLAN_REPLAY_ENV] = workload_plan_replay
     if route_trace_path is not None:
-        env["VLLM_SPARSE_FA3_ROUTE_TRACE_LOG"] = str(route_trace_path)
+        env[ROUTE_TRACE_ENV_KEY] = str(route_trace_path)
     if one_shot_timeline_path is not None:
         env["VLLM_SPARSE_ONE_SHOT_TIMELINE_LOG"] = str(one_shot_timeline_path)
     return env
@@ -5549,7 +5551,7 @@ def _run_gate_d_mode(args: argparse.Namespace) -> int:
         # before spawn so a stale file cannot leak into the readers.
         full_cudagraph_hook_profile_path.parent.mkdir(parents=True, exist_ok=True)
         full_cudagraph_hook_profile_path.write_text("", encoding="utf-8")
-        speed_env["VLLM_SPARSE_FULL_CUDAGRAPH_HOOK_PROFILE_LOG"] = str(
+        speed_env[FULL_CUDAGRAPH_HOOK_PROFILE_ENV_KEY] = str(
             full_cudagraph_hook_profile_path
         )
     gpu_before = _gpu_snapshot("pre", cuda_visible_devices=str(args.cuda_visible_devices))
@@ -5844,7 +5846,7 @@ def _run_gate_d_mode(args: argparse.Namespace) -> int:
         )
         diagnostic_arm_env = diagnostic_env
         diagnostic_arm_token = ""
-        diagnostic_env["VLLM_SPARSE_FULL_CUDAGRAPH_HOOK_PROFILE_LOG"] = str(
+        diagnostic_env[FULL_CUDAGRAPH_HOOK_PROFILE_ENV_KEY] = str(
             full_cudagraph_hook_profile_path
         )
         _copy_refresh_micro_profile_env_for_diagnostic(diagnostic_env)

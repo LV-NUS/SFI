@@ -16,7 +16,10 @@ from typing import Any, Callable
 
 CONTEXT_DELIMITER = "Context:"
 ESCAPED_CONTEXT_DELIMITER = "Context："
-CACHE_SCHEMA = "sfi.context_corpus_cache.v3"
+CACHE_SCHEMA = "sfi.context_corpus_cache.v4"
+SOURCE_STREAM_MODE = "cyclic_token_stream_v1"
+SOURCE_PHASE_SOLVER = "minimal_exact_cyclic_phase_v1"
+WIRE_VALIDATION_CONTRACT = "load_prompt_batch_exact_v1"
 _MODEL_WEIGHT_SUFFIXES = {
     ".bin",
     ".gguf",
@@ -39,13 +42,13 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 
-def build_context_corpus(
+def _build_context_corpus_with_report(
     source_text: str,
     tokenizer: Any,
     *,
     segments: int,
     tokens_per_segment: int,
-) -> str:
+) -> tuple[str, dict[str, object]]:
     """Token-slice ``source_text`` into the prompt loader's exact wire format."""
     segment_count = int(segments)
     segment_tokens = int(tokens_per_segment)
@@ -65,21 +68,41 @@ def build_context_corpus(
         CONTEXT_DELIMITER,
         ESCAPED_CONTEXT_DELIMITER,
     )
-    token_ids = list(
+    source_token_ids = list(
         tokenizer.encode(escaped_source_text, add_special_tokens=False)
     )
+    if not source_token_ids:
+        raise ValueError("source prompt tokenizes to zero tokens")
 
-    def _render_exact_prompt(start: int, segment_index: int) -> tuple[str, int]:
-        available = len(token_ids) - start
-        if available <= 0:
-            raise ValueError(
-                "source prompt is too short for exact wire prompt: "
-                f"segment={segment_index}, available_source_tokens={available}"
-            )
+    # The source is benchmark content, not a capacity limit.  Treat its tokens
+    # as one deterministic cyclic stream so every requested batch row can be
+    # built exactly, even when aggregate batch tokens exceed the source file.
+    # This is an offline corpus-build operation; inference never executes it.
+    def _source_slice(start: int, count: int) -> list[int]:
+        if count <= 0:
+            return []
+        source_size = len(source_token_ids)
+        offset = int(start) % source_size
+        first_count = min(int(count), source_size - offset)
+        result = source_token_ids[offset : offset + first_count]
+        remaining = int(count) - first_count
+        if remaining > 0:
+            full_cycles, tail = divmod(remaining, source_size)
+            if full_cycles:
+                result.extend(source_token_ids * full_cycles)
+            if tail:
+                result.extend(source_token_ids[:tail])
+        return result
+
+    def _try_render_exact_prompt(
+        start: int,
+        segment_index: int,
+    ) -> tuple[tuple[str, int] | None, tuple[int, int]]:
         prefix_tokens = len(
             tokenizer.encode(CONTEXT_DELIMITER, add_special_tokens=False)
         )
-        candidate = min(available, max(1, segment_tokens - prefix_tokens))
+        candidate = max(1, segment_tokens - prefix_tokens)
+        max_candidate = max(4096, segment_tokens * 4)
         seen: set[int] = set()
         measured: dict[int, tuple[str, int]] = {}
 
@@ -89,7 +112,7 @@ def build_context_corpus(
                 return cached
             decoded = str(
                 tokenizer.decode(
-                    token_ids[start : start + count],
+                    _source_slice(start, count),
                     skip_special_tokens=False,
                     clean_up_tokenization_spaces=False,
                 )
@@ -110,40 +133,100 @@ def build_context_corpus(
             seen.add(candidate)
             prompt, actual = _measure(candidate)
             if actual == segment_tokens:
-                return prompt, candidate
+                return (prompt, candidate), (candidate, actual)
             next_candidate = candidate + (segment_tokens - actual)
-            if next_candidate < 1 or next_candidate > available:
+            if next_candidate < 1 or next_candidate > max_candidate:
                 break
             candidate = next_candidate
 
         center = candidate
         lower = max(1, center - 64)
-        upper = min(available, center + 64)
+        upper = min(max_candidate, center + 64)
         for candidate in sorted(
             range(lower, upper + 1), key=lambda value: abs(value - center)
         ):
             prompt, actual = _measure(candidate)
             if actual == segment_tokens:
-                return prompt, candidate
+                return (prompt, candidate), (candidate, actual)
 
         closest_count, (_, closest_actual) = min(
             measured.items(),
             key=lambda item: abs(item[1][1] - segment_tokens),
         )
-        raise ValueError(
-            "unable to render exact wire prompt token length: "
-            f"segment={segment_index}, expected={segment_tokens}, "
-            f"closest={closest_actual}, source_tokens_used={closest_count}, "
-            f"available_source_tokens={available}"
-        )
+        return None, (closest_count, closest_actual)
 
-    rendered_segments: list[str] = []
-    source_cursor = 0
-    for segment_index in range(segment_count):
-        prompt, consumed = _render_exact_prompt(source_cursor, segment_index)
-        rendered_segments.append(prompt)
-        source_cursor += consumed
-    return "\n".join(rendered_segments)
+    # Decode/strip/re-encode is not length-surjective at every token boundary:
+    # a fixed source start can jump from N-1 to N+1 wire tokens.  Select one
+    # corpus-wide cyclic phase, then keep every segment contiguous and
+    # non-overlapping.  This retires per-segment source switching/skipping and
+    # makes the chosen stream deterministic for every batch shape.
+    # One complete token period is both necessary and sufficient: every later
+    # cyclic phase repeats a start already considered here.  Do not impose an
+    # arbitrary retry cap that could reject an existing canonical exact window.
+    phase_count = len(source_token_ids)
+    best_failure: tuple[int, int, int, int] | None = None
+    for source_phase in range(phase_count):
+        rendered_segments: list[str] = []
+        consumed_by_segment: list[int] = []
+        source_cursor = int(source_phase)
+        for segment_index in range(segment_count):
+            rendered, closest = _try_render_exact_prompt(
+                source_cursor,
+                segment_index,
+            )
+            if rendered is None:
+                closest_count, closest_actual = closest
+                failure = (
+                    abs(int(closest_actual) - segment_tokens),
+                    int(source_phase),
+                    int(segment_index),
+                    int(closest_count),
+                )
+                if best_failure is None or failure < best_failure:
+                    best_failure = failure
+                break
+            prompt, consumed = rendered
+            rendered_segments.append(prompt)
+            consumed_by_segment.append(int(consumed))
+            source_cursor += int(consumed)
+        else:
+            return "\n".join(rendered_segments), {
+                "source_phase": int(source_phase),
+                "source_phase_period_tokens": int(len(source_token_ids)),
+                "source_tokens_consumed_by_segment": consumed_by_segment,
+            }
+
+    _, closest_phase, closest_segment, closest_count = best_failure or (
+        -1,
+        -1,
+        -1,
+        -1,
+    )
+    raise ValueError(
+        "unable to render exact wire prompt token length with canonical "
+        "cyclic source phase: "
+        f"segment={closest_segment}, expected={segment_tokens}, "
+        f"closest_source_phase={closest_phase}, "
+        f"closest_source_tokens_used={closest_count}, "
+        f"phases_considered={phase_count}"
+    )
+
+
+def build_context_corpus(
+    source_text: str,
+    tokenizer: Any,
+    *,
+    segments: int,
+    tokens_per_segment: int,
+) -> str:
+    """Build the exact wire corpus from one canonical cyclic source stream."""
+    corpus, _ = _build_context_corpus_with_report(
+        source_text,
+        tokenizer,
+        segments=segments,
+        tokens_per_segment=tokens_per_segment,
+    )
+    return corpus
 
 
 def write_text_atomic(path: Path, text: str) -> None:
@@ -227,6 +310,8 @@ def context_corpus_cache_identity(
         "source_sha256": _file_sha256(source),
         "tokenizer_fingerprint": tokenizer_model_fingerprint(model),
         "source_delimiter_escape": ESCAPED_CONTEXT_DELIMITER,
+        "source_stream_mode": SOURCE_STREAM_MODE,
+        "source_phase_solver": SOURCE_PHASE_SOLVER,
         "segments": int(segments),
         "tokens_per_segment": int(tokens_per_segment),
     }
@@ -243,9 +328,37 @@ def _cache_entry_is_valid(
             manifest_path.read_text(encoding="utf-8"),
             parse_constant=_reject_json_constant,
         )
+        if not isinstance(manifest, dict):
+            return False
+        expected_segments = int(identity["segments"])
+        expected_tokens = int(identity["tokens_per_segment"])
+        wire_token_lengths = manifest.get("wire_token_lengths")
+        consumed_by_segment = manifest.get(
+            "source_tokens_consumed_by_segment"
+        )
+        source_phase_period_tokens = manifest.get(
+            "source_phase_period_tokens"
+        )
         return bool(
-            isinstance(manifest, dict)
-            and manifest.get("identity") == identity
+            manifest.get("identity") == identity
+            and manifest.get("wire_validation_contract")
+            == WIRE_VALIDATION_CONTRACT
+            and isinstance(wire_token_lengths, list)
+            and len(wire_token_lengths) == expected_segments
+            and all(
+                type(length) is int and length == expected_tokens
+                for length in wire_token_lengths
+            )
+            and type(manifest.get("source_phase")) is int
+            and type(source_phase_period_tokens) is int
+            and source_phase_period_tokens > 0
+            and 0 <= int(manifest["source_phase"]) < source_phase_period_tokens
+            and isinstance(consumed_by_segment, list)
+            and len(consumed_by_segment) == expected_segments
+            and all(
+                type(count) is int and count > 0
+                for count in consumed_by_segment
+            )
             and corpus_path.is_file()
             and int(manifest.get("corpus_size_bytes", -1))
             == int(corpus_path.stat().st_size)
@@ -301,17 +414,26 @@ def ensure_context_corpus_cached(
 
         source_text = source.read_text(encoding="utf-8")
         tokenizer = tokenizer_loader(model)
-        corpus = build_context_corpus(
+        corpus, build_report = _build_context_corpus_with_report(
             source_text,
             tokenizer,
             segments=int(segments),
             tokens_per_segment=int(tokens_per_segment),
         )
         write_text_atomic(corpus_path, corpus)
+        wire_token_lengths = validate_context_corpus(
+            corpus_path,
+            tokenizer,
+            segments=int(segments),
+            tokens_per_segment=int(tokens_per_segment),
+        )
         manifest = {
             "identity": identity,
             "corpus_sha256": _file_sha256(corpus_path),
             "corpus_size_bytes": int(corpus_path.stat().st_size),
+            "wire_validation_contract": WIRE_VALIDATION_CONTRACT,
+            "wire_token_lengths": list(wire_token_lengths),
+            **build_report,
         }
         write_text_atomic(
             manifest_path,
