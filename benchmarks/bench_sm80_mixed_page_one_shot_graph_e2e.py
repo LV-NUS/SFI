@@ -4611,7 +4611,8 @@ def _gate_d_payload(
             and not diagnostic_child_fatal_error
         )
     )
-    output_records = output_records or _canonical_output_records(outputs_path)
+    if output_records is None:
+        output_records = _canonical_output_records(outputs_path)
     output_length_gate = _output_completion_gate(
         output_records,
         expected_request_count=int(getattr(args, "batch_size", 1) or 1),
@@ -5338,6 +5339,66 @@ def _gate_d_payload(
     return payload
 
 
+def _command_result_failure_reasons(
+    result: Phase1CommandResult,
+    *,
+    lifecycle_green: bool = True,
+) -> list[str]:
+    reasons: list[str] = []
+    if result.returncode != 0:
+        reasons.append(f"returncode_nonzero:{result.returncode}")
+    if result.timed_out:
+        reasons.append("timed_out")
+    if _command_output_has_fatal_error(result):
+        reasons.append("fatal_child_output")
+    if not lifecycle_green:
+        reasons.append("arm_lifecycle_not_green")
+    return reasons
+
+
+def _write_gate_d_child_failure_artifacts(
+    *,
+    output_path: Path,
+    summary_output: str,
+    payload: dict[str, Any],
+    result: Phase1CommandResult,
+    failure_stage: str,
+    failure_reasons: list[str],
+    downstream_arms_skipped: list[str],
+) -> dict[str, Any]:
+    """Persist the failed child before any downstream artifact postflight."""
+    stdout_path = output_path.with_name(
+        f"{output_path.stem}_{failure_stage}_stdout.log"
+    )
+    stderr_path = output_path.with_name(
+        f"{output_path.stem}_{failure_stage}_stderr.log"
+    )
+    stdout_path.write_text(result.stdout, encoding="utf-8")
+    stderr_path.write_text(result.stderr, encoding="utf-8")
+    payload.update(
+        {
+            "gate_passed": False,
+            "production_gate_passed": False,
+            "failure_stage": failure_stage,
+            "failure_reasons": list(failure_reasons),
+            "downstream_arms_skipped": list(downstream_arms_skipped),
+            "failure_child_session_id": result.child_session_id,
+            "failure_child_stdout_path": str(stdout_path.resolve(strict=False)),
+            "failure_child_stderr_path": str(stderr_path.resolve(strict=False)),
+            "failure_child_stdout_bytes": len(result.stdout.encode("utf-8")),
+            "failure_child_stderr_bytes": len(result.stderr.encode("utf-8")),
+            "failure_child_streams_persisted": True,
+        }
+    )
+    serialized = json.dumps(payload, ensure_ascii=True, indent=2, allow_nan=False)
+    output_path.write_text(serialized, encoding="utf-8")
+    if summary_output:
+        summary_path = Path(summary_output)
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        summary_path.write_text(serialized, encoding="utf-8")
+    return payload
+
+
 def _run_gate_d_mode(args: argparse.Namespace) -> int:
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -5345,6 +5406,11 @@ def _run_gate_d_mode(args: argparse.Namespace) -> int:
     outputs_path = _default_gate_d_outputs_path(output_path)
     metrics_path.parent.mkdir(parents=True, exist_ok=True)
     outputs_path.parent.mkdir(parents=True, exist_ok=True)
+    # Each arm owns these generated artifacts.  Removing an earlier run's copy
+    # before launch prevents a failed child from being diagnosed with stale
+    # metrics or outputs under a reused tag.
+    metrics_path.unlink(missing_ok=True)
+    outputs_path.unlink(missing_ok=True)
     fa3_so_sha256 = _file_sha256(_resolve_gate_d_backend_artifact(args))
 
     if args.mode == "dense":
@@ -5617,6 +5683,73 @@ def _run_gate_d_mode(args: argparse.Namespace) -> int:
             speed_result,
             speed_arm_token,
         )
+    speed_child_failure_reasons = _command_result_failure_reasons(
+        speed_result,
+        lifecycle_green=speed_arm_green,
+    )
+    if speed_child_failure_reasons:
+        # A failed speed arm is a hard lifecycle boundary.  Persist its exact
+        # streams and a fail-closed summary before launching dense/diagnostic
+        # children or reading route/metrics artifacts that the child may never
+        # have produced.
+        gpu_after = _gpu_snapshot(
+            "post",
+            cuda_visible_devices=str(args.cuda_visible_devices),
+        )
+        payload = _gate_d_payload(
+            args,
+            mode="sparse",
+            result=speed_result,
+            metrics_path=metrics_path,
+            outputs_path=outputs_path,
+            metrics={},
+            route_trace_path=None,
+            route_summary={},
+            producer_route_summary={},
+            route_proof={
+                "passed": False,
+                "reasons": ["speed_child_failed_before_route_postflight"],
+            },
+            speed_env=speed_env,
+            fa3_so_sha256=fa3_so_sha256,
+            output_records=[],
+            run_provenance=_run_provenance_payload(
+                args,
+                env=speed_env,
+                fa3_so_sha256=fa3_so_sha256,
+                gpu_before=gpu_before,
+                gpu_after=gpu_after,
+            ),
+        )
+        payload["diagnostic_skipped_due_to_upstream_failure"] = True
+        payload["reference_scope"] = "not_run_after_sparse_speed_child_failure"
+        if bool(args.outputs_include_text):
+            payload["reference_gate_passed"] = False
+            payload["reference_gate_reasons"] = [
+                "reference_not_run_after_sparse_speed_child_failure"
+            ]
+        _apply_selector_extension_prewarm_payload(payload, selector_prewarm_result)
+        _apply_tp8_exact_lifecycle_payload(payload, tp8_lifecycle_state)
+        _apply_scheduler_graph_contract_payload(
+            payload,
+            args,
+            speed_metrics={},
+            diagnostic_metrics=None,
+        )
+        _write_gate_d_child_failure_artifacts(
+            output_path=output_path,
+            summary_output=args.summary_output,
+            payload=payload,
+            result=speed_result,
+            failure_stage="sparse_speed_child",
+            failure_reasons=speed_child_failure_reasons,
+            downstream_arms_skipped=[
+                "dense_reference",
+                "sparse_diagnostic",
+                "route_metrics_postflight",
+            ],
+        )
+        return GATE_FAILURE_EXIT_CODE
     # Keep the two observer-free timing arms adjacent under the same parent and
     # GPU lock.  Diagnostic tracing runs only after both throughput samples so
     # it cannot heat, allocate, or mutate state between sparse and dense.

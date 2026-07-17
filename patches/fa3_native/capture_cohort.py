@@ -198,8 +198,9 @@ def validate_capture_cohort_completion(
     cohort: ReadyCaptureCohort,
     *,
     ran_count: int,
+    terminal_event: Any,
 ) -> Any:
-    """Return the one shared job publication after strict lifecycle validation."""
+    """Validate and return the ordered cohort's terminal publication token."""
 
     if not isinstance(cohort, ReadyCaptureCohort):
         raise TypeError("capture cohort completion requires a ready cohort")
@@ -222,29 +223,29 @@ def validate_capture_cohort_completion(
             "E_SFI_CAPTURE_COHORT_LIFECYCLE: cohort jobs were not completed "
             "by the strict owner"
         )
-    completion_event = getattr(cohort.entries[0].job, "completion_event", None)
-    if completion_event is None or any(
-        getattr(entry.job, "completion_event", None) is not completion_event
-        for entry in cohort.entries
-    ):
+    if terminal_event is None or getattr(
+        cohort.entries[-1].job, "completion_event", None
+    ) is not terminal_event:
         raise RuntimeError(
-            "E_SFI_CAPTURE_COHORT_EVENT_IDENTITY: strict owner jobs must "
-            "publish one identical completion event"
+            "E_SFI_CAPTURE_COHORT_TERMINAL_EVENT: strict owner must publish "
+            "the final ordered job event"
         )
-    return completion_event
+    return terminal_event
 
 
 def publish_capture_cohort_completion(
     cohort: ReadyCaptureCohort,
     *,
     ran_count: int,
+    terminal_event: Any,
     fence: Any,
 ) -> Any:
-    """Legacy per-slot publisher retained for the ring owner only."""
+    """Publish one ordered terminal event to every cohort scratch slot."""
 
     event = validate_capture_cohort_completion(
         cohort,
         ran_count=ran_count,
+        terminal_event=terminal_event,
     )
     on_reduce = getattr(fence, "on_reduce", None)
     if not callable(on_reduce):

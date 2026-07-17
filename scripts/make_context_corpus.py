@@ -15,7 +15,8 @@ from typing import Any, Callable
 
 
 CONTEXT_DELIMITER = "Context:"
-CACHE_SCHEMA = "sfi.context_corpus_cache.v2"
+ESCAPED_CONTEXT_DELIMITER = "Context："
+CACHE_SCHEMA = "sfi.context_corpus_cache.v3"
 _MODEL_WEIGHT_SUFFIXES = {
     ".bin",
     ".gguf",
@@ -55,7 +56,18 @@ def build_context_corpus(
     if not source_text:
         raise ValueError("source prompt is empty")
 
-    token_ids = list(tokenizer.encode(source_text, add_special_tokens=False))
+    # ``Context:`` is the on-wire record delimiter consumed by
+    # load_prompt_batch.  Long sources can legitimately contain the same text
+    # far beyond the short-context smoke range.  Escape it once, before
+    # tokenization, so source content can never create extra records while the
+    # exact-token solver still measures the bytes the runner will consume.
+    escaped_source_text = source_text.replace(
+        CONTEXT_DELIMITER,
+        ESCAPED_CONTEXT_DELIMITER,
+    )
+    token_ids = list(
+        tokenizer.encode(escaped_source_text, add_special_tokens=False)
+    )
 
     def _render_exact_prompt(start: int, segment_index: int) -> tuple[str, int]:
         available = len(token_ids) - start
@@ -214,6 +226,7 @@ def context_corpus_cache_identity(
         "schema": CACHE_SCHEMA,
         "source_sha256": _file_sha256(source),
         "tokenizer_fingerprint": tokenizer_model_fingerprint(model),
+        "source_delimiter_escape": ESCAPED_CONTEXT_DELIMITER,
         "segments": int(segments),
         "tokens_per_segment": int(tokens_per_segment),
     }

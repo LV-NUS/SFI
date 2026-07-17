@@ -12762,7 +12762,7 @@ def _run_capture_only_mixed_forward(
     from patches.fa3_native.forward_capture import prepare_capture_forward_side_outputs
     from patches.fa3_native.install import load_vendored_flash_attn_bridge
     from patches.fa3_native.postprocess import (
-        run_capture_postprocess_job_sequence,
+        run_capture_postprocess_job_sequence_for_cohort,
         run_capture_postprocess_job_if_needed,
         run_prefill_capture_postprocess_if_needed,
     )
@@ -13721,7 +13721,10 @@ def _run_capture_only_mixed_forward(
                 postprocess_ran = False
                 if ready_cohort is not None:
                     with torch.cuda.stream(refresh_stream):
-                        ran_count = run_capture_postprocess_job_sequence(
+                        (
+                            ran_count,
+                            cohort_terminal_event,
+                        ) = run_capture_postprocess_job_sequence_for_cohort(
                             ready_cohort.jobs,
                             meta_cache_owner=controller,
                         )
@@ -13729,6 +13732,7 @@ def _run_capture_only_mixed_forward(
                         publish_capture_cohort_completion(
                             ready_cohort,
                             ran_count=int(ran_count),
+                            terminal_event=cohort_terminal_event,
                             fence=fence,
                         )
                     postprocess_ran = True

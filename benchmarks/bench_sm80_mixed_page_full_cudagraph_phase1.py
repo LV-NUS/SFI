@@ -7,6 +7,8 @@ import os
 import signal
 import subprocess
 import sys
+import threading
+import time
 from collections import Counter
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
@@ -50,6 +52,10 @@ DEFAULT_COMPACT_BLOCKS_PER_SLOT = 128
 DEFAULT_MAX_LIVE_SPARSE_SLOTS = 8
 DEFAULT_STAGE_A_RECENT = 256
 ACTIVE_SM80_GT1_RUNNER = "bench_sm80_mixed_page_one_shot_graph_e2e.py"
+_CHILD_SESSION_FAILED_EXIT_GRACE_S = 0.1
+_CHILD_SESSION_CLEAN_EXIT_GRACE_S = 1.0
+_CHILD_SESSION_TERM_GRACE_S = 2.0
+_CHILD_SESSION_KILL_GRACE_S = 2.0
 
 
 def _process_tree_snapshot() -> list[tuple[int, int]]:
@@ -94,8 +100,60 @@ def _descendant_pids_from_snapshot(
     return descendants
 
 
+def _process_session_record(pid: int) -> tuple[str, int] | None:
+    """Return ``(state, sid)`` without depending on a second ``ps`` child."""
+    try:
+        stat_text = (Path("/proc") / str(int(pid)) / "stat").read_text(
+            encoding="utf-8"
+        )
+    except OSError:
+        return None
+    right_paren = stat_text.rfind(")")
+    if right_paren < 0:
+        return None
+    fields = stat_text[right_paren + 2 :].split()
+    if len(fields) <= 3:
+        return None
+    try:
+        return str(fields[0]), int(fields[3])
+    except ValueError:
+        return None
+
+
+def _live_process_session_pids(session_id: int) -> list[int]:
+    """List live members of the exact session created by ``Popen``.
+
+    PPID ancestry is insufficient after the session leader exits because its
+    workers are immediately reparented.  SID remains stable for the lifetime
+    of every process in the launched arm, including workers that create their
+    own process group.  Zombies cannot hold inherited pipes and are excluded.
+    """
+    try:
+        entries = tuple(Path("/proc").iterdir())
+    except OSError:
+        return []
+    members: list[int] = []
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        record = _process_session_record(pid)
+        if record is None:
+            continue
+        state, observed_session_id = record
+        if observed_session_id == int(session_id) and state != "Z":
+            members.append(pid)
+    return sorted(members)
+
+
 def _terminate_process_tree(proc: subprocess.Popen[str], *, sig: signal.Signals) -> None:
-    pids = _descendant_pids_from_snapshot(int(proc.pid), _process_tree_snapshot())
+    pids = set(
+        _descendant_pids_from_snapshot(int(proc.pid), _process_tree_snapshot())
+    )
+    # ``start_new_session=True`` makes the child PID an exact ownership token.
+    # Session census still works after the leader has exited and the PPID tree
+    # has disappeared, and includes workers that moved to another process group.
+    pids.update(_live_process_session_pids(int(proc.pid)))
     try:
         os.killpg(int(proc.pid), sig)
     except ProcessLookupError:
@@ -104,13 +162,51 @@ def _terminate_process_tree(proc: subprocess.Popen[str], *, sig: signal.Signals)
         # Fall back to explicit child pids below. Process-group teardown can fail
         # if the child runtime creates its own session.
         pass
-    for pid in sorted(set(pids), reverse=True):
+    for pid in sorted(pids, reverse=True):
         if pid == os.getpid():
             continue
         try:
             os.kill(pid, sig)
         except ProcessLookupError:
             continue
+
+
+def _wait_for_process_session_exit(session_id: int, *, timeout_s: float) -> bool:
+    deadline = time.monotonic() + max(0.0, float(timeout_s))
+    while True:
+        if not _live_process_session_pids(int(session_id)):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+
+
+def _cleanup_process_session_after_leader_exit(
+    proc: subprocess.Popen[str],
+) -> None:
+    """Bound the inherited-pipe lifetime after the launched leader exits."""
+    returncode = int(proc.wait())
+    session_id = int(proc.pid)
+    if _wait_for_process_session_exit(
+        session_id,
+        timeout_s=(
+            _CHILD_SESSION_CLEAN_EXIT_GRACE_S
+            if returncode == 0
+            else _CHILD_SESSION_FAILED_EXIT_GRACE_S
+        ),
+    ):
+        return
+    _terminate_process_tree(proc, sig=signal.SIGTERM)
+    if _wait_for_process_session_exit(
+        session_id,
+        timeout_s=_CHILD_SESSION_TERM_GRACE_S,
+    ):
+        return
+    _terminate_process_tree(proc, sig=signal.SIGKILL)
+    _wait_for_process_session_exit(
+        session_id,
+        timeout_s=_CHILD_SESSION_KILL_GRACE_S,
+    )
 
 
 def _legacy_phase1_runner_disabled_message() -> str:
@@ -688,8 +784,28 @@ def _run_command(
         text=True,
         start_new_session=True,
     )
+    # ``communicate`` waits for EOF, not merely for the direct child.  A failed
+    # launcher can therefore exit while an orphaned TP worker/resource_tracker
+    # keeps the inherited stdout/stderr descriptors open.  The watcher blocks
+    # without polling during the benchmark and only performs cold-path session
+    # cleanup after the leader exits.
+    session_cleanup = threading.Thread(
+        target=_cleanup_process_session_after_leader_exit,
+        args=(proc,),
+        name=f"sfi-child-session-{proc.pid}",
+        daemon=True,
+    )
+    session_cleanup.start()
     try:
         stdout, stderr = proc.communicate(timeout=float(timeout_s))
+        session_cleanup.join(
+            timeout=(
+                _CHILD_SESSION_CLEAN_EXIT_GRACE_S
+                + _CHILD_SESSION_TERM_GRACE_S
+                + _CHILD_SESSION_KILL_GRACE_S
+                + 1.0
+            )
+        )
         return Phase1CommandResult(
             command=command,
             returncode=int(proc.returncode or 0),
@@ -704,7 +820,32 @@ def _run_command(
             stdout, stderr = proc.communicate(timeout=10.0)
         except subprocess.TimeoutExpired:
             _terminate_process_tree(proc, sig=signal.SIGKILL)
-            stdout, stderr = proc.communicate()
+            # Never re-enter an unbounded pipe wait after SIGKILL.  The exact
+            # session watcher normally closes the descriptors first; this last
+            # bound protects against a process that deliberately escaped the
+            # launched session while retaining an inherited descriptor.
+            try:
+                stdout, stderr = proc.communicate(timeout=10.0)
+            except subprocess.TimeoutExpired as final_timeout:
+                # The direct child has already been signalled.  Close only our
+                # read ends so a process that escaped the owned session cannot
+                # keep this harness blocked forever.
+                for stream in (proc.stdout, proc.stderr):
+                    if stream is not None:
+                        stream.close()
+                stdout = final_timeout.output or ""
+                stderr = final_timeout.stderr or ""
+                if isinstance(stdout, bytes):
+                    stdout = stdout.decode("utf-8", errors="replace")
+                if isinstance(stderr, bytes):
+                    stderr = stderr.decode("utf-8", errors="replace")
+        session_cleanup.join(
+            timeout=(
+                _CHILD_SESSION_TERM_GRACE_S
+                + _CHILD_SESSION_KILL_GRACE_S
+                + 1.0
+            )
+        )
         return Phase1CommandResult(
             command=command,
             returncode=124,
