@@ -534,7 +534,7 @@ def _final_outputs_with_decoded_text(
     engine: object,
 ) -> dict[str, object]:
     tokenizer = engine.get_tokenizer()  # type: ignore[attr-defined]
-    decode = getattr(tokenizer, "decode", None)
+    stop_token_ids = resolved_generation_stop_token_ids(engine, tokenizer)
     enriched: dict[str, object] = {}
     for rid, payload in final_outputs.items():
         if isinstance(payload, dict):
@@ -546,11 +546,11 @@ def _final_outputs_with_decoded_text(
             if isinstance(raw_token_ids, list)
             else []
         )
-        text = str(decode(token_ids)) if callable(decode) else ""
-        enriched[str(rid)] = {
-            "token_ids": token_ids,
-            "text": text,
-        }
+        enriched[str(rid)] = decoded_output_payload(
+            token_ids,
+            tokenizer,
+            stop_token_ids=stop_token_ids,
+        )
     return enriched
 
 try:
@@ -565,9 +565,11 @@ try:
         pull_step_outputs_with_timing,
     )
     from benchmarks.prompt_batch_io import (
+        decoded_output_payload,
         load_prompt_batch,
         maybe_apply_chat_template,
         output_payload_from_generation,
+        resolved_generation_stop_token_ids,
     )
     from benchmarks.vllm_profiler_scope import (
         build_vllm_torch_profiler_config,
@@ -586,9 +588,11 @@ except ModuleNotFoundError:
         pull_step_outputs_with_timing,
     )
     from prompt_batch_io import (  # type: ignore[no-redef]
+        decoded_output_payload,
         load_prompt_batch,
         maybe_apply_chat_template,
         output_payload_from_generation,
+        resolved_generation_stop_token_ids,
     )
     from vllm_profiler_scope import (  # type: ignore[no-redef]
         build_vllm_torch_profiler_config,
@@ -728,6 +732,8 @@ def _decode_run_config(
         "batch_size": int(args.batch_size),
         "max_num_seqs": _effective_max_num_seqs(args),
         "split_context_prompts": bool(args.split_context_prompts),
+        "chat_template": bool(args.chat_template),
+        "enable_thinking": bool(args.enable_thinking),
         "max_new_tokens": int(args.max_new_tokens),
         "mix_max_new_tokens": (
             None
@@ -1886,6 +1892,9 @@ def main() -> None:
     )
     exact_runtime_required = os.environ.get("SFI_RUNNER_TIER", "") == "tp8x64k"
     context_tokens = int(os.environ.get("SFI_RUNNER_CONTEXT_TOKENS", "0") or 0)
+    chat_template_reserve_tokens = int(
+        os.environ.get("SFI_RUNNER_CHAT_TEMPLATE_RESERVE_TOKENS", "0") or 0
+    )
     compact_blocks_per_slot = int(
         os.environ.get("SFI_RUNNER_COMPACT_BLOCKS_PER_SLOT", "0") or 0
     )
@@ -1902,6 +1911,7 @@ def main() -> None:
     )
     if exact_runtime_required and (
         context_tokens <= 0
+        or chat_template_reserve_tokens != 512
         or compact_blocks_per_slot <= 0
         or expected_kv_bytes_per_token <= 0
     ):
@@ -1913,7 +1923,9 @@ def main() -> None:
         tensor_parallel_size=int(engine_kwargs["tensor_parallel_size"]),
         required_batch_size=int(args.batch_size),
         required_tokens_per_request=(
-            context_tokens + int(args.max_new_tokens)
+            context_tokens
+            + int(args.max_new_tokens)
+            + chat_template_reserve_tokens
             if exact_runtime_required
             else 0
         ),

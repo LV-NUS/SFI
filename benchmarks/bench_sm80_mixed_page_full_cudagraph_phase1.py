@@ -874,12 +874,21 @@ def _canonical_output_records(path: Path) -> list[dict[str, Any]]:
         if isinstance(value, list):
             rows.append({"token_ids": [int(token_id) for token_id in value]})
         elif isinstance(value, dict) and isinstance(value.get("token_ids"), list):
-            rows.append(
-                {
-                    "token_ids": [int(token_id) for token_id in value["token_ids"]],
-                    "text": str(value.get("text", "")),
-                }
-            )
+            row: dict[str, Any] = {
+                "token_ids": [int(token_id) for token_id in value["token_ids"]],
+                "text": str(value.get("text", "")),
+            }
+            for field in (
+                "semantic_text",
+                "semantic_stop_seen",
+                "semantic_first_stop_token_index",
+                "semantic_stop_token_id",
+                "semantic_stop_token_ids",
+                "semantic_token_count",
+            ):
+                if field in value:
+                    row[field] = value[field]
+            rows.append(row)
     return rows
 
 
@@ -908,8 +917,18 @@ def _semantic_output_diffs(
         zip(sparse_records, dense_records)
     ):
         ok, mode, ref_semantic, test_semantic = semantic_match(
-            str(dense_record.get("text", "")),
-            str(sparse_record.get("text", "")),
+            str(
+                dense_record.get(
+                    "semantic_text",
+                    dense_record.get("text", ""),
+                )
+            ),
+            str(
+                sparse_record.get(
+                    "semantic_text",
+                    sparse_record.get("text", ""),
+                )
+            ),
         )
         dense_tokens = list(dense_record.get("token_ids", []))
         sparse_tokens = list(sparse_record.get("token_ids", []))

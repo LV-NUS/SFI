@@ -39,10 +39,8 @@
 #
 # Success criteria (printed at the end):
 #   decode_tps reported; all requests decode to MAX_NEW tokens; zero dense
-#   fallbacks. Exit code 2 from the harness with reasons
-#   'unknown_without_reference' / 'interval_trigger_intents_below_expected'
-#   is accepted only by non-exact diagnostic tiers. tp8x64k always runs the
-#   existing dense-reference correctness child and rejects unknown semantics.
+#   fallbacks; every producer, semantic, and dense-reference gate is green.
+#   Any non-zero harness return code fails closed.
 # =============================================================================
 set -euo pipefail
 
@@ -129,6 +127,7 @@ if [[ "${TIER}" == "tp8x64k" ]]; then
 else
   MAX_NEW="${MAX_NEW:-256}"
 fi
+CHAT_TEMPLATE_RESERVE_TOKENS=512
 REFRESH_INTERVAL="${REFRESH_INTERVAL:-96}"
 BLOCKS="${BLOCKS:-112}"
 K_HEAD="${K_HEAD:-1536}"
@@ -147,11 +146,7 @@ done
 SCHEDULING_MODE="async"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-${BS}}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-8192}"
-if [[ "${TIER}" == "tp8x64k" ]]; then
-  MAX_SEQ_LEN_TO_CAPTURE="${MAX_SEQ_LEN_TO_CAPTURE:-${MML}}"
-else
-  MAX_SEQ_LEN_TO_CAPTURE="${MAX_SEQ_LEN_TO_CAPTURE:-${MML}}"
-fi
+MAX_SEQ_LEN_TO_CAPTURE="${MAX_SEQ_LEN_TO_CAPTURE:-${MML}}"
 CHUNKED_PREFILL="${CHUNKED_PREFILL:-enabled}"
 for scheduler_integer in MAX_NUM_SEQS MAX_NUM_BATCHED_TOKENS MAX_SEQ_LEN_TO_CAPTURE; do
   scheduler_value="${!scheduler_integer}"
@@ -163,9 +158,9 @@ done
 MAX_NUM_SEQS=$((10#${MAX_NUM_SEQS}))
 MAX_NUM_BATCHED_TOKENS=$((10#${MAX_NUM_BATCHED_TOKENS}))
 MAX_SEQ_LEN_TO_CAPTURE=$((10#${MAX_SEQ_LEN_TO_CAPTURE}))
-NEEDED_SEQUENCE_TOKENS=$((CTX + MAX_NEW))
+NEEDED_SEQUENCE_TOKENS=$((CTX + MAX_NEW + CHAT_TEMPLATE_RESERVE_TOKENS))
 if (( MAX_SEQ_LEN_TO_CAPTURE < NEEDED_SEQUENCE_TOKENS || MAX_SEQ_LEN_TO_CAPTURE > MML )); then
-  echo "FAIL: MAX_SEQ_LEN_TO_CAPTURE=${MAX_SEQ_LEN_TO_CAPTURE} must cover CTX+MAX_NEW=${NEEDED_SEQUENCE_TOKENS} without exceeding MML=${MML}" >&2
+  echo "FAIL: MAX_SEQ_LEN_TO_CAPTURE=${MAX_SEQ_LEN_TO_CAPTURE} must cover CTX+MAX_NEW+chat_reserve=${NEEDED_SEQUENCE_TOKENS} without exceeding MML=${MML}" >&2
   exit 64
 fi
 if (( MAX_NUM_SEQS < BS )); then
@@ -316,9 +311,8 @@ PY="$(realpath -e -- "${PY}")"
 PYTHON="${PY}"
 export PYTHON
 # Canonicalize lexically while still in the caller's working directory. The
-# process later cd's to SFI_ROOT, so leaving relative MODEL/CORPUS values here
-# would make generation and execution refer to different files. -s preserves
-# the final component identity so explicit corpus symlinks can be rejected.
+# process later cd's to SFI_ROOT, so leaving a relative MODEL value here would
+# make corpus generation and execution refer to different files.
 MODEL="$(realpath -ms -- "${MODEL}")"
 FA_ROOT="$(realpath -ms -- "${FA_ROOT}")"
 if [[ -n "${CORPUS:-}" ]]; then
@@ -409,7 +403,7 @@ if [[ "${MODE}" == "sparse" ]]; then
   fi
   LEASE_BYTES=$((BS * BLOCKS * 16 * KV_TOKEN_BYTES * GEN_COUNT))
   CAP_TOKENS_PER_REQ=$(((KVB - LEASE_BYTES) / (KV_TOKEN_BYTES * BS)))
-  NEED_TOKENS_PER_REQ=$((CTX + MAX_NEW))
+  NEED_TOKENS_PER_REQ=$((CTX + MAX_NEW + CHAT_TEMPLATE_RESERVE_TOKENS))
   SFI_RUNNER_KV_PREFLIGHT_STATUS="passed"
   if ((CAP_TOKENS_PER_REQ < NEED_TOKENS_PER_REQ)); then
     KVB_SUGGEST_GIB=$(((NEED_TOKENS_PER_REQ * KV_TOKEN_BYTES * BS + LEASE_BYTES) / 1073741824 + 2))
@@ -428,7 +422,7 @@ ${KV_PREFLIGHT_VERDICT}
 The pool must hold full KV + compact lease without scheduler serialization:
   compact lease      = ${BS} slots x ${BLOCKS} blocks x 16 x ${KV_TOKEN_BYTES} B x ${GEN_COUNT} gen = ${LEASE_BYTES} B
   cap_tokens_per_req = (KVB - lease) / (${KV_TOKEN_BYTES} x ${BS}) = ${CAP_TOKENS_PER_REQ}
-  needed per request = CTX + MAX_NEW = ${NEED_TOKENS_PER_REQ}
+  needed per request = CTX + MAX_NEW + ${CHAT_TEMPLATE_RESERVE_TOKENS} chat-template reserve = ${NEED_TOKENS_PER_REQ}
 Fix: KVB >= ~${KVB_SUGGEST_GIB} GiB (KVB=$((KVB_SUGGEST_GIB * 1073741824))),
 or lower CTX/MAX_NEW/BS/BLOCKS. ${KV_PREFLIGHT_ACTION}
 ==============================================================================
@@ -856,31 +850,40 @@ if [[ "${ATTENTION_KERNEL}" == "fa4-cute" ]]; then
 fi
 
 if [[ -n "${CORPUS:-}" ]]; then
-  reject_symlink_output "${CORPUS}"
-  if [[ ! -f "${CORPUS}" ]]; then
-    echo "==> explicit corpus ${CORPUS} missing; generating"
-    "${PY}" "${SFI_ROOT}/scripts/make_context_corpus.py" \
-      --model "${MODEL}" --segments "${BS}" --tokens-per-segment "${CTX}" \
-      --output "${CORPUS}"
-    SFI_RUNNER_CORPUS_TOKEN_STATUS="generated_exact"
-  else
-    "${PY}" "${SFI_ROOT}/scripts/make_context_corpus.py" \
-      --model "${MODEL}" --segments "${BS}" --tokens-per-segment "${CTX}" \
-      --validate "${CORPUS}"
-    SFI_RUNNER_CORPUS_TOKEN_STATUS="validated_exact"
-  fi
-else
-  CORPUS_RESULT="$("${PY}" "${SFI_ROOT}/scripts/make_context_corpus.py" \
-    --model "${MODEL}" --segments "${BS}" --tokens-per-segment "${CTX}" \
-    --cache-dir "${OUT}/context_corpus_cache")"
-  CORPUS="$(printf '%s\n' "${CORPUS_RESULT}" | sed -n 's/^context_corpus_path=//p' | tail -1)"
-  if [[ -z "${CORPUS}" || ! -f "${CORPUS}" ]]; then
-    echo "FAIL: context corpus cache returned no readable path" >&2
-    exit 66
-  fi
-  SFI_RUNNER_CORPUS_TOKEN_STATUS="cache_exact"
+  echo "FAIL: explicit CORPUS is retired; release runs require the content-addressed v5 corpus cache" >&2
+  exit 64
 fi
+CORPUS_RESULT="$("${PY}" "${SFI_ROOT}/scripts/make_context_corpus.py" \
+  --model "${MODEL}" --segments "${BS}" --tokens-per-segment "${CTX}" \
+  --cache-dir "${OUT}/context_corpus_cache")"
+CORPUS="$(printf '%s\n' "${CORPUS_RESULT}" | sed -n 's/^context_corpus_path=//p' | tail -1)"
+if [[ -z "${CORPUS}" || ! -f "${CORPUS}" ]]; then
+  echo "FAIL: context corpus cache returned no readable path" >&2
+  exit 66
+fi
+SFI_RUNNER_CORPUS_TOKEN_STATUS="cache_exact"
 export SFI_RUNNER_CORPUS_TOKEN_STATUS
+CHAT_TEMPLATE_TSV="$({
+  "${PY}" -I "${SFI_ROOT}/scripts/check_chat_template_overhead.py" \
+    --model "${MODEL}" \
+    --corpus "${CORPUS}" \
+    --batch-size "${BS}" \
+    --context-tokens "${CTX}" \
+    --reserve-tokens "${CHAT_TEMPLATE_RESERVE_TOKENS}" \
+    --format tsv
+})" || {
+  echo "FAIL: exact chat-template token preflight failed" >&2
+  exit 78
+}
+IFS=$'\t' read -r \
+  SFI_RUNNER_CHAT_TEMPLATE_OVERHEAD_MIN \
+  SFI_RUNNER_CHAT_TEMPLATE_OVERHEAD_MAX \
+  SFI_RUNNER_CHAT_TEMPLATE_VERIFIED_COUNT \
+  <<< "${CHAT_TEMPLATE_TSV}"
+export SFI_RUNNER_CHAT_TEMPLATE_RESERVE_TOKENS="${CHAT_TEMPLATE_RESERVE_TOKENS}"
+export SFI_RUNNER_CHAT_TEMPLATE_OVERHEAD_MIN
+export SFI_RUNNER_CHAT_TEMPLATE_OVERHEAD_MAX
+export SFI_RUNNER_CHAT_TEMPLATE_VERIFIED_COUNT
 CORPUS_SHA256="$({
   "${PY}" -I - "${CORPUS}" <<'PY'
 from hashlib import sha256
@@ -890,8 +893,30 @@ import sys
 print(sha256(Path(sys.argv[1]).read_bytes()).hexdigest())
 PY
 })"
+CORPUS_MANIFEST_TSV="$({
+  "${PY}" -I "${SFI_ROOT}/scripts/make_context_corpus.py" \
+    --model "${MODEL}" --segments "${BS}" --tokens-per-segment "${CTX}" \
+    --validate "${CORPUS}" --format manifest-tsv
+})" || {
+  echo "FAIL: cached corpus manifest is not release-semantic grade" >&2
+  exit 78
+}
+IFS=$'\t' read -r \
+  SFI_RUNNER_CORPUS_MANIFEST_PATH \
+  SFI_RUNNER_CORPUS_MANIFEST_SHA256 \
+  SFI_RUNNER_CORPUS_MANIFEST_SCHEMA \
+  SFI_RUNNER_CORPUS_LAYOUT_MODE \
+  SFI_RUNNER_CORPUS_LAYOUT_VALIDATION_CONTRACT \
+  SFI_RUNNER_CORPUS_LAYOUT_VERIFIED_COUNT \
+  <<< "${CORPUS_MANIFEST_TSV}"
 export SFI_RUNNER_CORPUS_PATH="${CORPUS}"
 export SFI_RUNNER_CORPUS_SHA256="${CORPUS_SHA256}"
+export SFI_RUNNER_CORPUS_MANIFEST_PATH
+export SFI_RUNNER_CORPUS_MANIFEST_SHA256
+export SFI_RUNNER_CORPUS_MANIFEST_SCHEMA
+export SFI_RUNNER_CORPUS_LAYOUT_MODE
+export SFI_RUNNER_CORPUS_LAYOUT_VALIDATION_CONTRACT
+export SFI_RUNNER_CORPUS_LAYOUT_VERIFIED_COUNT
 
 export SFI_RUNNER_TENSOR_PARALLEL_SIZE="${TP}"
 export SFI_RUNNER_TIER="${TIER}"
@@ -931,7 +956,7 @@ echo "==> attention: arch=${CUDA_ARCH} capabilities=${CUDA_CAPABILITIES} kernel=
 if [[ "${CUDA_ARCH}" != "sm80" ]]; then
   echo "==> note: ${TIER} defaults are A100-derived compatibility shapes, not tuned ${CUDA_ARCH} settings"
 fi
-echo "==> infra: kv_preflight=${SFI_RUNNER_KV_PREFLIGHT_STATUS} gpu_lock=${SFI_RUNNER_GPU_LOCK_MODE} attention_preflight=${SFI_RUNNER_ATTENTION_PREFLIGHT_STATUS} corpus=${SFI_RUNNER_CORPUS_TOKEN_STATUS} selector_cache=${SELECTOR_CACHE_ROOT}"
+echo "==> infra: kv_preflight=${SFI_RUNNER_KV_PREFLIGHT_STATUS} gpu_lock=${SFI_RUNNER_GPU_LOCK_MODE} attention_preflight=${SFI_RUNNER_ATTENTION_PREFLIGHT_STATUS} corpus=${SFI_RUNNER_CORPUS_TOKEN_STATUS} chat_template=on overhead=${SFI_RUNNER_CHAT_TEMPLATE_OVERHEAD_MIN}..${SFI_RUNNER_CHAT_TEMPLATE_OVERHEAD_MAX} reserve=${CHAT_TEMPLATE_RESERVE_TOKENS} selector_cache=${SELECTOR_CACHE_ROOT}"
 cd "${SFI_ROOT}"
 RUN_STARTED_NS="$("${PY}" -c 'import time; print(time.time_ns())')"
 RUN_NONCE="${TAG}-${RUN_STARTED_NS}-$$"
@@ -942,9 +967,8 @@ for output_path in \
   "${OUT}/${TAG}_route.jsonl"; do
   reject_symlink_output "${output_path}"
 done
-# Preserve the harness return code for postflight. Exact TP8 carries its dense
-# reference and therefore rejects no-reference noise; directional tiers may
-# still return rc=2 only for explicitly documented gate noise.
+# Preserve the harness return code for postflight. The checker accepts only a
+# fully green harness; no diagnostic-tier failure is promoted to success.
 set +e
 VLLM_FLASH_ATTN_VERSION="${FLASH_ATTN_VERSION}" \
 VLLM_SPARSE_FA3_UPSTREAM_ROOT="${FA_ROOT}" \
@@ -968,6 +992,7 @@ PYTHONPATH="${FA_ROOT}:${SFI_ROOT}${PYTHONPATH:+:${PYTHONPATH}}" \
   --cuda-visible-devices "${GPU}" --timeout-s 3600 ${TP_ARGS[@]+"${TP_ARGS[@]}"} \
   ${VERDICT_ARGS[@]+"${VERDICT_ARGS[@]}"} \
   ${REFERENCE_ARGS[@]+"${REFERENCE_ARGS[@]}"} --outputs-include-text \
+  --chat-template \
   --output "${OUT}/${TAG}.json" \
   --summary-output "${OUT}/${TAG}_summary.json" \
   --run-nonce "${RUN_NONCE}" \

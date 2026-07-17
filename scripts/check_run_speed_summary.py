@@ -48,15 +48,20 @@ from scripts.check_tp8_arm_teardown import (
     arm_token_sha256,
     derive_arm_token,
 )
+from scripts.make_context_corpus import (
+    CACHE_SCHEMA as CONTEXT_CORPUS_SCHEMA,
+    DEFAULT_SOURCE as CONTEXT_CORPUS_SOURCE,
+    LONGBENCH_SOURCE_LAYOUT,
+    SOURCE_LAYOUT_VALIDATION_CONTRACT,
+    _load_local_tokenizer,
+    context_corpus_cache_identity,
+    validate_context_corpus_manifest,
+)
 from utils.model_kv_contract import (
     MODEL_KV_CONTRACT_SCHEMA,
     derive_model_kv_contract,
 )
-EXPECTED_GATE_NOISE = {
-    "semantic_output_health_not_ok:unknown_without_reference",
-    "interval_trigger_intents_below_expected",
-}
-EXPECTED_HARNESS_RETURNCODES = {0, 2}
+EXPECTED_HARNESS_RETURNCODES = {0}
 RUN_SPEED_TIERS = (
     "bs8x12k",
     "bs8x16k",
@@ -105,19 +110,6 @@ def _is_finite_positive_number(value: object) -> bool:
     )
 
 
-def _is_expected_gate_noise(reason: object) -> bool:
-    return str(reason) in EXPECTED_GATE_NOISE
-
-
-def _is_allowed_gate_noise(reason: object, *, exact_tier: bool) -> bool:
-    """Keep directional no-reference noise out of the exact TP8 contract."""
-    if exact_tier and str(reason) == (
-        "semantic_output_health_not_ok:unknown_without_reference"
-    ):
-        return False
-    return _is_expected_gate_noise(reason)
-
-
 def _reject_nonstandard_json_constant(value: str) -> None:
     raise ValueError(f"non-standard JSON numeric constant: {value}")
 
@@ -147,6 +139,77 @@ def _file_sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _corpus_manifest_reasons(provenance: dict[str, Any]) -> list[str]:
+    if provenance.get("runner_corpus_token_status") != "cache_exact":
+        return ["runner_corpus_status_not_cache_exact"]
+
+    reasons: list[str] = []
+    expected_fields = {
+        "runner_corpus_manifest_schema": CONTEXT_CORPUS_SCHEMA,
+        "runner_corpus_layout_mode": LONGBENCH_SOURCE_LAYOUT,
+        "runner_corpus_layout_validation_contract": (
+            SOURCE_LAYOUT_VALIDATION_CONTRACT
+        ),
+    }
+    for field, expected in expected_fields.items():
+        if provenance.get(field) != expected:
+            reasons.append(f"runner_corpus_manifest_field_mismatch:{field}")
+
+    expected_rows = provenance.get("batch_size")
+    verified_rows = provenance.get("runner_corpus_layout_verified_count")
+    if not _is_exact_positive_int(verified_rows, expected_rows):
+        reasons.append("runner_corpus_layout_verified_count_mismatch")
+
+    corpus_path_value = provenance.get("runner_corpus_path")
+    manifest_path_value = provenance.get("runner_corpus_manifest_path")
+    if not isinstance(corpus_path_value, str) or not corpus_path_value:
+        reasons.append("runner_corpus_path_missing")
+        return reasons
+    if not isinstance(manifest_path_value, str) or not manifest_path_value:
+        reasons.append("runner_corpus_manifest_path_missing")
+        return reasons
+    corpus_path = Path(corpus_path_value)
+    manifest_path = Path(manifest_path_value)
+    if manifest_path != corpus_path.with_suffix(".manifest.json"):
+        reasons.append("runner_corpus_manifest_path_mismatch")
+
+    recorded_sha256 = provenance.get("runner_corpus_manifest_sha256")
+    if not isinstance(recorded_sha256, str) or not re.fullmatch(
+        r"[0-9a-f]{64}", recorded_sha256
+    ):
+        reasons.append("runner_corpus_manifest_sha256_invalid")
+        return reasons
+    try:
+        model_path = Path(str(provenance.get("model", "") or ""))
+        source_snapshot = CONTEXT_CORPUS_SOURCE.read_bytes()
+        expected_identity = context_corpus_cache_identity(
+            source_path=CONTEXT_CORPUS_SOURCE,
+            model_path=model_path,
+            segments=int(provenance.get("batch_size", 0)),
+            tokens_per_segment=int(
+                provenance.get("runner_context_tokens", 0)
+            ),
+        )
+        validated_path, validated_sha256, manifest = (
+            validate_context_corpus_manifest(
+                corpus_path=corpus_path,
+                expected_identity=expected_identity,
+                source_snapshot=source_snapshot,
+                tokenizer=_load_local_tokenizer(model_path),
+            )
+        )
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        reasons.append(f"runner_corpus_manifest_invalid:{exc}")
+        return reasons
+    if validated_path != manifest_path:
+        reasons.append("runner_corpus_manifest_validated_path_mismatch")
+    if validated_sha256 != recorded_sha256:
+        reasons.append("runner_corpus_manifest_sha256_mismatch")
+    if manifest.get("corpus_sha256") != provenance.get("runner_corpus_sha256"):
+        reasons.append("runner_corpus_manifest_corpus_sha256_mismatch")
+    return reasons
 
 
 def _live_code_scope_untracked_files() -> list[str]:
@@ -289,7 +352,6 @@ def _reference_gate_integrity_reasons(
     *,
     mode: str,
     exact_tier: bool = False,
-    allow_local_pair_comparison_only: bool = False,
 ) -> list[str]:
     if mode == "dense":
         return []
@@ -314,12 +376,6 @@ def _reference_gate_integrity_reasons(
             return ["debug_dense_reference_gate_must_be_none"]
         if reference_reasons != ["dense_reference_skipped_for_debug"]:
             return ["debug_dense_reference_reason_mismatch"]
-        return []
-    if allow_local_pair_comparison_only:
-        if reference_passed is not False:
-            return ["local_pair_comparison_reference_gate_must_be_false"]
-        if reference_reasons != ["reference_semantic_mismatch"]:
-            return ["local_pair_comparison_reference_reason_mismatch"]
         return []
     if reference_passed is not True:
         return ["dense_reference_gate_not_green"]
@@ -634,6 +690,9 @@ def _model_kv_contract_reasons(
             compact_blocks = int(provenance.get("compact_blocks_per_slot", 0))
             context_tokens = int(provenance.get("runner_context_tokens", 0))
             max_new_tokens = int(provenance.get("max_new_tokens_effective", 0))
+            chat_template_reserve = int(
+                provenance.get("runner_chat_template_reserve_tokens", 0)
+            )
         except (TypeError, ValueError):
             reasons.append("runner_model_kv_capacity_inputs_invalid")
         else:
@@ -652,7 +711,7 @@ def _model_kv_contract_reasons(
                 if denominator > 0
                 else -1
             )
-            needed = context_tokens + max_new_tokens
+            needed = context_tokens + max_new_tokens + chat_template_reserve
             preflight_status = provenance.get("runner_kv_preflight_status")
             if capacity < needed and preflight_status == "passed":
                 reasons.append(
@@ -1257,8 +1316,8 @@ def _exact_runtime_proof_reasons(
         ),
         "engine_runtime_kv_page_size_identity_passed": True,
         "engine_runtime_kv_null_block_count": 1,
-        "engine_runtime_kv_required_blocks_per_request": 4_128,
-        "engine_runtime_kv_required_workload_blocks": 132_096,
+        "engine_runtime_kv_required_blocks_per_request": 4_160,
+        "engine_runtime_kv_required_workload_blocks": 133_120,
         "engine_runtime_kv_capacity_covers_required_total": True,
     }
     for field, expected in expected_top.items():
@@ -1493,10 +1552,10 @@ def _exact_runtime_proof_reasons(
             "compact_generation_count": compact_generation_count,
             "compact_lease_blocks": compact_lease_blocks,
             "required_batch_size": 32,
-            "required_tokens_per_request": 66_048,
-            "required_workload_tokens": 2_113_536,
-            "required_blocks_per_request": 4_128,
-            "required_workload_blocks": 132_096,
+            "required_tokens_per_request": 66_560,
+            "required_workload_tokens": 2_129_920,
+            "required_blocks_per_request": 4_160,
+            "required_workload_blocks": 133_120,
             "expected_bytes_per_token": expected_kv_bytes_per_token,
             "capacity_covers_required_total": True,
         }
@@ -1507,7 +1566,7 @@ def _exact_runtime_proof_reasons(
                 )
         if type(num_blocks) is int:
             expected_ordinary = num_blocks - 1 - compact_lease_blocks
-            expected_total = 1 + compact_lease_blocks + 132_096
+            expected_total = 1 + compact_lease_blocks + 133_120
             if admission_record.get("ordinary_blocks") != expected_ordinary:
                 reasons.append(f"{prefix}_rank{rank}_ordinary_blocks_mismatch")
             if admission_record.get("required_total_blocks") != expected_total:
@@ -1649,35 +1708,6 @@ def _explicit_local_pair_reasons(summary: dict[str, Any]) -> list[str]:
     return reasons
 
 
-def _is_documented_local_pair_comparison_only(
-    summary: dict[str, Any],
-    *,
-    mode: str,
-    exact_tier: bool,
-    expect_local_paired_comparison: bool,
-    semantic_gate_reasons: list[object],
-    producer_gate_reasons: list[object],
-) -> bool:
-    """Recognize the sole non-production exit allowed for a valid local pair."""
-    return bool(
-        expect_local_paired_comparison
-        and mode == "sparse"
-        and not exact_tier
-        and semantic_gate_reasons
-        == ["semantic_output_health_not_ok:semantic_mismatch"]
-        and producer_gate_reasons == []
-        and summary.get("reference_gate_passed") is False
-        and summary.get("reference_gate_reasons")
-        == ["reference_semantic_mismatch"]
-        and summary.get("reference_returncode") == 0
-        and summary.get("reference_timed_out") is False
-        and summary.get("skip_dense_reference") is not True
-        and summary.get("gate_passed") is False
-        and summary.get("production_gate_passed") is False
-        and not _explicit_local_pair_reasons(summary)
-    )
-
-
 def _exact_engine_runtime_and_pair_reasons(
     summary: dict[str, Any],
     *,
@@ -1813,6 +1843,10 @@ def _exact_engine_runtime_and_pair_reasons(
                 reasons.append(
                     f"tp8_exact_pair_{arm}_raw_runner_mismatch:{location}"
                 )
+        if nested.get("chat_template") is not True:
+            reasons.append(f"tp8_exact_pair_{arm}_chat_template_not_enabled")
+        if nested.get("enable_thinking") is not False:
+            reasons.append(f"tp8_exact_pair_{arm}_thinking_not_disabled")
     if summary.get("sparse_dense_pair_arm_runner_observed") != raw_runner_observed:
         reasons.append("tp8_exact_pair_runner_observed_not_raw")
     sparse_boundary = sparse_metrics.get("boundary_diagnostics")
@@ -2602,7 +2636,6 @@ def _harness_condition_reasons(
     expected_git_commit: str | None,
     expected_model_config_sha256: str | None,
     expect_local_paired_comparison: bool = False,
-    allow_local_pair_comparison_only: bool = False,
 ) -> list[str]:
     reasons: list[str] = []
     exact_tier = expected_tier == "tp8x64k"
@@ -2676,12 +2709,33 @@ def _harness_condition_reasons(
                         f"runner_release_identity_mismatch:{field}:"
                         f"actual={provenance.get(field)!r}:expected={expected!r}"
                     )
-        if provenance.get("runner_corpus_token_status") not in {
-            "cache_exact",
-            "generated_exact",
-            "validated_exact",
-        }:
+        if provenance.get("runner_corpus_token_status") != "cache_exact":
             reasons.append("runner_corpus_token_status_not_exact")
+        reasons.extend(_corpus_manifest_reasons(provenance))
+        if provenance.get("chat_template") is not True:
+            reasons.append("runner_chat_template_not_enabled")
+        if provenance.get("enable_thinking") is not False:
+            reasons.append("runner_thinking_mode_not_disabled")
+        chat_reserve = provenance.get("runner_chat_template_reserve_tokens")
+        chat_overhead_min = provenance.get("runner_chat_template_overhead_min")
+        chat_overhead_max = provenance.get("runner_chat_template_overhead_max")
+        chat_verified = provenance.get("runner_chat_template_verified_count")
+        if chat_reserve != 512:
+            reasons.append("runner_chat_template_reserve_mismatch")
+        if (
+            type(chat_overhead_min) is not int
+            or type(chat_overhead_max) is not int
+            or chat_overhead_min < 0
+            or chat_overhead_max < chat_overhead_min
+            or type(chat_reserve) is not int
+            or chat_overhead_max > chat_reserve
+        ):
+            reasons.append("runner_chat_template_overhead_invalid")
+        if not _is_exact_positive_int(
+            chat_verified,
+            provenance.get("batch_size"),
+        ):
+            reasons.append("runner_chat_template_verified_count_mismatch")
     output_length_gate = summary.get("output_length_gate")
     if not isinstance(output_length_gate, dict):
         reasons.append("output_length_gate_missing_or_invalid")
@@ -2878,29 +2932,14 @@ def _harness_condition_reasons(
     elif summary.get("producer_gate_passed") is not True:
         reasons.append("producer_gate_not_green_without_reason")
 
-    all_gate_reasons = semantic_gate_reasons + producer_gate_reasons
-    only_allowed_gate_noise = mode == "sparse" and bool(all_gate_reasons) and all(
-        _is_allowed_gate_noise(reason, exact_tier=exact_tier)
-        for reason in all_gate_reasons
-    )
-    production_gate_passed = summary.get("production_gate_passed")
-    if allow_local_pair_comparison_only:
-        if production_gate_passed is not False:
-            reasons.append(
-                "production_gate_state_inconsistent_with_local_comparison_only"
-            )
-    elif only_allowed_gate_noise:
-        if production_gate_passed is not False:
-            reasons.append("production_gate_state_inconsistent_with_allowed_noise")
-    elif production_gate_passed is not True:
-        reasons.append("production_gate_not_green_without_only_allowed_noise")
+    if summary.get("production_gate_passed") is not True:
+        reasons.append("production_gate_not_green")
 
     reasons.extend(
         _reference_gate_integrity_reasons(
             summary,
             mode=mode,
             exact_tier=exact_tier,
-            allow_local_pair_comparison_only=allow_local_pair_comparison_only,
         )
     )
     return reasons
@@ -3032,32 +3071,7 @@ def check_run_speed_summary(
         producer_gate_reasons: list[object] = []
     else:
         producer_gate_reasons = list(producer_gate_reasons_raw)
-    gate_reasons = semantic_gate_reasons + producer_gate_reasons
-    local_pair_comparison_only = _is_documented_local_pair_comparison_only(
-        summary,
-        mode=mode,
-        exact_tier=exact_tier,
-        expect_local_paired_comparison=expect_local_paired_comparison,
-        semantic_gate_reasons=semantic_gate_reasons,
-        producer_gate_reasons=producer_gate_reasons,
-    )
-    unexpected_gate_reasons = (
-        []
-        if local_pair_comparison_only
-        else [
-            reason
-            for reason in gate_reasons
-            if mode != "sparse"
-            or not _is_allowed_gate_noise(reason, exact_tier=exact_tier)
-        ]
-    )
-    documented_gate_noise_present = bool(
-        mode == "sparse"
-        and any(
-            _is_allowed_gate_noise(reason, exact_tier=exact_tier)
-            for reason in gate_reasons
-        )
-    )
+    unexpected_gate_reasons = semantic_gate_reasons + producer_gate_reasons
     selector_reasons = (
         _selector_artifact_reasons(
             summary,
@@ -3084,7 +3098,6 @@ def check_run_speed_summary(
             expected_git_commit=expected_git_commit,
             expected_model_config_sha256=expected_model_config_sha256,
             expect_local_paired_comparison=expect_local_paired_comparison,
-            allow_local_pair_comparison_only=local_pair_comparison_only,
         )
     )
 
@@ -3130,16 +3143,6 @@ def check_run_speed_summary(
         messages.append("SPEED RUN CHECK FAILED")
         return harness_returncode, messages
     if (
-        harness_returncode == 2
-        and not documented_gate_noise_present
-        and not local_pair_comparison_only
-    ):
-        messages.append(
-            "HARNESS returncode=2 rejected: current summary has no documented "
-            "no-reference gate reason"
-        )
-        summary_ok = False
-    if (
         harness_returncode == 0
         and summary.get("production_gate_passed") is not True
     ):
@@ -3149,27 +3152,9 @@ def check_run_speed_summary(
         summary_ok = False
     if not summary_ok:
         messages.append("SPEED RUN CHECK FAILED")
-        return (2 if harness_returncode == 2 else 1), messages
-
-    if harness_returncode == 2:
-        if local_pair_comparison_only:
-            messages.append(
-                "HARNESS returncode=2 accepted: local pair is valid; "
-                "production correctness remains failed on the documented "
-                "reference semantic mismatch"
-            )
-        else:
-            messages.append(
-                "HARNESS returncode=2 accepted: current summary contains only "
-                "the documented no-reference gate noise"
-            )
+        return 1, messages
     if exact_tier and mode == "sparse":
         messages.append("SPARSE/DENSE PAIRED ENGINE-LOOP SPEEDUP OK")
-    elif local_pair_comparison_only:
-        messages.append(
-            "SPARSE/DENSE LOCAL PAIRED COMPARISON ONLY "
-            "(production correctness failed: reference_semantic_mismatch)"
-        )
     elif expect_local_paired_comparison and mode == "sparse":
         messages.append("SPARSE/DENSE LOCAL PAIRED COMPARISON OK")
     else:

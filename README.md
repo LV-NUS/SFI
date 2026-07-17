@@ -172,7 +172,7 @@ patched clone is loaded at process startup through
 | vLLM | `0.19.x` v1 engine; SFI fails closed on incompatible private-API drift |
 | CUDA toolkit | toolkit supported by the chosen PyTorch/vLLM build and target architecture, with `nvcc` available |
 | Build tools | `git`, `cmake`, `ninja`, and a supported host compiler |
-| Model | current automated release gates target Qwen3-family checkpoints |
+| Model | current automated release gates target Qwen3 instruction checkpoints whose tokenizer provides a chat template |
 
 PyTorch, the CUDA toolkit, the NVIDIA driver, and the target GPU architecture
 must be mutually compatible. Because SFI patches vLLM v1 private interfaces,
@@ -480,9 +480,29 @@ The built-in tiers are A100-40GB starting points:
 
 Each run creates or reuses a tokenizer-bound, content-addressed corpus with
 exactly `BS × CTX` tokens derived from the tracked fixed calibration source.
-The source hash, tokenizer fingerprint, and corpus hash are part of the
-artifact identity. Dense/sparse comparisons must use the same generated corpus
-and all other workload parameters; changing the corpus starts a new baseline.
+`CTX` is the token count before chat rendering. Every row keeps one fixed
+instruction, one `<text>` envelope, and one fixed question; only the text body
+is cycled. The source hash, tokenizer fingerprint, shape, corpus hash, and
+per-row layout proof are bound by the v5 manifest. Corpus and manifest must be
+regular non-symlink files. `run_speed.sh` accepts only this content-addressed
+cache contract; the old explicit `CORPUS` path is retired and there is no
+arbitrary-text fallback. Dense/sparse comparisons must use the same generated
+corpus and all other workload parameters; changing the corpus starts a new
+baseline.
+
+Before engine startup, each raw row is rendered as one user turn with
+`add_generation_prompt=True` and `enable_thinking=False`. The runner measures
+the exact per-row chat-template overhead and reserves 512 tokens in the model
+length, graph-capture, and KV-capacity preflights. Any row exceeding that
+reserve or any insufficient capacity fails before timing.
+
+Fixed-length timing may continue after the first valid generation stop token;
+that suffix is timing load only. Quality checks and sparse/dense semantic
+comparison use the proven prefix ending at the earliest token in the model's
+effective stop-token set. Artifacts bind the complete stop set, matched token
+ID and index, semantic token count, and full-text prefix relation. Missing or
+inconsistent stop proof fails closed; the post-stop suffix is never presented
+as a quality result.
 
 On SM90/SM100, another model, or a GPU with different memory capacity, treat
 the tier only as a workload shape and override `BS`, `CTX`, `KVB`, `MML`, and

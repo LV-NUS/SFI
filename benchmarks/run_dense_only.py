@@ -34,9 +34,11 @@ try:
         summarize_cudagraph_runtime_observer,
     )
     from benchmarks.prompt_batch_io import (
+        decoded_output_payload,
         load_prompt_batch,
         maybe_apply_chat_template,
         output_payload_from_generation,
+        resolved_generation_stop_token_ids,
     )
     from benchmarks.scheduler_contract import (
         CHUNKED_PREFILL_MODES,
@@ -74,9 +76,11 @@ except ModuleNotFoundError:
         summarize_cudagraph_runtime_observer,
     )
     from prompt_batch_io import (  # type: ignore[no-redef]
+        decoded_output_payload,
         load_prompt_batch,
         maybe_apply_chat_template,
         output_payload_from_generation,
+        resolved_generation_stop_token_ids,
     )
     from scheduler_contract import (  # type: ignore[no-redef]
         CHUNKED_PREFILL_MODES,
@@ -105,7 +109,7 @@ def _final_outputs_with_decoded_text(
     runner's helper of the same name.
     """
     tokenizer = engine.get_tokenizer()  # type: ignore[attr-defined]
-    decode = getattr(tokenizer, "decode", None)
+    stop_token_ids = resolved_generation_stop_token_ids(engine, tokenizer)
     enriched: dict[str, object] = {}
     for rid, payload in final_outputs.items():
         if isinstance(payload, dict):
@@ -117,11 +121,11 @@ def _final_outputs_with_decoded_text(
             if isinstance(raw_token_ids, list)
             else []
         )
-        text = str(decode(token_ids)) if callable(decode) else ""
-        enriched[str(rid)] = {
-            "token_ids": token_ids,
-            "text": text,
-        }
+        enriched[str(rid)] = decoded_output_payload(
+            token_ids,
+            tokenizer,
+            stop_token_ids=stop_token_ids,
+        )
     return enriched
 
 
@@ -187,6 +191,8 @@ def _decode_run_config(
         "batch_size": int(args.batch_size),
         "max_num_seqs": _effective_max_num_seqs(args),
         "split_context_prompts": bool(args.split_context_prompts),
+        "chat_template": bool(args.chat_template),
+        "enable_thinking": bool(args.enable_thinking),
         "max_new_tokens": int(args.max_new_tokens),
         "respect_eos": bool(args.respect_eos),
         "ignore_eos": not bool(args.respect_eos),
@@ -377,8 +383,11 @@ def _install_dense_fa3_route_trace_probe() -> None:
         return
     try:
         from patches.fa3_native.install import install_dense_fa3_route_trace_probe_patch
-    except Exception:
-        return
+    except Exception as exc:
+        raise RuntimeError(
+            "E_DENSE_ROUTE_TRACE_PROBE_IMPORT: required dense route probe "
+            f"import failed: {type(exc).__name__}: {exc}"
+        ) from exc
     install_dense_fa3_route_trace_probe_patch()
 
 
@@ -387,8 +396,11 @@ def _install_fa4_dense_fallback_gateway_if_requested() -> None:
         return
     try:
         from patches.patch_installer import install_fa4_dense_fallback_gateway
-    except Exception:
-        return
+    except Exception as exc:
+        raise RuntimeError(
+            "E_FA4_DENSE_GATEWAY_IMPORT: required FA4 dense gateway import "
+            f"failed: {type(exc).__name__}: {exc}"
+        ) from exc
     install_fa4_dense_fallback_gateway()
 
 
@@ -658,6 +670,9 @@ def main() -> None:
     )
     exact_runtime_required = os.environ.get("SFI_RUNNER_TIER", "") == "tp8x64k"
     context_tokens = int(os.environ.get("SFI_RUNNER_CONTEXT_TOKENS", "0") or 0)
+    chat_template_reserve_tokens = int(
+        os.environ.get("SFI_RUNNER_CHAT_TEMPLATE_RESERVE_TOKENS", "0") or 0
+    )
     expected_kv_bytes_per_token = int(
         os.environ.get(
             "SFI_RUNNER_KV_TOKEN_BYTES_PER_RANK_EFFECTIVE", "0"
@@ -665,17 +680,21 @@ def main() -> None:
         or 0
     )
     if exact_runtime_required and (
-        context_tokens <= 0 or expected_kv_bytes_per_token <= 0
+        context_tokens <= 0
+        or chat_template_reserve_tokens != 512
+        or expected_kv_bytes_per_token <= 0
     ):
         raise RuntimeError(
-            "E_ENGINE_RUNTIME_CONTRACT_INPUT: exact runner KV/context identity missing"
+            "E_ENGINE_RUNTIME_CONTRACT_INPUT: exact runner KV/context/chat identity missing"
         )
     engine_runtime_contract_proof = collect_engine_runtime_contract_proof(
         engine,
         tensor_parallel_size=int(engine_kwargs["tensor_parallel_size"]),
         required_batch_size=int(args.batch_size),
         required_tokens_per_request=(
-            context_tokens + int(args.max_new_tokens)
+            context_tokens
+            + int(args.max_new_tokens)
+            + chat_template_reserve_tokens
             if exact_runtime_required
             else 0
         ),
@@ -731,9 +750,18 @@ def main() -> None:
 
     def _reset_prefix_cache() -> None:
         try:
-            engine.llm_engine.reset_prefix_cache()  # type: ignore[attr-defined]
-        except Exception:
-            return
+            reset_result = (  # type: ignore[attr-defined]
+                engine.llm_engine.reset_prefix_cache()
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "E_PREFIX_CACHE_RESET: reset_prefix_cache raised "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+        if reset_result is False:
+            raise RuntimeError(
+                "E_PREFIX_CACHE_RESET: reset_prefix_cache explicitly returned False"
+            )
 
     def _generate_with_engine_step() -> tuple[float, float, int, int, list[float], float, float, dict[str, object]]:
         # Use cumulative outputs, track per-request token deltas.
@@ -770,6 +798,7 @@ def main() -> None:
         step_engine_core_timing_all: list[dict[str, float]] = []
         step_host_begin_ns_all: list[int] = []
         step_host_end_ns_all: list[int] = []
+        final_output_items: dict[str, object] = {}
 
         t_total0 = time.perf_counter()
         while engine.llm_engine.has_unfinished_requests():  # type: ignore[attr-defined]
@@ -827,10 +856,7 @@ def main() -> None:
                     outputs = getattr(item, "outputs", None)
                     if rid is None or not outputs:
                         continue
-                    final_outputs[str(rid)] = output_payload_from_generation(
-                        item,
-                        include_text=bool(args.outputs_include_text),
-                    )
+                    final_output_items[str(rid)] = item
 
             if step_new_tokens > 0:
                 if first_emit_step_index < 0:
@@ -842,6 +868,13 @@ def main() -> None:
             decode_meter.observe(core_ts, step_new_tokens)
             total_engine_steps += 1
         t_total1 = time.perf_counter()
+        if args.outputs_json:
+            final_outputs.clear()
+            for rid, item in final_output_items.items():
+                final_outputs[str(rid)] = output_payload_from_generation(
+                    item,
+                    include_text=False,
+                )
         decode_elapsed, decode_tokens, _decode_tps, decode_step_durations_s = decode_meter.finalize()
         ad_elapsed_s, ad_tokens, ad_tps, ad_steps = decode_meter.finalize_all_decode()
         first_emit_delay_s, post_decode_tail_s = decode_meter.boundary_delays(

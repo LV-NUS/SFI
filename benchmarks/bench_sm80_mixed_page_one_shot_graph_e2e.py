@@ -2283,6 +2283,45 @@ def _run_provenance_payload(
         "runner_corpus_sha256": str(
             env.get("SFI_RUNNER_CORPUS_SHA256", "") or ""
         ),
+        "runner_corpus_manifest_path": str(
+            env.get("SFI_RUNNER_CORPUS_MANIFEST_PATH", "") or ""
+        ),
+        "runner_corpus_manifest_sha256": str(
+            env.get("SFI_RUNNER_CORPUS_MANIFEST_SHA256", "") or ""
+        ),
+        "runner_corpus_manifest_schema": str(
+            env.get("SFI_RUNNER_CORPUS_MANIFEST_SCHEMA", "") or ""
+        ),
+        "runner_corpus_layout_mode": str(
+            env.get("SFI_RUNNER_CORPUS_LAYOUT_MODE", "") or ""
+        ),
+        "runner_corpus_layout_validation_contract": str(
+            env.get(
+                "SFI_RUNNER_CORPUS_LAYOUT_VALIDATION_CONTRACT",
+                "",
+            )
+            or ""
+        ),
+        "runner_corpus_layout_verified_count": _as_int(
+            env.get("SFI_RUNNER_CORPUS_LAYOUT_VERIFIED_COUNT", "0"),
+            0,
+        ),
+        "runner_chat_template_reserve_tokens": _as_int(
+            env.get("SFI_RUNNER_CHAT_TEMPLATE_RESERVE_TOKENS", "0"),
+            0,
+        ),
+        "runner_chat_template_overhead_min": _as_int(
+            env.get("SFI_RUNNER_CHAT_TEMPLATE_OVERHEAD_MIN", "-1"),
+            -1,
+        ),
+        "runner_chat_template_overhead_max": _as_int(
+            env.get("SFI_RUNNER_CHAT_TEMPLATE_OVERHEAD_MAX", "-1"),
+            -1,
+        ),
+        "runner_chat_template_verified_count": _as_int(
+            env.get("SFI_RUNNER_CHAT_TEMPLATE_VERIFIED_COUNT", "0"),
+            0,
+        ),
         "runner_tier": str(env.get("SFI_RUNNER_TIER", "") or ""),
         "runner_mode": str(env.get("SFI_RUNNER_MODE", "") or ""),
         "runner_tensor_parallel_size": str(
@@ -2678,12 +2717,91 @@ def _reference_text_informational_reasons(
     )
 
 
-def _generated_text_from_output_record(record: dict[str, Any]) -> str:
+def _full_generated_text_from_output_record(record: dict[str, Any]) -> str:
     for key in ("text", "generated_text", "output_text"):
         value = record.get(key)
         if isinstance(value, str):
             return value
     return ""
+
+
+def _semantic_output_text_and_proof_reason(
+    record: dict[str, Any],
+) -> tuple[str, str]:
+    """Return stop-bounded semantic text or a fail-closed proof reason."""
+
+    full_text = _full_generated_text_from_output_record(record)
+    proof_fields = (
+        "semantic_text",
+        "semantic_stop_seen",
+        "semantic_first_stop_token_index",
+        "semantic_stop_token_id",
+        "semantic_stop_token_ids",
+        "semantic_token_count",
+    )
+    if not any(field in record for field in proof_fields):
+        return full_text, "semantic_stop_proof_missing"
+    if any(field not in record for field in proof_fields):
+        return full_text, "semantic_stop_proof_incomplete"
+
+    token_ids = record.get("token_ids")
+    semantic_text = record.get("semantic_text")
+    stop_seen = record.get("semantic_stop_seen")
+    first_stop_index = record.get("semantic_first_stop_token_index")
+    stop_token_id = record.get("semantic_stop_token_id")
+    stop_token_ids = record.get("semantic_stop_token_ids")
+    semantic_token_count = record.get("semantic_token_count")
+    if (
+        not isinstance(token_ids, list)
+        or any(type(token_id) is not int for token_id in token_ids)
+        or not isinstance(semantic_text, str)
+        or type(stop_seen) is not bool
+        or type(first_stop_index) is not int
+        or type(stop_token_id) is not int
+        or not isinstance(stop_token_ids, list)
+        or not stop_token_ids
+        or any(type(token_id) is not int or token_id < 0 for token_id in stop_token_ids)
+        or stop_token_ids != sorted(set(stop_token_ids))
+        or type(semantic_token_count) is not int
+    ):
+        return full_text, "semantic_stop_proof_invalid"
+
+    stop_token_set = set(stop_token_ids)
+    if stop_seen:
+        if (
+            first_stop_index < 0
+            or first_stop_index >= len(token_ids)
+            or stop_token_id not in stop_token_set
+            or token_ids[first_stop_index] != stop_token_id
+            or any(
+                token_id in stop_token_set
+                for token_id in token_ids[:first_stop_index]
+            )
+            or semantic_token_count != first_stop_index + 1
+            or not semantic_text.strip()
+            or not full_text.startswith(semantic_text)
+        ):
+            return full_text, "semantic_stop_proof_invalid"
+        return semantic_text, ""
+
+    if (
+        first_stop_index != -1
+        or stop_token_id != -1
+        or semantic_token_count != len(token_ids)
+        or any(token_id in stop_token_set for token_id in token_ids)
+        or semantic_text != full_text
+    ):
+        return full_text, "semantic_stop_proof_invalid"
+    return full_text, ""
+
+
+def _generated_text_from_output_record(record: dict[str, Any]) -> str:
+    semantic_text, proof_reason = _semantic_output_text_and_proof_reason(record)
+    return (
+        semantic_text
+        if not proof_reason
+        else _full_generated_text_from_output_record(record)
+    )
 
 
 def _text_quality_stats(text: str) -> dict[str, float]:
@@ -9838,14 +9956,8 @@ def _eos_seen(records: list[dict[str, Any]]) -> bool | None:
     return False if seen_any else None
 
 
-def _semantic_output_health(
-    reference_semantic_match: bool | None,
-    records: list[dict[str, Any]],
-) -> str:
-    # Kept in the signature for legacy call sites and artifact compatibility.
-    # Cross-arm equivalence is recorded separately and never defines whether
-    # either arm produced a healthy output.
-    del reference_semantic_match
+def _semantic_output_health(records: list[dict[str, Any]]) -> str:
+    """Return single-arm output health; cross-arm text is separate evidence."""
     return _sparse_output_content_health(records)
 
 
@@ -9859,7 +9971,12 @@ def _semantic_gate_reasons(mode: str, semantic_output_health: str) -> list[str]:
 
 
 def _sparse_output_content_health(records: list[dict[str, Any]]) -> str:
-    texts = [str(record.get("text", "")) for record in records]
+    texts: list[str] = []
+    for record in records:
+        text, proof_reason = _semantic_output_text_and_proof_reason(record)
+        if proof_reason:
+            return proof_reason
+        texts.append(text)
     if not texts or any(not text.strip() for text in texts):
         return "missing_text"
     for text in texts:
@@ -10544,7 +10661,7 @@ def _record_from_result(
     semantic_output_health = str(
         metrics.get(
             "semantic_output_health",
-            _semantic_output_health(reference_semantic_match, output_records),
+            _semantic_output_health(output_records),
         )
         or ""
     )
