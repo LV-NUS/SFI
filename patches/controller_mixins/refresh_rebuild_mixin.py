@@ -47,6 +47,7 @@ from patches.refresh_runtime.producer_workspace import (
 from patches.selector_runtime.selected_out_ring import (
     SLOT_VALID_SET_ATTR,
     SelectedOutRing,
+    SelectedOutRingSlot,
     SlotStableOverrides,
 )
 from patches.sparse_constants import (
@@ -57,8 +58,9 @@ from patches.sparse_constants import (
     _DEFERRED_SELECTOR_PROFILE_DETAIL_CACHED,
     _selected_out_ring_enabled,
     _selected_out_ring_slots,
-    _PENDING_REBUILD_MAX_QUEUE_CACHED,
+    _PENDING_REBUILD_MAX_QUEUE_OVERRIDE_CACHED,
     _REFRESH_GROUPED_ASYNC_ENVELOPE_CACHED,
+    _REFRESH_PROFILE_CACHED,
     _REFRESH_PRODUCER_SPLIT_SELECTOR_WRITER_RELEASE_AUTO_CACHED,
     _REFRESH_PRODUCER_SPLIT_SELECTOR_WRITER_RELEASE_CACHED,
     _REFRESH_PRODUCER_SPLIT_SELECTOR_WRITER_RELEASE_MAX_PER_HANDLE_CACHED,
@@ -79,14 +81,6 @@ if TYPE_CHECKING:
     )
 
 _log = logging.getLogger(__name__)
-
-# Upper bound on the diagnostic _deadline_rebuild_drain_submit_decode_steps set.
-# It is populated with a distinct monotonic decode-step int per drain submit and is
-# consumed only by the flush_worker refresh-profile snapshot; without a bound it grows
-# one int per step forever (slow host-RAM creep in the deadline-rebuild drain regime).
-# Keep only the most recent CAP steps. Host-only (cannot cause GPU OOM); generous so
-# unit contracts (which add a handful of steps) are unaffected.
-_DEADLINE_DRAIN_SUBMIT_DECODE_STEPS_CAP = 4096
 
 
 def _selected_scope_target_matches_key(
@@ -298,14 +292,16 @@ class RefreshRebuildMixin:
         self._deadline_async_producer_graph_capture_cpu_us_total: float = 0.0
         self._deadline_async_producer_graph_capture_cpu_us_max: float = 0.0
         # ASYNC_PRODUCER_WRITER_GRAPH (task #9): captured writer-graph holder.
-        # ``graphs`` maps key -> CUDAGraph (each graph owns a PRIVATE mempool,
-        # [POOL-PRIVATE] — never the decode-graph pool, never shared);
-        # ``bypass`` is retained only to reject stale in-process state from the
-        # retired fail-open implementation. Current code never sets it.
+        # ``graphs`` maps the exact launch key -> CUDAGraph; ``scope_keys``
+        # maps the bounded (batch, layer-group) ownership scope -> its current
+        # exact key. Each graph owns a PRIVATE mempool ([POOL-PRIVATE] — never
+        # the decode-graph pool, never shared). A geometry change replaces only
+        # that scope, so heterogeneous scheduler batches cannot grow this cache
+        # without bound or flush unrelated hot graphs.
         self._writer_graph_state: Optional[Dict[str, object]] = None
-        self._writer_graph_recapture_window: int = 0
+        # Cold-path telemetry: exact-key replacements within an existing
+        # bounded scope. Initial captures of new scopes are not recaptures.
         self._writer_graph_recapture_count: int = 0
-        self._writer_graph_evict_clear_count: int = 0
         # [S1-KA1 2026-07-12] dedicated idle stream for writer-graph capture
         # (lazy-created on the cold capture path). Capturing on refresh_stream
         # forced a pre-capture refresh_stream.synchronize() that drained the
@@ -582,7 +578,16 @@ class RefreshRebuildMixin:
             return None
         ring = getattr(self, "_selected_out_ring", None)
         if ring is None:
-            ring = SelectedOutRing(slots=_selected_out_ring_slots())
+            # The model has registered every attention layer before the first
+            # deferred selector run. Derive exactly one persistent owner per
+            # real layer chunk here (cold construction only), rather than using
+            # a model-specific global slot count.
+            ring = SelectedOutRing(
+                slots=_selected_out_ring_slots(
+                    layer_count=len(self.layer_cache_keys),
+                    capture_chunk=int(_CAPTURE_CHUNK),
+                )
+            )
             self._selected_out_ring = ring
         return ring
 
@@ -1097,15 +1102,19 @@ class RefreshRebuildMixin:
             step_min if cur_min < 0 else min(cur_min, step_min)
         )
         self._deadline_rebuild_drain_submit_decode_step_max = max(cur_max, step_max)
-        self._deadline_rebuild_drain_submit_decode_steps.update(steps)
-        # Bound this diagnostic set (monotonic decode-step ints): drop the oldest
-        # beyond the cap so it cannot grow unbounded in host RAM. No-op until it
-        # exceeds the cap (i.e. never for unit-scale step counts).
-        _ds = self._deadline_rebuild_drain_submit_decode_steps
-        if len(_ds) > _DEADLINE_DRAIN_SUBMIT_DECODE_STEPS_CAP:
-            _excess = len(_ds) - _DEADLINE_DRAIN_SUBMIT_DECODE_STEPS_CAP
-            for _old_step in sorted(_ds)[:_excess]:
-                _ds.discard(_old_step)
+        # Exact step identities are diagnostic-only.  Their real owner is one
+        # refresh-profile sampling window, not the controller lifetime and not
+        # an empirical global capacity.  Default serving therefore pays no set
+        # update; profile emission drains the enabled collector below.
+        if _REFRESH_PROFILE_CACHED:
+            self._deadline_rebuild_drain_submit_decode_steps.update(steps)
+
+    def _take_deadline_rebuild_drain_submit_decode_steps(self) -> Tuple[int, ...]:
+        """Return and retire exact drain steps for one profile sample window."""
+        steps = self._deadline_rebuild_drain_submit_decode_steps
+        snapshot = tuple(sorted(steps))
+        steps.clear()
+        return snapshot
 
     def _record_deferred_selector_compute_profile(
         self,
@@ -1510,25 +1519,6 @@ class RefreshRebuildMixin:
         self._pending_refresh_rebuilds = kept
         return coalesced
 
-    def _pending_refresh_rebuild_count_superseded(
-        self,
-        pending: "PendingRefreshRebuild",
-    ) -> int:
-        """Count same-scope pending work without mutating queue or leases."""
-        if not self._pending_refresh_rebuilds:
-            return 0
-        count = 0
-        for old in self._pending_refresh_rebuilds:
-            if old is pending:
-                continue
-            if RefreshRebuildMixin._pending_refresh_rebuild_can_coalesce(
-                self,
-                old,
-                pending,
-            ):
-                count += 1
-        return int(count)
-
     def _pending_refresh_rebuild_finish_boundary_drain(
         self,
         *,
@@ -1539,9 +1529,11 @@ class RefreshRebuildMixin:
         Deadline rule:
           - if all rows covered by a pending rebuild are finished, the work is
             stale before any future decode can consume it, so drop it;
-          - if the item also contains active rows, drain it now so active rows
-            can still receive the refresh while finished slots are released
-            only after the rebuild has been submitted.
+          - any mixed finished/active cohort is no longer a valid batch
+            snapshot. Invalidate it and rearm its active rows instead of
+            making the decision depend on rank-local writer submission timing;
+          - if work was already submitted, wait its recorded event before
+            releasing resources, but do not publish the invalidated cohort.
         """
         if not finished_ids or not self._pending_refresh_rebuilds:
             return (0, 0, 0)
@@ -1591,54 +1583,22 @@ class RefreshRebuildMixin:
                 dropped += 1
                 continue
 
-            if self._wait_pending_refresh_rebuild_writer_done(pending):
-                if not self._pending_refresh_rebuild_is_latest(pending):
-                    _mark_pending_selected_scope_terminal(
-                        pending,
-                        status="drop_non_latest",
-                    )
-                    drop_req_ids = self._pending_refresh_rebuild_drop_req_ids(
-                        pending,
-                        req_ids=req_ids,
-                    )
-                    if drop_req_ids:
-                        self._resolve_refresh_lease(
-                            req_ids=drop_req_ids,
-                            reason="pending_rebuild_drop_non_latest_finish_boundary",
-                        )
-                    self._pending_refresh_rebuild_clear_completed_buf_work(
-                        pending,
-                        pending_buf_ref_counts=pending_buf_ref_counts,
-                    )
-                    self._pending_refresh_rebuild_clear(pending)
-                    dropped += 1
-                    continue
-                result = getattr(pending, "result", None)
-                if result is None:
-                    raise RuntimeError(
-                        "pending refresh writer_done_event has no selection result"
-                    )
-                self._commit_pending_refresh_rebuild_compact_meta(pending)
-                if not bool(getattr(pending, "tracking_published", False)):
-                    self._publish_pending_refresh_rebuild_selection_tracking(
-                        pending,
-                        result,
-                    )
-                    pending.tracking_published = True
-                self._mark_pending_refresh_rebuild_accepted(pending)
-                self._pending_refresh_rebuild_clear_completed_buf_work(
-                    pending,
-                    pending_buf_ref_counts=pending_buf_ref_counts,
-                )
-                self._pending_refresh_rebuild_clear(pending)
-                drained += 1
-                partial += 1
-                continue
-
-            self._record_pending_refresh_rebuild_drain_submit(pending)
-            self._submit_pending_refresh_rebuild(pending)
-            self._pending_refresh_rebuild_clear(pending)
-            drained += 1
+            # The cohort membership change is the invalidation boundary, not
+            # whether this rank happened to submit its writer first. Basing
+            # commit/drop on writer_done_event makes TP ranks choose different
+            # row modes under ordinary asynchronous scheduling. The common
+            # drop path waits any already-recorded work before releasing it;
+            # dual-gen keeps active rows' previous generation readable, and
+            # the lease resolver rearms only live request states.
+            self._drop_pending_refresh_rebuild(
+                pending,
+                status="drop_partial_finished_cohort",
+                lease_reason="pending_rebuild_partial_finished_cohort_invalidated",
+                req_ids=req_ids,
+                pending_buf_ref_counts=pending_buf_ref_counts,
+                wait_recorded_work=True,
+            )
+            dropped += 1
             partial += 1
 
         self._pending_refresh_rebuilds = kept
@@ -1898,7 +1858,7 @@ class RefreshRebuildMixin:
             _sel_out_ring = self._selected_out_ring_for_pending()
             _ring_slot = (
                 _sel_out_ring.begin_run(
-                    preferred=int(getattr(pending, "chunk_id", -1) or -1)
+                    preferred=int(getattr(pending, "chunk_id", -1) or -1),
                 )
                 if _sel_out_ring is not None
                 else None
@@ -1995,23 +1955,78 @@ class RefreshRebuildMixin:
 
         # [DUAL-GEN-LAYER-PARITY] 本 commit 轮的 slot→落代账本(跨层一致性)。
         self._dual_gen_flip_parity_by_slot = {}
-        # [DUAL-GEN-PARITY-FORENSICS 2026-07-08] commit 轮审计环:每轮记
-        # (来源, 各 entry 的 layer_index+flip_slots)。违例时把近 16 轮历史
-        # +全层 read_gen[slot] 快照带进异常消息,一次定名分叉形态(块状丢轮
-        # =flush 暂存覆写型 / 单层双翻=double-append 型)。纯诊断,健康路径
-        # 仅每 flip 轮一次 O(entries) 追加。
-        _audit_ring = getattr(self, "_dual_gen_commit_audit", None)
-        if _audit_ring is None:
-            from collections import deque
-
-            _audit_ring = deque(maxlen=16)
-            self._dual_gen_commit_audit = _audit_ring
+        # [DUAL-GEN-PARITY-FORENSICS] The atomic commit round itself is the
+        # complete owner of parity evidence. Keeping an arbitrary number of
+        # healthy historical rounds added hot bookkeeping yet could never
+        # guarantee that the causal round survived. On failure report this
+        # exact round plus the live per-layer generation table instead.
         _audit_round: Dict[str, object] = {
             "src": str(source),
             "n": len(tuple(commit_log)),
             "entries": [],
         }
-        _audit_pushed = False
+        # A deferred metadata transaction is valid only while the request that
+        # produced it still owns the physical slot.  Cache the immutable owner
+        # maps once per payload group; each layer entry shares the same tuple.
+        _owner_map_by_snapshot_id: Dict[int, Dict[int, str]] = {}
+        _owner_liveness_by_slot_req: Dict[Tuple[int, str], bool] = {}
+
+        def _entry_live_owned_slots(
+            entry: Dict[str, object],
+            state: "LayerState",
+        ) -> Tuple[Dict[int, str], Set[int]]:
+            raw_snapshot = entry.get("slot_owner_snapshot")
+            if not isinstance(raw_snapshot, tuple) or not raw_snapshot:
+                raise RuntimeError(
+                    "deferred compact metadata missing submission-step slot owners"
+                )
+            snapshot_key = id(raw_snapshot)
+            owner_by_slot = _owner_map_by_snapshot_id.get(snapshot_key)
+            if owner_by_slot is None:
+                owner_by_slot = {}
+                for raw_pair in raw_snapshot:
+                    if not isinstance(raw_pair, tuple) or len(raw_pair) != 2:
+                        raise RuntimeError(
+                            "deferred compact metadata slot owner snapshot is malformed"
+                        )
+                    slot = int(raw_pair[0])
+                    req_id = str(raw_pair[1])
+                    if slot in owner_by_slot:
+                        raise RuntimeError(
+                            "deferred compact metadata slot owner snapshot has duplicates"
+                        )
+                    owner_by_slot[slot] = req_id
+                _owner_map_by_snapshot_id[snapshot_key] = owner_by_slot
+
+            batch_request_ids = getattr(state, "batch_request_ids", None)
+            if batch_request_ids is None:
+                raise RuntimeError(
+                    "deferred compact metadata commit requires live slot ownership"
+                )
+            live_slots: Set[int] = set()
+            for slot, expected_req_id in owner_by_slot.items():
+                current_req_id = (
+                    batch_request_ids[slot]
+                    if 0 <= slot < len(batch_request_ids)
+                    else None
+                )
+                is_live = bool(
+                    current_req_id is not None
+                    and not _is_free_slot_id(current_req_id)
+                    and str(current_req_id) == expected_req_id
+                )
+                liveness_key = (slot, expected_req_id)
+                if liveness_key in _owner_liveness_by_slot_req:
+                    if _owner_liveness_by_slot_req[liveness_key] != is_live:
+                        raise RuntimeError(
+                            "deferred compact metadata slot ownership differs across layers: "
+                            f"slot={slot} request_id={expected_req_id}"
+                        )
+                else:
+                    _owner_liveness_by_slot_req[liveness_key] = is_live
+                if is_live:
+                    live_slots.add(slot)
+            return owner_by_slot, live_slots
 
         def _dual_gen_read_gen_table(slot: int) -> str:
             rows = []
@@ -2027,19 +2042,45 @@ class RefreshRebuildMixin:
 
         for entry in tuple(commit_log):
             state = entry["state"]
+            owner_by_slot, live_owned_slots = _entry_live_owned_slots(entry, state)
+
+            def _tracked_slot(raw_slot: object, *, field: str) -> int:
+                slot = int(raw_slot)
+                if slot not in owner_by_slot:
+                    raise RuntimeError(
+                        "deferred compact metadata references an unowned slot: "
+                        f"field={field} slot={slot}"
+                    )
+                return slot
+
+            if not live_owned_slots:
+                # The producing request completed or the physical slot was
+                # rebound before publication.  Its GPU write targets an obsolete
+                # lease and must not mutate metadata for the new owner.
+                continue
             if str(entry.get("phase", "")) == "refresh":
                 state.last_reason = "refresh"
             for raw_slot in tuple(entry.get("reset_slot_commits", tuple())):
-                _reset_compact_slot_metadata(state, int(raw_slot))
+                slot = _tracked_slot(raw_slot, field="reset_slot_commits")
+                if slot in live_owned_slots:
+                    _reset_compact_slot_metadata(state, slot)
             # [DUAL-GEN-L2a-C] writer_done 已在 main stream wait 之后:对本批
             # writer 写过的 slot 原子切读代(read_gen 翻转+offset/三视图指向
             # 新半区)。后续 slot_meta/pad_marker commits 描述的即新半区内容,
             # 顺序自洽。关态恒空 tuple=零行为。
-            _flip_slots = tuple(entry.get("dual_gen_flip_slots", tuple()))
+            _flip_slots_all = tuple(
+                _tracked_slot(raw_slot, field="dual_gen_flip_slots")
+                for raw_slot in tuple(entry.get("dual_gen_flip_slots", tuple()))
+            )
+            if len(set(_flip_slots_all)) != len(_flip_slots_all):
+                raise RuntimeError(
+                    "dual-gen flip slot duplicated in one commit entry "
+                    "(double flip reads stale half)"
+                )
+            _flip_slots = tuple(
+                slot for slot in _flip_slots_all if slot in live_owned_slots
+            )
             if _flip_slots:
-                if not _audit_pushed:
-                    _audit_ring.append(_audit_round)
-                    _audit_pushed = True
                 _audit_round["entries"].append(
                     (
                         int(getattr(entry["state"], "layer_index", -1)),
@@ -2091,8 +2132,7 @@ class RefreshRebuildMixin:
                             f"{int(getattr(state, 'layer_index', -1))}; "
                             f"read_gen[slot] by layer: "
                             f"{_dual_gen_read_gen_table(_slot)}; "
-                            f"recent flip commit rounds (oldest->newest): "
-                            f"{list(_audit_ring)}"
+                            f"current flip commit round: {_audit_round}"
                         )
                     state.compact_read_gen[_slot] = _new_gen
                     _off = compact_slot_offset_tokens(
@@ -2109,7 +2149,9 @@ class RefreshRebuildMixin:
             for raw_slot, raw_sink_len, raw_persist_len, raw_kv_len in tuple(
                 entry.get("slot_meta_commits", tuple())
             ):
-                slot = int(raw_slot)
+                slot = _tracked_slot(raw_slot, field="slot_meta_commits")
+                if slot not in live_owned_slots:
+                    continue
                 if slot < 0 or slot >= len(state.compact_kv_len):
                     continue
                 state.compact_sink_len[slot] = int(raw_sink_len)
@@ -2118,11 +2160,15 @@ class RefreshRebuildMixin:
             for raw_slot, raw_marker in tuple(
                 entry.get("pad_marker_commits", tuple())
             ):
-                slot = int(raw_slot)
+                slot = _tracked_slot(raw_slot, field="pad_marker_commits")
+                if slot not in live_owned_slots:
+                    continue
                 if 0 <= slot < len(state.compact_pad_zeroed_len):
                     state.compact_pad_zeroed_len[slot] = int(raw_marker)
             for raw_slot in tuple(entry.get("bootstrap_slots", tuple())):
-                slot = int(raw_slot)
+                slot = _tracked_slot(raw_slot, field="bootstrap_slots")
+                if slot not in live_owned_slots:
+                    continue
                 if slot >= len(state.compact_kv_len) or int(state.compact_kv_len[slot]) <= 0:
                     raise RuntimeError(
                         f"bootstrap slot {slot} has empty compact buffer after rebuild"
@@ -2164,9 +2210,6 @@ class RefreshRebuildMixin:
     # ------------------------------------------------------------------
     # ASYNC_PRODUCER_WRITER_GRAPH (task #9): captured writer-graph dispatcher.
     # ------------------------------------------------------------------
-    _WRITER_GRAPH_THRASH_RECAPTURES = 4
-    _WRITER_GRAPH_THRASH_WINDOW = 64
-
     def _writer_graph_split_active(self) -> bool:
         """Defect #4: per-pending fresh selected_indices_out override -> eager.
 
@@ -2192,33 +2235,6 @@ class RefreshRebuildMixin:
         return isinstance(override, dict) and not isinstance(
             override, SlotStableOverrides
         )
-
-    def _writer_graph_record_recapture(self) -> bool:
-        """Thrash adjudicator: latch bypass only on UNBOUNDED key churn.
-
-        [SYNC-STORM family 2026-07-09, mirrors the selector track] recapture
-        volume alone is NOT churn: a bounded key family (layer-groups x
-        writer-stable buffer generations; bootstrap and batch-composition
-        windows recapture legitimately) can exceed any count threshold and
-        must never latch bypass — that latch was exactly the selector track's
-        "capture==THRASH_WINDOW then dead" shape. Unbounded churn ALWAYS
-        overflows the 8-entry per-key graph cache (clear-before-insert), so
-        require BOTH signals inside one window: recaptures over threshold AND
-        at least one cache clear.
-        """
-        self._writer_graph_recapture_window += 1
-        self._writer_graph_recapture_count += 1
-        if self._writer_graph_recapture_window >= int(self._WRITER_GRAPH_THRASH_WINDOW):
-            recaptures = int(self._writer_graph_recapture_count)
-            clears = int(self._writer_graph_evict_clear_count)
-            self._writer_graph_recapture_window = 0
-            self._writer_graph_recapture_count = 0
-            self._writer_graph_evict_clear_count = 0
-            return (
-                recaptures > int(self._WRITER_GRAPH_THRASH_RECAPTURES)
-                and clears > 0
-            )
-        return False
 
     def _writer_graph_capture_stream(self, *, device: torch.device) -> Any:
         """[S1-KA1] Dedicated idle stream for writer-graph capture.
@@ -2248,7 +2264,7 @@ class RefreshRebuildMixin:
         key_fields: Tuple[int, ...],
         key_unresolved: bool = False,
     ) -> None:
-        """Replay the captured writer graph on a key hit; else eager (+recapture).
+        """Replay the captured writer graph on an exact launch-key hit.
 
         Capture/replay failures are terminal. Retrying through eager after an
         asynchronous graph failure can double-submit a partial writer and hide
@@ -2274,6 +2290,14 @@ class RefreshRebuildMixin:
         ``key_unresolved`` (layer-group identity unresolved, -1 fields): the
         degenerate key would collide both layer groups -> never capture or
         replay under it (the pre-split ROW1-corruption regime); eager only.
+
+        The first four key fields are the bounded ownership scope
+        ``(batch, first_layer, last_layer, layer_segment_hash)``. Full launch
+        geometry remains in the exact key, but a geometry change replaces only
+        that scope's graph. This matches scheduler reality (mixed prefill and
+        decode legitimately exercise several batch shapes) without a global
+        cache-size guess or a clear-all storm. The hot-hit path remains the
+        same single full-key dict lookup.
         """
         _wg_dbg = os.environ.get("VLLM_SPARSE_SELECTOR_TOPK_GRAPH_DEBUG_LOG", "")
 
@@ -2306,7 +2330,7 @@ class RefreshRebuildMixin:
             eager_fn()
             return
         key = tuple(int(v) for v in key_fields)
-        # #9-KEY v5: per-key graph CACHE. Two writer pendings per refresh
+        # #9-KEY v6: exact-key graph CACHE. Two writer pendings per refresh
         # (contiguous layer chunks) alternate forever; a single global slot
         # either COLLIDES (pre-v5 ROW1 corruption, when keys lacked group
         # identity) or evicts itself every call (with group-distinct keys),
@@ -2433,22 +2457,40 @@ class RefreshRebuildMixin:
                     graph.capture_end()
         finally:
             self._clear_rebuild_ptr_capture_wait_satisfied()
-        # #9-KEY v5: per-key cache insert (state may be None / legacy shape).
+        # #9-KEY v6: scope-owned cache insert. The first four exact-key fields
+        # are the bounded scheduler/model scope: (batch, first layer, last
+        # layer, exact segment hash). A scope owns at most one current graph;
+        # a true launch-geometry change atomically replaces only that entry.
+        # This derives boundedness from runtime structure instead of the old
+        # global constant 8 (BS8 x three legal layer groups already needs 24).
         key_t = tuple(int(v) for v in key)
-        if not isinstance(state, dict) or not isinstance(state.get("graphs"), dict):
-            state = {"graphs": {}}
+        if (
+            len(key_t) < 4
+            or key_t[0] <= 0
+            or key_t[1] < 0
+            or key_t[2] < key_t[1]
+        ):
+            raise RuntimeError("E_SFI_WRITER_GRAPH_INVALID_SCOPE_KEY")
+        if (
+            not isinstance(state, dict)
+            or not isinstance(state.get("graphs"), dict)
+            or not isinstance(state.get("scope_keys"), dict)
+        ):
+            state = {"graphs": {}, "scope_keys": {}}
             self._writer_graph_state = state
         graphs_map = state["graphs"]
-        # Defensive bound: beyond any plausible (layer-group x batch-shape)
-        # population the keys are churning; drop the stale set BEFORE the
-        # insert (keep the just-captured graph) and let the thrash detector
-        # adjudicate a bypass.
-        if len(graphs_map) >= 8 and key_t not in graphs_map:
-            graphs_map.clear()
-            # Thrash joint-verdict signal: unbounded churn is the only way to
-            # overflow this cache (bounded families never reach 8 live keys).
-            self._writer_graph_evict_clear_count += 1
+        scope_keys = state["scope_keys"]
+        scope = key_t[:4]
+        previous_key = scope_keys.get(scope)
+        if previous_key is not None and previous_key != key_t:
+            previous_graph = graphs_map.pop(previous_key, None)
+            if previous_graph is None:
+                raise RuntimeError("E_SFI_WRITER_GRAPH_SCOPE_INDEX_CORRUPT")
+            self._writer_graph_recapture_count += 1
+        elif previous_key == key_t and key_t not in graphs_map:
+            raise RuntimeError("E_SFI_WRITER_GRAPH_SCOPE_INDEX_CORRUPT")
         graphs_map[key_t] = graph
+        scope_keys[scope] = key_t
         self._record_deadline_async_producer_count("graph_capture")
         _wg_dbg = os.environ.get("VLLM_SPARSE_SELECTOR_TOPK_GRAPH_DEBUG_LOG", "")
         if _wg_dbg:
@@ -2459,8 +2501,6 @@ class RefreshRebuildMixin:
                     _fh.write(f"{os.getpid()}\twriter\t{key_t}\n")
             except OSError:
                 pass
-        if self._writer_graph_record_recapture():
-            raise RuntimeError("E_SFI_WRITER_GRAPH_UNBOUNDED_KEY_CHURN")
 
     def _run_pending_refresh_rebuild_compact_writer(
         self,
@@ -3235,7 +3275,18 @@ class RefreshRebuildMixin:
             return
         self._publish_pending_refresh_rebuild_selection_tracking(pending, result)
         pending.tracking_published = True
+        # The fallback submitters call this body inline on the consumer CUDA
+        # stream.  They still need the same atomic compact-metadata transaction
+        # as the asynchronous producer: dual-gen writers target the inactive
+        # half, so no layer may flip its read generation until every layer's
+        # writer launch has been submitted.  Deferring here and committing
+        # immediately after the writer preserves stream ordering without a GPU
+        # synchronize or an extra event.  This path is deadline/finished-drain
+        # only; the steady async producer keeps its writer-done publication
+        # boundary.
+        pending.compact_meta_defer_publish = True
         self._run_pending_refresh_rebuild_compact_writer(pending, result)
+        self._commit_pending_refresh_rebuild_compact_meta(pending)
         self._mark_pending_refresh_rebuild_accepted(pending)
 
     def _submit_pending_refresh_rebuild_batch(
@@ -3630,30 +3681,37 @@ class RefreshRebuildMixin:
             if profile_accum is not None:
                 profile_accum.refresh_rebuild_coalesced_count += int(coalesced_count)
 
-        bypass_submit_now = False
         coalesce_after_group_submit = False
         if req_ids:
-            max_queue = int(_PENDING_REBUILD_MAX_QUEUE_CACHED)
+            # Every current queued entry must own at least one live
+            # (request, layer-scope) ledger key.  The ledger is bounded by the
+            # real active request population and model-derived producer
+            # chunks, so it is the structural queue capacity; a global value
+            # such as 64 either fires too early or permits silent growth.
+            owner_key_capacity = len(self._pending_refresh_rebuild_by_req)
+            if owner_key_capacity <= 0:
+                raise RuntimeError(
+                    "E_SFI_PENDING_REBUILD_OWNER_LEDGER_EMPTY_AFTER_REGISTER"
+                )
+            configured_ceiling = _PENDING_REBUILD_MAX_QUEUE_OVERRIDE_CACHED
+            queue_capacity = int(owner_key_capacity)
+            if configured_ceiling is not None:
+                queue_capacity = min(queue_capacity, int(configured_ceiling))
             queue_size = len(self._pending_refresh_rebuilds)
-            if max_queue > 0 and queue_size >= max_queue:
-                coalesced_count_estimate = self._pending_refresh_rebuild_count_superseded(
-                    pending
-                )
-                queue_size = max(0, queue_size - int(coalesced_count_estimate))
-            if max_queue > 0 and queue_size >= max_queue:
-                # 压力路径：先压缩陈旧项，避免队列增长导致 EngineDead。
+            if queue_size >= queue_capacity:
+                # Cold pressure path: retire only entries that have already
+                # lost their authoritative owner.  Do not switch the new work
+                # to a different synchronous submission path.
                 self._pending_refresh_rebuild_compact_stale()
-                coalesced_count_estimate = self._pending_refresh_rebuild_count_superseded(
-                    pending
-                )
-                queue_size = max(
-                    0,
-                    len(self._pending_refresh_rebuilds)
-                    - int(coalesced_count_estimate),
-                )
-                if queue_size >= max_queue:
-                    # 若仍满，旁路当前项：直接提交 rebuild，不再入队。
-                    bypass_submit_now = True
+                queue_size = len(self._pending_refresh_rebuilds)
+                if queue_size >= queue_capacity:
+                    raise RuntimeError(
+                        "E_SFI_PENDING_REBUILD_OWNER_CAPACITY: no queue slot "
+                        "exists for the newly registered owner without "
+                        "invalidating live async work; "
+                        f"queued={queue_size} owner_keys={owner_key_capacity} "
+                        f"configured_ceiling={configured_ceiling}"
+                    )
         # ===== Off-loop pre-publish (spec 2026-05-10) =====
         # 异步 refresh 启用且不处于 cudagraph capture 时，立即在 refresh
         # stream 上跑 selector + writer，把 writer_done_event 录到 pending；
@@ -3663,7 +3721,6 @@ class RefreshRebuildMixin:
         # 一次 trigger 看到正确状态。
         if (
             payloads
-            and not bypass_submit_now
             and self._async_refresh_enabled()
             and not _is_stream_capturing_or_raise(stage="pending_refresh_rebuild_enqueue")
         ):
@@ -4156,17 +4213,6 @@ class RefreshRebuildMixin:
             else:
                 self._compact_pending_refresh_payloads(payloads)
             _detail_add_elapsed("pending_group_enqueue_compact_us", compact_start_ns)
-        if bypass_submit_now:
-            _log.warning(
-                "pending refresh rebuild queue overflow: "
-                f"size={len(self._pending_refresh_rebuilds)}, "
-                f"limit={int(_PENDING_REBUILD_MAX_QUEUE_CACHED)}; "
-                "bypass enqueue and submit now"
-            )
-            _coalesce_superseded_now()
-            self._submit_pending_refresh_rebuild(pending)
-            self._pending_refresh_rebuild_clear(pending)
-            return
         if not coalesce_after_group_submit:
             _coalesce_superseded_now()
         queue_insert_start_ns = _detail_start_ns()

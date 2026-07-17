@@ -1,7 +1,29 @@
 from __future__ import annotations
 
 import heapq
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Sequence, Tuple
+
+
+_U64_MASK = (1 << 64) - 1
+_FNV64_OFFSET_BASIS = 1469598103934665603
+_FNV64_PRIME = 1099511628211
+
+
+def stable_request_id_hash64(value: str) -> int:
+    """Deterministic request-id hash; callers own any lifecycle cache."""
+    h = _FNV64_OFFSET_BASIS
+    for byte in value.encode("utf-8"):
+        h ^= int(byte)
+        h = (h * _FNV64_PRIME) & _U64_MASK
+    return h & _U64_MASK
+
+
+def _mix_u64(sig: int, value: int) -> int:
+    sig_u64 = int(sig) & _U64_MASK
+    sig_u64 ^= int(value) & _U64_MASK
+    sig_u64 = (sig_u64 * _FNV64_PRIME) & _U64_MASK
+    sig_u64 ^= sig_u64 >> 32
+    return sig_u64 & _U64_MASK
 
 
 def _validate_request_id(request_id: str) -> str:
@@ -24,6 +46,10 @@ class GlobalSlotAllocator:
                 raise ValueError(f"capacity must be > 0, got {capacity}")
         self._capacity: Optional[int] = int(capacity) if capacity is not None else None
         self._request_to_slot: Dict[str, int] = {}
+        # Hash proof follows the exact active request lifecycle. It is populated
+        # once on acquire and retired on release; no process-global population
+        # cap or periodic clear/re-hash storm.
+        self._request_hash64: Dict[str, int] = {}
         self._slot_to_request: Dict[int, str] = {}
         self._free_slots: list[int] = []
         self._next_slot: int = 0
@@ -55,6 +81,7 @@ class GlobalSlotAllocator:
             return int(slot)
         slot = self._allocate_slot()
         self._request_to_slot[rid] = int(slot)
+        self._request_hash64[rid] = stable_request_id_hash64(rid)
         self._slot_to_request[int(slot)] = rid
         self._slot_generation.setdefault(int(slot), 0)
         return int(slot)
@@ -68,12 +95,30 @@ class GlobalSlotAllocator:
         slot = self._request_to_slot.pop(rid, None)
         if slot is None:
             return None
+        self._request_hash64.pop(rid, None)
         owner = self._slot_to_request.get(int(slot))
         if owner == rid:
             del self._slot_to_request[int(slot)]
         self._slot_generation[int(slot)] = int(self._slot_generation.get(int(slot), 0)) + 1
         heapq.heappush(self._free_slots, int(slot))
         return int(slot)
+
+    def stable_signature64(self, active_request_ids: Sequence[str]) -> int:
+        active_ids = tuple(str(rid) for rid in active_request_ids)
+        sig = _mix_u64(_FNV64_OFFSET_BASIS, len(active_ids))
+        for index, rid in enumerate(active_ids):
+            slot = int(self._request_to_slot.get(rid, -1))
+            request_hash = self._request_hash64.get(rid)
+            if request_hash is None:
+                # Fail closed on an uncovered active set instead of caching an
+                # unowned request outside the allocator lifecycle.
+                raise RuntimeError(
+                    f"global slot signature request is not allocated: {rid!r}"
+                )
+            sig = _mix_u64(sig, index + 1)
+            sig = _mix_u64(sig, request_hash)
+            sig = _mix_u64(sig, slot + 2)
+        return sig & _U64_MASK
 
     def slot_of(self, request_id: str) -> Optional[int]:
         rid = _validate_request_id(request_id)

@@ -691,12 +691,13 @@ done
 
 snapshot_evidence() {
   "${PYTHON}" -I - \
-    "${REFRESH_PROFILE_LOG}" "${ROUTE_COUNTER_MMAP}" "${STEP_TRACE_LOG}" <<'PY'
+    "${REFRESH_PROFILE_LOG}" "${ROUTE_COUNTER_MMAP}" "${STEP_TRACE_LOG}" \
+    "${ROUTE_TRACE_LOG}" <<'PY'
 import os
 import struct
 import sys
 
-profile, mmap_path, step_trace = sys.argv[1:]
+profile, mmap_path, step_trace, route_trace = sys.argv[1:]
 print(os.path.getsize(profile) if os.path.isfile(profile) else 0)
 compact_steps = 0
 if os.path.isfile(mmap_path):
@@ -710,6 +711,7 @@ if os.path.isfile(mmap_path):
         )
 print(compact_steps)
 print(os.path.getsize(step_trace) if os.path.isfile(step_trace) else 0)
+print(os.path.getsize(route_trace) if os.path.isfile(route_trace) else 0)
 PY
 }
 
@@ -718,7 +720,8 @@ run_liveness_delta() {
   local profile_offset="$2"
   local compact_baseline="$3"
   local step_trace_offset="$4"
-  local request_policy="$5"
+  local route_trace_offset="$5"
+  local request_policy="$6"
   local -a liveness_args=(
     --refresh-profile-log "${REFRESH_PROFILE_LOG}" \
     --route-trace "${ROUTE_TRACE_LOG}" \
@@ -727,6 +730,7 @@ run_liveness_delta() {
     --run-since "${SERVER_STARTED_EPOCH}" \
     --min-world-publish 1 \
     --refresh-profile-offset "${profile_offset}" \
+    --route-trace-offset "${route_trace_offset}" \
     --baseline-compact-row-steps "${compact_baseline}" \
     --min-compact-row-step-delta 1 \
     --step-trace-offset "${step_trace_offset}" \
@@ -744,7 +748,7 @@ run_liveness_delta() {
 }
 
 mapfile -t SMOKE_BASELINE < <(snapshot_evidence)
-(( ${#SMOKE_BASELINE[@]} == 3 )) || die "cannot snapshot sparse evidence"
+(( ${#SMOKE_BASELINE[@]} == 4 )) || die "cannot snapshot sparse evidence"
 
 # One long request must create fresh producer and replay-aware read evidence.
 "${PYTHON}" -I - \
@@ -833,10 +837,10 @@ print(
 PY
 run_liveness_delta "smoke" \
   "${SMOKE_BASELINE[0]}" "${SMOKE_BASELINE[1]}" \
-  "${SMOKE_BASELINE[2]}" "strict-long"
+  "${SMOKE_BASELINE[2]}" "${SMOKE_BASELINE[3]}" "strict-long"
 
 mapfile -t EVAL_BASELINE < <(snapshot_evidence)
-(( ${#EVAL_BASELINE[@]} == 3 )) || die "cannot snapshot pre-eval sparse evidence"
+(( ${#EVAL_BASELINE[@]} == 4 )) || die "cannot snapshot pre-eval sparse evidence"
 
 echo "==> LongBench v2: alias=${MODEL_NAME} served_model=${SERVED_MODEL_ID} n_proc=${N_PROC} server_pid=${SERVER_PID}"
 echo "    arch=${CUDA_ARCH} kernel=${ATTENTION_KERNEL} version=${FLASH_ATTN_VERSION}"
@@ -861,7 +865,7 @@ set -e
 
 run_liveness_delta "posteval" \
   "${EVAL_BASELINE[0]}" "${EVAL_BASELINE[1]}" \
-  "${EVAL_BASELINE[2]}" "sticky"
+  "${EVAL_BASELINE[2]}" "${EVAL_BASELINE[3]}" "sticky"
 
 "${PYTHON}" -I - \
   "${PREDICTIONS_DIR}" "${EXPECTED_ROWS}" "${DATASET_IDENTITY}" \

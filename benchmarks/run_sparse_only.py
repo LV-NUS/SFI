@@ -794,26 +794,11 @@ def _engine_args_accepts(name: str) -> bool:
     return name in getattr(EngineArgs, "__dataclass_fields__", {})
 
 
-def _sync_scheduling_requested(args) -> bool:
-    if bool(getattr(args, "sync_scheduling", False)):
-        return True
-    return str(os.environ.get("VLLM_SPARSE_SYNC_SCHEDULING", "")).strip().lower() in (
-        "1",
-        "true",
-        "yes",
-    )
-
-
 def _requested_engine_scheduling_mode(args: argparse.Namespace) -> str:
     mode = str(getattr(args, "scheduling_mode", "auto") or "auto")
     if mode not in {"auto", "async", "sync"}:
         raise RuntimeError(f"E_ENGINE_SCHEDULING_MODE: mode={mode!r}")
-    # An explicit mode owns matched-run identity.  The legacy sparse-only
-    # sync flag/env is consulted only in auto mode, so a stale shell variable
-    # cannot silently turn one side of an explicit async pair synchronous.
-    if mode != "auto":
-        return mode
-    return "sync" if _sync_scheduling_requested(args) else "auto"
+    return mode
 
 
 def _engine_scheduling_kwargs(mode: str) -> dict[str, object]:
@@ -1110,10 +1095,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--scheduling-mode",
         choices=("auto", "async", "sync"),
         default="auto",
-        help=(
-            "Engine scheduling policy. An explicit mode takes precedence over "
-            "the legacy sparse-only sync environment escape hatch."
-        ),
+        help="Engine scheduling policy.",
     )
     parser.add_argument(
         "--max-num-batched-tokens",
@@ -1132,16 +1114,6 @@ def build_parser() -> argparse.ArgumentParser:
         choices=CHUNKED_PREFILL_MODES,
         default="auto",
         help="Explicit chunked-prefill policy for matched benchmark children.",
-    )
-    parser.add_argument(
-        "--sync-scheduling",
-        action="store_true",
-        help=(
-            "Legacy sparse-only synchronous scheduling escape hatch. It is "
-            "consulted only when --scheduling-mode=auto; explicit matched-run "
-            "modes take precedence. VLLM_SPARSE_SYNC_SCHEDULING=1 has the "
-            "same legacy-auto behavior."
-        ),
     )
     parser.add_argument(
         "--enable-custom-all-reduce",

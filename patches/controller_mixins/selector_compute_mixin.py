@@ -38,7 +38,13 @@ from typing import (
 import torch
 
 from hybrid_selectors.alpha_fair_selector import AlphaFairSelectorConfig
-from patches.cpu_gpu_staging import _record_stage_h2d_evt, _wait_stage_h2d_evt
+from patches.cpu_gpu_staging import (
+    _acquire_stage_h2d_group,
+    _current_cuda_stream_contract,
+    _new_cpu_tensor,
+    _protect_failed_stage_h2d,
+    _record_stage_h2d_evt,
+)
 from patches.selector_runtime.batched_selection import (
     compute_alpha_selection_batched_impl,
 )
@@ -67,7 +73,6 @@ from patches.sparse_constants import (
     _SELECTOR_CPP_STACK_CACHED,
     _SELECTOR_FAST_SIG_CACHED,
     _SELECTOR_KBUCKET_CACHED,
-    _SELECTOR_KEY_NORMS_CACHE_CAP_CACHED,
     _SELECTOR_PIPELINE_UNIFIED_CACHED,
     _SELECTOR_TRUSTED_SHAPES_CACHED,
     _is_free_slot_id,
@@ -75,7 +80,6 @@ from patches.sparse_constants import (
 )
 from patches.sparse_utils import (
     _align_up_int,
-    _get_row_index_tensor_from_cache,
     _get_selector_batch_ext,
     _is_stream_capturing_or_raise,
 )
@@ -97,6 +101,94 @@ if init_logger is not None:
 else:
     import logging
     _log = logging.getLogger(__name__)
+
+
+def _acquire_selector_key_norms_delta_fifo_carrier(
+    state: Dict[str, object],
+) -> Tuple[Optional[Dict[str, object]], int]:
+    """只探测 FIFO oldest；返回 carrier 或冷扩插入位置。"""
+    carriers = state.get("carriers")
+    if not isinstance(carriers, list):
+        raise RuntimeError("selector key_norms delta carrier pool is invalid")
+    if not carriers:
+        return None, 0
+
+    oldest_index = int(state.get("next", 0)) % len(carriers)
+    oldest = carriers[oldest_index]
+    if not isinstance(oldest, dict):
+        raise RuntimeError("selector key_norms delta carrier is invalid")
+    event = oldest.get("completion_event")
+    if event is None:
+        raise RuntimeError("selector key_norms delta carrier event is missing")
+
+    # 同一 CUDA stream 上提交顺序即 carrier 年龄顺序。只查最老事件一次：
+    # ready 则复用；busy/reserved 证明所有更新提交都不能覆写，冷扩一个最新槽。
+    ready = not bool(oldest.get("reserved", False)) and (
+        not bool(oldest.get("completion_recorded", False)) or bool(event.query())
+    )
+    if ready:
+        oldest["reserved"] = True
+        state["next"] = (oldest_index + 1) % len(carriers)
+        return oldest, -1
+
+    return None, oldest_index
+
+
+def _insert_selector_key_norms_delta_fifo_carrier(
+    state: Dict[str, object],
+    carrier: Dict[str, object],
+    *,
+    oldest_index: int,
+) -> None:
+    """仅在初建或真实压力时把一个新 carrier 接入 FIFO。"""
+    carriers = state.get("carriers")
+    if not isinstance(carriers, list):
+        raise RuntimeError("selector key_norms delta carrier pool is invalid")
+    carrier["reserved"] = True
+    if not carriers:
+        if int(oldest_index) != 0:
+            raise RuntimeError("selector key_norms delta initial cursor is invalid")
+        carriers.append(carrier)
+        state["next"] = 0
+        state["max_depth"] = 1
+        return
+
+    # 物理尾不一定是时间尾。把最新槽插在物理 oldest 之前，旧 oldest 右移后
+    # 仍是 next，确保非零 cursor 下逻辑 FIFO 顺序不变且无需扫描。
+    if int(oldest_index) < 0 or int(oldest_index) >= len(carriers):
+        raise RuntimeError("selector key_norms delta growth cursor is invalid")
+    carriers.insert(oldest_index, carrier)
+    state["next"] = oldest_index + 1
+    state["growth_count"] = int(state.get("growth_count", 0)) + 1
+    state["max_depth"] = len(carriers)
+
+
+def _record_selector_key_norms_delta_carrier_event(
+    carrier: Optional[Dict[str, object]],
+) -> None:
+    """最终 consumer 后在原提交流记录持久事件并释放 lease。"""
+    if carrier is None:
+        return
+    if not bool(carrier.get("reserved", False)):
+        raise RuntimeError("selector key_norms delta carrier is not reserved")
+    event = carrier.get("completion_event")
+    stream = carrier.get("stream")
+    if event is None or stream is None:
+        raise RuntimeError("selector key_norms delta carrier ownership is invalid")
+    event.record(stream)
+    carrier["completion_recorded"] = True
+    carrier["reserved"] = False
+
+
+def _release_unused_selector_key_norms_delta_carrier(
+    carrier: Optional[Dict[str, object]],
+) -> None:
+    """无 H2D/consumer 的世代直接归还 carrier，不制造 CUDA 事件。"""
+    if carrier is None:
+        return
+    if not bool(carrier.get("reserved", False)):
+        raise RuntimeError("selector key_norms delta carrier is not reserved")
+    carrier["reserved"] = False
 
 
 
@@ -225,17 +317,31 @@ class SelectorComputeMixin:
     def _init_selector_compute_state(self) -> None:
         """Initialize selector compute state variables."""
         # #13 STAGE-0 selector-topk captured graph (default OFF). Disjoint
-        # namespace from the writer graph: own state dict / mempool / stream /
-        # thrash window. None resting state -> the dispatcher allocates lazily.
+        # namespace from the writer graph: own state dict / mempool / stream.
+        # None resting state -> the dispatcher allocates lazily.
         self._selector_topk_graph_state: Optional[Dict[str, object]] = None
         self._selector_topk_graph_stream = None
-        self._selector_topk_graph_recapture_window: int = 0
-        self._selector_topk_graph_recapture_count: int = 0
         # Real (graph-agnostic) replay counter, bumped by the dispatcher in its
         # replay branch -> observable proof the captured graph actually replayed,
         # independent of whatever graph object is cached (mirrors the writer
         # track's _record_deadline_async_producer_count("graph_replay")).
         self._selector_topk_graph_replay_count: int = 0
+        # A physical slot/structural-shape scope may own one exact graph during
+        # an active lifecycle.  The first real K/slice/storage drift retires
+        # that scope until the controller reaches idle; repeatedly recapturing
+        # heterogeneous geometries fragments CUDA graph/private allocator
+        # pools without producing useful replay hits.
+        self._selector_topk_graph_scope_replacement_count: int = 0
+        # A cold exact key must recur before it earns a graph.  One candidate
+        # per runtime-derived structural scope is sufficient proof of reuse
+        # and prevents heterogeneous request lengths from capturing thousands
+        # of one-shot graphs into private CUDA pools.
+        self._selector_topk_graph_candidate_by_scope: Dict[
+            Tuple[int, ...], Tuple[int, ...]
+        ] = {}
+        self._selector_topk_graph_admission_deferred_count: int = 0
+        self._selector_base_proof_cache: Dict[object, object] = {}
+        self._selector_base_proof_scope_keys: Dict[object, object] = {}
         self._selector_key_norms_all: Optional[torch.Tensor] = None
         self._selector_key_norms_shape: Optional[Tuple[int, int, int, int]] = None
         self._selector_key_norms_all_reallocated: bool = False
@@ -251,10 +357,14 @@ class SelectorComputeMixin:
         self._selector_capture_scores_all: Optional[torch.Tensor] = None
         self._selector_log_f_denoms_all: Optional[torch.Tensor] = None
         self._selector_kv_lengths_all: Optional[torch.Tensor] = None
-        self._selector_key_norms_delta_start_cpu: Optional[torch.Tensor] = None
-        self._selector_key_norms_delta_end_cpu: Optional[torch.Tensor] = None
-        self._selector_key_norms_delta_start_gpu: Optional[torch.Tensor] = None
-        self._selector_key_norms_delta_end_gpu: Optional[torch.Tensor] = None
+        # shared(non-override) delta staging 按实际 (device, raw stream) 分池。
+        # 每池是单生产流 FIFO；忙压只扩小 carrier，不做 host wait/线性扫描。
+        self._selector_key_norms_delta_carrier_pools: Dict[
+            Tuple[int, int], Dict[str, object]
+        ] = {}
+        self._selector_key_norms_delta_active_carrier: Optional[
+            Dict[str, object]
+        ] = None
         self._selector_key_norms_delta_buffer_override: Optional[
             object
         ] = None
@@ -322,8 +432,8 @@ class SelectorComputeMixin:
         self._tail_offsets_cache_device: Optional[torch.device] = None
         self._tail_offsets_cache_cap: int = 0
         self._tail_offsets_cache: Optional[torch.Tensor] = None
-        self._row_index_cache: Dict[Tuple[str, int, Tuple[int, ...]], torch.Tensor] = {}
         self._logits_patch_cache_key: Optional[Tuple[object, ...]] = None
+        self._logits_patch_row_index: Optional[torch.Tensor] = None
         self._logits_patch_last_n_i32: Optional[torch.Tensor] = None
         self._logits_patch_row_offsets_i32: Optional[torch.Tensor] = None
         self._logits_patch_caps_i32: Optional[torch.Tensor] = None
@@ -431,12 +541,6 @@ class SelectorComputeMixin:
         start_idx = self._tail_offsets_cache_cap - cap
         return cached[..., start_idx:]
 
-    def _get_row_index_tensor(self, *, rows: Sequence[int], device: torch.device) -> torch.Tensor:
-        return _get_row_index_tensor_from_cache(
-            self._row_index_cache, rows=rows, device=device, cache_owner=self
-        )
-
-
     # NOTE: _compute_selected_indices_physical_block_major_order(物理槽位键
     # 重排实验,VLLM_SPARSE_REBUILD_PHYSICAL_BLOCK_SORT 门控)已删除——被
     # [SELECTOR-PACK-ORDER-DETERMINISM 2026-07-11] 的无条件逻辑 index 升序
@@ -479,10 +583,10 @@ class SelectorComputeMixin:
                 and self._logits_patch_row_offsets_i32 is not None
                 and self._logits_patch_caps_i32 is not None
                 and self._logits_patch_rows_gt1 is not None
+                and self._logits_patch_row_index is not None
             ):
-                row_index = self._get_row_index_tensor(rows=rows_tuple, device=device)
                 return (
-                    row_index,
+                    self._logits_patch_row_index,
                     self._logits_patch_last_n_i32,
                     self._logits_patch_row_offsets_i32,
                     self._logits_patch_caps_i32,
@@ -491,18 +595,30 @@ class SelectorComputeMixin:
 
         row_offsets = [max(0, int(q_len_tuple[i]) - int(last_n_tuple[i])) for i in range(len(rows_tuple))]
         caps = [min(int(ctx_len_tuple[i]), int(kv_max)) for i in range(len(rows_tuple))]
+        row_index = torch.tensor(rows_tuple, dtype=torch.long, device=device)
         last_n_i32 = torch.tensor(last_n_tuple, dtype=torch.int32, device=device)
         row_offsets_i32 = torch.tensor(row_offsets, dtype=torch.int32, device=device)
         caps_i32 = torch.tensor(caps, dtype=torch.int32, device=device)
         rows_gt1 = tuple(int(r) for r in rows_tuple if int(logits_last_n_by_row[int(r)]) > 1)
 
+        # Cache owner is the exact logits-patch step key above. Retire only the
+        # previous step's tensors, with allocator stream guards, instead of
+        # accumulating row combinations behind an empirical global limit.
+        for stale in (
+            self._logits_patch_row_index,
+            self._logits_patch_last_n_i32,
+            self._logits_patch_row_offsets_i32,
+            self._logits_patch_caps_i32,
+        ):
+            if isinstance(stale, torch.Tensor) and stale.is_cuda:
+                self._uaf_guard_record_streams_before_discard(stale)
         self._logits_patch_cache_key = key
+        self._logits_patch_row_index = row_index
         self._logits_patch_last_n_i32 = last_n_i32
         self._logits_patch_row_offsets_i32 = row_offsets_i32
         self._logits_patch_caps_i32 = caps_i32
         self._logits_patch_rows_gt1 = rows_gt1
 
-        row_index = self._get_row_index_tensor(rows=rows_tuple, device=device)
         return row_index, last_n_i32, row_offsets_i32, caps_i32, rows_gt1
 
     def _selector_trusted_shapes_enabled(self, *, phase: str) -> bool:
@@ -543,9 +659,23 @@ class SelectorComputeMixin:
             # key_norms 指针永新(rv8 keys 取证:其余 9 指针全 3 槽周期,唯
             # key_norms 24 唯一≈每世代一个)。环模式 valid 集每 run 清空=
             # 必重填,语义键的跨 run 复用本已不存在,按容量复用值语义相同。
-            if isinstance(override, SlotStableOverrides) or cache_key is None:
+            slot_capacity = isinstance(override, SlotStableOverrides)
+            if slot_capacity:
+                # One grow-only flat carrier per structural shape. Exact K is
+                # a view, not a cache key: variable request lengths therefore
+                # cannot accumulate multi-GiB buffers in a persistent ring
+                # slot, while the base pointer remains stable after growth.
                 override_key = (
-                    "__slot_capacity__" if isinstance(override, SlotStableOverrides) else "__default__",
+                    "__slot_capacity__",
+                    str(device),
+                    str(dtype),
+                    int(layers),
+                    int(batch),
+                    int(num_kv_heads),
+                )
+            elif cache_key is None:
+                override_key = (
+                    "__default__",
                     str(device),
                     str(dtype),
                     tuple(int(v) for v in alloc_shape),
@@ -554,19 +684,35 @@ class SelectorComputeMixin:
                 override_key = cache_key
             buf = override.get(override_key)
             self._selector_key_norms_all_reallocated = False
-            if (
-                buf is None
-                or buf.device != device
-                or buf.dtype != dtype
-                or buf.shape[0] < shape[0]
-                or buf.shape[1] < shape[1]
-                or buf.shape[2] < shape[2]
-                or buf.shape[3] < shape[3]
-            ):
+            alloc_numel = int(layers) * int(batch) * int(num_kv_heads) * int(kv_capacity)
+            view_numel = int(layers) * int(batch) * int(num_kv_heads) * int(kv_len)
+            if slot_capacity:
+                needs_alloc = (
+                    buf is None
+                    or buf.device != device
+                    or buf.dtype != dtype
+                    or buf.dim() != 1
+                    or int(buf.numel()) < alloc_numel
+                )
+            else:
+                needs_alloc = (
+                    buf is None
+                    or buf.device != device
+                    or buf.dtype != dtype
+                    or buf.shape[0] < shape[0]
+                    or buf.shape[1] < shape[1]
+                    or buf.shape[2] < shape[2]
+                    or buf.shape[3] < shape[3]
+                )
+            if needs_alloc:
                 if buf is not None and buf.is_cuda:
                     # [SELECTED-OUT-RING v2] 槽稳定容器换代弃旧走守卫。
                     self._uaf_guard_record_streams_before_discard(buf)
-                buf = torch.empty(alloc_shape, device=device, dtype=dtype)
+                buf = torch.empty(
+                    (alloc_numel,) if slot_capacity else alloc_shape,
+                    device=device,
+                    dtype=dtype,
+                )
                 override[override_key] = buf
                 valid_keys = getattr(
                     self,
@@ -576,6 +722,8 @@ class SelectorComputeMixin:
                 if isinstance(valid_keys, set):
                     valid_keys.discard(cache_key)
                 self._selector_key_norms_all_reallocated = True
+            if slot_capacity:
+                return buf[:view_numel].view(shape)
             return buf[:layers, :batch, :num_kv_heads, :kv_len]
         if cache_key is None:
             buf = self._selector_key_norms_all
@@ -619,40 +767,32 @@ class SelectorComputeMixin:
         return buf[:layers, :batch, :num_kv_heads, :kv_len]
 
     def _prune_selector_key_norms_cache(self, *, active_key, device) -> None:
-        """Bound the per-shape key_norms_all GPU buffer cache (LRU, async-safe free).
+        """Retain exactly the current owner of the shared key-norm carrier.
 
-        The cache holds one [layers, batch, kv_heads, kv_capacity] fp16 buffer per
-        distinct (phase, layer_indices, slots, batch, kv_bucket) key. Under a general
-        server load (variable context lengths -> many kv_buckets, churning slot sets)
-        it would otherwise grow unbounded -- each buffer is multi-GiB at long contexts,
-        OOMing outside vLLM's util budget. Keep only the active key plus a small LRU
-        window; release evicted buffers via record_stream on the current + refresh
-        streams (deferred free, no cross-stream UAF), never during graph capture. The
-        active set is always retained, so incremental reuse / output bytes are unchanged.
+        Semantic keys include request slots and K buckets, so an empirical LRU
+        population still grows multi-GiB GPU residency and has no correctness
+        meaning.  The non-ring path has one active selector owner; retire every
+        inactive carrier with stream recording.  Actual reclamation remains
+        ordered by the CUDA allocator, so in-flight readers stay safe without
+        a global cache-size guess or a hot-path synchronization.
         """
         cache = getattr(self, "_selector_key_norms_all_cache", None)
         if not isinstance(cache, dict) or not cache:
             return
-        # Mark active_key most-recently-used (dict preserves insertion order).
-        if active_key in cache:
-            cache[active_key] = cache.pop(active_key)
-        cap = int(_SELECTOR_KEY_NORMS_CACHE_CAP_CACHED)
-        if cap < 1:
-            cap = 1
-        if len(cache) <= cap:
+        if len(cache) <= 1 and active_key in cache:
             return
+        dev = torch.device(device)
         # [GUARD-NO-SWALLOW] capture 态查询失败若吞掉则会在 capture 内 free
         # （本函数要防的事故本身）；流解析失败若吞成 cur=None 则跳过
         # record_stream=异步 UAF。两者都必须炸。
-        if _is_stream_capturing_or_raise(stage="selector_key_norms_cache_prune"):
+        if dev.type == "cuda" and _is_stream_capturing_or_raise(
+            stage="selector_key_norms_cache_prune"
+        ):
             return  # never free during capture; prune on a later eager call
-        dev = torch.device(device)
         cur = torch.cuda.current_stream(device=dev) if dev.type == "cuda" else None
         refresh_stream = getattr(self, "refresh_stream", None)
         valid_keys = getattr(self, "_selector_key_norms_all_valid_cache_keys", None)
         for key in list(cache.keys()):
-            if len(cache) <= cap:
-                break
             if key == active_key:
                 continue
             old = cache.pop(key)
@@ -710,11 +850,14 @@ class SelectorComputeMixin:
         layers: int,
         batch: int,
         device: torch.device,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """为 key_norms delta 复用 [layers, batch] 的 int32 staging 缓冲。"""
+        return_lease: bool = False,
+    ) -> Tuple[torch.Tensor, ...]:
+        """复用 delta staging；shared async 路径必须显式接收 lease。"""
         if layers <= 0 or batch <= 0:
             empty_cpu = torch.empty((0, 0), device="cpu", dtype=torch.int32)
             empty_gpu = torch.empty((0, 0), device=device, dtype=torch.int32)
+            if return_lease:
+                return empty_cpu, empty_cpu, empty_gpu, empty_gpu, None
             return empty_cpu, empty_cpu, empty_gpu, empty_gpu
         device = torch.device(device)
         if device.type == "cuda" and device.index is None:
@@ -786,12 +929,13 @@ class SelectorComputeMixin:
                 gpu_start_o = torch.empty(shape, device=device, dtype=torch.int32)
                 gpu_end_o = torch.empty(shape, device=device, dtype=torch.int32)
                 override[key] = (cpu_start_o, cpu_end_o, gpu_start_o, gpu_end_o)
-            return (
+            result = (
                 cpu_start_o[: shape[0], : shape[1]],
                 cpu_end_o[: shape[0], : shape[1]],
                 gpu_start_o[: shape[0], : shape[1]],
                 gpu_end_o[: shape[0], : shape[1]],
             )
+            return (*result, None) if return_lease else result
         if isinstance(override, tuple) and len(override) == 4:
             cpu_start_o, cpu_end_o, gpu_start_o, gpu_end_o = override
             if (
@@ -822,72 +966,178 @@ class SelectorComputeMixin:
                 and gpu_end_o.shape[0] >= shape[0]
                 and gpu_end_o.shape[1] >= shape[1]
             ):
-                return (
+                result = (
                     cpu_start_o[: shape[0], : shape[1]],
                     cpu_end_o[: shape[0], : shape[1]],
                     gpu_start_o[: shape[0], : shape[1]],
                     gpu_end_o[: shape[0], : shape[1]],
                 )
-        # [KEY-NORMS-DELTA-PINNED-H2D-WAR-FIX] R7:共享持久 pinned/GPU delta 对
-        # 即将被本世代覆写(host 写 pinned + copy_ 写 GPU dst),上一世代的
-        # non_blocking H2D 与 delta kernel 可能未决(pinned staging 同型撕裂)。
-        # 覆写者是 CPU 侧写,设备 wait 无法排它 → host 侧 query-first:稳态上一
-        # 世代(隔多步)早已完成=query 即过零成本;仅密集 flush 重叠窗真等。
-        _evt = getattr(self, "_selector_key_norms_delta_inflight_evt", None)
-        if _evt is not None and not _evt.query():
-            _evt.synchronize()
-        cpu_start = self._selector_key_norms_delta_start_cpu
-        if (
-            cpu_start is None
-            or cpu_start.dim() != 2
+                if return_lease:
+                    # 裸 tuple 没有 dict/ring 的外部槽生命周期，也没有 shared
+                    # pool 的 completion event/stream owner，不能假装 lease=None
+                    # 后继续异步覆写。保留旧四张量只读兼容入口；生产消费必须
+                    # 使用 dict/ring override 或 shared pool。
+                    raise RuntimeError(
+                        "selector key_norms delta tuple override has no async "
+                        "ownership lease"
+                    )
+                return result
+            raise RuntimeError(
+                "selector key_norms delta tuple override contract is invalid"
+            )
+
+        if not return_lease:
+            raise RuntimeError(
+                "selector key_norms delta shared carrier requires async "
+                "ownership lease"
+            )
+        if device.type != "cuda":
+            raise ValueError("selector key_norms delta shared carrier requires CUDA")
+        if getattr(self, "_selector_key_norms_delta_active_carrier", None) is not None:
+            raise RuntimeError("selector key_norms delta carrier lease is already active")
+        stream, stream_contract = _current_cuda_stream_contract(device)
+        pools = getattr(self, "_selector_key_norms_delta_carrier_pools", None)
+        if not isinstance(pools, dict):
+            raise RuntimeError("selector key_norms delta carrier pools are invalid")
+        state = pools.get(stream_contract)
+        if state is None:
+            state = {
+                "stream": stream,
+                "carriers": [],
+                "next": 0,
+                "growth_count": 0,
+                "max_depth": 0,
+            }
+            pools[stream_contract] = state
+        elif not isinstance(state, dict) or state.get("stream") is None:
+            raise RuntimeError("selector key_norms delta stream ownership drift")
+        else:
+            # 保存首个 stream wrapper 的强引用，避免 raw handle 在池存活期被
+            # 销毁/复用；后续 current_stream wrapper 即使对象身份不同也不 rebind。
+            stream = state["stream"]
+
+        carrier, oldest_index = _acquire_selector_key_norms_delta_fifo_carrier(state)
+        if carrier is None:
+            carrier = {
+                "cpu_start": _new_cpu_tensor(
+                    shape, dtype=torch.int32, pin_memory=True
+                ),
+                "cpu_end": _new_cpu_tensor(
+                    shape, dtype=torch.int32, pin_memory=True
+                ),
+                "gpu_start": torch.empty(shape, device=device, dtype=torch.int32),
+                "gpu_end": torch.empty(shape, device=device, dtype=torch.int32),
+                "completion_event": torch.cuda.Event(enable_timing=False),
+                "completion_recorded": False,
+                "reserved": False,
+                "stream": stream,
+            }
+            _insert_selector_key_norms_delta_fifo_carrier(
+                state,
+                carrier,
+                oldest_index=oldest_index,
+            )
+
+        carrier["enqueue_started"] = False
+        self._selector_key_norms_delta_active_carrier = carrier
+
+        cpu_start = carrier.get("cpu_start")
+        cpu_end = carrier.get("cpu_end")
+        gpu_start = carrier.get("gpu_start")
+        gpu_end = carrier.get("gpu_end")
+        if not all(
+            isinstance(t, torch.Tensor)
+            for t in (cpu_start, cpu_end, gpu_start, gpu_end)
+        ):
+            raise RuntimeError("selector key_norms delta carrier tensors are invalid")
+        needs_grow = (
+            cpu_start.dim() != 2
             or cpu_start.shape[0] < shape[0]
             or cpu_start.shape[1] < shape[1]
-            or not cpu_start.is_pinned()
-        ):
-            cpu_start = torch.empty(shape, device="cpu", dtype=torch.int32, pin_memory=True)
-            self._selector_key_norms_delta_start_cpu = cpu_start
-        cpu_end = self._selector_key_norms_delta_end_cpu
-        if (
-            cpu_end is None
             or cpu_end.dim() != 2
             or cpu_end.shape[0] < shape[0]
             or cpu_end.shape[1] < shape[1]
-            or not cpu_end.is_pinned()
-        ):
-            cpu_end = torch.empty(shape, device="cpu", dtype=torch.int32, pin_memory=True)
-            self._selector_key_norms_delta_end_cpu = cpu_end
-        gpu_start = self._selector_key_norms_delta_start_gpu
-        if (
-            gpu_start is None
             or gpu_start.dim() != 2
             or gpu_start.shape[0] < shape[0]
             or gpu_start.shape[1] < shape[1]
-            or gpu_start.device != device
-        ):
-            if gpu_start is not None and gpu_start.is_cuda:
-                # [SELECTOR-SHARED-SCRATCH-REALLOC-UAF-FIX] R5:delta GPU 载体
-                # 换代弃旧,消费者(delta kernel/H2D)可在另一流在飞。冷事件。
-                self._uaf_guard_record_streams_before_discard(gpu_start)
-            gpu_start = torch.empty(shape, device=device, dtype=torch.int32)
-            self._selector_key_norms_delta_start_gpu = gpu_start
-        gpu_end = self._selector_key_norms_delta_end_gpu
-        if (
-            gpu_end is None
             or gpu_end.dim() != 2
             or gpu_end.shape[0] < shape[0]
             or gpu_end.shape[1] < shape[1]
-            or gpu_end.device != device
-        ):
-            if gpu_end is not None and gpu_end.is_cuda:
-                self._uaf_guard_record_streams_before_discard(gpu_end)
+        )
+        if needs_grow:
+            # oldest completion 已证明换代安全；事件与 stream owner 原位保留。
+            cpu_start = _new_cpu_tensor(shape, dtype=torch.int32, pin_memory=True)
+            cpu_end = _new_cpu_tensor(shape, dtype=torch.int32, pin_memory=True)
+            gpu_start = torch.empty(shape, device=device, dtype=torch.int32)
             gpu_end = torch.empty(shape, device=device, dtype=torch.int32)
-            self._selector_key_norms_delta_end_gpu = gpu_end
-        return (
+            carrier["cpu_start"] = cpu_start
+            carrier["cpu_end"] = cpu_end
+            carrier["gpu_start"] = gpu_start
+            carrier["gpu_end"] = gpu_end
+
+        if (
+            not cpu_start.is_pinned()
+            or not cpu_end.is_pinned()
+            or cpu_start.dtype != torch.int32
+            or cpu_end.dtype != torch.int32
+            or gpu_start.device != device
+            or gpu_end.device != device
+            or gpu_start.dtype != torch.int32
+            or gpu_end.dtype != torch.int32
+        ):
+            raise RuntimeError("selector key_norms delta carrier contract drift")
+        result = (
             cpu_start[: shape[0], : shape[1]],
             cpu_end[: shape[0], : shape[1]],
             gpu_start[: shape[0], : shape[1]],
             gpu_end[: shape[0], : shape[1]],
         )
+        return (*result, carrier) if return_lease else result
+
+    def _record_selector_key_norms_delta_carrier_completion(
+        self,
+        carrier: Optional[Dict[str, object]],
+    ) -> None:
+        if carrier is not None and getattr(
+            self, "_selector_key_norms_delta_active_carrier", None
+        ) is not carrier:
+            raise RuntimeError("selector key_norms delta carrier lease identity drift")
+        _record_selector_key_norms_delta_carrier_event(carrier)
+        if carrier is not None:
+            self._selector_key_norms_delta_active_carrier = None
+
+    def _mark_selector_key_norms_delta_carrier_enqueue_started(
+        self,
+        carrier: Optional[Dict[str, object]],
+    ) -> None:
+        if carrier is None:
+            return
+        if getattr(self, "_selector_key_norms_delta_active_carrier", None) is not carrier:
+            raise RuntimeError("selector key_norms delta carrier lease identity drift")
+        carrier["enqueue_started"] = True
+
+    def _release_selector_key_norms_delta_carrier_without_work(
+        self,
+        carrier: Optional[Dict[str, object]],
+    ) -> None:
+        if carrier is not None and getattr(
+            self, "_selector_key_norms_delta_active_carrier", None
+        ) is not carrier:
+            raise RuntimeError("selector key_norms delta carrier lease identity drift")
+        _release_unused_selector_key_norms_delta_carrier(carrier)
+        if carrier is not None:
+            self._selector_key_norms_delta_active_carrier = None
+
+    def _abort_selector_key_norms_delta_carrier_lease(self) -> None:
+        """异常漏斗：按是否可能 enqueue 选择直接归还或流序 fence。"""
+        carrier = getattr(self, "_selector_key_norms_delta_active_carrier", None)
+        if carrier is None:
+            return
+        if bool(carrier.get("enqueue_started", False)):
+            _record_selector_key_norms_delta_carrier_event(carrier)
+        else:
+            _release_unused_selector_key_norms_delta_carrier(carrier)
+        self._selector_key_norms_delta_active_carrier = None
 
     def _ensure_selector_key_norms_target_cpu_buffer(
         self,
@@ -1470,6 +1720,11 @@ class SelectorComputeMixin:
             or buf.shape[3] < shape[3]
             or buf.shape[4] < shape[4]
         ):
+            if buf is not None and buf.is_cuda:
+                # Geometry growth retires the previous owner-scope graph only
+                # after the replacement capture. Protect an in-flight replay's
+                # baked input pointer until every consumer stream completes.
+                self._uaf_guard_record_streams_before_discard(buf)
             buf = torch.empty(shape, device=device, dtype=dtype)
             self._selector_capture_scores_all = buf
         return buf[:layers, :batch, :num_heads, :window, :kv_len]
@@ -1494,6 +1749,8 @@ class SelectorComputeMixin:
             or buf.shape[1] < shape[1]
             or buf.shape[2] < shape[2]
         ):
+            if buf is not None and buf.is_cuda:
+                self._uaf_guard_record_streams_before_discard(buf)
             buf = torch.empty(shape, device=device, dtype=torch.float32)
             self._selector_log_f_denoms_all = buf
         return buf[:layers, :batch, :num_heads]
@@ -1665,6 +1922,44 @@ class SelectorComputeMixin:
             )
 
         override = getattr(self, "_selector_pipeline_workspace_override", None)
+        if isinstance(override, SlotStableOverrides):
+            # Persistent ring slots must not retain one (rows,K) pair per
+            # request length. A flat grow-only carrier yields an exact,
+            # contiguous (rows,K) view for the C++ contract and keeps the same
+            # base pointer for every K within the observed high-water mark.
+            capacity_key = ("__slot_capacity__", int(rows), str(device))
+            pair = override.get(capacity_key)
+            needed = int(rows) * int(kv_needed)
+
+            def _is_capacity(buf: Optional[torch.Tensor]) -> bool:
+                return (
+                    buf is not None
+                    and buf.device == device
+                    and buf.dtype == torch.float32
+                    and buf.dim() == 1
+                    and int(buf.numel()) >= needed
+                    and buf.is_contiguous()
+                )
+
+            if (
+                not isinstance(pair, tuple)
+                or len(pair) != 2
+                or not _is_capacity(pair[0])
+                or not _is_capacity(pair[1])
+            ):
+                if isinstance(pair, tuple):
+                    for old in pair:
+                        if isinstance(old, torch.Tensor) and old.is_cuda:
+                            self._uaf_guard_record_streams_before_discard(old)
+                pair = (
+                    torch.empty((needed,), device=device, dtype=torch.float32),
+                    torch.empty((needed,), device=device, dtype=torch.float32),
+                )
+                override[capacity_key] = pair
+            return (
+                pair[0][:needed].view(rows, kv_needed),
+                pair[1][:needed].view(rows, kv_needed),
+            )
         if isinstance(override, dict):
             pair = override.get(key)
             if pair is None or not _is_valid(pair[0]) or not _is_valid(pair[1]):
@@ -1705,9 +2000,6 @@ class SelectorComputeMixin:
     # Disjoint-namespace clone of the ASYNC_PRODUCER_WRITER_GRAPH dispatcher.
     # Engaged only when _SELECTOR_TOPK_GRAPH_CACHED is true at the call site.
     # =====================================================================
-    _SELECTOR_TOPK_GRAPH_THRASH_RECAPTURES = 4
-    _SELECTOR_TOPK_GRAPH_THRASH_WINDOW = 64
-
     def _selector_topk_graph_stable_active(self) -> bool:
         """True iff the captured selector graph is SAFE to engage this call.
 
@@ -1742,30 +2034,71 @@ class SelectorComputeMixin:
                 return False
         return True
 
-    def _selector_topk_graph_record_recapture(self) -> bool:
-        """Thrash detector: recapture 超阈 **且窗口内发生过防御性清库** -> bypass。
+    def _selector_topk_graph_current_slot(self) -> Optional[int]:
+        """返回 pending run 当前物理 storage-owner 槽。
 
-        [SELECTED-OUT-RING v2] 旧判据只数 capture 次数——环门控后合法稳态
-        key 族(3 槽×两臂+ramp 形状)首窗即可超过 4,误闩死永久 bypass。
-        真 churn 的签名是 8-graph 上限清库风暴(population 溢出),故加
-        clear 计数联判:无清库=population 有界=不闩(rv7 取证:sync 路径
-        churn 正是靠清库风暴打满 64 窗)。
+        dispatcher 的生产调用只会发生在 selected-out ring 的非 spill run；
+        ``None`` 保留给同步/单测调用。
         """
-        self._selector_topk_graph_recapture_window += 1
-        self._selector_topk_graph_recapture_count += 1
-        if self._selector_topk_graph_recapture_window >= int(
-            self._SELECTOR_TOPK_GRAPH_THRASH_WINDOW
-        ):
-            recaptures = int(self._selector_topk_graph_recapture_count)
-            clears = int(getattr(self, "_selector_topk_graph_window_clear_count", 0))
-            self._selector_topk_graph_recapture_window = 0
-            self._selector_topk_graph_recapture_count = 0
-            self._selector_topk_graph_window_clear_count = 0
-            return (
-                recaptures > int(self._SELECTOR_TOPK_GRAPH_THRASH_RECAPTURES)
-                and clears > 0
-            )
-        return False
+        ring = getattr(self, "_selected_out_ring", None)
+        if ring is None or not bool(getattr(ring, "run_open", False)):
+            return None
+        slot_index = getattr(ring, "current_slot_index", None)
+        return int(slot_index) if slot_index is not None else None
+
+    def _retire_selector_topk_graph_scope(
+        self,
+        *,
+        state: Dict[str, object],
+        scope: Tuple[int, ...],
+    ) -> bool:
+        """Retire one drifted graph scope for the current active lifecycle.
+
+        A captured graph owns exact device pointers.  Once that structural
+        scope observes a different exact key, keeping the graph risks stale
+        pointer replay while replacing it repeatedly creates allocator churn.
+        The only safe and bounded policy is to drain the caller stream, reset
+        the old graph, and keep the scope eager until ``release_idle_buffers``
+        drops the lifecycle state.  This is a cold transition; exact-key replay
+        retains its original zero-sync path.
+        """
+        graphs = state.get("graphs")
+        scope_keys = state.get("scope_keys")
+        if not isinstance(graphs, dict) or not isinstance(scope_keys, dict):
+            raise RuntimeError("E_SFI_SELECTOR_GRAPH_SCOPE_INDEX_CORRUPT")
+        old_key = scope_keys.get(scope)
+        if old_key is None:
+            return False
+        old_entry = graphs.get(old_key)
+        if not isinstance(old_entry, dict):
+            raise RuntimeError("E_SFI_SELECTOR_GRAPH_SCOPE_INDEX_CORRUPT")
+        old_graph = old_entry.get("graph")
+        if old_graph is None:
+            raise RuntimeError("E_SFI_SELECTOR_GRAPH_SCOPE_INDEX_CORRUPT")
+
+        import torch as _torch
+
+        _torch.cuda.current_stream().synchronize()
+        old_graph.reset()
+        graphs.pop(old_key)
+        scope_keys.pop(scope)
+        retired_scopes = state.get("retired_scopes")
+        if retired_scopes is None:
+            retired_scopes = set()
+            state["retired_scopes"] = retired_scopes
+        if not isinstance(retired_scopes, set):
+            raise RuntimeError("E_SFI_SELECTOR_GRAPH_RETIRED_SCOPE_STATE_CORRUPT")
+        retired_scopes.add(scope)
+        candidates = getattr(self, "_selector_topk_graph_candidate_by_scope", None)
+        if isinstance(candidates, dict):
+            candidates.pop(scope, None)
+        self._selector_topk_graph_scope_replacement_count = int(
+            getattr(self, "_selector_topk_graph_scope_replacement_count", 0)
+        ) + 1
+        if not graphs:
+            # Resetting the last graph invalidates the zero-use pool token.
+            state["mempool"] = None
+        return True
 
     def _selector_topk_graph_dispatch(
         self,
@@ -1788,20 +2121,25 @@ class SelectorComputeMixin:
         regime change (override realloc, kbucket clamp-fallback, slice pad,
         env-flip) naturally misses and refuses to capture.
         """
-        import torch as _torch
-
         # Deferred / split-writer mode -> per-pending buffers -> never capture.
         if not self._selector_topk_graph_stable_active():
             return eager_fn()
-        state = self._selector_topk_graph_state
         key = tuple(int(v) for v in key_fields)
+        if len(key) < 5:
+            raise RuntimeError("E_SFI_SELECTOR_GRAPH_INVALID_STRUCTURAL_KEY")
+        slot_index = self._selector_topk_graph_current_slot()
+        slot_i = -1 if slot_index is None else int(slot_index)
+        structural_scope = (slot_i, len(key), *key[:5])
+        state = self._selector_topk_graph_state
         graphs = state.get("graphs") if isinstance(state, dict) else None
         entry = graphs.get(key) if isinstance(graphs, dict) else None
-        # Hot path: key hit and a captured graph exists -> replay only.
-        # ([转正清理 2026-07-11] GRAPH_LRU 旋钮下线:MRU touch 分支随删,
-        # eviction 恒为 clear-all+thrash 联判——population16 后合法稳态
-        # key 全集 12<16,清库臂本身罕至。)
-        if entry is not None and not ptr_rebuild_miss:
+        # Hot path: exact-key hit in the current physical slot -> replay only.
+        # No LRU touch and no population check are paid here.
+        if (
+            isinstance(entry, dict)
+            and entry.get("slot_index") == slot_index
+            and not ptr_rebuild_miss
+        ):
             entry["graph"].replay()
             # Real replay counter (graph-agnostic): proof the captured graph
             # replayed, independent of the cached graph object's own .replay
@@ -1810,8 +2148,22 @@ class SelectorComputeMixin:
                 int(getattr(self, "_selector_topk_graph_replay_count", 0)) + 1
             )
             return entry["result"]
-        # Cold / new-key / ptr-rebuild step: run eager NOW (also the recapture
-        # step). Only (re)capture when no pointer rebuild happened this step.
+
+        scope_keys = state.get("scope_keys") if isinstance(state, dict) else None
+        active_scope_key = (
+            scope_keys.get(structural_scope)
+            if isinstance(scope_keys, dict)
+            else None
+        )
+        if active_scope_key is not None and (
+            ptr_rebuild_miss or active_scope_key != key
+        ):
+            self._retire_selector_topk_graph_scope(
+                state=state,
+                scope=structural_scope,
+            )
+        # Cold / new-key / ptr-rebuild step: run eager NOW.  Capture admission
+        # is decided after the eager result is available.
         # [C'-FORENSIC 2026-07-11] cold-arm eager vs capture 段分解仪器(detail
         # 门下零税)。capdet_tk 定谳:cold eager per=474µs / capture 段 per=
         # 2788µs;defer-capture(B')两发 603.0/603.2 vs 原位 604.1-605.5=
@@ -1832,11 +2184,42 @@ class SelectorComputeMixin:
             ) + 1.0
         else:
             result = eager_fn()
+        candidate_by_scope = getattr(
+            self, "_selector_topk_graph_candidate_by_scope", None
+        )
+        if not isinstance(candidate_by_scope, dict):
+            candidate_by_scope = {}
+            self._selector_topk_graph_candidate_by_scope = candidate_by_scope
         if ptr_rebuild_miss:
-            if isinstance(graphs, dict):
-                graphs.pop(key, None)
+            candidate_by_scope.pop(structural_scope, None)
             return result
-        self._capture_selector_topk_graph(eager_fn=eager_fn, key=key)
+        retired_scopes = (
+            state.get("retired_scopes") if isinstance(state, dict) else None
+        )
+        if isinstance(retired_scopes, set) and structural_scope in retired_scopes:
+            candidate_by_scope.pop(structural_scope, None)
+            return result
+        if retired_scopes is not None and not isinstance(retired_scopes, set):
+            raise RuntimeError("E_SFI_SELECTOR_GRAPH_RETIRED_SCOPE_STATE_CORRUPT")
+        # Capturing on the first sighting of every exact K/pointer geometry is
+        # a memory leak in effect under heterogeneous serving: the graph is
+        # replaced before it ever replays, while its private-pool allocations
+        # accumulate allocator pressure.  The logically minimal admission
+        # rule is recurrence: retain only one candidate per structural scope,
+        # and capture when that exact key is observed again.  Hot replay keeps
+        # the original single dict lookup; this branch is cold-miss only.
+        if candidate_by_scope.get(structural_scope) != key:
+            candidate_by_scope[structural_scope] = key
+            self._selector_topk_graph_admission_deferred_count = int(
+                getattr(self, "_selector_topk_graph_admission_deferred_count", 0)
+            ) + 1
+            return result
+        candidate_by_scope.pop(structural_scope, None)
+        self._capture_selector_topk_graph(
+            eager_fn=eager_fn,
+            key=key,
+            slot_index=slot_index,
+        )
         return result
 
     def _capture_selector_topk_graph(
@@ -1844,7 +2227,8 @@ class SelectorComputeMixin:
         *,
         eager_fn,
         key,
-    ) -> None:
+        slot_index: Optional[int] = None,
+    ) -> bool:
         """Capture the eager selector closure into a per-key CUDA graph.
 
         The closure is a pure function of its (now data_ptr-stable) launch
@@ -1860,13 +2244,48 @@ class SelectorComputeMixin:
         if bool(_torch.cuda.is_current_stream_capturing()):
             # Already capturing the outer decode graph -> do NOT nest. The eager
             # selector launch issued by the caller belongs to that outer graph.
-            return
+            return False
+        key_t = tuple(int(v) for v in key)
+        if len(key_t) < 5:
+            raise RuntimeError("E_SFI_SELECTOR_GRAPH_INVALID_STRUCTURAL_KEY")
+        slot_i = -1 if slot_index is None else int(slot_index)
+        # Key fields 0..4 are the true structural geometry
+        # (layers,batch,kv-heads,queries-per-kv,k-head). Tuple arity separates
+        # logits and pre-denom entrypoints. Exact K/slice/pointers stay in the
+        # full key and replace only this structural scope on change.
+        scope = (slot_i, len(key_t), *key_t[:5])
         state = self._selector_topk_graph_state
-        mempool = None
-        if isinstance(state, dict):
-            mempool = state.get("mempool")
+        if (
+            not isinstance(state, dict)
+            or not isinstance(state.get("graphs"), dict)
+            or not isinstance(state.get("scope_keys"), dict)
+        ):
+            state = {
+                "graphs": {},
+                "scope_keys": {},
+                "retired_scopes": set(),
+                "mempool": None,
+            }
+            self._selector_topk_graph_state = state
+        graphs_map = state["graphs"]
+        scope_keys = state["scope_keys"]
+        retired_scopes = state.get("retired_scopes")
+        if not isinstance(retired_scopes, set):
+            raise RuntimeError("E_SFI_SELECTOR_GRAPH_RETIRED_SCOPE_STATE_CORRUPT")
+        if scope in retired_scopes:
+            raise RuntimeError("E_SFI_SELECTOR_GRAPH_RETIRED_SCOPE_CAPTURE")
+        previous_key = scope_keys.get(scope)
+        if previous_key is not None and previous_key != key_t:
+            raise RuntimeError("E_SFI_SELECTOR_GRAPH_SCOPE_DRIFT_CAPTURE")
+        elif previous_key == key_t:
+            if key_t not in graphs_map:
+                raise RuntimeError("E_SFI_SELECTOR_GRAPH_SCOPE_INDEX_CORRUPT")
+            raise RuntimeError("E_SFI_SELECTOR_GRAPH_DUPLICATE_CAPTURE")
+
+        mempool = state.get("mempool")
         if mempool is None:
             mempool = _torch.cuda.graph_pool_handle()
+            state["mempool"] = mempool
         stream = self._selector_topk_graph_stream
         if stream is None:
             stream = _torch.cuda.Stream()
@@ -1912,30 +2331,13 @@ class SelectorComputeMixin:
             _pd_det["sel_capture_calls"] = float(
                 _pd_det.get("sel_capture_calls", 0.0) or 0.0
             ) + 1.0
-        key_t = tuple(int(v) for v in key)
-        if not isinstance(state, dict) or not isinstance(state.get("graphs"), dict):
-            state = {"graphs": {}, "mempool": mempool}
-            self._selector_topk_graph_state = state
-        state["mempool"] = mempool
-        graphs_map = state["graphs"]
-        # Defensive bound: beyond a plausible shape population the keys are
-        # churning; drop the stale set (keep the just-captured graph) and let the
-        # thrash detector adjudicate a bypass.
-        # [TOPK-GRAPH-POPULATION-16 2026-07-10] 8→16:off-loop 生产 key 全集实测
-        # =12(3 ring 槽×2 capture buf×2 层组形状),8 装不下→每逢新 key 清库循环
-        # (tk3on 轮 capture=17 实证);16 覆盖全集留余量,合法稳态永不触发此臂。
-        if len(graphs_map) >= 16 and key_t not in graphs_map:
-            # [SELECTED-OUT-RING v2] 清库=population 溢出的 churn 实证,计数
-            # 供 thrash 联判(合法稳态 key 族有界,永不触发此臂)。
-            # ([转正清理 2026-07-11] GRAPH_LRU 旋钮下线,eviction 恒 clear-all。)
-            self._selector_topk_graph_window_clear_count = (
-                int(getattr(self, "_selector_topk_graph_window_clear_count", 0)) + 1
-            )
-            graphs_map.clear()
         graphs_map[key_t] = {
             "graph": graph,
             "result": captured_result,
+            "scope": scope,
+            "slot_index": slot_index,
         }
+        scope_keys[scope] = key_t
         # [SELECTED-OUT-RING v2] 判据仪器:capture 累计(flush 遥测导出)。
         self._selector_topk_graph_capture_count = (
             int(getattr(self, "_selector_topk_graph_capture_count", 0)) + 1
@@ -1950,8 +2352,7 @@ class SelectorComputeMixin:
                     )
             except OSError:
                 pass
-        if self._selector_topk_graph_record_recapture():
-            raise RuntimeError("E_SFI_SELECTOR_GRAPH_UNBOUNDED_KEY_CHURN")
+        return True
 
     def _get_selector_layer_index_tensor(
         self,
@@ -2337,25 +2738,30 @@ class SelectorComputeMixin:
                 device=device,
             )
 
-        _wait_stage_h2d_evt(
+        stage_base_key = "_decode_logits_stage_h2d"
+        stage_slot_key, stage_stream = _acquire_stage_h2d_group(
             stage_cache=None,
             cache_owner=self,
-            key="_decode_logits_stage_h2d_evt",
+            base_key=stage_base_key,
+            device=device,
         )
+        stage_suffix = stage_slot_key[len(stage_base_key) :]
 
         def _ensure_stage(name: str) -> torch.Tensor:
-            stage = getattr(self, name, None)
+            slot_name = f"{name}{stage_suffix}"
+            stage = getattr(self, slot_name, None)
             if (
                 not isinstance(stage, torch.Tensor)
                 or stage.device.type != "cpu"
                 or stage.dtype != torch.long
                 or stage.numel() < tensor_cap
             ):
-                try:
-                    stage = torch.empty((tensor_cap,), dtype=torch.long, device="cpu", pin_memory=True)
-                except RuntimeError:
-                    stage = torch.empty((tensor_cap,), dtype=torch.long, device="cpu")
-                setattr(self, name, stage)
+                stage = _new_cpu_tensor(
+                    (tensor_cap,),
+                    dtype=torch.long,
+                    pin_memory=True,
+                )
+                setattr(self, slot_name, stage)
             return stage
 
         last_n_stage = _ensure_stage("_decode_logits_last_n_stage_cpu_i64")
@@ -2363,19 +2769,31 @@ class SelectorComputeMixin:
         for idx in range(num_reqs):
             last_n_stage[idx] = int(logits_last_n[idx])
             cap_stage[idx] = int(logits_capacity[idx])
-        self._decode_logits_last_n_i64[:num_reqs].copy_(
-            last_n_stage[:num_reqs],
-            non_blocking=True,
-        )
-        self._decode_logits_cap_i64[:num_reqs].copy_(
-            cap_stage[:num_reqs],
-            non_blocking=True,
-        )
+        try:
+            self._decode_logits_last_n_i64[:num_reqs].copy_(
+                last_n_stage[:num_reqs],
+                non_blocking=True,
+            )
+            self._decode_logits_cap_i64[:num_reqs].copy_(
+                cap_stage[:num_reqs],
+                non_blocking=True,
+            )
+        except BaseException as exc:
+            _protect_failed_stage_h2d(
+                stage_cache=None,
+                cache_owner=self,
+                key=f"{stage_slot_key}_evt",
+                device=device,
+                stream=stage_stream,
+                error=exc,
+            )
+            raise
         _record_stage_h2d_evt(
             stage_cache=None,
             cache_owner=self,
-            key="_decode_logits_stage_h2d_evt",
+            key=f"{stage_slot_key}_evt",
             device=device,
+            stream=stage_stream,
         )
         if step_context.step_authority is not None and step_context.step_authority.epoch == step_context.epoch:
             step_context.step_authority = step_context.step_authority.with_logits(
@@ -2773,16 +3191,37 @@ class SelectorComputeMixin:
         require_base: bool = False,
         phase: str = "decode",
     ) -> Optional[SelectorResult]:
-        return compute_alpha_selection_batched_impl(
-            self,
-            payloads,
-            require_base=bool(require_base),
-            phase=str(phase),
-            align_up_int_fn=_align_up_int,
-            selector_cpp_stack_cached=bool(_SELECTOR_CPP_STACK_CACHED),
-            get_selector_batch_ext_fn=_get_selector_batch_ext,
-            selector_kbucket_cached=bool(_SELECTOR_KBUCKET_CACHED),
-        )
+        try:
+            return compute_alpha_selection_batched_impl(
+                self,
+                payloads,
+                require_base=bool(require_base),
+                phase=str(phase),
+                align_up_int_fn=_align_up_int,
+                selector_cpp_stack_cached=bool(_SELECTOR_CPP_STACK_CACHED),
+                get_selector_batch_ext_fn=_get_selector_batch_ext,
+                selector_kbucket_cached=bool(_SELECTOR_KBUCKET_CACHED),
+            )
+        except BaseException as exc:
+            # 成功路径没有额外 CUDA/API 调用；只有异常才触发 owner-local lease
+            # 漏斗。cleanup 若自身失败只挂到原异常，root cause 仍原样上抛。
+            try:
+                self._abort_selector_key_norms_delta_carrier_lease()
+            except BaseException as cleanup_exc:
+                try:
+                    setattr(
+                        exc,
+                        "selector_key_norms_delta_cleanup_error",
+                        cleanup_exc,
+                    )
+                except BaseException:
+                    pass
+                if hasattr(exc, "add_note"):
+                    exc.add_note(
+                        "selector key_norms delta carrier cleanup failed: "
+                        f"{cleanup_exc!r}"
+                    )
+            raise
 
     def _update_selection_tracking(
         self,

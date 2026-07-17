@@ -57,12 +57,11 @@ _PSC_BSKIP_ENABLED = os.environ.get("VLLM_SPARSE_PSC_BSKIP", "1") != "0"
 _PSC_BSKIP_ASSERT = os.environ.get("VLLM_SPARSE_PSC_BSKIP_ASSERT", "0") == "1"
 
 # === Phased env cache for OFF-by-default per-step diagnostic reads ===
-# Production hot path reads the cached constant; PyTest / explicit dynamic
-# runs (_DYNAMIC_ENV) read live os.environ at each site (see
-# unified_attention_worker.py:57 for the canonical idiom).
-_DEFER_BOOTSTRAP_PRODUCER_CACHED = (
-    os.environ.get("VLLM_SPARSE_DEFER_BOOTSTRAP_PRODUCER", "0") == "1"
-)
+# Production hot path reads cached constants; PyTest / explicit dynamic runs
+# (_DYNAMIC_ENV) read live os.environ at each site (see
+# unified_attention_worker.py:57 for the canonical idiom).  Deferred-bootstrap
+# policy is owned by WaitDeciderMixin so publication and submission-ledger
+# admission cannot drift apart.
 # [PERF-05 默认开 2026-07-07] decode-only 步跳过 prefill capture 预约默认启用：
 # decode-only ⇒ 候选恒空（prefill 行才进 candidates），missing_reservation 不注册
 # 进 reservations_by_identity、返回值被调用方丢弃、count_miss=False 计数不漂——
@@ -70,14 +69,6 @@ _DEFER_BOOTSTRAP_PRODUCER_CACHED = (
 _SKIP_DECODE_PREFILL_RESERVE_CACHED = (
     os.environ.get("VLLM_SPARSE_SKIP_DECODE_PREFILL_RESERVE", "1") != "0"
 )
-# [JUDGE-REPLAY-AWARE 2026-07-09] Env-gated compact-residency poison probe. Read
-# once here; when unset every step pays exactly one cached-bool check and never
-# imports the probe module. See patches/debug/compact_poison_probe.py.
-_COMPACT_POISON_PROBE_ARMED = bool(
-    os.environ.get("VLLM_SPARSE_DEBUG_COMPACT_POISON")
-)
-
-
 def _psc_bskip_restamp_authority(auth, *, epoch, handle_id, handle_generation,
                                  decode_plan_version, consume_key, consume_handle,
                                  target_key, wait_handle,
@@ -166,13 +157,11 @@ _HASH_MASK_I64 = 0x7FFFFFFFFFFFFFFF
 def _compute_step_request_hashes(
     *,
     req_ids_tuple: Tuple[str, ...],
-    is_prefill_by_row: Sequence[bool],
-    num_reqs: int,
+    prefill_rows: Tuple[int, ...],
 ) -> Tuple[int, int]:
     """Build order-insensitive req-set hash + order-sensitive row-phase hash."""
     req_set_hash = hash(req_ids_tuple) & _HASH_MASK_I64
-    is_prefill_tuple = tuple(bool(is_prefill_by_row[i]) for i in range(num_reqs))
-    row_phase_hash = hash((req_ids_tuple, is_prefill_tuple)) & _HASH_MASK_I64
+    row_phase_hash = hash((req_ids_tuple, prefill_rows)) & _HASH_MASK_I64
     return int(req_set_hash), int(row_phase_hash)
 
 
@@ -231,11 +220,17 @@ def _publish_bootstrap_readiness_before_step_authority(
             if self._request_can_bridge_bootstrap_decode(str(rid))
         )
 
-    defer_bootstrap_producer = (
-        (os.environ.get("VLLM_SPARSE_DEFER_BOOTSTRAP_PRODUCER", "0") == "1")
-        if _DYNAMIC_ENV
-        else _DEFER_BOOTSTRAP_PRODUCER_CACHED
-    )
+    defer_bootstrap_producer = self._deferred_bootstrap_producer_enabled()
+    if not defer_bootstrap_producer:
+        # [TP-BOOTSTRAP-SUBMISSION-BOUNDARY] Request-local final events are
+        # produced by rank-local async flushes. Validate the host-owned
+        # submission boundary before bootstrap_done becomes row-policy-visible;
+        # otherwise one TP rank may consume compact while another still consumes
+        # native KV. A device wait cannot synthesize a missing host finalize.
+        self._validate_prefill_submission_before_bootstrap_publish(
+            req_ids=req_ids_tuple,
+            epoch=self.step_context_epoch,
+        )
     bridge_bootstrap_ids = _bridge_bootstrap_ids()
     if defer_bootstrap_producer:
         self._stage_deferred_bootstrap_producer_jobs(
@@ -712,7 +707,8 @@ def prepare_step_context_impl(
             # ⚠️ 注意：last_decode_refresh_step=0 是合法值（首个 decode token 后），不能用 `or -1` 判空。
             if tracking.decode_step >= 0 and tracking.last_decode_refresh_step < 0:
                 tracking.last_decode_refresh_step = tracking.decode_step
-            # 方案 1：request-wise 的 prefill_done 仅代表 prompt ingest 是否完成（阶段信号）
+            # request-wise prefill_done 仅代表 prompt ingest 是否完成；它不是
+            # 本步执行 owner，q_len>1 的 post-prompt/recompute 行仍可归 prefill。
             if prompt_len > 0:
                 tracking.prefill_done = bool(computed >= prompt_len)
             # 短上下文（无需 compact bootstrap）：一旦 prompt 完成即可直接视为“已 bootstrapped”
@@ -780,7 +776,8 @@ def prepare_step_context_impl(
                     else:
                         tracking._was_short_dense = is_short
 
-            # 记录 prompt 判定（用于 is_decode_only 与 release 判定）
+            # 记录 prompt-ingest 进度；has_prefill_by_prompt 保留诊断语义，
+            # buffer release 还会在逐行 owner 分类完成后纳入 q_len>1 执行事实。
             if prompt_len > 0 and computed < prompt_len:
                 prefill_active = True
                 has_prefill_by_prompt = True
@@ -837,22 +834,39 @@ def prepare_step_context_impl(
 
     # mixchunk 判定：仅使用“当前 step 事实”，不依赖跨步粘连状态。
     # 当同一步内同时存在 prefill row 和 decode row 时，视为 mixed-phase。
+    # prefill_rows 是 row phase 的唯一不可变签名；StepMeta/StepAuthority 也直接
+    # 复用这一份冻结结果，避免 helper 与两个下游各自重复分配 tuple。
+    prefill_rows = tuple(prefill_rows_list)
     has_request_phase_mix = bool(has_prefill_row and has_decode_row)
-    # step-wise hash 签名：缓存稳态 decode（req_ids + phase 不变时跳过 hash）。
-    _hash_cache_key = (req_ids_tuple, has_prefill_row)
+    # prefill buffer 生命周期跟随执行 owner，而不是仅表示 prompt ingest 进度
+    # 的 computed<prompt_len。跨过 prompt 边界的 q_len>1 行仍可能执行 prefill
+    # capture；此处只覆盖 True，不改变无 prompt counter 时的既有释放 grace。
+    if has_prefill_row:
+        prefill_active = True
+    # step-wise hash 签名：req_ids + 精确 prefill row 位置共同定相。同一 mixed
+    # layout 可安全命中；A/B row phase 翻转则必 miss，不再使用 has_prefill_row
+    # 这个无法区分具体 row 的粗粒度 key。
     _prev = getattr(self, "_step_hash_cache", None)
     # [PERF-07] 原 `is` 身份比较结构性恒 miss（req_ids_tuple 每步经 list→tuple
     # 新建对象），"稳态跳过 hash"设计从未生效；等值比较（str tuple，字符串驻留
     # 下近 O(1)/元素）使缓存按设计命中。
-    if _prev is not None and _prev[0] == _hash_cache_key[0] and _prev[1] == _hash_cache_key[1]:
+    if (
+        _prev is not None
+        and _prev[0] == req_ids_tuple
+        and _prev[1] == prefill_rows
+    ):
         req_set_hash, row_phase_hash = _prev[2], _prev[3]
     else:
         req_set_hash, row_phase_hash = _compute_step_request_hashes(
             req_ids_tuple=req_ids_tuple,
-            is_prefill_by_row=is_prefill_by_row_list,
-            num_reqs=num_reqs,
+            prefill_rows=prefill_rows,
         )
-        self._step_hash_cache = (req_ids_tuple, has_prefill_row, req_set_hash, row_phase_hash)
+        self._step_hash_cache = (
+            req_ids_tuple,
+            prefill_rows,
+            req_set_hash,
+            row_phase_hash,
+        )
 
     # 回退判据：当上游不给 prompt/computed 时，基于"近期是否有 prefill enqueue"判断是否可释放。
     if prefill_active is None:
@@ -1316,32 +1330,11 @@ def prepare_step_context_impl(
     # 实际 block_size 会在 dispatcher 中通过 block_table 推断
     block_size = 16
 
-    # 判断是否全部是 decode：
-    # - 使用 prompt_len 与 num_computed_tokens 判断是否越过 prompt
-    # - 兼容 multi-step decode（q_len > 1）
-    # - 兜底：decode_step>=0 或 q_len==1
+    # decode-only 必须复用上面 owner 派发的逐行权威分类。重新根据
+    # prompt/computed/decode_step 推导会遗漏 q_len>1 的跨 prompt chunk，造成
+    # has_prefill_row=True 但 is_decode_only=True 的 split-brain。
     if q_lens:
-        is_decode_only = True
-        for idx, (rid, q_len) in enumerate(zip(req_ids_tuple, q_lens)):
-            tracking = self.request_states.get(rid)
-            decode_started = (
-                tracking is not None
-                and tracking.decode_step is not None
-                and tracking.decode_step >= 0
-            )
-            prompt_len = prompt_len_list[idx] if idx < len(prompt_len_list) else 0
-            computed = computed_list[idx] if idx < len(computed_list) else -1
-            if prompt_len > 0:
-                # 关键：prefill 的最后一个 chunk 可能 q_len==1，但仍应视为 prefill（否则会错误走 decode-only 路径）
-                decode_by_prompt = bool(computed >= prompt_len)
-                if decode_by_prompt or decode_started:
-                    continue
-            else:
-                # prompt_len 不可用时，使用 decode_started / q_len 作为弱判据（保持旧行为）
-                if decode_started or q_len == 1:
-                    continue
-            is_decode_only = False
-            break
+        is_decode_only = not has_prefill_row
     else:
         is_decode_only = False
         has_prefill_by_prompt = False
@@ -1373,7 +1366,7 @@ def prepare_step_context_impl(
         is_prefill_by_row=tuple(is_prefill_by_row_list),
         has_prefill_row=has_prefill_row,
         has_decode_row=has_decode_row,
-        prefill_rows=tuple(prefill_rows_list),
+        prefill_rows=prefill_rows,
         is_decode_only=is_decode_only,
         has_prefill_by_prompt=bool(has_prefill_by_prompt),
         short_dense_by_row=short_dense_by_row,
@@ -1456,14 +1449,6 @@ def prepare_step_context_impl(
         from patches.fa3_native.install import bump_step_compact_row_liveness
 
         bump_step_compact_row_liveness(sum(1 for _uc in _use_compact if _uc))
-        if _COMPACT_POISON_PROBE_ARMED:
-            from patches.debug.compact_poison_probe import (
-                maybe_fire_compact_poison_probe,
-            )
-
-            maybe_fire_compact_poison_probe(
-                self, _use_compact, slot_by_row, seq_lens_tuple
-            )
     has_request_phase_mix_i32 = 1 if has_request_phase_mix else 0
     previous_step_authority = getattr(self, "step_authority", None)
     consume_selected_scope_key, consume_selected_scope_wait_handle = (
@@ -1504,7 +1489,7 @@ def prepare_step_context_impl(
             is_prefill_by_row=tuple(is_prefill_by_row_list),
             has_prefill_row=has_prefill_row,
             has_decode_row=has_decode_row,
-            prefill_rows=tuple(prefill_rows_list),
+            prefill_rows=prefill_rows,
             is_decode_only=is_decode_only,
             has_prefill_by_prompt=bool(has_prefill_by_prompt),
             bootstrap_done_by_row=tuple(bootstrap_done_list),

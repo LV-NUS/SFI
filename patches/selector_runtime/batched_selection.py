@@ -321,6 +321,10 @@ def compute_alpha_selection_batched_impl(
         return None
     if self.config is None or self.config.alpha_fair is None:
         raise RuntimeError("alpha selector requires config.alpha_fair")
+    # Entry-local specialization: downstream native kernels already accept an
+    # empty sentinel for gamma=0. Compute the immutable gate once; host-side
+    # key-norm preparation must not partially execute on the disabled arm.
+    use_key_norms = float(self.config.alpha_fair.gamma) != 0.0
 
     first = payloads[0]
     batch_size, num_heads, window, kv_len_total = first.capture_scores.shape
@@ -339,7 +343,7 @@ def compute_alpha_selection_batched_impl(
         raise ValueError("num_queries_per_kv must be > 0")
 
     device = first.capture_scores.device
-    key_cache_dtype = first.key_cache.dtype
+    key_cache_dtype = first.key_cache.dtype if use_key_norms else None
 
     max_slot = max(slot_list_ref) if slot_list_ref else -1
 
@@ -355,38 +359,52 @@ def compute_alpha_selection_batched_impl(
         for p in payloads:
             p.state.ensure_batch(batch_target)
     layer_index_by_cache_key = getattr(self, "layer_index_by_cache_key", {})
-    key_norms_layer_indices = tuple(
-        int(
-            payload.layer_index
-            if int(getattr(payload, "layer_index", -1)) >= 0
-            else layer_index_by_cache_key.get(payload.cache_key, payload_index)
-        )
-        for payload_index, payload in enumerate(payloads)
-    )
-    key_norms_kv_bucket = _align_up_int(int(kv_len_total) + 1, 4096)
-    key_norms_cache_key = (
-        str(phase),
-        key_norms_layer_indices,
-        tuple(int(slot) for slot in slot_list_ref),
-        int(batch_size),
-        int(num_kv_heads),
-        int(key_norms_kv_bucket),
-        str(device),
-        "float16",
-    )
-    block_size_ref: Optional[int] = None
+    # block_size is consumed by generic selector bounds on both gamma arms.
+    # Keep it independent from key-norm dtype/layout metadata.
+    if first.key_cache.dim() < 2:
+        raise RuntimeError("key_cache must be at least 2D for selector bounds")
+    selector_block_size = int(first.key_cache.shape[1])
     head_dim_ref: Optional[int] = None
     row_list_ref: Optional[List[int]] = None
-    key_norms_all = self._ensure_selector_key_norms_buffer(
-        layers=len(payloads),
-        batch=batch_size,
-        num_kv_heads=num_kv_heads,
-        kv_len=kv_len_total,
-        device=device,
-        dtype=torch.float16,
-        cache_key=key_norms_cache_key,
-    )
-    key_norms_active_valid = bool(self._selector_key_norms_active_buffer_valid())
+    if use_key_norms:
+        key_norms_layer_indices = tuple(
+            int(
+                payload.layer_index
+                if int(getattr(payload, "layer_index", -1)) >= 0
+                else layer_index_by_cache_key.get(payload.cache_key, payload_index)
+            )
+            for payload_index, payload in enumerate(payloads)
+        )
+        key_norms_kv_bucket = _align_up_int(int(kv_len_total) + 1, 4096)
+        key_norms_cache_key = (
+            str(phase),
+            key_norms_layer_indices,
+            tuple(int(slot) for slot in slot_list_ref),
+            int(batch_size),
+            int(num_kv_heads),
+            int(key_norms_kv_bucket),
+            str(device),
+            "float16",
+        )
+        block_size_ref: Optional[int] = selector_block_size
+        key_norms_all = self._ensure_selector_key_norms_buffer(
+            layers=len(payloads),
+            batch=batch_size,
+            num_kv_heads=num_kv_heads,
+            kv_len=kv_len_total,
+            device=device,
+            dtype=torch.float16,
+            cache_key=key_norms_cache_key,
+        )
+        key_norms_active_valid = bool(
+            self._selector_key_norms_active_buffer_valid()
+        )
+    else:
+        block_size_ref = selector_block_size
+        # Zero-width view: same storage owner, zero allocation, accepted by the
+        # native gamma=0 specialization without shape/dtype materialization.
+        key_norms_all = first.capture_scores[..., :0]
+        key_norms_active_valid = False
 
     capture_base = getattr(first.capture_scores, "_base", None)
     use_capture_base = (
@@ -433,21 +451,37 @@ def compute_alpha_selection_batched_impl(
     profile_cpu_key_norms_pack_us: Optional[float] = None
     profile_cpu_select_us: Optional[float] = None
     t_validate0_ns: Optional[int] = time.perf_counter_ns() if profile_detail else None
-    _main_evts = self._create_profile_events_batch(12, device, profile_detail)
-    (
-        profile_gather_evt0,
-        profile_gather_evt1,
-        profile_key_norms_preproc_evt0,
-        profile_key_norms_preproc_evt1,
-        profile_key_norms_evt0,
-        profile_key_norms_evt1,
-        profile_key_norms_h2d_evt0,
-        profile_key_norms_h2d_evt1,
-        profile_key_norms_delta_evt0,
-        profile_key_norms_delta_evt1,
-        profile_key_norms_pack_evt0,
-        profile_key_norms_pack_evt1,
-    ) = _main_evts
+    if use_key_norms:
+        (
+            profile_gather_evt0,
+            profile_gather_evt1,
+            profile_key_norms_preproc_evt0,
+            profile_key_norms_preproc_evt1,
+            profile_key_norms_evt0,
+            profile_key_norms_evt1,
+            profile_key_norms_h2d_evt0,
+            profile_key_norms_h2d_evt1,
+            profile_key_norms_delta_evt0,
+            profile_key_norms_delta_evt1,
+            profile_key_norms_pack_evt0,
+            profile_key_norms_pack_evt1,
+        ) = self._create_profile_events_batch(12, device, profile_detail)
+    else:
+        profile_gather_evt0, profile_gather_evt1 = (
+            self._create_profile_events_batch(2, device, profile_detail)
+        )
+        (
+            profile_key_norms_preproc_evt0,
+            profile_key_norms_preproc_evt1,
+            profile_key_norms_evt0,
+            profile_key_norms_evt1,
+            profile_key_norms_h2d_evt0,
+            profile_key_norms_h2d_evt1,
+            profile_key_norms_delta_evt0,
+            profile_key_norms_delta_evt1,
+            profile_key_norms_pack_evt0,
+            profile_key_norms_pack_evt1,
+        ) = (None,) * 10
 
     # ========== 优化：利用 payloads 同质性减少检查 ==========
     # 首个 payload 做完整验证，后续 payload 只验证关键变化属性并收集数据
@@ -482,8 +516,50 @@ def compute_alpha_selection_batched_impl(
     # 批组成变化均经由键自身失效——zero-stale-by-construction。仅 fast_sig_ok
     # （全层签名可用）时启用；命中后 slot/row 逐层等值活护栏仍保留（循环内）。
     _proof_cache_key = None
+    _proof_cache_scope = None
     _proof_hit = None
     if fast_sig_ok and (use_capture_base or use_denoms_base or use_kv_lengths_direct_ref):
+        first_state = getattr(first, "state", None)
+        selector_capture_chunk_id = int(
+            getattr(first_state, "capture_chunk_id", -1)
+        )
+        selector_capture_buf_id = int(
+            getattr(first_state, "capture_buf_id", -1)
+        )
+        first_layer_index = int(
+            first.layer_index
+            if int(getattr(first, "layer_index", -1)) >= 0
+            else layer_index_by_cache_key.get(first.cache_key, -1)
+        )
+        last_payload = payloads[-1]
+        last_layer_index = int(
+            last_payload.layer_index
+            if int(getattr(last_payload, "layer_index", -1)) >= 0
+            else layer_index_by_cache_key.get(last_payload.cache_key, -1)
+        )
+        _ring = getattr(self, "_selected_out_ring", None)
+        _ring_scope = (
+            getattr(_ring, "current_scope", None)
+            if _ring is not None and bool(getattr(_ring, "run_open", False))
+            else None
+        )
+        _owner_slot = int(_ring_scope[0]) if _ring_scope is not None else -1
+        # One current proof per runtime-owned structural scope. Chunk/buffer
+        # and O(1) layer endpoints distinguish same-size disjoint groups without
+        # rebuilding a per-layer tuple on gamma=0. Exact base/pointer/shape
+        # identity remains in _proof_cache_key, so scope collisions can only
+        # evict and never reuse an unrelated proof. All scope dimensions are
+        # bounded by the live capture topology; no population cap is needed.
+        _proof_cache_scope = (
+            _owner_slot,
+            str(phase),
+            selector_capture_chunk_id,
+            selector_capture_buf_id,
+            first_layer_index,
+            last_layer_index,
+            int(len(payloads)),
+            bool(denoms_ref is not None),
+        )
         _proof_cache_key = (
             id(capture_base),
             id(denoms_base),
@@ -526,31 +602,33 @@ def compute_alpha_selection_batched_impl(
                         raise ValueError("log_f_denoms must have shape [batch, num_heads] when provided")
                 if payload.state.num_kv_heads != num_kv_heads or payload.state.num_heads != num_heads:
                     raise ValueError("layer state head configuration mismatch")
-                if len(payload.row_list) != batch_size:
-                    raise RuntimeError("row_list length mismatch")
-                row_list_ref = payload.row_list if isinstance(payload.row_list, list) else list(payload.row_list)
-                if payload.key_cache.dtype != key_cache_dtype:
-                    raise RuntimeError("key_cache dtype mismatch across layers")
-                if payload.capture_scores.device != device:
+                if use_key_norms:
+                    if len(payload.row_list) != batch_size:
+                        raise RuntimeError("row_list length mismatch")
+                    row_list_ref = payload.row_list if isinstance(payload.row_list, list) else list(payload.row_list)
+                    if payload.key_cache.dtype != key_cache_dtype:
+                        raise RuntimeError("key_cache dtype mismatch across layers")
+                    if payload.capture_scores.device != device:
+                        raise RuntimeError("capture_scores device mismatch across layers")
+                    if payload.block_table.device != payload.key_cache.device:
+                        raise RuntimeError("block_table device mismatch with key_cache")
+                    if payload.key_cache.dim() < 4:
+                        raise RuntimeError("key_cache must be 4D for key_norms")
+                    head_dim_ref = int(payload.key_cache.shape[-1])
+                    if head_dim_ref <= 0:
+                        raise RuntimeError("head_dim must be > 0 for key_norms")
+                    block_table_ref = payload.block_table
+                elif payload.capture_scores.device != device:
                     raise RuntimeError("capture_scores device mismatch across layers")
-                if payload.block_table.device != payload.key_cache.device:
-                    raise RuntimeError("block_table device mismatch with key_cache")
-                if payload.key_cache.dim() < 4:
-                    raise RuntimeError("key_cache must be 4D for key_norms")
-                block_size_ref = int(payload.key_cache.shape[1]) if payload.key_cache.dim() >= 2 else 0
-                head_dim_ref = int(payload.key_cache.shape[-1])
-                if head_dim_ref <= 0:
-                    raise RuntimeError("head_dim must be > 0 for key_norms")
-                block_table_ref = payload.block_table
             else:
-                row_list_ref = payload.row_list if isinstance(payload.row_list, list) else list(payload.row_list)
-                block_table_ref = payload.block_table
-                if payload.key_cache.dim() < 4:
-                    raise RuntimeError("key_cache must be 4D for key_norms")
-                block_size_ref = int(payload.key_cache.shape[1]) if payload.key_cache.dim() >= 2 else 0
-                head_dim_ref = int(payload.key_cache.shape[-1])
-                if head_dim_ref <= 0:
-                    raise RuntimeError("head_dim must be > 0 for key_norms")
+                if use_key_norms:
+                    row_list_ref = payload.row_list if isinstance(payload.row_list, list) else list(payload.row_list)
+                    block_table_ref = payload.block_table
+                    if payload.key_cache.dim() < 4:
+                        raise RuntimeError("key_cache must be 4D for key_norms")
+                    head_dim_ref = int(payload.key_cache.shape[-1])
+                    if head_dim_ref <= 0:
+                        raise RuntimeError("head_dim must be > 0 for key_norms")
         else:
             slot_list_cur = payload.slot_list if isinstance(payload.slot_list, list) else list(payload.slot_list)
             if len(slot_list_cur) != batch_size:
@@ -561,24 +639,25 @@ def compute_alpha_selection_batched_impl(
                     f"ref={slot_list_ref} got={slot_list_cur}"
                 )
 
-            row_list_cur = payload.row_list if isinstance(payload.row_list, list) else list(payload.row_list)
-            if len(row_list_cur) != batch_size:
-                raise RuntimeError("row_list length mismatch")
-            if row_list_ref is None:
-                row_list_ref = row_list_cur
-            elif row_list_cur != row_list_ref:
-                raise RuntimeError(
-                    f"cross-layer row_list mismatch at layer_idx={layer_idx}: "
-                    f"ref={row_list_ref} got={row_list_cur}"
-                )
+            if use_key_norms:
+                row_list_cur = payload.row_list if isinstance(payload.row_list, list) else list(payload.row_list)
+                if len(row_list_cur) != batch_size:
+                    raise RuntimeError("row_list length mismatch")
+                if row_list_ref is None:
+                    row_list_ref = row_list_cur
+                elif row_list_cur != row_list_ref:
+                    raise RuntimeError(
+                        f"cross-layer row_list mismatch at layer_idx={layer_idx}: "
+                        f"ref={row_list_ref} got={row_list_cur}"
+                    )
 
-            if payload.key_cache.dim() < 4:
-                raise RuntimeError("key_cache must be 4D for key_norms")
-            head_dim_cur = int(payload.key_cache.shape[-1])
-            if head_dim_cur <= 0:
-                raise RuntimeError("head_dim must be > 0 for key_norms")
-            if payload.block_table.device != payload.key_cache.device:
-                raise RuntimeError("block_table device mismatch with key_cache")
+                if payload.key_cache.dim() < 4:
+                    raise RuntimeError("key_cache must be 4D for key_norms")
+                head_dim_cur = int(payload.key_cache.shape[-1])
+                if head_dim_cur <= 0:
+                    raise RuntimeError("head_dim must be > 0 for key_norms")
+                if payload.block_table.device != payload.key_cache.device:
+                    raise RuntimeError("block_table device mismatch with key_cache")
 
             if not trusted_shapes:
                 if payload.capture_scores.shape != expected_cs_shape:
@@ -593,14 +672,16 @@ def compute_alpha_selection_batched_impl(
                         raise ValueError("log_f_denoms must have shape [batch, num_heads] when provided")
                 if payload.state.num_kv_heads != num_kv_heads or payload.state.num_heads != num_heads:
                     raise ValueError("layer state head configuration mismatch")
-                if payload.key_cache.dtype != key_cache_dtype:
+                if use_key_norms and payload.key_cache.dtype != key_cache_dtype:
                     raise RuntimeError("key_cache dtype mismatch across layers")
                 if payload.capture_scores.device != device:
                     raise RuntimeError("capture_scores device mismatch across layers")
-                block_size_cur = int(payload.key_cache.shape[1]) if payload.key_cache.dim() >= 2 else 0
+                if payload.key_cache.dim() < 2:
+                    raise RuntimeError("key_cache must be at least 2D for selector bounds")
+                block_size_cur = int(payload.key_cache.shape[1])
                 if block_size_ref is not None and block_size_cur != block_size_ref:
                     raise RuntimeError("key_cache block_size mismatch across layers")
-                if head_dim_ref is not None and head_dim_cur != head_dim_ref:
+                if use_key_norms and head_dim_ref is not None and head_dim_cur != head_dim_ref:
                     raise RuntimeError("key_cache head_dim mismatch across layers")
 
         # 所有 payload：收集数据
@@ -695,12 +776,23 @@ def compute_alpha_selection_batched_impl(
     # [BASE-PROOF-GEN-CACHE] miss 时把本世代证明结论写缓存（含 base 强引用）。
     if _proof_cache_key is not None and _proof_hit is None:
         _proof_cache = getattr(self, "_selector_base_proof_cache", None)
-        if _proof_cache is None:
+        _proof_scope_keys = getattr(
+            self, "_selector_base_proof_scope_keys", None
+        )
+        if not isinstance(_proof_cache, dict) or not isinstance(
+            _proof_scope_keys, dict
+        ):
             _proof_cache = {}
             self._selector_base_proof_cache = _proof_cache
-        elif len(_proof_cache) > 16:
-            # 层段×buf×批形态的合法组合为个位数；超界=键高频漂（防泄漏上界）。
-            _proof_cache.clear()
+            _proof_scope_keys = {}
+            self._selector_base_proof_scope_keys = _proof_scope_keys
+        _previous_key = _proof_scope_keys.get(_proof_cache_scope)
+        if _previous_key is not None and _previous_key != _proof_cache_key:
+            _previous_proof = _proof_cache.pop(_previous_key, None)
+            if _previous_proof is None:
+                raise RuntimeError("selector base-proof scope index is corrupt")
+        elif _previous_key == _proof_cache_key and _proof_cache_key not in _proof_cache:
+            raise RuntimeError("selector base-proof scope index is corrupt")
         _proof_cache[_proof_cache_key] = (
             bool(use_capture_base),
             capture_base_batch_start,
@@ -712,69 +804,16 @@ def compute_alpha_selection_batched_impl(
             capture_base,
             denoms_base,
         )
-
-    if layer_indices is None:
-        selector_layer_start = 0
-        selector_layer_end = len(payloads) - 1
-    else:
-        selector_layer_start = min(layer_indices) if layer_indices else 0
-        selector_layer_end = max(layer_indices) if layer_indices else len(payloads) - 1
-    selector_chunk_id = int(getattr(getattr(first, "state", None), "capture_chunk_id", -1) or -1)
-    selector_buf_id = int(getattr(getattr(first, "state", None), "capture_buf_id", -1) or -1)
-    selector_layer_span_cache_suffix = (
-        f"_l{selector_layer_start}_{selector_layer_end}"
-        f"_c{selector_chunk_id}_b{selector_buf_id}"
-    )
+        _proof_scope_keys[_proof_cache_scope] = _proof_cache_key
 
     if profile_detail and t_validate0_ns is not None:
         profile_cpu_validate_us = (time.perf_counter_ns() - t_validate0_ns) / 1000.0
-    t_key_norms0_ns: Optional[int] = time.perf_counter_ns() if profile_detail else None
 
-    # key_norms：P0.1 增量更新（delta 到 target_len），避免 refresh 每次扫全量 K
-    self._record_event_safe(profile_key_norms_preproc_evt0, device)
-
-    # --------------------------------------------------------------
-    # P0.1：key_norms 增量更新（delta 到 target_len），避免 refresh 每次扫全量 K
-    # --------------------------------------------------------------
-    # 方案 I 优化：使用辅助方法记录 event
-    self._record_event_safe(profile_key_norms_preproc_evt1, device)
-    self._record_event_safe(profile_key_norms_evt0, device)
-
-    # [DETERMINISTIC-SLOT-SOURCE 2026-07-03] 恒从 slot_list(host 权威值快照)
-    # 构造,勿改回 payload 的 slot_tensor(复用 buffer 的 live 视图,错峰
-    # bootstrap 下一行 flush 会原位覆写):它喂非连续 slots 分支的
-    # arena.index_select 打包,脏 slot=打包错行 norms 的静默错选。
-    slot_tensor_ref = cached_sequence_to_device(
-        slot_list_ref,
-        device=device,
-        dtype=torch.long,
-        cache_name="selector_slot_tensor_i64",
-        cache_owner=self,
-        reuse_unchanged=True,
-    )
-
-    # key_norms arena stride：优先使用 capture_base 的 K 维（已按 256 对齐，可跨 step 稳定复用）
-    kv_stride_tokens = 0
-    if use_capture_base and isinstance(capture_base, torch.Tensor) and capture_base.dim() == 5:
-        kv_stride_tokens = int(capture_base.shape[4])
-    if kv_stride_tokens <= 0:
-        kv_stride_tokens = _align_up_int(int(kv_len_total), 256)
-
-    # 方案 A 优化：将重复的 tensor 创建移到循环外（节省 ~670us）
-    # slot_indices_cpu 和 seq_lens_tensor 在所有层中相同，只需创建一次
-    # [DETERMINISTIC-SLOT-SOURCE 2026-07-03] 恒从 slot_list(host 权威值快照)构造,
-    # 勿改回 payload 的 slot_tensor_cpu(CPU 复用 buffer 的 live 视图,错峰
-    # bootstrap 下一行 flush 会原位覆写):它喂 delta 的 start_lens 读取(index_select)
-    # 与 key_norms_len 簿记发布(index_copy_),读错/写错 slot 都是静默错数。
-    slot_tensor_cpu_hit = False
-    slot_indices_cpu = torch.tensor(slot_list_ref, dtype=torch.long)
+    # Submission-step lengths and semantic policy are consumed again by generic
+    # selector bounds/top-k. Keep them outside the key-norm specialization.
     first_seq_lens_cpu = first.seq_lens_cpu
     if first_seq_lens_cpu is None or len(first_seq_lens_cpu) < batch_size:
-        raise RuntimeError("key_norms delta requires seq_lens_cpu")
-    # [注 2026-07-03 晚更新] seq_lens_tensor_cpu 自确定性快照族起已是 flush 入
-    # 口的提交步快照([DETERMINISTIC-LEN-SNAPSHOT],flush_worker by-ptr clone),
-    # 此处读到的即提交步值;黄金判据已重锚定(3ff97b89/0d5f663c)。旧"保持实时
-    # 语义/t14 实证"表述随旧黄金 5b2f4444 一并作废。
+        raise RuntimeError("selector requires seq_lens_cpu")
     seq_lens_tensor_cpu_ref = getattr(first, "seq_lens_tensor_cpu", None)
     seq_lens_tensor_cpu_hit = False
     if (
@@ -785,425 +824,490 @@ def compute_alpha_selection_batched_impl(
         if seq_lens_tensor_cpu_ref.dtype == torch.long:
             seq_lens_tensor = seq_lens_tensor_cpu_ref[:batch_size]
         else:
-            seq_lens_tensor = seq_lens_tensor_cpu_ref[:batch_size].to(dtype=torch.long)
+            seq_lens_tensor = seq_lens_tensor_cpu_ref[:batch_size].to(
+                dtype=torch.long
+            )
         seq_lens_tensor_cpu_hit = True
     else:
         seq_lens_tensor = torch.tensor(
             [max(0, int(s)) for s in first_seq_lens_cpu[:batch_size]],
             dtype=torch.long,
         )
-    cap_key_norms = min(int(kv_len_total), int(kv_stride_tokens))
-    semantic_snapshot = self._get_step_semantic_snapshot() if self.config is not None else None
-
-    any_delta = False
+    semantic_snapshot = (
+        self._get_step_semantic_snapshot() if self.config is not None else None
+    )
     profile_key_norms_delta_total_tokens = 0
+    # -1 means the key-norm delta arm did not run. The telemetry aggregator
+    # relies on this sentinel to avoid counting gamma=0 selector invocations.
     profile_key_norms_delta_max_tokens = -1
     profile_key_norms_delta_layers = 0
-    key_norms_cur_nonzero_count = 0
-    max_delta_direct_value = 0
-    # 方案 F+G 合并优化：单次遍历同时完成 ensure_batch + index_select + ensure_arena
-    recent_cfg_direct = (
-        int(semantic_snapshot.recent_tokens)
-        if semantic_snapshot is not None
-        else 0
-    )
-    tgt_lens_global_i32 = self._ensure_selector_key_norms_target_cpu_buffer(
-        batch=batch_size,
-    )
-    _fill_key_norms_visible_lens_cpu_i32(
-        tgt_lens_global_i32,
-        first_seq_lens_cpu,
-        batch_size=batch_size,
-        phase=phase,
-        one_shot_bootstrap_only=bool(
-            getattr(getattr(self, "config", None), "one_shot_bootstrap_only", False)
-        ),
-        block_size=int(block_size_ref or 0),
-        recent_tokens=recent_cfg_direct,
-        cap_key_norms=cap_key_norms,
-    )
-    t_key_norms_arena0_ns: Optional[int] = (
-        time.perf_counter_ns() if profile_detail else None
-    )
-    _arenas: List[torch.Tensor] = []
-    _kv_stride_int = int(kv_stride_tokens)
-    _required_slots = max_slot + 1
-    _num_kv_heads_int = int(num_kv_heads)
-    _slot0 = int(slot_list_ref[0]) if slot_list_ref else 0
-    _slotN = int(slot_list_ref[-1]) if slot_list_ref else -1
-    _slots_contiguous = (_slotN - _slot0 + 1 == batch_size)
-    _single_slot_delta_fast_path = bool(_slots_contiguous and int(batch_size) == 1)
-    (
-        _stacked_start_cpu,
-        _stacked_end_cpu,
-        _stacked_start_gpu_buf,
-        _stacked_end_gpu_buf,
-    ) = self._ensure_selector_key_norms_delta_buffers(
-        layers=len(payloads),
-        batch=batch_size,
-        device=device,
-    )
-    if _single_slot_delta_fast_path:
-        target_len_single = int(tgt_lens_global_i32[0])
-        delta_total_tokens = 0
-        delta_layers = 0
-        for layer_idx, payload in enumerate(payloads):
-            st = payload.state
-            start_len = int(st.key_norms_len[_slot0])
-            end_len = start_len if start_len >= target_len_single else target_len_single
-            _stacked_start_cpu[layer_idx, 0] = int(start_len)
-            _stacked_end_cpu[layer_idx, 0] = int(end_len)
-            delta = int(end_len) - int(start_len)
-            if start_len != 0:
-                key_norms_cur_nonzero_count += 1
-            if delta > 0:
-                any_delta = True
-                delta_total_tokens += delta
-                delta_layers += 1
-            if delta > max_delta_direct_value:
-                max_delta_direct_value = delta
-            if not _key_norms_arena_ready(
-                st.key_norms_arena,
-                device=device,
-                stride_tokens=_kv_stride_int,
-                required_slots=_required_slots,
-                num_kv_heads=_num_kv_heads_int,
-            ):
-                st.ensure_key_norms_arena(
-                    stride_tokens=_kv_stride_int,
-                    required_slots=_required_slots,
-                    num_kv_heads=_num_kv_heads_int,
-                    refresh_stream=self.refresh_stream,
-                    stride_floor=int(
-                        getattr(self, "_key_norms_stride_floor_mml", 0) or 0
-                    ),
-                )
-            arena = st.key_norms_arena
-            if arena.numel() == 0:
-                raise RuntimeError("key_norms_arena missing after ensure_key_norms_arena")
-            _arenas.append(arena)
-        if profile_detail:
-            profile_key_norms_delta_total_tokens = int(delta_total_tokens)
-            if any_delta:
-                profile_key_norms_delta_max_tokens = int(max_delta_direct_value)
-                profile_key_norms_delta_layers = int(delta_layers)
-    else:
-        for layer_idx, payload in enumerate(payloads):
-            st = payload.state
-            if _slots_contiguous:
-                _stacked_start_cpu[layer_idx].copy_(
-                    st.key_norms_len.narrow(0, _slot0, batch_size)
-                )
-            else:
-                _stacked_start_cpu[layer_idx].copy_(
-                    st.key_norms_len.index_select(0, slot_indices_cpu)
-                )
-            if not _key_norms_arena_ready(
-                st.key_norms_arena,
-                device=device,
-                stride_tokens=_kv_stride_int,
-                required_slots=_required_slots,
-                num_kv_heads=_num_kv_heads_int,
-            ):
-                st.ensure_key_norms_arena(
-                    stride_tokens=_kv_stride_int,
-                    required_slots=_required_slots,
-                    num_kv_heads=_num_kv_heads_int,
-                    refresh_stream=self.refresh_stream,
-                    stride_floor=int(
-                        getattr(self, "_key_norms_stride_floor_mml", 0) or 0
-                    ),
-                )
-            arena = st.key_norms_arena
-            if arena.numel() == 0:
-                raise RuntimeError("key_norms_arena missing after ensure_key_norms_arena")
-            _arenas.append(arena)
-        torch.maximum(
+    if use_key_norms:
+        selector_layer_start = (
+            min(key_norms_layer_indices) if key_norms_layer_indices else 0
+        )
+        selector_layer_end = (
+            max(key_norms_layer_indices)
+            if key_norms_layer_indices
+            else len(payloads) - 1
+        )
+        selector_chunk_id = int(
+            getattr(getattr(first, "state", None), "capture_chunk_id", -1)
+        )
+        selector_buf_id = int(
+            getattr(getattr(first, "state", None), "capture_buf_id", -1)
+        )
+        selector_layer_span_cache_suffix = (
+            f"_l{selector_layer_start}_{selector_layer_end}"
+            f"_c{selector_chunk_id}_b{selector_buf_id}"
+        )
+        t_key_norms0_ns: Optional[int] = time.perf_counter_ns() if profile_detail else None
+
+        # key_norms：P0.1 增量更新（delta 到 target_len），避免 refresh 每次扫全量 K
+        self._record_event_safe(profile_key_norms_preproc_evt0, device)
+
+        # --------------------------------------------------------------
+        # P0.1：key_norms 增量更新（delta 到 target_len），避免 refresh 每次扫全量 K
+        # --------------------------------------------------------------
+        # 方案 I 优化：使用辅助方法记录 event
+        self._record_event_safe(profile_key_norms_preproc_evt1, device)
+        self._record_event_safe(profile_key_norms_evt0, device)
+
+        # [DETERMINISTIC-SLOT-SOURCE 2026-07-03] 恒从 slot_list(host 权威值快照)
+        # 构造,勿改回 payload 的 slot_tensor(复用 buffer 的 live 视图,错峰
+        # bootstrap 下一行 flush 会原位覆写):它喂非连续 slots 分支的
+        # arena.index_select 打包,脏 slot=打包错行 norms 的静默错选。
+        slot_tensor_ref = cached_sequence_to_device(
+            slot_list_ref,
+            device=device,
+            dtype=torch.long,
+            cache_name="selector_slot_tensor_i64",
+            cache_owner=self,
+            reuse_unchanged=True,
+        )
+
+        # key_norms arena stride：优先使用 capture_base 的 K 维（已按 256 对齐，可跨 step 稳定复用）
+        kv_stride_tokens = 0
+        if use_capture_base and isinstance(capture_base, torch.Tensor) and capture_base.dim() == 5:
+            kv_stride_tokens = int(capture_base.shape[4])
+        if kv_stride_tokens <= 0:
+            kv_stride_tokens = _align_up_int(int(kv_len_total), 256)
+
+        # 方案 A 优化：将重复的 tensor 创建移到循环外（节省 ~670us）
+        # slot_indices_cpu 和 seq_lens_tensor 在所有层中相同，只需创建一次
+        # [DETERMINISTIC-SLOT-SOURCE 2026-07-03] 恒从 slot_list(host 权威值快照)构造,
+        # 勿改回 payload 的 slot_tensor_cpu(CPU 复用 buffer 的 live 视图,错峰
+        # bootstrap 下一行 flush 会原位覆写):它喂 delta 的 start_lens 读取(index_select)
+        # 与 key_norms_len 簿记发布(index_copy_),读错/写错 slot 都是静默错数。
+        slot_tensor_cpu_hit = False
+        slot_indices_cpu = torch.tensor(slot_list_ref, dtype=torch.long)
+        cap_key_norms = min(int(kv_len_total), int(kv_stride_tokens))
+
+        any_delta = False
+        profile_key_norms_delta_total_tokens = 0
+        profile_key_norms_delta_max_tokens = -1
+        profile_key_norms_delta_layers = 0
+        key_norms_cur_nonzero_count = 0
+        max_delta_direct_value = 0
+        # 方案 F+G 合并优化：单次遍历同时完成 ensure_batch + index_select + ensure_arena
+        recent_cfg_direct = (
+            int(semantic_snapshot.recent_tokens)
+            if semantic_snapshot is not None
+            else 0
+        )
+        tgt_lens_global_i32 = self._ensure_selector_key_norms_target_cpu_buffer(
+            batch=batch_size,
+        )
+        _fill_key_norms_visible_lens_cpu_i32(
+            tgt_lens_global_i32,
+            first_seq_lens_cpu,
+            batch_size=batch_size,
+            phase=phase,
+            one_shot_bootstrap_only=bool(
+                getattr(getattr(self, "config", None), "one_shot_bootstrap_only", False)
+            ),
+            block_size=int(block_size_ref or 0),
+            recent_tokens=recent_cfg_direct,
+            cap_key_norms=cap_key_norms,
+        )
+        t_key_norms_arena0_ns: Optional[int] = (
+            time.perf_counter_ns() if profile_detail else None
+        )
+        _arenas: List[torch.Tensor] = []
+        _kv_stride_int = int(kv_stride_tokens)
+        _required_slots = max_slot + 1
+        _num_kv_heads_int = int(num_kv_heads)
+        _slot0 = int(slot_list_ref[0]) if slot_list_ref else 0
+        _slotN = int(slot_list_ref[-1]) if slot_list_ref else -1
+        _slots_contiguous = (_slotN - _slot0 + 1 == batch_size)
+        _single_slot_delta_fast_path = bool(_slots_contiguous and int(batch_size) == 1)
+        (
             _stacked_start_cpu,
-            tgt_lens_global_i32.unsqueeze(0),
-            out=_stacked_end_cpu,
+            _stacked_end_cpu,
+            _stacked_start_gpu_buf,
+            _stacked_end_gpu_buf,
+            _key_norms_delta_carrier,
+        ) = self._ensure_selector_key_norms_delta_buffers(
+            layers=len(payloads),
+            batch=batch_size,
+            device=device,
+            return_lease=True,
         )
-        key_norms_delta_matrix = _stacked_end_cpu - _stacked_start_cpu
-        if key_norms_delta_matrix.numel() > 0:
-            max_delta_direct_value = int(key_norms_delta_matrix.max().item())
-            any_delta = max_delta_direct_value > 0
-            key_norms_cur_nonzero_count = int(torch.count_nonzero(_stacked_start_cpu).item())
+        if _single_slot_delta_fast_path:
+            target_len_single = int(tgt_lens_global_i32[0])
+            delta_total_tokens = 0
+            delta_layers = 0
+            for layer_idx, payload in enumerate(payloads):
+                st = payload.state
+                start_len = int(st.key_norms_len[_slot0])
+                end_len = start_len if start_len >= target_len_single else target_len_single
+                _stacked_start_cpu[layer_idx, 0] = int(start_len)
+                _stacked_end_cpu[layer_idx, 0] = int(end_len)
+                delta = int(end_len) - int(start_len)
+                if start_len != 0:
+                    key_norms_cur_nonzero_count += 1
+                if delta > 0:
+                    any_delta = True
+                    delta_total_tokens += delta
+                    delta_layers += 1
+                if delta > max_delta_direct_value:
+                    max_delta_direct_value = delta
+                if not _key_norms_arena_ready(
+                    st.key_norms_arena,
+                    device=device,
+                    stride_tokens=_kv_stride_int,
+                    required_slots=_required_slots,
+                    num_kv_heads=_num_kv_heads_int,
+                ):
+                    st.ensure_key_norms_arena(
+                        stride_tokens=_kv_stride_int,
+                        required_slots=_required_slots,
+                        num_kv_heads=_num_kv_heads_int,
+                        refresh_stream=self.refresh_stream,
+                        stride_floor=int(
+                            getattr(self, "_key_norms_stride_floor_mml", 0) or 0
+                        ),
+                    )
+                arena = st.key_norms_arena
+                if arena.numel() == 0:
+                    raise RuntimeError("key_norms_arena missing after ensure_key_norms_arena")
+                _arenas.append(arena)
             if profile_detail:
-                profile_key_norms_delta_total_tokens = int(
-                    key_norms_delta_matrix.sum().item()
-                )
-            if any_delta:
-                profile_key_norms_delta_max_tokens = max_delta_direct_value
-                profile_key_norms_delta_layers = int(
-                    torch.count_nonzero(
-                        torch.amax(key_norms_delta_matrix, dim=1) > 0
-                    ).item()
-                )
-    max_delta_override = getattr(self, "_selector_key_norms_max_delta_override", None)
-    if max_delta_override is not None:
-        try:
-            max_delta_override_int = int(max_delta_override)
-        except (TypeError, ValueError):
-            max_delta_override_int = 0
-        if max_delta_override_int > max_delta_direct_value:
-            max_delta_direct_value = int(max_delta_override_int)
-            any_delta = True
-    # [DETERMINISTIC-SLOT-SOURCE 2026-07-03] 原地曾有 slot_tensor_i32_ref/
-    # row_indices_i32_ref 的 live 视图捕获与 dtype 转换(deferred 实读),delta
-    # kernel 改用 list 同源张量后成为死存储,整块删除防回潮。
-
-    # Phase 2: 预计算循环不变量
-    _use_direct_layers_key_norms = False
-    _direct_key_norms_written = False
-    _direct_key_norms_scratch_needs_pack = False
-    if (
-        any_delta
-        and phase in ("prefill", "decode")
-        and bool(getattr(getattr(self, "config", None), "one_shot_bootstrap_only", False))
-        and block_table_ref is not None
-        and block_size_ref is not None
-        and head_dim_ref is not None
-    ):
-        cur_is_empty = key_norms_cur_nonzero_count == 0
-        key_strides_ref = tuple(int(s) for s in first.key_cache.stride())
-        same_key_strides = all(
-            tuple(int(s) for s in payload.key_cache.stride()) == key_strides_ref
-            for payload in payloads
-        )
-        if cur_is_empty and not same_key_strides:
-            raise RuntimeError(
-                "one-shot direct key_norms requires identical key_cache strides"
+                profile_key_norms_delta_total_tokens = int(delta_total_tokens)
+                if any_delta:
+                    profile_key_norms_delta_max_tokens = int(max_delta_direct_value)
+                    profile_key_norms_delta_layers = int(delta_layers)
+        else:
+            for layer_idx, payload in enumerate(payloads):
+                st = payload.state
+                if _slots_contiguous:
+                    _stacked_start_cpu[layer_idx].copy_(
+                        st.key_norms_len.narrow(0, _slot0, batch_size)
+                    )
+                else:
+                    _stacked_start_cpu[layer_idx].copy_(
+                        st.key_norms_len.index_select(0, slot_indices_cpu)
+                    )
+                if not _key_norms_arena_ready(
+                    st.key_norms_arena,
+                    device=device,
+                    stride_tokens=_kv_stride_int,
+                    required_slots=_required_slots,
+                    num_kv_heads=_num_kv_heads_int,
+                ):
+                    st.ensure_key_norms_arena(
+                        stride_tokens=_kv_stride_int,
+                        required_slots=_required_slots,
+                        num_kv_heads=_num_kv_heads_int,
+                        refresh_stream=self.refresh_stream,
+                        stride_floor=int(
+                            getattr(self, "_key_norms_stride_floor_mml", 0) or 0
+                        ),
+                    )
+                arena = st.key_norms_arena
+                if arena.numel() == 0:
+                    raise RuntimeError("key_norms_arena missing after ensure_key_norms_arena")
+                _arenas.append(arena)
+            torch.maximum(
+                _stacked_start_cpu,
+                tgt_lens_global_i32.unsqueeze(0),
+                out=_stacked_end_cpu,
             )
-        _use_direct_layers_key_norms = bool(same_key_strides)
-        _direct_key_norms_scratch_needs_pack = bool(
-            getattr(self, "_selector_key_norms_all_reallocated", False)
-            or not key_norms_active_valid
-        ) and not cur_is_empty
-    if profile_detail and t_key_norms_arena0_ns is not None:
-        profile_cpu_key_norms_arena_us = (
-            time.perf_counter_ns() - t_key_norms_arena0_ns
-        ) / 1000.0
+            key_norms_delta_matrix = _stacked_end_cpu - _stacked_start_cpu
+            if key_norms_delta_matrix.numel() > 0:
+                max_delta_direct_value = int(key_norms_delta_matrix.max().item())
+                any_delta = max_delta_direct_value > 0
+                key_norms_cur_nonzero_count = int(torch.count_nonzero(_stacked_start_cpu).item())
+                if profile_detail:
+                    profile_key_norms_delta_total_tokens = int(
+                        key_norms_delta_matrix.sum().item()
+                    )
+                if any_delta:
+                    profile_key_norms_delta_max_tokens = max_delta_direct_value
+                    profile_key_norms_delta_layers = int(
+                        torch.count_nonzero(
+                            torch.amax(key_norms_delta_matrix, dim=1) > 0
+                        ).item()
+                    )
+        max_delta_override = getattr(self, "_selector_key_norms_max_delta_override", None)
+        if max_delta_override is not None:
+            try:
+                max_delta_override_int = int(max_delta_override)
+            except (TypeError, ValueError):
+                max_delta_override_int = 0
+            if max_delta_override_int > max_delta_direct_value:
+                max_delta_direct_value = int(max_delta_override_int)
+                any_delta = True
+        if not any_delta:
+            self._release_selector_key_norms_delta_carrier_without_work(
+                _key_norms_delta_carrier
+            )
+            _key_norms_delta_carrier = None
+        # [DETERMINISTIC-SLOT-SOURCE 2026-07-03] 原地曾有 slot_tensor_i32_ref/
+        # row_indices_i32_ref 的 live 视图捕获与 dtype 转换(deferred 实读),delta
+        # kernel 改用 list 同源张量后成为死存储,整块删除防回潮。
 
-    t_key_norms_direct0_ns: Optional[int] = (
-        time.perf_counter_ns() if profile_detail else None
-    )
-
-    # Phase 3: 如果有 delta，将 stacked_cur / stacked_tgt 批量转换+拷贝到 GPU。
-    _stacked_start_gpu: Optional[torch.Tensor] = None
-    _stacked_end_gpu: Optional[torch.Tensor] = None
-    _idx_gpu: Optional[torch.Tensor] = None
-    key_ptrs_direct: Optional[torch.Tensor] = None
-    key_norms_arena_ptrs: Optional[torch.Tensor] = None
-    row_indices_direct: Optional[torch.Tensor] = None
-    _key_norm_views: Optional[List[torch.Tensor]] = [] if _slots_contiguous else None
-
-    def _pack_key_norms_from_sidecar() -> None:
-        nonlocal profile_cpu_key_norms_pack_us
-        # pack key_norms sidecar even when no delta was needed: prefill can
-        # warm key_norms_arena before selector, but selector kernels still
-        # consume the cross-layer key_norms_all buffer today.
-        t_pack0_ns: Optional[int] = time.perf_counter_ns() if profile_detail else None
-        self._record_event_safe(profile_key_norms_pack_evt0, device)
-        for layer_idx, arena in enumerate(_arenas):
-            if _slots_contiguous:
-                view = arena.narrow(0, _slot0, batch_size)[:, :, :kv_len_total]
-                if _key_norm_views is not None:
-                    _key_norm_views.append(view)
-            else:
-                view = arena.index_select(0, slot_tensor_ref)
-                key_norms_all[layer_idx].copy_(view[:, :, :kv_len_total])
-        if _key_norm_views is not None:
-            torch.stack(_key_norm_views, dim=0, out=key_norms_all)
-        self._record_event_safe(profile_key_norms_pack_evt1, device)
-        if t_pack0_ns is not None:
-            profile_cpu_key_norms_pack_us = (
-                time.perf_counter_ns() - t_pack0_ns
+        # Phase 2: 预计算循环不变量
+        _use_direct_layers_key_norms = False
+        _direct_key_norms_written = False
+        _direct_key_norms_scratch_needs_pack = False
+        if (
+            any_delta
+            and phase in ("prefill", "decode")
+            and bool(getattr(getattr(self, "config", None), "one_shot_bootstrap_only", False))
+            and block_table_ref is not None
+            and block_size_ref is not None
+            and head_dim_ref is not None
+        ):
+            cur_is_empty = key_norms_cur_nonzero_count == 0
+            key_strides_ref = tuple(int(s) for s in first.key_cache.stride())
+            same_key_strides = all(
+                tuple(int(s) for s in payload.key_cache.stride()) == key_strides_ref
+                for payload in payloads
+            )
+            if cur_is_empty and not same_key_strides:
+                raise RuntimeError(
+                    "one-shot direct key_norms requires identical key_cache strides"
+                )
+            _use_direct_layers_key_norms = bool(same_key_strides)
+            _direct_key_norms_scratch_needs_pack = bool(
+                getattr(self, "_selector_key_norms_all_reallocated", False)
+                or not key_norms_active_valid
+            ) and not cur_is_empty
+        if profile_detail and t_key_norms_arena0_ns is not None:
+            profile_cpu_key_norms_arena_us = (
+                time.perf_counter_ns() - t_key_norms_arena0_ns
             ) / 1000.0
 
-    def _publish_key_norms_lens_from_stacked_end() -> None:
-        if not any_delta:
-            return
-        for layer_idx, payload in enumerate(payloads):
-            st = payload.state
-            layer_end_cpu_i32 = _stacked_end_cpu[layer_idx]
-            if _slots_contiguous:
-                st.key_norms_len[_slot0 : _slot0 + batch_size] = layer_end_cpu_i32
-            else:
-                # [KEY-NORMS-LEN-I32 2026-07-06] 载体统一 int32 后与 delta 源同
-                # dtype，index_copy_ 直写（旧 int64 载体时代的对齐 cast 已退休；
-                # gpu mirror 死载体同批删除）。
-                st.key_norms_len.index_copy_(0, slot_indices_cpu, layer_end_cpu_i32)
-
-    if any_delta:
-        t_key_norms_direct_prepare0_ns: Optional[int] = (
-            time.perf_counter_ns()
-            if profile_detail and _use_direct_layers_key_norms
-            else None
+        t_key_norms_direct0_ns: Optional[int] = (
+            time.perf_counter_ns() if profile_detail else None
         )
-        self._record_event_safe(profile_key_norms_h2d_evt0, device)
-        _stacked_start_gpu = _stacked_start_gpu_buf
-        _stacked_end_gpu = _stacked_end_gpu_buf
-        _stacked_start_gpu.copy_(_stacked_start_cpu, non_blocking=True)
-        _stacked_end_gpu.copy_(_stacked_end_cpu, non_blocking=True)
-        # [KEY-NORMS-DELTA-PINNED-H2D-WAR-FIX] R7:共享持久 delta 对的 H2D 在飞
-        # 事件;下一世代覆写 pinned/GPU dst 前在 _ensure_..._delta_buffers 入口
-        # query-first 等待。仅共享臂记录(override=per-pending fresh 免疫)。
-        if not isinstance(
-            getattr(self, "_selector_key_norms_delta_buffer_override", None), dict
-        ):
-            _delta_evt = getattr(self, "_selector_key_norms_delta_inflight_evt", None)
-            if _delta_evt is None:
-                _delta_evt = torch.cuda.Event(enable_timing=False)
-                self._selector_key_norms_delta_inflight_evt = _delta_evt
-            _delta_evt.record(torch.cuda.current_stream(device=device))
-        if not _slots_contiguous:
-            _idx_gpu = cached_cpu_tensor_to_device(
-                slot_indices_cpu,
-                device=device,
-                dtype=slot_indices_cpu.dtype,
-                cache_name=f"selector_slot_indices{selector_layer_span_cache_suffix}",
-                cache_owner=self,
+
+        # Phase 3: 如果有 delta，将 stacked_cur / stacked_tgt 批量转换+拷贝到 GPU。
+        _stacked_start_gpu: Optional[torch.Tensor] = None
+        _stacked_end_gpu: Optional[torch.Tensor] = None
+        _idx_gpu: Optional[torch.Tensor] = None
+        key_ptrs_direct: Optional[torch.Tensor] = None
+        key_norms_arena_ptrs: Optional[torch.Tensor] = None
+        row_indices_direct: Optional[torch.Tensor] = None
+        _key_norm_views: Optional[List[torch.Tensor]] = [] if _slots_contiguous else None
+
+        def _pack_key_norms_from_sidecar() -> None:
+            nonlocal profile_cpu_key_norms_pack_us
+            # pack key_norms sidecar even when no delta was needed: prefill can
+            # warm key_norms_arena before selector, but selector kernels still
+            # consume the cross-layer key_norms_all buffer today.
+            t_pack0_ns: Optional[int] = time.perf_counter_ns() if profile_detail else None
+            self._record_event_safe(profile_key_norms_pack_evt0, device)
+            for layer_idx, arena in enumerate(_arenas):
+                if _slots_contiguous:
+                    view = arena.narrow(0, _slot0, batch_size)[:, :, :kv_len_total]
+                    if _key_norm_views is not None:
+                        _key_norm_views.append(view)
+                else:
+                    view = arena.index_select(0, slot_tensor_ref)
+                    key_norms_all[layer_idx].copy_(view[:, :, :kv_len_total])
+            if _key_norm_views is not None:
+                torch.stack(_key_norm_views, dim=0, out=key_norms_all)
+            self._record_event_safe(profile_key_norms_pack_evt1, device)
+            if t_pack0_ns is not None:
+                profile_cpu_key_norms_pack_us = (
+                    time.perf_counter_ns() - t_pack0_ns
+                ) / 1000.0
+
+        def _publish_key_norms_lens_from_stacked_end() -> None:
+            if not any_delta:
+                return
+            for layer_idx, payload in enumerate(payloads):
+                st = payload.state
+                layer_end_cpu_i32 = _stacked_end_cpu[layer_idx]
+                if _slots_contiguous:
+                    st.key_norms_len[_slot0 : _slot0 + batch_size] = layer_end_cpu_i32
+                else:
+                    # [KEY-NORMS-LEN-I32 2026-07-06] 载体统一 int32 后与 delta 源同
+                    # dtype，index_copy_ 直写（旧 int64 载体时代的对齐 cast 已退休；
+                    # gpu mirror 死载体同批删除）。
+                    st.key_norms_len.index_copy_(0, slot_indices_cpu, layer_end_cpu_i32)
+
+        if any_delta:
+            t_key_norms_direct_prepare0_ns: Optional[int] = (
+                time.perf_counter_ns()
+                if profile_detail and _use_direct_layers_key_norms
+                else None
             )
-        if _use_direct_layers_key_norms:
-            key_ptrs_direct = cached_sequence_to_device(
-                [int(payload.key_cache.data_ptr()) for payload in payloads],
-                device=device,
-                dtype=torch.int64,
-                cache_name=f"selector_key_ptrs_i64{selector_layer_span_cache_suffix}",
-                cache_owner=self,
-                reuse_unchanged=True,
+            self._record_event_safe(profile_key_norms_h2d_evt0, device)
+            _stacked_start_gpu = _stacked_start_gpu_buf
+            _stacked_end_gpu = _stacked_end_gpu_buf
+            # non_blocking copy_ 可能已提交 DMA 后才抛出；因此必须在首个 H2D
+            # 调用前进入 enqueue 异常合同。此前 host/校验异常仍可直接归还，
+            # 此后异常漏斗在原 stream 尾部 record，覆盖任何部分提交。
+            self._mark_selector_key_norms_delta_carrier_enqueue_started(
+                _key_norms_delta_carrier
             )
-            if key_norms_arena_ptrs is None:
-                key_norms_arena_ptrs = cached_sequence_to_device(
-                    [int(arena.data_ptr()) for arena in _arenas],
+            _stacked_start_gpu.copy_(_stacked_start_cpu, non_blocking=True)
+            _stacked_end_gpu.copy_(_stacked_end_cpu, non_blocking=True)
+            if not _slots_contiguous:
+                _idx_gpu = cached_cpu_tensor_to_device(
+                    slot_indices_cpu,
+                    device=device,
+                    dtype=slot_indices_cpu.dtype,
+                    cache_name=f"selector_slot_indices{selector_layer_span_cache_suffix}",
+                    cache_owner=self,
+                )
+            if _use_direct_layers_key_norms:
+                key_ptrs_direct = cached_sequence_to_device(
+                    [int(payload.key_cache.data_ptr()) for payload in payloads],
                     device=device,
                     dtype=torch.int64,
-                    cache_name=f"selector_key_norms_arena_ptrs_i64{selector_layer_span_cache_suffix}",
+                    cache_name=f"selector_key_ptrs_i64{selector_layer_span_cache_suffix}",
                     cache_owner=self,
                     reuse_unchanged=True,
                 )
-            # [DETERMINISTIC-SLOT-SOURCE 2026-07-03] payload 的 row_tensor_i32 与
-            # slot_tensor_i32 同为 per-batch 复用 buffer 的 live 视图:错峰
-            # bootstrap 下一行的 flush 会原位覆写,deferred selector 的后续层组
-            # 晚读时拿到覆写值(slot 失配已被 Qwen3-4B bs2 探针实证)。delta
-            # kernel 的 row/slot 输入恒从 row_list/slot_list(host 值快照,与
-            # ensure/簿记同源)构造;黄金工况 list 恒定,reuse_unchanged 缓存
-            # 命中,数值路径逐字不变。
-            if row_list_ref is None:
-                raise RuntimeError("direct key_norms layers path requires row_list")
-            row_indices_direct = cached_sequence_to_device(
-                row_list_ref,
-                device=device,
-                dtype=torch.int32,
-                cache_name=f"selector_row_indices_direct_i32{selector_layer_span_cache_suffix}",
-                cache_owner=self,
-                reuse_unchanged=True,
-            )
-            slot_indices_from_list_i32 = cached_sequence_to_device(
-                [int(s) for s in slot_list_ref],
-                device=device,
-                dtype=torch.int32,
-                cache_name=f"selector_key_norms_slot_list_i32{selector_layer_span_cache_suffix}",
-                cache_owner=self,
-                reuse_unchanged=True,
-            )
-        self._record_event_safe(profile_key_norms_h2d_evt1, device)
-        if profile_detail and t_key_norms_direct_prepare0_ns is not None:
-            profile_cpu_key_norms_direct_prepare_us = (
-                time.perf_counter_ns() - t_key_norms_direct_prepare0_ns
-            ) / 1000.0
+                if key_norms_arena_ptrs is None:
+                    key_norms_arena_ptrs = cached_sequence_to_device(
+                        [int(arena.data_ptr()) for arena in _arenas],
+                        device=device,
+                        dtype=torch.int64,
+                        cache_name=f"selector_key_norms_arena_ptrs_i64{selector_layer_span_cache_suffix}",
+                        cache_owner=self,
+                        reuse_unchanged=True,
+                    )
+                # [DETERMINISTIC-SLOT-SOURCE 2026-07-03] payload 的 row_tensor_i32 与
+                # slot_tensor_i32 同为 per-batch 复用 buffer 的 live 视图:错峰
+                # bootstrap 下一行的 flush 会原位覆写,deferred selector 的后续层组
+                # 晚读时拿到覆写值(slot 失配已被 Qwen3-4B bs2 探针实证)。delta
+                # kernel 的 row/slot 输入恒从 row_list/slot_list(host 值快照,与
+                # ensure/簿记同源)构造;黄金工况 list 恒定,reuse_unchanged 缓存
+                # 命中,数值路径逐字不变。
+                if row_list_ref is None:
+                    raise RuntimeError("direct key_norms layers path requires row_list")
+                row_indices_direct = cached_sequence_to_device(
+                    row_list_ref,
+                    device=device,
+                    dtype=torch.int32,
+                    cache_name=f"selector_row_indices_direct_i32{selector_layer_span_cache_suffix}",
+                    cache_owner=self,
+                    reuse_unchanged=True,
+                )
+                slot_indices_from_list_i32 = cached_sequence_to_device(
+                    [int(s) for s in slot_list_ref],
+                    device=device,
+                    dtype=torch.int32,
+                    cache_name=f"selector_key_norms_slot_list_i32{selector_layer_span_cache_suffix}",
+                    cache_owner=self,
+                    reuse_unchanged=True,
+                )
+            self._record_event_safe(profile_key_norms_h2d_evt1, device)
+            if profile_detail and t_key_norms_direct_prepare0_ns is not None:
+                profile_cpu_key_norms_direct_prepare_us = (
+                    time.perf_counter_ns() - t_key_norms_direct_prepare0_ns
+                ) / 1000.0
 
-    if _use_direct_layers_key_norms and any_delta and _stacked_start_gpu is not None:
-        if (
-            key_ptrs_direct is None
-            or key_norms_arena_ptrs is None
-            or row_indices_direct is None
-            or _stacked_end_gpu is None
-            or max_delta_direct_value <= 0
-        ):
-            raise RuntimeError("direct key_norms delta path missing prepared tensors")
-        max_delta_direct = int(max_delta_direct_value)
-        t_key_norms_direct_launch0_ns: Optional[int] = (
-            time.perf_counter_ns() if profile_detail else None
-        )
-        self._record_event_safe(profile_key_norms_delta_evt0, device)
-        compute_key_norms_paged_batched_layers_delta_cuda(
-            key_ptrs=key_ptrs_direct,
-            out_ptrs=key_norms_arena_ptrs,
-            block_table=block_table_ref,
-            start_lens=_stacked_start_gpu,
-            end_lens=_stacked_end_gpu,
-            # [DETERMINISTIC-SLOT-SOURCE 2026-07-03] 恒用 slot_list 同源张量,
-            # 勿改回 payload 的 slot_tensor_i32(live 视图,错峰下被覆写)。
-            slot_indices=slot_indices_from_list_i32,
-            kv_dtype=key_cache_dtype,
-            out_dtype=_arenas[0].dtype,
-            head_dim=int(head_dim_ref),
-            block_size=int(block_size_ref),
-            key_strides=tuple(int(s) for s in first.key_cache.stride()),
-            out_strides=tuple(int(s) for s in _arenas[0].stride()),
-            max_delta=max_delta_direct,
-            row_indices=row_indices_direct,
-            scratch_norms=key_norms_all,
-        )
-        self._record_event_safe(profile_key_norms_delta_evt1, device)
-        # [KEY-NORMS-DELTA-PINNED-H2D-WAR-FIX] R7:delta kernel 消费 GPU 对之后
-        # 再次 record 同一事件=栅栏前移,下一世代覆写前等到 kernel 读完。
-        if not isinstance(
-            getattr(self, "_selector_key_norms_delta_buffer_override", None), dict
-        ):
-            _delta_evt = getattr(self, "_selector_key_norms_delta_inflight_evt", None)
-            if _delta_evt is None:
-                _delta_evt = torch.cuda.Event(enable_timing=False)
-                self._selector_key_norms_delta_inflight_evt = _delta_evt
-            _delta_evt.record(torch.cuda.current_stream(device=device))
-        if profile_detail and t_key_norms_direct_launch0_ns is not None:
-            profile_cpu_key_norms_direct_launch_us = (
-                time.perf_counter_ns() - t_key_norms_direct_launch0_ns
-            ) / 1000.0
-        _publish_key_norms_lens_from_stacked_end()
-        if _direct_key_norms_scratch_needs_pack:
-            _pack_key_norms_from_sidecar()
-        else:
-            self._record_event_safe(profile_key_norms_pack_evt0, device)
-            self._record_event_safe(profile_key_norms_pack_evt1, device)
-            if profile_detail:
-                profile_cpu_key_norms_pack_us = 0.0
-        self._mark_selector_key_norms_active_buffer_valid()
-        _direct_key_norms_written = True
-    if profile_detail and t_key_norms_direct0_ns is not None:
-        profile_cpu_key_norms_direct_us = (
-            time.perf_counter_ns() - t_key_norms_direct0_ns
-        ) / 1000.0
-
-    if not _direct_key_norms_written:
-        if any_delta:
-            raise RuntimeError(
-                "selector key_norms delta requires CUDA layers delta path; "
-                "legacy Triton key_norms fallback is retired. The direct CUDA "
-                "path gates on config.one_shot_bootstrap_only — serve/bench "
-                "sparse form must set \"one_shot_bootstrap_only\": true plus "
-                "\"continuous_producer_enabled\": true in "
-                "VLLM_SPARSE_CONTROLLER_JSON (production full-open form; "
-                "2026-07-09 serve smoke hit this with the fields missing)"
+        if _use_direct_layers_key_norms and any_delta and _stacked_start_gpu is not None:
+            if (
+                key_ptrs_direct is None
+                or key_norms_arena_ptrs is None
+                or row_indices_direct is None
+                or _stacked_end_gpu is None
+                or max_delta_direct_value <= 0
+            ):
+                raise RuntimeError("direct key_norms delta path missing prepared tensors")
+            max_delta_direct = int(max_delta_direct_value)
+            t_key_norms_direct_launch0_ns: Optional[int] = (
+                time.perf_counter_ns() if profile_detail else None
             )
-        self._record_event_safe(profile_key_norms_delta_evt0, device)
-        _publish_key_norms_lens_from_stacked_end()
-        self._record_event_safe(profile_key_norms_delta_evt1, device)
-
-        if key_norms_active_valid:
-            self._record_event_safe(profile_key_norms_pack_evt0, device)
-            self._record_event_safe(profile_key_norms_pack_evt1, device)
-            if profile_detail:
-                profile_cpu_key_norms_pack_us = 0.0
-        else:
-            _pack_key_norms_from_sidecar()
+            self._record_event_safe(profile_key_norms_delta_evt0, device)
+            compute_key_norms_paged_batched_layers_delta_cuda(
+                key_ptrs=key_ptrs_direct,
+                out_ptrs=key_norms_arena_ptrs,
+                block_table=block_table_ref,
+                start_lens=_stacked_start_gpu,
+                end_lens=_stacked_end_gpu,
+                # [DETERMINISTIC-SLOT-SOURCE 2026-07-03] 恒用 slot_list 同源张量,
+                # 勿改回 payload 的 slot_tensor_i32(live 视图,错峰下被覆写)。
+                slot_indices=slot_indices_from_list_i32,
+                kv_dtype=key_cache_dtype,
+                out_dtype=_arenas[0].dtype,
+                head_dim=int(head_dim_ref),
+                block_size=int(block_size_ref),
+                key_strides=tuple(int(s) for s in first.key_cache.stride()),
+                out_strides=tuple(int(s) for s in _arenas[0].stride()),
+                max_delta=max_delta_direct,
+                row_indices=row_indices_direct,
+                scratch_norms=key_norms_all,
+            )
+            self._record_event_safe(profile_key_norms_delta_evt1, device)
+            # 最终 consumer 入队后才发布 carrier；事件证明覆盖 H2D 与 kernel 读取。
+            self._record_selector_key_norms_delta_carrier_completion(
+                _key_norms_delta_carrier
+            )
+            _key_norms_delta_carrier = None
+            if profile_detail and t_key_norms_direct_launch0_ns is not None:
+                profile_cpu_key_norms_direct_launch_us = (
+                    time.perf_counter_ns() - t_key_norms_direct_launch0_ns
+                ) / 1000.0
+            _publish_key_norms_lens_from_stacked_end()
+            if _direct_key_norms_scratch_needs_pack:
+                _pack_key_norms_from_sidecar()
+            else:
+                self._record_event_safe(profile_key_norms_pack_evt0, device)
+                self._record_event_safe(profile_key_norms_pack_evt1, device)
+                if profile_detail:
+                    profile_cpu_key_norms_pack_us = 0.0
             self._mark_selector_key_norms_active_buffer_valid()
+            _direct_key_norms_written = True
+        if profile_detail and t_key_norms_direct0_ns is not None:
+            profile_cpu_key_norms_direct_us = (
+                time.perf_counter_ns() - t_key_norms_direct0_ns
+            ) / 1000.0
 
-    # 方案 I 优化：使用辅助方法记录 event
-    self._record_event_safe(profile_key_norms_evt1, device)
-    if profile_detail and t_key_norms0_ns is not None:
-        profile_cpu_key_norms_us = (time.perf_counter_ns() - t_key_norms0_ns) / 1000.0
+        if not _direct_key_norms_written:
+            if any_delta:
+                raise RuntimeError(
+                    "selector key_norms delta requires CUDA layers delta path; "
+                    "legacy Triton key_norms fallback is retired. The direct CUDA "
+                    "path gates on config.one_shot_bootstrap_only — serve/bench "
+                    "sparse form must set \"one_shot_bootstrap_only\": true plus "
+                    "\"continuous_producer_enabled\": true in "
+                    "VLLM_SPARSE_CONTROLLER_JSON (production full-open form; "
+                    "2026-07-09 serve smoke hit this with the fields missing)"
+                )
+            self._record_event_safe(profile_key_norms_delta_evt0, device)
+            _publish_key_norms_lens_from_stacked_end()
+            self._record_event_safe(profile_key_norms_delta_evt1, device)
+
+            if key_norms_active_valid:
+                self._record_event_safe(profile_key_norms_pack_evt0, device)
+                self._record_event_safe(profile_key_norms_pack_evt1, device)
+                if profile_detail:
+                    profile_cpu_key_norms_pack_us = 0.0
+            else:
+                _pack_key_norms_from_sidecar()
+                self._mark_selector_key_norms_active_buffer_valid()
+
+        # 方案 I 优化：使用辅助方法记录 event
+        self._record_event_safe(profile_key_norms_evt1, device)
+        if profile_detail and t_key_norms0_ns is not None:
+            profile_cpu_key_norms_us = (time.perf_counter_ns() - t_key_norms0_ns) / 1000.0
 
     if layer_indices_expected:
         layer_indices_valid = True

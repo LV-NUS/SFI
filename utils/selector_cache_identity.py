@@ -11,6 +11,11 @@ import sysconfig
 from functools import lru_cache
 from pathlib import Path
 
+if __package__:
+    from utils.ext_toolchain import configure_cuda_toolchain_or_raise
+else:
+    from ext_toolchain import configure_cuda_toolchain_or_raise
+
 
 _ABI_KEY_RE = re.compile(r"^[0-9a-f]{16}$")
 
@@ -19,12 +24,17 @@ def current_selector_cache_abi_key() -> str:
     """Return the ABI key for the interpreter executing this function."""
     import torch
 
+    toolchain = configure_cuda_toolchain_or_raise(
+        owner="selector extension cache identity"
+    )
     identity = "|".join(
         (
             str(sysconfig.get_config_var("SOABI") or "unknown"),
             str(torch.__version__),
             str(torch.version.cuda or "cpu"),
             str(getattr(torch._C, "_GLIBCXX_USE_CXX11_ABI", "unknown")),
+            toolchain.nvcc_path,
+            toolchain.release,
         )
     )
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
@@ -38,7 +48,11 @@ def selector_cache_abi_key_for_python(
 ) -> str:
     """Query the ABI key from the exact interpreter that will load the .so."""
     python_path = Path(python_executable).expanduser()
-    if not python_path.is_absolute() or not os.access(python_path, os.X_OK):
+    if (
+        not python_path.is_absolute()
+        or not python_path.is_file()
+        or not os.access(python_path, os.X_OK)
+    ):
         raise ValueError(
             f"python executable must be an executable absolute path: {python_path}"
         )

@@ -22,7 +22,8 @@
 # In sparse mode the KV pool itself must hold the FULL KV of every request
 # PLUS the compact-page lease (slots x blocks/slot x 16 x KV-bytes/token) —
 # the preflight below checks this and fails before launching by default.
-# Override any knob via env: BS CTX KVB MML MAX_NEW REFRESH_INTERVAL BLOCKS.
+# Override any knob via env: BS CTX KVB MML MAX_NEW REFRESH_INTERVAL BLOCKS
+# K_HEAD.
 #
 # Multi-GPU (tensor parallel): TP=2 and pass a GPU list, e.g.
 #   TP=2 BS=2 CTX=128000 KVB=20401094656 MML=132096 \
@@ -54,6 +55,19 @@ case "${MODE}" in
   sparse|dense) ;;
   *) echo "FAIL: mode must be sparse or dense: ${MODE}" >&2; exit 64 ;;
 esac
+WITH_DENSE_REFERENCE="${WITH_DENSE_REFERENCE:-0}"
+case "${WITH_DENSE_REFERENCE}" in
+  0|1) ;;
+  *) echo "FAIL: WITH_DENSE_REFERENCE must be 0 or 1: ${WITH_DENSE_REFERENCE}" >&2; exit 64 ;;
+esac
+if [[ "${MODE}" == "dense" && "${WITH_DENSE_REFERENCE}" == "1" ]]; then
+  echo "FAIL: WITH_DENSE_REFERENCE=1 is only valid in sparse mode" >&2
+  exit 64
+fi
+if [[ "${WITH_DENSE_REFERENCE}" == "1" && "${VERDICT_ONLY:-0}" == "1" ]]; then
+  echo "FAIL: WITH_DENSE_REFERENCE=1 forbids VERDICT_ONLY=1; a local timed pair requires the full observer-free sparse+dense contract" >&2
+  exit 64
+fi
 RETIRED_ENV_NAMES=(
   "VLLM_SPARSE_SELECTOR_LOG_F_TP8_64K_GROUP"
   "VLLM_SPARSE_FULL_CUDAGRAPH_REPLAY_WRAPPER_ABLATE_EXTRA"
@@ -117,8 +131,9 @@ else
 fi
 REFRESH_INTERVAL="${REFRESH_INTERVAL:-96}"
 BLOCKS="${BLOCKS:-112}"
+K_HEAD="${K_HEAD:-1536}"
 TP="${TP:-1}"
-for workload_integer in BS CTX KVB MML MAX_NEW REFRESH_INTERVAL BLOCKS; do
+for workload_integer in BS CTX KVB MML MAX_NEW REFRESH_INTERVAL BLOCKS K_HEAD; do
   workload_value="${!workload_integer}"
   if [[ ! "${workload_value}" =~ ^[0-9]+$ ]] || (( 10#${workload_value} <= 0 )); then
     echo "FAIL: ${workload_integer} must be a positive integer: ${workload_value}" >&2
@@ -268,9 +283,19 @@ if [[ "${VERDICT_ONLY:-0}" == "1" && "${MODE}" == "sparse" ]]; then
   VERDICT_ARGS=(--verdict-only)
 fi
 REFERENCE_ARGS=(--skip-dense-reference)
+SFI_RUNNER_PAIR_CONTRACT="none"
+PAIR_POSTFLIGHT_ARGS=()
 if [[ "${TIER}" == "tp8x64k" ]]; then
   REFERENCE_ARGS=()
+  if [[ "${MODE}" == "sparse" ]]; then
+    SFI_RUNNER_PAIR_CONTRACT="exact_speedup_verdict"
+  fi
+elif [[ "${MODE}" == "sparse" && "${WITH_DENSE_REFERENCE}" == "1" ]]; then
+  REFERENCE_ARGS=()
+  SFI_RUNNER_PAIR_CONTRACT="explicit_local_comparison"
+  PAIR_POSTFLIGHT_ARGS=(--expect-local-paired-comparison)
 fi
+export SFI_RUNNER_PAIR_CONTRACT
 
 SFI_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FA_ROOT="${VLLM_SPARSE_FA3_UPSTREAM_ROOT:-${SFI_ROOT}/third_party_upstreams/vllm-project-flash-attention}"
@@ -287,6 +312,9 @@ if ! command -v realpath >/dev/null 2>&1; then
   echo "FAIL: realpath is required for stable benchmark path identities" >&2
   exit 69
 fi
+PY="$(realpath -e -- "${PY}")"
+PYTHON="${PY}"
+export PYTHON
 # Canonicalize lexically while still in the caller's working directory. The
 # process later cd's to SFI_ROOT, so leaving relative MODEL/CORPUS values here
 # would make generation and execution refer to different files. -s preserves
@@ -297,10 +325,10 @@ if [[ -n "${CORPUS:-}" ]]; then
   CORPUS="$(realpath -ms -- "${CORPUS}")"
 fi
 
-# Exact TP8 capacity is derived from the model identity, never from the old
-# Qwen3-4B constant. The same per-rank value is recorded for dense and sparse;
-# sparse additionally uses it for the physical KV+compact-lease admission gate.
-MODEL_KV_SCHEMA="legacy_explicit_or_qwen3_default"
+# Derive one model identity for every tier before launch.  Capacity and pair
+# geometry must never depend on a model-family constant or an unverified
+# override; TP8 adds an externally pinned config hash to this shared contract.
+MODEL_KV_SCHEMA=""
 MODEL_CONFIG_PATH=""
 MODEL_CONFIG_SHA256=""
 MODEL_NUM_HIDDEN_LAYERS=""
@@ -311,54 +339,44 @@ MODEL_KV_DTYPE_BYTES=""
 MODEL_KV_TOTAL_BYTES_PER_TOKEN=""
 MODEL_KV_PER_RANK_BYTES_PER_TOKEN=""
 KV_TOKEN_BYTES_OVERRIDE_PRESENT="0"
+if ! MODEL_KV_TSV="$(
+  "${PY}" "${SFI_ROOT}/utils/model_kv_contract.py" \
+    --model "${MODEL}" --tensor-parallel-size "${TP}" --format tsv
+)"; then
+  echo "FAIL: cannot derive an exact per-rank KV contract from ${MODEL}/config.json" >&2
+  exit 78
+fi
+IFS=$'\t' read -r \
+  MODEL_KV_SCHEMA MODEL_CONFIG_PATH MODEL_CONFIG_SHA256 \
+  MODEL_NUM_HIDDEN_LAYERS MODEL_NUM_KEY_VALUE_HEADS MODEL_HEAD_DIM \
+  MODEL_KV_DTYPE MODEL_KV_DTYPE_BYTES MODEL_KV_TP \
+  MODEL_KV_TOTAL_BYTES_PER_TOKEN MODEL_KV_PER_RANK_BYTES_PER_TOKEN \
+  <<< "${MODEL_KV_TSV}"
+if [[ "${MODEL_KV_SCHEMA}" != "sfi.model_kv_contract.v1" \
+   || "${MODEL_KV_TP}" != "${TP}" \
+   || ! "${MODEL_KV_TOTAL_BYTES_PER_TOKEN}" =~ ^[0-9]+$ \
+   || ! "${MODEL_KV_PER_RANK_BYTES_PER_TOKEN}" =~ ^[0-9]+$ \
+   || "${MODEL_KV_PER_RANK_BYTES_PER_TOKEN}" == "0" \
+   || ! "${MODEL_CONFIG_SHA256}" =~ ^[0-9a-f]{64}$ \
+   || -z "${MODEL_CONFIG_PATH}" ]]; then
+  echo "FAIL: invalid model-derived KV contract: ${MODEL_KV_TSV}" >&2
+  exit 78
+fi
 if [[ "${TIER}" == "tp8x64k" ]]; then
-  if ! MODEL_KV_TSV="$(
-    "${PY}" "${SFI_ROOT}/utils/model_kv_contract.py" \
-      --model "${MODEL}" --tensor-parallel-size "${TP}" --format tsv
-  )"; then
-    echo "FAIL: tier=tp8x64k cannot derive an exact per-rank KV contract from ${MODEL}/config.json" >&2
-    exit 78
-  fi
-  IFS=$'\t' read -r \
-    MODEL_KV_SCHEMA MODEL_CONFIG_PATH MODEL_CONFIG_SHA256 \
-    MODEL_NUM_HIDDEN_LAYERS MODEL_NUM_KEY_VALUE_HEADS MODEL_HEAD_DIM \
-    MODEL_KV_DTYPE MODEL_KV_DTYPE_BYTES MODEL_KV_TP \
-    MODEL_KV_TOTAL_BYTES_PER_TOKEN MODEL_KV_PER_RANK_BYTES_PER_TOKEN \
-    <<< "${MODEL_KV_TSV}"
-  if [[ "${MODEL_KV_TP}" != "${TP}" \
-     || ! "${MODEL_KV_PER_RANK_BYTES_PER_TOKEN}" =~ ^[0-9]+$ \
-     || ! "${MODEL_CONFIG_SHA256}" =~ ^[0-9a-f]{64}$ ]]; then
-    echo "FAIL: invalid model-derived KV contract: ${MODEL_KV_TSV}" >&2
-    exit 78
-  fi
   if [[ "${MODEL_CONFIG_SHA256}" != "${SFI_EXPECTED_MODEL_CONFIG_SHA256}" ]]; then
     echo "FAIL: model config identity mismatch: derived=${MODEL_CONFIG_SHA256} expected=${SFI_EXPECTED_MODEL_CONFIG_SHA256}" >&2
     exit 78
   fi
-  if [[ -n "${KV_TOKEN_BYTES:-}" ]]; then
-    KV_TOKEN_BYTES_OVERRIDE_PRESENT="1"
-    if [[ ! "${KV_TOKEN_BYTES}" =~ ^[0-9]+$ \
-       || "${KV_TOKEN_BYTES}" != "${MODEL_KV_PER_RANK_BYTES_PER_TOKEN}" ]]; then
-      echo "FAIL: tier=tp8x64k KV_TOKEN_BYTES override must equal model-derived per-rank value ${MODEL_KV_PER_RANK_BYTES_PER_TOKEN}, got ${KV_TOKEN_BYTES}" >&2
-      exit 78
-    fi
-  fi
-  KV_TOKEN_BYTES="${MODEL_KV_PER_RANK_BYTES_PER_TOKEN}"
-else
-  if [[ -n "${KV_TOKEN_BYTES:-}" ]]; then
-    KV_TOKEN_BYTES_OVERRIDE_PRESENT="1"
-  fi
-  if (( 147456 % TP != 0 )) && [[ -z "${KV_TOKEN_BYTES:-}" ]]; then
-    echo "FAIL: legacy KV token default is not divisible by TP=${TP}; set KV_TOKEN_BYTES explicitly" >&2
-    exit 64
-  fi
-  KV_TOKEN_BYTES="${KV_TOKEN_BYTES:-$((147456 / TP))}"
-  if [[ ! "${KV_TOKEN_BYTES}" =~ ^[0-9]+$ ]] || (( 10#${KV_TOKEN_BYTES} <= 0 )); then
-    echo "FAIL: KV_TOKEN_BYTES must be a positive per-rank byte count: ${KV_TOKEN_BYTES}" >&2
-    exit 64
-  fi
-  KV_TOKEN_BYTES=$((10#${KV_TOKEN_BYTES}))
 fi
+if [[ -n "${KV_TOKEN_BYTES:-}" ]]; then
+  KV_TOKEN_BYTES_OVERRIDE_PRESENT="1"
+  if [[ ! "${KV_TOKEN_BYTES}" =~ ^[0-9]+$ \
+     || "${KV_TOKEN_BYTES}" != "${MODEL_KV_PER_RANK_BYTES_PER_TOKEN}" ]]; then
+    echo "FAIL: KV_TOKEN_BYTES override must equal model-derived per-rank value ${MODEL_KV_PER_RANK_BYTES_PER_TOKEN}, got ${KV_TOKEN_BYTES}" >&2
+    exit 78
+  fi
+fi
+KV_TOKEN_BYTES="${MODEL_KV_PER_RANK_BYTES_PER_TOKEN}"
 
 export SFI_RUNNER_MODEL_KV_CONTRACT_SCHEMA="${MODEL_KV_SCHEMA}"
 export SFI_RUNNER_MODEL_CONFIG_PATH="${MODEL_CONFIG_PATH}"
@@ -580,7 +598,7 @@ if [[ "${SFI_ALLOW_SHARED_GPU:-0}" != "1" ]]; then
     SFI_RUNNER_GPU_LOCK_SCOPE="arm"
   fi
 fi
-if [[ "${TIER}" == "tp8x64k" && "${MODE}" == "sparse" \
+if [[ "${SFI_RUNNER_PAIR_CONTRACT}" != "none" \
    && "${SFI_RUNNER_GPU_LOCK_MODE}" == "exclusive" ]]; then
   SFI_RUNNER_GPU_LOCK_SCOPE="pair"
 fi
@@ -590,7 +608,7 @@ export SFI_RUNNER_GPU_LOCK_SCOPE
 # Inspect every selected physical GPU through the exact benchmark interpreter.
 # CUDA_VISIBLE_DEVICES remaps the physical IDs to logical TP ranks; requiring
 # the exact visible count avoids silently benchmarking a partial device list.
-CUDA_CAPABILITIES="$({
+CUDA_CAPABILITIES="$(
   CUDA_VISIBLE_DEVICES="${GPU}" "${PY}" -I -c '
 import sys
 import torch
@@ -611,7 +629,7 @@ for logical_rank in range(expected):
     capabilities.append(f"{major}.{minor}")
 print(",".join(capabilities))
 ' "${#GPU_IDS[@]}"
-} 2>&1)" || {
+)" || {
   echo "FAIL: cannot inspect all selected GPUs ${GPU}: ${CUDA_CAPABILITIES}" >&2
   exit 69
 }
@@ -720,25 +738,53 @@ case "${CUDA_ARCH}" in
 esac
 export SFI_RUNNER_CUDA_CAPABILITIES="${CUDA_CAPABILITIES}"
 
-# The extension loader keys builds by module name, so a fixed shared root can
-# import or overwrite an incompatible .so. Partition the default cache by the
-# selected interpreter's SOABI plus Torch/CUDA ABI. An explicit cache root is
-# still an operator-owned override; it retains precedence and is absolutized.
-if [[ -n "${TORCH_EXTENSIONS_DIR:-}" ]]; then
-  SELECTOR_CACHE_ROOT="$(realpath -ms -- "${TORCH_EXTENSIONS_DIR}")"
-else
-  if ! SELECTOR_CACHE_ABI_KEY="$(
-    "${PY}" "${SFI_ROOT}/utils/selector_cache_identity.py"
-  )"; then
-    echo "FAIL: selected PYTHON cannot derive the selector cache ABI identity: ${PY}" >&2
-    exit 70
-  fi
-  if [[ ! "${SELECTOR_CACHE_ABI_KEY}" =~ ^[0-9a-f]{16}$ ]]; then
-    echo "FAIL: invalid selector cache ABI identity from ${PY}: ${SELECTOR_CACHE_ABI_KEY}" >&2
-    exit 70
-  fi
-  SELECTOR_CACHE_ROOT="${SFI_ROOT}/tmp/torch_extensions/${CUDA_ARCH}_gt1_${SELECTOR_CACHE_ABI_KEY}"
+# Resolve the exact build-time CUDA toolkit before deriving a selector cache
+# identity or entering any FA4/selector JIT path.  The resolver delegates the
+# source/binary proof to the canonical checker, then rejects caller overrides
+# that select a different compiler.
+CUDA_TOOLCHAIN_RESOLVER="${SFI_ROOT}/scripts/resolve_flash_attention_toolchain.py"
+BUILD_PROVENANCE_CHECKER="${SFI_ROOT}/scripts/check_flash_attention_build_provenance.py"
+if [[ ! -f "${CUDA_TOOLCHAIN_RESOLVER}" ]]; then
+  echo "FAIL: CUDA toolchain resolver is missing: ${CUDA_TOOLCHAIN_RESOLVER}" >&2
+  exit 66
 fi
+if [[ ! -f "${BUILD_PROVENANCE_CHECKER}" ]]; then
+  echo "FAIL: FlashAttention build-provenance checker is missing: ${BUILD_PROVENANCE_CHECKER}" >&2
+  exit 66
+fi
+if ! CUDA_TOOLCHAIN_EXPORTS="$(
+  "${PY}" -I "${CUDA_TOOLCHAIN_RESOLVER}" \
+    --sfi-root "${SFI_ROOT}" \
+    --target "${FA_ROOT}" \
+    --architecture "${CUDA_ARCH}" \
+    --checker "${BUILD_PROVENANCE_CHECKER}"
+)"; then
+  echo "FAIL: FlashAttention CUDA toolchain preflight failed" >&2
+  exit 78
+fi
+eval "${CUDA_TOOLCHAIN_EXPORTS}"
+unset CUDA_TOOLCHAIN_EXPORTS
+echo "==> CUDA toolchain: home=${CUDA_HOME} compiler=${CUDACXX} release=${SFI_RUNNER_CUDA_COMPILER_RELEASE}"
+
+# The extension loader keys builds by module name, so every cache root must be
+# owned by the selected Python/Torch/CUDA ABI.  An explicit directory is only
+# a caller-owned base; it cannot bypass the keyed child partition.
+if ! SELECTOR_CACHE_ABI_KEY="$(
+  "${PY}" "${SFI_ROOT}/utils/selector_cache_identity.py"
+)"; then
+  echo "FAIL: selected PYTHON cannot derive the selector cache ABI identity: ${PY}" >&2
+  exit 70
+fi
+if [[ ! "${SELECTOR_CACHE_ABI_KEY}" =~ ^[0-9a-f]{16}$ ]]; then
+  echo "FAIL: invalid selector cache ABI identity from ${PY}: ${SELECTOR_CACHE_ABI_KEY}" >&2
+  exit 70
+fi
+if [[ -n "${TORCH_EXTENSIONS_DIR:-}" ]]; then
+  SELECTOR_CACHE_BASE="$(realpath -ms -- "${TORCH_EXTENSIONS_DIR}")"
+else
+  SELECTOR_CACHE_BASE="${SFI_ROOT}/tmp/torch_extensions"
+fi
+SELECTOR_CACHE_ROOT="${SELECTOR_CACHE_BASE}/${CUDA_ARCH}_gt1_${SELECTOR_CACHE_ABI_KEY}"
 export TORCH_EXTENSIONS_DIR="${SELECTOR_CACHE_ROOT}"
 export SFI_RUNNER_SELECTOR_CACHE_ROOT="${SELECTOR_CACHE_ROOT}"
 
@@ -794,26 +840,6 @@ else
   SFI_RUNNER_FA3_PREFLIGHT_STATUS="not_applicable"
   ATTENTION_PREFLIGHT_DETAIL="fa4_cute_fake_jit_ready"
 fi
-BUILD_PROVENANCE_CHECKER="${SFI_ROOT}/scripts/check_flash_attention_build_provenance.py"
-if [[ ! -f "${BUILD_PROVENANCE_CHECKER}" ]]; then
-  echo "FAIL: FlashAttention build-provenance checker is missing: ${BUILD_PROVENANCE_CHECKER}" >&2
-  exit 66
-fi
-if ! ATTENTION_BUILD_IDENTITY_JSON="$({
-  "${PY}" "${BUILD_PROVENANCE_CHECKER}" \
-    --sfi-root "${SFI_ROOT}" \
-    --target "${FA_ROOT}" \
-    --architecture "${CUDA_ARCH}"
-} 2>&1)"; then
-  echo "FAIL: FlashAttention build provenance is stale or invalid" >&2
-  printf '%s\n' "${ATTENTION_BUILD_IDENTITY_JSON}" >&2
-  exit 78
-fi
-if ! "${PY}" -I -c 'import json,sys; value=json.loads(sys.argv[1]); assert isinstance(value,dict) and value.get("schema") == "sfi.flash_attention_build_identity.v1"' "${ATTENTION_BUILD_IDENTITY_JSON}"; then
-  echo "FAIL: FlashAttention build-provenance checker returned an invalid identity" >&2
-  exit 78
-fi
-export SFI_RUNNER_ATTENTION_BUILD_IDENTITY_JSON="${ATTENTION_BUILD_IDENTITY_JSON}"
 SFI_RUNNER_ATTENTION_PREFLIGHT_STATUS="passed"
 export SFI_RUNNER_FA3_PREFLIGHT_STATUS
 export SFI_RUNNER_ATTENTION_PREFLIGHT_STATUS
@@ -920,6 +946,8 @@ done
 # reference and therefore rejects no-reference noise; directional tiers may
 # still return rc=2 only for explicitly documented gate noise.
 set +e
+VLLM_FLASH_ATTN_VERSION="${FLASH_ATTN_VERSION}" \
+VLLM_SPARSE_FA3_UPSTREAM_ROOT="${FA_ROOT}" \
 PYTHONPATH="${FA_ROOT}:${SFI_ROOT}${PYTHONPATH:+:${PYTHONPATH}}" \
   "${PY}" -m "${BENCHMARK_MODULE}" \
   --mode "${MODE}" --producer-mode full-open-gt1 \
@@ -933,6 +961,7 @@ PYTHONPATH="${FA_ROOT}:${SFI_ROOT}${PYTHONPATH:+:${PYTHONPATH}}" \
   --max-seq-len-to-capture "${MAX_SEQ_LEN_TO_CAPTURE}" \
   --scheduling-mode "${SCHEDULING_MODE}" \
   --refresh-interval "${REFRESH_INTERVAL}" --prefill-last-n 2 \
+  --alpha-k-head "${K_HEAD}" \
   --max-live-sparse-slots "${BS}" --compact-blocks-per-slot "${BLOCKS}" \
   --gpu-mem-util "${UTIL:-0.9}" \
   --model "${MODEL}" --python "${PY}" --fa3-upstream-root "${FA_ROOT}" \
@@ -959,5 +988,6 @@ set -e
   --expected-attention-kernel "${ATTENTION_KERNEL}" \
   --expected-backend "${ATTENTION_BACKEND}" \
   --expected-flash-attn-version "${FLASH_ATTN_VERSION}" \
+  ${PAIR_POSTFLIGHT_ARGS[@]+"${PAIR_POSTFLIGHT_ARGS[@]}"} \
   ${EXPECTED_GIT_ARGS[@]+"${EXPECTED_GIT_ARGS[@]}"} \
   ${EXPECTED_MODEL_CONFIG_ARGS[@]+"${EXPECTED_MODEL_CONFIG_ARGS[@]}"}

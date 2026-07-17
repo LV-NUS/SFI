@@ -776,12 +776,23 @@ def _sparse_vendored_fa3_probe_requested() -> bool:
     )
 
 
+def _vendored_flash_attn_metadata_probe_requested() -> bool:
+    return bool(
+        os.environ.get("VLLM_SPARSE_FA3_UPSTREAM_ROOT")
+        and os.environ.get("VLLM_FLASH_ATTN_VERSION") in ("3", "4")
+    )
+
+
 def should_install_vendored_flash_attn_probe_patch() -> bool:
     flash_backend_probe = (
         os.environ.get("VLLM_ATTENTION_BACKEND") == "FLASH_ATTN_VLLM_V1"
         and os.environ.get("VLLM_FLASH_ATTN_VERSION") in ("3", "4")
     )
-    return flash_backend_probe or _sparse_vendored_fa3_probe_requested()
+    return (
+        flash_backend_probe
+        or _sparse_vendored_fa3_probe_requested()
+        or _vendored_flash_attn_metadata_probe_requested()
+    )
 
 
 def _flash_backend_probe_requested() -> bool:
@@ -829,13 +840,15 @@ _TRANSFORMERS_PDM_SEED_STUBS: dict[str, str] = {
 
 def _seed_transformers_package_distribution_mapping() -> list[str]:
     seeded: list[str] = []
-    try:
-        from transformers.utils import import_utils as tf_import_utils
-    except Exception:
-        return seeded
+    from transformers.utils import import_utils as tf_import_utils
+
     mapping = getattr(tf_import_utils, "PACKAGE_DISTRIBUTION_MAPPING", None)
-    if not isinstance(mapping, dict):
+    if mapping is None:
         return seeded
+    if not isinstance(mapping, dict):
+        raise RuntimeError(
+            "transformers PACKAGE_DISTRIBUTION_MAPPING must be a dict when present"
+        )
     for pkg_name, stub_distribution in _TRANSFORMERS_PDM_SEED_STUBS.items():
         if mapping.get(pkg_name):
             continue
@@ -844,60 +857,6 @@ def _seed_transformers_package_distribution_mapping() -> list[str]:
         mapping[pkg_name] = [stub_distribution]
         seeded.append(pkg_name)
     return seeded
-
-
-def _guard_transformers_flash_attn_probes() -> list[str]:
-    # [TRANSFORMERS-FLASH-PROBE-GUARD 2026-07-10] vendored flash_attn 在
-    # sys.path 而无 pip 安装分发时,transformers 5.x 的
-    # is_flash_attn_{2,3}_available() 对 PACKAGE_DISTRIBUTION_MAPPING 裸下标
-    # 抛【裸 KeyError】(5.6.2 :951/:970 亲证;importlib.metadata.
-    # PackageNotFoundError 是 ModuleNotFoundError 子类、与 KeyError 无继承
-    # 关系,炸点不是它),沿 vllm BlockPool import 链传染
-    # → sitecustomize sparse patch SystemExit(远端 TP8×64k A800 静默回退案
-    # 根因;远端 boot-only 同修法验证有效)。
-    # [2026-07-11] 第一层防线已下沉为 _seed_transformers_package_distribution_
-    # mapping(覆盖 modeling 侧导入期绑定副本与 :78/:97/:105 lambda 直查);
-    # 本函数保留为第二层,兜 import_utils 命名空间直调的异形版本。except 窄化
-    # 收 (KeyError, IndexError) 两类查找失败:IndexError 对应 5.x
-    # _is_package_available 的 distributions[0] 空列表形态(他方播种/异常
-    # dist 元数据可产生),不收其它异常。
-    # vendored 形态下该探测的正确语义=不可用:接为 False。
-    # 幂等(_sfi_keyerror_guard 标记);同步 transformers.utils 顶层
-    # re-export;transformers 缺席=零行为。
-    wrapped: list[str] = []
-    try:
-        from transformers.utils import import_utils as tf_import_utils
-    except Exception:
-        return wrapped
-    try:
-        import transformers.utils as tf_utils
-    except Exception:
-        tf_utils = None
-    for probe_name in (
-        "is_flash_attn_2_available",
-        "is_flash_attn_3_available",
-    ):
-        fn = getattr(tf_import_utils, probe_name, None)
-        if fn is None or bool(getattr(fn, "_sfi_keyerror_guard", False)):
-            continue
-
-        def _make_guarded(inner):
-            def _guarded(*args, **kwargs):
-                try:
-                    return inner(*args, **kwargs)
-                except (KeyError, IndexError):
-                    return False
-
-            _guarded._sfi_keyerror_guard = True
-            _guarded.__name__ = getattr(inner, "__name__", "flash_attn_probe")
-            return _guarded
-
-        guarded = _make_guarded(fn)
-        setattr(tf_import_utils, probe_name, guarded)
-        if tf_utils is not None and getattr(tf_utils, probe_name, None) is fn:
-            setattr(tf_utils, probe_name, guarded)
-        wrapped.append(probe_name)
-    return wrapped
 
 
 def install_vendored_flash_attn_probe_patch(
@@ -909,13 +868,15 @@ def install_vendored_flash_attn_probe_patch(
         "requested_attn_backend": os.environ.get("VLLM_ATTENTION_BACKEND"),
         "requested_flash_attn_version": os.environ.get("VLLM_FLASH_ATTN_VERSION"),
         "sparse_fa3_requested": _sparse_vendored_fa3_probe_requested(),
+        "metadata_probe_requested": _vendored_flash_attn_metadata_probe_requested(),
         "patched_modules": [],
         "transformers_pdm_seeded": [],
-        "transformers_probe_guards": [],
     }
     flash_probe_requested = _flash_backend_probe_requested()
     sparse_probe_requested = bool(summary["sparse_fa3_requested"])
-    if not flash_probe_requested and not sparse_probe_requested:
+    metadata_probe_requested = bool(summary["metadata_probe_requested"])
+    full_bridge_requested = flash_probe_requested or sparse_probe_requested
+    if not full_bridge_requested and not metadata_probe_requested:
         if summary["requested_attn_backend"] != "FLASH_ATTN_VLLM_V1":
             summary["reason"] = "non_flash_backend"
             return summary
@@ -923,14 +884,15 @@ def install_vendored_flash_attn_probe_patch(
             summary["reason"] = "unsupported_flash_attn_request"
             return summary
     # 先于任何下游 import(vllm BlockPool 链会触发 transformers 探测)。
-    # 双层防线:第一层播种共享 dict(源头修,覆盖任何命名空间的任何副本,
-    # 含 modeling_flash_attention_utils 导入期绑定副本与 lambda 直查;
-    # 且原地 mutate 对"modeling 已先被导入"的时序同样生效);
-    # 第二层包裹 import_utils 命名空间探针(异形版本兜底)。
+    # 原地播种共享 dict，覆盖 modeling_flash_attention_utils 导入期绑定
+    # 副本与 lambda 直查。metadata-only 启动只做这一项，不加载 FA bridge，
+    # 因而不会在 benchmark parent 中创建 CUDA context。
     summary["transformers_pdm_seeded"] = (
         _seed_transformers_package_distribution_mapping()
     )
-    summary["transformers_probe_guards"] = _guard_transformers_flash_attn_probes()
+    if not full_bridge_requested:
+        summary["reason"] = "metadata_only"
+        return summary
     bridge = load_vendored_flash_attn_bridge(repo_root=repo_root)
     native_get_flash_attn_version = build_vendored_get_flash_attn_version(bridge)
     resolved_flash_attn_version = native_get_flash_attn_version()

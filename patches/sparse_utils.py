@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 import os
 from contextlib import nullcontext
-from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -22,6 +22,7 @@ from patches.sparse_constants import (
     _ROW_MODE_LOG_F_PREFILL,
     _ROW_MODE_LOG_F_REFRESH,
     _SELECTOR_FIXED_K_CACHED,
+    _is_free_slot_id,
 )
 
 if TYPE_CHECKING:
@@ -49,6 +50,58 @@ def _selector_fixed_k_enabled() -> bool:
     if _DYNAMIC_ENV:
         return os.environ.get("VLLM_SPARSE_SELECTOR_FIXED_K", "1") == "1"
     return bool(_SELECTOR_FIXED_K_CACHED)
+
+
+def _submission_slot_owner_snapshot(
+    payloads: Sequence[object],
+    slot_list: Sequence[int],
+    *,
+    stage: str,
+) -> Tuple[Tuple[int, str], ...]:
+    """Validate and return the immutable slot owners carried by payloads."""
+
+    if not payloads:
+        return tuple()
+    slots = tuple(int(slot) for slot in slot_list)
+    if len(set(slots)) != len(slots):
+        raise RuntimeError(f"{stage} slot_list contains duplicate slots")
+
+    first_req_ids_raw = getattr(payloads[0], "slot_req_ids", None)
+    if first_req_ids_raw is None:
+        raise RuntimeError(
+            f"{stage} missing submission-step slot_req_ids "
+            "(live batch_request_ids fallback retired)"
+        )
+
+    def _normalize(raw_req_ids: Sequence[object]) -> Tuple[str, ...]:
+        req_ids = []
+        for req_id in raw_req_ids:
+            if req_id is None or _is_free_slot_id(req_id):
+                raise RuntimeError(
+                    f"{stage} contains an invalid submission-step request identity"
+                )
+            req_ids.append(str(req_id))
+        return tuple(req_ids)
+
+    req_ids = _normalize(first_req_ids_raw)
+    if len(req_ids) != len(slots):
+        raise RuntimeError(
+            f"{stage} slot_req_ids/slot_list length mismatch: "
+            f"slot_req_ids={len(req_ids)} slot_list={len(slots)}"
+        )
+    for payload in payloads[1:]:
+        payload_slots = tuple(int(slot) for slot in getattr(payload, "slot_list", ()))
+        payload_req_ids_raw = getattr(payload, "slot_req_ids", None)
+        if payload_req_ids_raw is None:
+            raise RuntimeError(
+                f"{stage} missing submission-step slot_req_ids "
+                "(live batch_request_ids fallback retired)"
+            )
+        if payload_slots != slots or _normalize(payload_req_ids_raw) != req_ids:
+            raise RuntimeError(
+                f"{stage} submission identity mismatch across layers"
+            )
+    return tuple(zip(slots, req_ids))
 
 
 def _resolve_compact_row_gate(
@@ -404,40 +457,3 @@ def _get_selector_batch_ext():
             raise
         _SELECTOR_BATCH_EXT_LOADED = True
     return _SELECTOR_BATCH_EXT_MODULE
-
-
-def _get_row_index_tensor_from_cache(
-    cache: Dict[Tuple[str, int, Tuple[int, ...]], torch.Tensor],
-    *,
-    rows: Sequence[int],
-    device: torch.device,
-    cache_owner=None,
-) -> torch.Tensor:
-    """返回 rows 对应的 GPU long tensor，使用外部 cache 复用 small tensor 分配。"""
-    if not rows:
-        return torch.empty((0,), device=device, dtype=torch.long)
-    rows_tuple = tuple(int(r) for r in rows)
-    dev_index = int(device.index) if device.index is not None else -1
-    key = (str(device.type), dev_index, rows_tuple)
-    cached = cache.get(key)
-    if cached is None or cached.device != device or cached.dtype != torch.long or cached.numel() != len(rows_tuple):
-        cached = torch.tensor(rows_tuple, dtype=torch.long, device=device)
-        # 防止 cache 无界增长（正常 batch<=32 且 rows 形态有限，基本不触发）
-        if len(cache) > 128:
-            # [ROW-INDEX-CACHE-CLEAR-UAF-FIX] P2-b:clear 弃引用前三流守卫,
-            # 消费者(logits patch/index kernel)在主步与 flush(refresh_stream)
-            # 双上下文;rows 键随 decode 世代漂,长跑必触发(ROW-CACHE 同型)。
-            _streams = []
-            _rs = getattr(cache_owner, "refresh_stream", None)
-            if _rs is not None:
-                _streams.append(_rs)
-            for _cand in (torch.cuda.current_stream(), torch.cuda.default_stream()):
-                if all(_cand != s for s in _streams):
-                    _streams.append(_cand)
-            for _stale in cache.values():
-                if _stale.is_cuda:
-                    for _s in _streams:
-                        _stale.record_stream(_s)
-            cache.clear()
-        cache[key] = cached
-    return cached

@@ -5,7 +5,19 @@ from typing import MutableMapping, Sequence
 import torch
 
 
-_PINNED_STAGE_RING_SIZE = 4
+_STAGE_H2D_QUARANTINED = object()
+_STAGE_GPU_VALUE_INVALID = object()
+
+
+def _annotate_stage_h2d_error(error: BaseException, note: str) -> None:
+    add_note = getattr(error, "add_note", None)
+    if callable(add_note):
+        add_note(note)
+        return
+    # Python 3.10 compatibility for the runtime environment.  Keep the
+    # original exception type/message stable and attach diagnostics out of
+    # band rather than replacing the causative copy/record failure.
+    setattr(error, "_stage_h2d_note", note)
 
 
 def _new_cpu_tensor(
@@ -14,12 +26,15 @@ def _new_cpu_tensor(
     dtype: torch.dtype,
     pin_memory: bool,
 ) -> torch.Tensor:
-    if pin_memory:
-        try:
-            return torch.empty(shape, device="cpu", dtype=dtype, pin_memory=True)
-        except RuntimeError:
-            pass
-    return torch.empty(shape, device="cpu", dtype=dtype)
+    tensor = torch.empty(
+        shape,
+        device="cpu",
+        dtype=dtype,
+        pin_memory=bool(pin_memory),
+    )
+    if pin_memory and not tensor.is_pinned():
+        raise RuntimeError("CUDA H2D staging source must use pinned CPU memory")
+    return tensor
 
 
 def _cache_get(
@@ -52,87 +67,208 @@ def _stage_ring_slot_key(base_key: str, slot: int) -> str:
     return base_key if slot == 0 else f"{base_key}_ring{slot}"
 
 
+def _current_cuda_stream_contract(
+    device: torch.device,
+) -> tuple[object, tuple[int, int]]:
+    stream = torch.cuda.current_stream(device=device)
+    raw_stream = getattr(stream, "cuda_stream", None)
+    if raw_stream is None:
+        raise RuntimeError("CUDA staging stream must expose cuda_stream")
+    device_index = (
+        int(device.index)
+        if device.index is not None
+        else int(torch.cuda.current_device())
+    )
+    return stream, (device_index, int(raw_stream))
+
+
+def _stage_pool_state(
+    *,
+    stage_cache: MutableMapping[str, object] | None,
+    cache_owner: object | None,
+    base_key: str,
+    stream_contract: tuple[int, int],
+) -> dict[str, object]:
+    """Return the one-stream FIFO source pool for ``base_key``.
+
+    The stable GPU destination is cached under the same logical cache name.
+    Binding the whole cache entry to the actual ``(device, cudaStream_t)`` is
+    therefore required: per-stream CPU sources alone would not make concurrent
+    writes to that shared GPU destination safe.
+    """
+
+    if stage_cache is None and cache_owner is None:
+        raise ValueError(
+            "CUDA H2D staging requires a persistent stage_cache or cache_owner"
+        )
+    state_key = f"{base_key}_pool"
+    state = _cache_get(
+        stage_cache=stage_cache,
+        cache_owner=cache_owner,
+        key=state_key,
+    )
+    if state is None:
+        state = {
+            "stream": stream_contract,
+            "slots": [base_key],
+            "next": 0,
+            "next_slot": 1,
+        }
+        _cache_set(
+            stage_cache=stage_cache,
+            cache_owner=cache_owner,
+            key=state_key,
+            value=state,
+        )
+        return state
+    if not isinstance(state, dict):
+        raise RuntimeError("CUDA H2D staging pool state is invalid")
+    if state.get("stream") != stream_contract:
+        raise RuntimeError(
+            "CUDA H2D staging cache cannot share one GPU destination across "
+            "different device/stream owners"
+        )
+    slots = state.get("slots")
+    if not isinstance(slots, list) or not slots:
+        raise RuntimeError("CUDA H2D staging pool slots are invalid")
+    if not isinstance(state.get("next"), int) or not isinstance(
+        state.get("next_slot"), int
+    ):
+        raise RuntimeError("CUDA H2D staging pool cursor is invalid")
+    return state
+
+
+def _validate_unchanged_stage_stream_owner(
+    *,
+    stage_cache: MutableMapping[str, object] | None,
+    cache_owner: object | None,
+    base_key: str,
+    device: torch.device,
+) -> None:
+    """Validate a no-copy reuse against the destination's stream owner.
+
+    Same-stream reuse is ordered by the CUDA stream even while the original
+    H2D is pending.  A different stream has no such dependency and therefore
+    must not consume the shared destination.  This check performs no event
+    query, wait, synchronization, or device transfer.
+    """
+
+    _stream, stream_contract = _current_cuda_stream_contract(device)
+    state = _cache_get(
+        stage_cache=stage_cache,
+        cache_owner=cache_owner,
+        key=f"{base_key}_pool",
+    )
+    if state is None:
+        raise RuntimeError(
+            "CUDA H2D staging reuse has no stream-ownership proof"
+        )
+    _stage_pool_state(
+        stage_cache=stage_cache,
+        cache_owner=cache_owner,
+        base_key=base_key,
+        stream_contract=stream_contract,
+    )
+
+
 def _acquire_stage_ring_slot(
     *,
     stage_cache: MutableMapping[str, object] | None,
     cache_owner: object | None,
     base_key: str,
+    stream_contract: tuple[int, int],
 ) -> str:
-    """Return a pinned-source slot that is no longer consumed by an H2D.
+    """Acquire one FIFO pinned source without scanning or blocking the host.
 
     The GPU destination remains single-buffered so callers retain a stable
-    data pointer (including CUDA-graph inputs). Only the host source is ringed:
-    copies and their consumers keep stream order, while the CPU can prepare a
-    later step without overwriting an in-flight pinned source.
+    data pointer (including CUDA-graph inputs).  One device/stream owns the
+    pool, so its cursor is always the oldest submitted source.  A single event
+    query either proves that source reusable or measures real pressure and
+    grows exactly one newest slot.  There is no empirical cap, linear scan, or
+    host synchronization fallback.
     """
 
-    cursor_key = f"{base_key}_ring_next"
-    cached_cursor = _cache_get(
+    state = _stage_pool_state(
         stage_cache=stage_cache,
         cache_owner=cache_owner,
-        key=cursor_key,
+        base_key=base_key,
+        stream_contract=stream_contract,
     )
-    start = (
-        int(cached_cursor) % _PINNED_STAGE_RING_SIZE
-        if isinstance(cached_cursor, int)
-        else 0
-    )
-    selected_slot: int | None = None
-    selected_event = None
-    for offset in range(_PINNED_STAGE_RING_SIZE):
-        slot = (start + offset) % _PINNED_STAGE_RING_SIZE
-        slot_key = _stage_ring_slot_key(base_key, slot)
+    slots = state["slots"]
+    while True:
+        oldest_index = int(state.get("next", 0)) % len(slots)
+        oldest_key = slots[oldest_index]
+        if not isinstance(oldest_key, str):
+            raise RuntimeError("CUDA H2D staging pool slot key is invalid")
         evt = _cache_get(
             stage_cache=stage_cache,
             cache_owner=cache_owner,
-            key=f"{slot_key}_evt",
+            key=f"{oldest_key}_evt",
         )
+        if evt is _STAGE_H2D_QUARANTINED:
+            # Event publication failed after a copy might have entered the
+            # original stream.  Keep the source tensor referenced by its cache
+            # key, but retire it from the reusable FIFO forever: without an
+            # event there can never be a completion proof.
+            slots.pop(oldest_index)
+            if slots:
+                state["next"] = oldest_index % len(slots)
+                continue
+            next_slot = int(state.get("next_slot", 0))
+            if next_slot <= 0:
+                raise RuntimeError(
+                    "CUDA H2D staging pool slot generation is invalid"
+                )
+            newest_key = _stage_ring_slot_key(base_key, next_slot)
+            state["next_slot"] = next_slot + 1
+            slots.append(newest_key)
+            state["next"] = 0
+            return newest_key
         # [GUARD-NO-SWALLOW] query 失败意味着无法证明 pinned source 可覆写，
         # 必须原样传播，不能把坏事件当成空闲槽。
         if evt is None or evt.query():
-            selected_slot = slot
-            break
+            state["next"] = (oldest_index + 1) % len(slots)
+            return oldest_key
+        break
 
-    if selected_slot is None:
-        # 有界回压：四个 source 都仍在被 GPU 读取时，只等最老候选槽；不再
-        # 像单槽实现那样每次遇到一个 pending H2D 就串行阻塞 host。
-        selected_slot = start
-        slot_key = _stage_ring_slot_key(base_key, selected_slot)
-        selected_event = _cache_get(
-            stage_cache=stage_cache,
-            cache_owner=cache_owner,
-            key=f"{slot_key}_evt",
-        )
-        if selected_event is not None:
-            selected_event.synchronize()
-
-    _cache_set(
-        stage_cache=stage_cache,
-        cache_owner=cache_owner,
-        key=cursor_key,
-        value=(selected_slot + 1) % _PINNED_STAGE_RING_SIZE,
-    )
-    return _stage_ring_slot_key(base_key, selected_slot)
+    next_slot = int(state.get("next_slot", 0))
+    if next_slot <= 0:
+        raise RuntimeError("CUDA H2D staging pool slot generation is invalid")
+    newest_key = _stage_ring_slot_key(base_key, next_slot)
+    state["next_slot"] = next_slot + 1
+    # The physical tail is not the temporal tail when the cursor is nonzero.
+    # Insert the new submission immediately before the oldest physical index;
+    # the old oldest shifts right and remains the cursor.  Logical FIFO order
+    # is therefore [oldest, ..., previous-newest, new-slot] after wrap/growth.
+    slots.insert(oldest_index, newest_key)
+    state["next"] = oldest_index + 1
+    return newest_key
 
 
-# [STAGE-RING-FIX 2026-07-02] Host-side WAR guard for reused PINNED staging
-# buffers: `gpu.copy_(cpu_stage, non_blocking=True)` returns before the H2D
-# completes, so rewriting the same cached cpu_stage races the in-flight transfer.
-# Direct call sites retain this single-slot guard; the shared cached helpers use
-# `_acquire_stage_ring_slot` to avoid serial host waits while preserving it.
-def _wait_stage_h2d_evt(
+def _acquire_stage_h2d_group(
     *,
     stage_cache: MutableMapping[str, object] | None,
     cache_owner: object | None,
-    key: str,
-) -> None:
-    evt = _cache_get(stage_cache=stage_cache, cache_owner=cache_owner, key=key)
-    if evt is None:
-        return
-    # [GUARD-NO-SWALLOW] query/synchronize 失败时继续=在 H2D 在飞时覆写
-    # pinned 缓冲（本守卫要防的 WAR 撕裂本身），必须炸。
-    if not evt.query():
-        evt.synchronize()
+    base_key: str,
+    device: torch.device,
+) -> tuple[str, object]:
+    """Acquire one slot shared by a group of pinned source tensors.
+
+    Callers derive the same slot suffix for every member and record the slot
+    event only after the group's final H2D.  This preserves the atomic lifetime
+    formerly expressed by one blocking event around multiple source tensors.
+    """
+
+    if device.type != "cuda":
+        raise ValueError("CUDA H2D staging group requires a CUDA device")
+    stream, stream_contract = _current_cuda_stream_contract(device)
+    slot_key = _acquire_stage_ring_slot(
+        stage_cache=stage_cache,
+        cache_owner=cache_owner,
+        base_key=base_key,
+        stream_contract=stream_contract,
+    )
+    return slot_key, stream
 
 
 def _record_stage_h2d_evt(
@@ -141,42 +277,100 @@ def _record_stage_h2d_evt(
     cache_owner: object | None,
     key: str,
     device: torch.device,
-    reuse_existing: bool = False,
+    stream: object | None = None,
 ) -> None:
     if device.type != "cuda":
         return
-    # [GUARD-NO-SWALLOW] record 失败时静默返回=下次 wait 无事件可等（守卫
-    # 整体失效、无声放行覆写），必须炸。
-    evt = (
-        _cache_get(
+    # [GUARD-NO-SWALLOW] record 失败时静默返回=槽位没有完成证明，
+    # 下次 acquire 会把在飞 source 当成未使用并无声覆写，必须炸。
+    try:
+        evt = _cache_get(
             stage_cache=stage_cache,
             cache_owner=cache_owner,
             key=key,
         )
-        if reuse_existing
-        else None
-    )
-    if evt is not None:
-        event_device = getattr(evt, "device", None)
-        target_index = (
-            int(device.index)
-            if device.index is not None
-            else int(torch.cuda.current_device())
-        )
-        if (
-            event_device is not None
-            and (
-                torch.device(event_device).type != "cuda"
-                or torch.device(event_device).index != target_index
-            )
-        ):
-            # TP worker/device 迁移后旧 event 仍绑定原 CUDA device；CPU source
-            # 已由 acquire 证明空闲，但 event 本体不能跨 device 重新 record。
+        if evt is _STAGE_H2D_QUARANTINED:
             evt = None
-    if evt is None:
-        evt = torch.cuda.Event(enable_timing=False)
-    evt.record(torch.cuda.current_stream(device=device))
-    _cache_set(stage_cache=stage_cache, cache_owner=cache_owner, key=key, value=evt)
+        if evt is not None:
+            event_device = getattr(evt, "device", None)
+            target_index = (
+                int(device.index)
+                if device.index is not None
+                else int(torch.cuda.current_device())
+            )
+            if (
+                event_device is not None
+                and (
+                    torch.device(event_device).type != "cuda"
+                    or torch.device(event_device).index != target_index
+                )
+            ):
+                # TP worker/device 迁移后旧 event 仍绑定原 CUDA device；CPU source
+                # 已由 acquire 证明空闲，但 event 本体不能跨 device 重新 record。
+                evt = None
+        if evt is None:
+            evt = torch.cuda.Event(enable_timing=False)
+        evt.record(
+            stream if stream is not None else torch.cuda.current_stream(device=device)
+        )
+        # Publishing the recorded event is part of the same ownership
+        # transaction.  If cache publication fails, treating the slot as if
+        # it still carried an older/empty event would be a false completion
+        # proof just as surely as a failed Event.record().
+        _cache_set(
+            stage_cache=stage_cache,
+            cache_owner=cache_owner,
+            key=key,
+            value=evt,
+        )
+    except BaseException as exc:
+        # A prior event can already be complete, so leaving it cached after a
+        # failed re-record would create a false completion proof.  Replace it
+        # with a permanent quarantine marker before propagating the failure.
+        try:
+            _cache_set(
+                stage_cache=stage_cache,
+                cache_owner=cache_owner,
+                key=key,
+                value=_STAGE_H2D_QUARANTINED,
+            )
+        except BaseException as quarantine_exc:
+            _annotate_stage_h2d_error(
+                exc,
+                "failed to publish the H2D completion event and to quarantine "
+                f"its source slot: {quarantine_exc!r}",
+            )
+        raise
+
+
+def _protect_failed_stage_h2d(
+    *,
+    stage_cache: MutableMapping[str, object] | None,
+    cache_owner: object | None,
+    key: str,
+    device: torch.device,
+    stream: object,
+    error: BaseException,
+) -> None:
+    """Fence a possibly partial H2D submission without masking its error."""
+
+    try:
+        _record_stage_h2d_evt(
+            stage_cache=stage_cache,
+            cache_owner=cache_owner,
+            key=key,
+            device=device,
+            stream=stream,
+        )
+    except BaseException as fence_exc:
+        # _record_stage_h2d_evt already quarantined the slot.  Preserve the
+        # original copy failure while making the failed completion proof
+        # visible to diagnostics.
+        _annotate_stage_h2d_error(
+            error,
+            "failed to publish completion proof for a partial H2D submission; "
+            f"the source slot was quarantined: {fence_exc!r}",
+        )
 
 
 def cached_sequence_to_device(
@@ -262,6 +456,7 @@ def cached_sequence_to_device(
         gpu_stage = cached_gpu
 
     values_key = f"_cpu_gpu_stage_{cache_name}_values"
+    cpu_base_key = f"_cpu_gpu_stage_{cache_name}_cpu"
     if bool(reuse_unchanged) and out is None:
         cached_values = _cache_get(
             stage_cache=stage_cache,
@@ -269,13 +464,51 @@ def cached_sequence_to_device(
             key=values_key,
         )
         if gpu_stage_reused and cached_values == values_tuple:
+            if length > 0:
+                _validate_unchanged_stage_stream_owner(
+                    stage_cache=stage_cache,
+                    cache_owner=cache_owner,
+                    base_key=cpu_base_key,
+                    device=device,
+                )
             return gpu_stage if int(gpu_stage.numel()) == length else gpu_stage[:length]
 
-    cpu_base_key = f"_cpu_gpu_stage_{cache_name}_cpu"
+    # Empty row/slot cohorts are legal at capture-layout boundaries. There is
+    # no source lifetime to protect because no H2D is submitted; preserve the
+    # existing GPU empty-view/value-cache result without touching CUDA stream
+    # or pool state.
+    if length == 0:
+        if out is None:
+            _cache_set(
+                stage_cache=stage_cache,
+                cache_owner=cache_owner,
+                key=values_key,
+                value=values_tuple,
+            )
+        return gpu_stage[:0]
+
+    # The cached value label is the commit record for the stable GPU
+    # destination.  Invalidate it before a changed H2D can touch that
+    # destination, then publish the new tuple only after both the copy and its
+    # completion event have been published.  A partial copy/record failure can
+    # therefore never make an older label describe contaminated GPU storage.
+    # This write exists only on the changed-copy path; unchanged hits above pay
+    # no extra branch or cache mutation.
+    _cache_set(
+        stage_cache=stage_cache,
+        cache_owner=cache_owner,
+        key=values_key,
+        value=_STAGE_GPU_VALUE_INVALID,
+    )
+
+    # The unchanged-value hit above performs only a host-side stream-identity
+    # check. Event queries and source-pool acquisition remain H2D-only work.
+    current_stream, stream_contract = _current_cuda_stream_contract(device)
     cpu_key = _acquire_stage_ring_slot(
         stage_cache=stage_cache,
         cache_owner=cache_owner,
         base_key=cpu_base_key,
+        stream_contract=stream_contract,
     )
     cpu_stage = _cache_get(
         stage_cache=stage_cache,
@@ -304,17 +537,26 @@ def cached_sequence_to_device(
     # 小张量 staging 的公共地板，capture eager 步每层 20-40 次调用）换 C 层一次
     # 构造+整块拷贝：值/位置逐位等价（torch.as_tensor 对 bool/int 的转换与原
     # 逐元素 bool()/int() 同语义），META-STAGE-BULK（d63a188）同款。
-    if length > 0:
-        cpu_stage[:length].copy_(torch.as_tensor(values_tuple, dtype=dtype))
-    if length > 0:
+    cpu_stage[:length].copy_(torch.as_tensor(values_tuple, dtype=dtype))
+    try:
         gpu_stage[:length].copy_(cpu_stage[:length], non_blocking=True)
-        _record_stage_h2d_evt(
+    except BaseException as exc:
+        _protect_failed_stage_h2d(
             stage_cache=stage_cache,
             cache_owner=cache_owner,
             key=f"{cpu_key}_evt",
             device=device,
-            reuse_existing=True,
+            stream=current_stream,
+            error=exc,
         )
+        raise
+    _record_stage_h2d_evt(
+        stage_cache=stage_cache,
+        cache_owner=cache_owner,
+        key=f"{cpu_key}_evt",
+        device=device,
+        stream=current_stream,
+    )
     if out is None:
         _cache_set(
             stage_cache=stage_cache,
@@ -374,13 +616,36 @@ def cached_cpu_tensor_to_device(
         # 容量/shape/dtype/device 换代后的 GPU stage 尚未写入，即便 host
         # values 与上代相同也不能复用；否则会把未初始化新 buffer 当命中返回。
         if gpu_stage_reused and cached_values == values_tuple:
+            if tensor.numel() > 0:
+                _validate_unchanged_stage_stream_owner(
+                    stage_cache=stage_cache,
+                    cache_owner=cache_owner,
+                    base_key=cpu_base_name,
+                    device=device,
+                )
             return gpu_stage
     else:
         values_tuple = None
+    # See cached_sequence_to_device: the value label commits only after the
+    # H2D event is safely published.  Even a caller that currently opts out of
+    # unchanged reuse must invalidate an older label for the same cache name;
+    # otherwise a later opt-in call could mistake partially overwritten GPU
+    # storage for that older value.  No tuple materialization is added to the
+    # opt-out path.
+    _cache_set(
+        stage_cache=stage_cache,
+        cache_owner=cache_owner,
+        key=values_name,
+        value=_STAGE_GPU_VALUE_INVALID,
+    )
+    # The unchanged-value hit above performs only a host-side stream-identity
+    # check. Event queries and source-pool acquisition remain H2D-only work.
+    current_stream, stream_contract = _current_cuda_stream_contract(device)
     cpu_name = _acquire_stage_ring_slot(
         stage_cache=stage_cache,
         cache_owner=cache_owner,
         base_key=cpu_base_name,
+        stream_contract=stream_contract,
     )
     cpu_stage = _cache_get(
         stage_cache=stage_cache,
@@ -401,13 +666,24 @@ def cached_cpu_tensor_to_device(
             value=cpu_stage,
         )
     cpu_stage.copy_(tensor)
-    gpu_stage.copy_(cpu_stage, non_blocking=True)
+    try:
+        gpu_stage.copy_(cpu_stage, non_blocking=True)
+    except BaseException as exc:
+        _protect_failed_stage_h2d(
+            stage_cache=stage_cache,
+            cache_owner=cache_owner,
+            key=f"{cpu_name}_evt",
+            device=device,
+            stream=current_stream,
+            error=exc,
+        )
+        raise
     _record_stage_h2d_evt(
         stage_cache=stage_cache,
         cache_owner=cache_owner,
         key=f"{cpu_name}_evt",
         device=device,
-        reuse_existing=True,
+        stream=current_stream,
     )
     if values_tuple is not None:
         _cache_set(

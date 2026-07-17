@@ -67,12 +67,6 @@ ARENA_PHASE1_QWEN06_BS2_CAP262K_BUDGET_BYTES = _align_up_int(
     _CAP262K_PROJECTED_BYTES,
     _CAP262K_BUDGET_GRAIN_BYTES,
 )
-# Bound on dead reservation metadata. Live set/step <= _CAPTURE_IN_FLIGHT(2)
-# (ONE_SHOT_BOOTSTRAP intent), all consumed same-step before the next insert, so
-# FIFO-oldest eviction down to this cap can only drop dead prior-step entries.
-_RESERVATIONS_CAP = 1024
-
-
 class CaptureArenaIntent(str, Enum):
     ONE_SHOT_BOOTSTRAP = "one_shot_bootstrap"
     REFRESH = "refresh"
@@ -249,12 +243,20 @@ class SparseCaptureMetaArena:
     metrics: ArenaMetrics = field(default_factory=ArenaMetrics)
 
     def _store_reservation(self, identity, reservation) -> None:
-        # newest insertion == current-step live entry; evict OLDEST (dead) past cap.
+        # Reservation lookup is exact-step scoped and all consumers bind within
+        # that step. Retire prior-step metadata when the authoritative identity
+        # advances; retain every intent of the current step. This derives the
+        # live set from lifecycle rather than an empirical FIFO population cap.
         d = self.reservations_by_identity
+        step_identity = tuple(identity[:3])
+        stale_identities = [
+            existing
+            for existing in d
+            if tuple(existing[:3]) != step_identity
+        ]
+        for stale_identity in stale_identities:
+            d.pop(stale_identity, None)
         d[identity] = reservation
-        cap = int(_RESERVATIONS_CAP)
-        while len(d) > cap:
-            d.popitem(last=False)
 
     def reset_step_metrics(self) -> None:
         reserved_bytes = int(self.metrics.arena_reserved_bytes)

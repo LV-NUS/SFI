@@ -47,8 +47,12 @@ _RRP_SAME_STREAM_ORDERED_ATTR = (
 )
 
 from patches.runtime_deps import require_runtime_dep
-from patches.cpu_gpu_staging import _record_stage_h2d_evt, _wait_stage_h2d_evt
-from patches.layer_state import _stable_slot_signature64
+from patches.cpu_gpu_staging import (
+    _acquire_stage_h2d_group,
+    _new_cpu_tensor,
+    _protect_failed_stage_h2d,
+    _record_stage_h2d_evt,
+)
 from patches.refresh_runtime.post_kernel_worker import (
     build_step_cache_invariants,
     publish_selected_scope_launch_ready_if_needed,
@@ -4521,25 +4525,60 @@ def _validate_layer_slot_signature_consistency(
     layer_states: Dict[object, object],
     step_epoch: int,
     stage: str,
+    stable_request_ids: Optional[Tuple[object, ...]] = None,
+    stable_slot_signature64: Optional[int] = None,
 ) -> None:
+    """Fail closed on cross-layer slot divergence before metadata writes.
+
+    A layer can carry the prior step epoch even though its request set and
+    slot signature already prove that its slot mapping is unchanged. Advance
+    only that exact stable case before comparing layers; any request or
+    signature divergence remains visible to the guard.
+    """
     if not layer_cache_keys:
         return
+    expected_epoch = int(step_epoch)
+    reconcile_stable_epoch = (
+        stable_request_ids is not None and stable_slot_signature64 is not None
+    )
+    expected_stable_signature = (
+        int(stable_slot_signature64) if reconcile_stable_epoch else -1
+    )
+
     first_key = layer_cache_keys[0]
     first_state = layer_states.get(first_key)
     if first_state is None:
         return
     base_epoch = int(getattr(first_state, "slot_epoch", -1))
     base_sig = int(getattr(first_state, "slot_signature64", -1))
+    if (
+        reconcile_stable_epoch
+        and base_epoch != expected_epoch
+        and base_sig == expected_stable_signature
+        and getattr(first_state, "last_active_request_ids", None) == stable_request_ids
+    ):
+        first_state.slot_epoch = expected_epoch
+        first_state._align_epoch_seen = expected_epoch
+        base_epoch = expected_epoch
     for layer_idx, layer_key in enumerate(layer_cache_keys[1:], start=1):
         state = layer_states.get(layer_key)
         if state is None:
             continue
         cur_epoch = int(getattr(state, "slot_epoch", -1))
         cur_sig = int(getattr(state, "slot_signature64", -1))
+        if (
+            reconcile_stable_epoch
+            and cur_epoch != expected_epoch
+            and cur_sig == expected_stable_signature
+            and getattr(state, "last_active_request_ids", None) == stable_request_ids
+        ):
+            state.slot_epoch = expected_epoch
+            state._align_epoch_seen = expected_epoch
+            cur_epoch = expected_epoch
         if cur_epoch != base_epoch or cur_sig != base_sig:
             raise RuntimeError(
                 f"slot signature mismatch before {stage} meta pack; "
-                f"step_epoch={int(step_epoch)} base_layer=0 base_epoch={base_epoch} "
+                f"step_epoch={expected_epoch} base_layer=0 base_epoch={base_epoch} "
                 f"base_sig={base_sig} layer_index={layer_idx} "
                 f"layer_key={layer_key!r} layer_epoch={cur_epoch} layer_sig={cur_sig}"
             )
@@ -6918,9 +6957,8 @@ def maybe_build_step_decode_data_from_metadata_impl(
             )
 
         global_slot_map_step = self.get_step_global_slot_map(step_authority.req_ids)
-        global_slot_signature_step = _stable_slot_signature64(
-            global_slot_map_step,
-            step_authority.req_ids,
+        global_slot_signature_step = self._global_slot_allocator.stable_signature64(
+            step_authority.req_ids
         )
         has_refresh_rows = any(layer_effective_refresh_by_row_step)
         layer_group_enabled = bool(self._refresh_layer_group_enabled)
@@ -7013,6 +7051,8 @@ def maybe_build_step_decode_data_from_metadata_impl(
             layer_states=self.layer_states,
             step_epoch=step_authority.epoch,
             stage="decode",
+            stable_request_ids=_sa_req_ids,
+            stable_slot_signature64=global_slot_signature_step,
         )
         # P12 lever-2: per-step active_slots hoist target. Lazy: filled by the
         # first layer that takes the launch-view refresh leg (post-align, so
@@ -7025,13 +7065,6 @@ def maybe_build_step_decode_data_from_metadata_impl(
         _lsc_step_invariants = None
         for state in layer_states_for_refresh:
             if (
-                state.last_active_request_ids == _sa_req_ids
-                and state.slot_signature64 == global_slot_signature_step
-                and state.slot_epoch != step_authority.epoch
-            ):
-                state.slot_epoch = int(step_authority.epoch)
-                state._align_epoch_seen = int(step_authority.epoch)
-            if (
                 state.last_active_request_ids != _sa_req_ids
                 or state.slot_epoch != step_authority.epoch
                 or state.slot_signature64 != global_slot_signature_step
@@ -7040,6 +7073,7 @@ def maybe_build_step_decode_data_from_metadata_impl(
                     _sa_req_ids,
                     epoch=step_authority.epoch,
                     slot_by_request=global_slot_map_step,
+                    stable_slot_signature64=global_slot_signature_step,
                 )
                 state.last_active_request_ids = _sa_req_ids
             layer_effective_refresh_by_row = layer_effective_refresh_by_row_step
@@ -8669,12 +8703,16 @@ def maybe_build_step_prefill_global_meta_from_metadata_impl(
     # Align slots for all layers once (dispatcher 将复用 last_active_request_ids 避免重复 align)
     active_req_ids = step_authority.req_ids[:batch_size]
     global_slot_map_step = self.get_step_global_slot_map(active_req_ids)
+    global_slot_signature_step = self._global_slot_allocator.stable_signature64(
+        active_req_ids
+    )
     for state in self.layer_states.values():
         if state.last_active_request_ids != step_authority.req_ids:
             state.align_slots(
                 active_req_ids,
                 epoch=step_authority.epoch,
                 slot_by_request=global_slot_map_step,
+                stable_slot_signature64=global_slot_signature_step,
             )
             state.last_active_request_ids = step_authority.req_ids
 
@@ -8683,6 +8721,8 @@ def maybe_build_step_prefill_global_meta_from_metadata_impl(
         layer_states=self.layer_states,
         step_epoch=step_authority.epoch,
         stage="prefill",
+        stable_request_ids=step_authority.req_ids,
+        stable_slot_signature64=global_slot_signature_step,
     )
     _mark_detail_phase("align_slots")
 
@@ -8713,14 +8753,18 @@ def maybe_build_step_prefill_global_meta_from_metadata_impl(
         or self._prefill_last_n_i32 is None
         or self._prefill_cap_i32 is None
     ):
-        _wait_stage_h2d_evt(
+        stage_base_key = "_prefill_i32_stage_h2d"
+        stage_slot_key, stage_stream = _acquire_stage_h2d_group(
             stage_cache=None,
             cache_owner=self,
-            key="_prefill_i32_stage_h2d_evt",
+            base_key=stage_base_key,
+            device=device,
         )
+        stage_suffix = stage_slot_key[len(stage_base_key) :]
 
         def _ensure_prefill_cpu_stage(name: str) -> torch.Tensor:
-            buf = getattr(self, name, None)
+            slot_name = f"{name}{stage_suffix}"
+            buf = getattr(self, slot_name, None)
             if (
                 buf is None
                 or not isinstance(buf, torch.Tensor)
@@ -8728,8 +8772,12 @@ def maybe_build_step_prefill_global_meta_from_metadata_impl(
                 or buf.dtype != torch.int32
                 or buf.numel() < max_batch_size
             ):
-                buf = torch.empty((max_batch_size,), device="cpu", dtype=torch.int32, pin_memory=True)
-                setattr(self, name, buf)
+                buf = _new_cpu_tensor(
+                    (max_batch_size,),
+                    dtype=torch.int32,
+                    pin_memory=True,
+                )
+                setattr(self, slot_name, buf)
             return buf
 
         last_n_cpu_stage = _ensure_prefill_cpu_stage("_prefill_last_n_cpu_i32")[:batch_size]
@@ -8769,13 +8817,31 @@ def maybe_build_step_prefill_global_meta_from_metadata_impl(
             or self._prefill_cap_i32.numel() < max_batch_size
         ):
             self._prefill_cap_i32 = torch.empty((max_batch_size,), device=device, dtype=torch.int32)
-        self._prefill_last_n_i32[:batch_size].copy_(last_n_cpu_stage, non_blocking=True)
-        self._prefill_cap_i32[:batch_size].copy_(cap_cpu_stage, non_blocking=True)
+        try:
+            self._prefill_last_n_i32[:batch_size].copy_(
+                last_n_cpu_stage,
+                non_blocking=True,
+            )
+            self._prefill_cap_i32[:batch_size].copy_(
+                cap_cpu_stage,
+                non_blocking=True,
+            )
+        except BaseException as exc:
+            _protect_failed_stage_h2d(
+                stage_cache=None,
+                cache_owner=self,
+                key=f"{stage_slot_key}_evt",
+                device=device,
+                stream=stage_stream,
+                error=exc,
+            )
+            raise
         _record_stage_h2d_evt(
             stage_cache=None,
             cache_owner=self,
-            key="_prefill_i32_stage_h2d_evt",
+            key=f"{stage_slot_key}_evt",
             device=device,
+            stream=stage_stream,
         )
         if batch_size < max_batch_size:
             self._prefill_last_n_i32[batch_size:max_batch_size].zero_()

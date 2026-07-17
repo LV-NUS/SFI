@@ -39,6 +39,7 @@ from benchmarks.scheduler_contract import (
     SCHEDULER_GRAPH_CONTRACT_SCHEMA,
     SCHEDULER_GRAPH_RUNTIME_FIELDS,
 )
+from benchmarks.sm80_run_pair import build_config_digest
 from scripts.check_tp8_arm_teardown import (
     ATTRIBUTION_SCOPE as TP8_ATTRIBUTION_SCOPE,
     arm_token_sha256,
@@ -285,6 +286,7 @@ def _reference_gate_integrity_reasons(
     *,
     mode: str,
     exact_tier: bool = False,
+    allow_local_pair_comparison_only: bool = False,
 ) -> list[str]:
     if mode == "dense":
         return []
@@ -309,6 +311,12 @@ def _reference_gate_integrity_reasons(
             return ["debug_dense_reference_gate_must_be_none"]
         if reference_reasons != ["dense_reference_skipped_for_debug"]:
             return ["debug_dense_reference_reason_mismatch"]
+        return []
+    if allow_local_pair_comparison_only:
+        if reference_passed is not False:
+            return ["local_pair_comparison_reference_gate_must_be_false"]
+        if reference_reasons != ["reference_semantic_mismatch"]:
+            return ["local_pair_comparison_reference_reason_mismatch"]
         return []
     if reference_passed is not True:
         return ["dense_reference_gate_not_green"]
@@ -559,10 +567,13 @@ def _model_kv_contract_reasons(
     if not isinstance(recorded, dict):
         return ["runner_model_kv_contract_missing_or_invalid"]
     reasons: list[str] = []
+    tensor_parallel_size = provenance.get("tensor_parallel_size")
+    if type(tensor_parallel_size) is not int or tensor_parallel_size <= 0:
+        return ["runner_model_kv_tensor_parallel_size_invalid"]
     try:
         derived = derive_model_kv_contract(
             Path(str(provenance.get("model", "") or "")),
-            tensor_parallel_size=8,
+            tensor_parallel_size=tensor_parallel_size,
         )
     except (OSError, ValueError) as exc:
         return [f"runner_model_kv_contract_unverifiable:{exc}"]
@@ -623,7 +634,11 @@ def _model_kv_contract_reasons(
         except (TypeError, ValueError):
             reasons.append("runner_model_kv_capacity_inputs_invalid")
         else:
-            generation_count = 2
+            dual_gen = provenance.get("runner_compact_dual_gen")
+            if dual_gen not in {"0", "1"}:
+                reasons.append("runner_model_kv_compact_dual_gen_invalid")
+                return reasons
+            generation_count = 2 if dual_gen == "1" else 1
             per_rank = int(derived["per_rank_bytes_per_token"])
             lease_bytes = (
                 batch_size * compact_blocks * 16 * per_rank * generation_count
@@ -635,11 +650,14 @@ def _model_kv_contract_reasons(
                 else -1
             )
             needed = context_tokens + max_new_tokens
-            if capacity < needed:
+            preflight_status = provenance.get("runner_kv_preflight_status")
+            if capacity < needed and preflight_status == "passed":
                 reasons.append(
                     "runner_model_kv_capacity_insufficient:"
                     f"capacity={capacity}:needed={needed}"
                 )
+            elif capacity >= needed and preflight_status == "undersized_override":
+                reasons.append("runner_model_kv_undersized_override_not_needed")
     return reasons
 
 
@@ -793,6 +811,14 @@ def _runner_config_identity_reasons(
                 "runner_explicit_async_scheduling_proof_mismatch:"
                 f"{field}:actual={actual!r}:expected={expected!r}"
             )
+    if expected_tier is not None:
+        reasons.extend(
+            _model_kv_contract_reasons(
+                summary,
+                mode=mode,
+                expected_model_config_sha256=expected_model_config_sha256,
+            )
+        )
     if expected_tier == "tp8x64k":
         tp8_exact_fields: dict[str, object] = {
             "tensor_parallel_size": 8,
@@ -830,13 +856,6 @@ def _runner_config_identity_reasons(
                     "runner_tp8_exact_workload_mismatch:"
                     f"{field}:actual={actual!r}:expected={expected!r}"
                 )
-        reasons.extend(
-            _model_kv_contract_reasons(
-                summary,
-                mode=mode,
-                expected_model_config_sha256=expected_model_config_sha256,
-            )
-        )
         if provenance.get("runner_gpu_physical_capacity_status") != "passed":
             reasons.append("runner_tp8_gpu_physical_capacity_not_proven")
         for field in (
@@ -1509,6 +1528,153 @@ def _exact_runtime_proof_reasons(
     return reasons
 
 
+_PAIR_BACKEND_CONTRACT = {
+    "sparse": "FLASH_ATTN",
+    "dense": "FLASH_ATTN_VLLM_V1",
+}
+_PAIR_RUNNER_CONTRACT = {
+    "sparse": "run_sparse_only.py",
+    "dense": "run_dense_only.py",
+}
+
+
+def _pair_summary_integrity_reasons(
+    summary: dict[str, Any],
+    *,
+    prefix: str,
+) -> list[str]:
+    """Validate pair evidence shared by local comparison and exact TP8."""
+    reasons: list[str] = []
+    expected_fields = {
+        "sparse_dense_pair_required": True,
+        "sparse_dense_pair_execution_order": (
+            "sparse_speed,dense_reference,sparse_diagnostic"
+        ),
+        "sparse_dense_pair_scope": (
+            "same_parent_same_gpu_lock_adjacent_observer_free_engine_loop"
+        ),
+        "sparse_dense_pair_total_wall_scope": (
+            "measurement_engine_loop_prefill_plus_decode_excludes_engine_init"
+        ),
+        "sparse_dense_pair_observer_free": True,
+        "sparse_dense_pair_child_identity_scope": "arm_invariant_projection",
+        "sparse_dense_pair_arm_backend_contract": _PAIR_BACKEND_CONTRACT,
+        "sparse_dense_pair_arm_backend_contract_passed": True,
+        "sparse_dense_pair_arm_runner_contract": _PAIR_RUNNER_CONTRACT,
+        "sparse_dense_pair_arm_runner_contract_passed": True,
+        "sparse_dense_pair_arm_runner_observed": {
+            arm: {
+                "top_level": runner,
+                "run_config": runner,
+            }
+            for arm, runner in _PAIR_RUNNER_CONTRACT.items()
+        },
+        "sparse_dense_pair_geometry_match": True,
+    }
+    for field, expected in expected_fields.items():
+        if summary.get(field) != expected:
+            reasons.append(f"{prefix}_field_mismatch:{field}")
+
+    geometries: dict[str, dict[str, Any]] = {}
+    recorded_digests: dict[str, str] = {}
+    for arm in ("sparse", "dense"):
+        geometry = summary.get(f"sparse_dense_pair_{arm}_geometry")
+        if not isinstance(geometry, dict) or not geometry:
+            reasons.append(f"{prefix}_{arm}_geometry_invalid")
+            continue
+        geometries[arm] = geometry
+        digest_field = f"sparse_dense_pair_{arm}_geometry_digest"
+        recorded_digest = str(summary.get(digest_field, "") or "")
+        if re.fullmatch(r"[0-9a-f]{64}", recorded_digest) is None:
+            reasons.append(f"{prefix}_{arm}_geometry_digest_invalid")
+            continue
+        recorded_digests[arm] = recorded_digest
+        if recorded_digest != build_config_digest(geometry):
+            reasons.append(f"{prefix}_{arm}_geometry_digest_not_raw")
+
+    if geometries.get("sparse") != geometries.get("dense"):
+        reasons.append(f"{prefix}_actual_geometry_mismatch")
+    if recorded_digests.get("sparse") != recorded_digests.get("dense"):
+        reasons.append(f"{prefix}_geometry_digest_mismatch")
+
+    for arm, expected_backend in _PAIR_BACKEND_CONTRACT.items():
+        identity = summary.get(f"sparse_dense_pair_{arm}_child_identity")
+        if not isinstance(identity, dict):
+            reasons.append(f"{prefix}_{arm}_child_identity_invalid")
+        elif identity.get("attention_backend") != expected_backend:
+            reasons.append(f"{prefix}_{arm}_attention_backend_mismatch")
+    return reasons
+
+
+def _explicit_local_pair_reasons(summary: dict[str, Any]) -> list[str]:
+    """Validate a local timed pair without upgrading it to a speedup verdict."""
+    reasons = _pair_summary_integrity_reasons(summary, prefix="local_pair")
+    expected_fields = {
+        "sparse_dense_pair_contract_kind": "explicit_local_comparison",
+        "sparse_dense_pair_dense_metrics_readable": True,
+        "sparse_dense_pair_comparison_gate_passed": True,
+        "sparse_dense_pair_comparison_gate_reasons": [],
+        "sparse_dense_pair_speedup_gate_passed": None,
+        "sparse_dense_pair_speedup_gate_reasons": [],
+        "sparse_dense_pair_claim": "paired_engine_loop_comparison",
+    }
+    for field, expected in expected_fields.items():
+        if summary.get(field) != expected:
+            reasons.append(f"local_pair_field_mismatch:{field}")
+    for field in (
+        "total_wall_speedup",
+        "total_token_speedup",
+        "decode_speedup",
+        "all_decode_speedup",
+    ):
+        if not _is_finite_positive_number(summary.get(field)):
+            reasons.append(f"local_pair_ratio_invalid:{field}")
+    expected_speedup_observed = all(
+        _is_finite_positive_number(summary.get(field))
+        and float(summary[field]) > 1.0
+        for field in (
+            "total_wall_speedup",
+            "total_token_speedup",
+            "decode_speedup",
+            "all_decode_speedup",
+        )
+    )
+    if summary.get("sparse_dense_pair_speedup_observed") is not (
+        expected_speedup_observed
+    ):
+        reasons.append("local_pair_speedup_observed_mismatch")
+    return reasons
+
+
+def _is_documented_local_pair_comparison_only(
+    summary: dict[str, Any],
+    *,
+    mode: str,
+    exact_tier: bool,
+    expect_local_paired_comparison: bool,
+    semantic_gate_reasons: list[object],
+    producer_gate_reasons: list[object],
+) -> bool:
+    """Recognize the sole non-production exit allowed for a valid local pair."""
+    return bool(
+        expect_local_paired_comparison
+        and mode == "sparse"
+        and not exact_tier
+        and semantic_gate_reasons
+        == ["semantic_output_health_not_ok:semantic_mismatch"]
+        and producer_gate_reasons == []
+        and summary.get("reference_gate_passed") is False
+        and summary.get("reference_gate_reasons")
+        == ["reference_semantic_mismatch"]
+        and summary.get("reference_returncode") == 0
+        and summary.get("reference_timed_out") is False
+        and summary.get("skip_dense_reference") is not True
+        and summary.get("gate_passed") is False
+        and summary.get("production_gate_passed") is False
+        and not _explicit_local_pair_reasons(summary)
+    )
+
+
 def _exact_engine_runtime_and_pair_reasons(
     summary: dict[str, Any],
     *,
@@ -1583,16 +1749,18 @@ def _exact_engine_runtime_and_pair_reasons(
     if mode != "sparse":
         return reasons
 
+    reasons.extend(
+        _pair_summary_integrity_reasons(
+            summary,
+            prefix="tp8_exact_pair",
+        )
+    )
     exact_pair_fields = {
-        "sparse_dense_pair_required": True,
-        "sparse_dense_pair_execution_order": (
-            "sparse_speed,dense_reference,sparse_diagnostic"
-        ),
-        "sparse_dense_pair_observer_free": True,
-        "sparse_dense_pair_child_identity_scope": "arm_invariant_projection",
-        "sparse_dense_pair_arm_backend_contract_passed": True,
-        "sparse_dense_pair_arm_runner_contract_passed": True,
-        "sparse_dense_pair_geometry_match": True,
+        "sparse_dense_pair_contract_kind": "exact_speedup_verdict",
+        "sparse_dense_pair_dense_metrics_readable": True,
+        "sparse_dense_pair_comparison_gate_passed": None,
+        "sparse_dense_pair_comparison_gate_reasons": [],
+        "sparse_dense_pair_speedup_observed": True,
         "sparse_dense_pair_speedup_gate_passed": True,
         "sparse_dense_pair_speedup_gate_reasons": [],
         "sparse_dense_pair_claim": (
@@ -1602,36 +1770,6 @@ def _exact_engine_runtime_and_pair_reasons(
     for field, expected in exact_pair_fields.items():
         if summary.get(field) != expected:
             reasons.append(f"tp8_exact_pair_field_mismatch:{field}")
-    expected_backend_contract = {
-        "sparse": "FLASH_ATTN",
-        "dense": "FLASH_ATTN_VLLM_V1",
-    }
-    if summary.get("sparse_dense_pair_arm_backend_contract") != (
-        expected_backend_contract
-    ):
-        reasons.append("tp8_exact_pair_backend_contract_mismatch")
-    expected_runner_contract = {
-        "sparse": "run_sparse_only.py",
-        "dense": "run_dense_only.py",
-    }
-    if summary.get("sparse_dense_pair_arm_runner_contract") != (
-        expected_runner_contract
-    ):
-        reasons.append("tp8_exact_pair_runner_contract_mismatch")
-    for field in (
-        "sparse_dense_pair_sparse_geometry_digest",
-        "sparse_dense_pair_dense_geometry_digest",
-    ):
-        if re.fullmatch(r"[0-9a-f]{64}", str(summary.get(field, "") or "")) is None:
-            reasons.append(f"tp8_exact_pair_digest_invalid:{field}")
-    if summary.get("sparse_dense_pair_sparse_geometry_digest") != summary.get(
-        "sparse_dense_pair_dense_geometry_digest"
-    ):
-        reasons.append("tp8_exact_pair_digest_mismatch")
-    if summary.get("sparse_dense_pair_sparse_geometry") != summary.get(
-        "sparse_dense_pair_dense_geometry"
-    ):
-        reasons.append("tp8_exact_pair_actual_geometry_mismatch")
     for field in (
         "total_wall_speedup",
         "total_token_speedup",
@@ -1668,7 +1806,7 @@ def _exact_engine_runtime_and_pair_reasons(
         }
         raw_runner_observed[arm] = observed
         for location in ("top_level", "run_config"):
-            if observed.get(location) != expected_runner_contract[arm]:
+            if observed.get(location) != _PAIR_RUNNER_CONTRACT[arm]:
                 reasons.append(
                     f"tp8_exact_pair_{arm}_raw_runner_mismatch:{location}"
                 )
@@ -1820,7 +1958,7 @@ def _exact_engine_runtime_and_pair_reasons(
                 reasons.append(
                     f"tp8_exact_pair_{arm}_child_identity_mismatch:{field}"
                 )
-        if raw_identity.get("attention_backend") != expected_backend_contract[arm]:
+        if raw_identity.get("attention_backend") != _PAIR_BACKEND_CONTRACT[arm]:
             reasons.append(
                 f"tp8_exact_pair_{arm}_attention_backend_mismatch"
             )
@@ -1845,20 +1983,6 @@ def _exact_engine_runtime_and_pair_reasons(
             reasons.append(
                 f"tp8_exact_pair_{arm}_child_identity_projection_mismatch"
             )
-        recorded_digest = summary.get(
-            f"sparse_dense_pair_{arm}_geometry_digest"
-        )
-        computed_digest = hashlib.sha256(
-            json.dumps(
-                geometry,
-                sort_keys=True,
-                separators=(",", ":"),
-                ensure_ascii=True,
-                default=str,
-            ).encode("utf-8")
-        ).hexdigest()
-        if recorded_digest != computed_digest:
-            reasons.append(f"tp8_exact_pair_{arm}_geometry_digest_not_raw")
     if invariant_projections.get("sparse") != invariant_projections.get("dense"):
         reasons.append("tp8_exact_pair_child_identity_invariant_mismatch")
     return reasons
@@ -2474,6 +2598,8 @@ def _harness_condition_reasons(
     expected_flash_attn_version: int | None,
     expected_git_commit: str | None,
     expected_model_config_sha256: str | None,
+    expect_local_paired_comparison: bool = False,
+    allow_local_pair_comparison_only: bool = False,
 ) -> list[str]:
     reasons: list[str] = []
     exact_tier = expected_tier == "tp8x64k"
@@ -2721,6 +2847,13 @@ def _harness_condition_reasons(
                 mode=mode,
             )
         )
+    if expect_local_paired_comparison:
+        if mode != "sparse":
+            reasons.append("local_pair_requires_sparse_mode")
+        elif exact_tier:
+            reasons.append("local_pair_cannot_replace_exact_tp8_verdict")
+        else:
+            reasons.extend(_explicit_local_pair_reasons(summary))
 
     if producer_gate_reasons:
         if summary.get("producer_gate_passed") is not False:
@@ -2734,7 +2867,12 @@ def _harness_condition_reasons(
         for reason in all_gate_reasons
     )
     production_gate_passed = summary.get("production_gate_passed")
-    if only_allowed_gate_noise:
+    if allow_local_pair_comparison_only:
+        if production_gate_passed is not False:
+            reasons.append(
+                "production_gate_state_inconsistent_with_local_comparison_only"
+            )
+    elif only_allowed_gate_noise:
         if production_gate_passed is not False:
             reasons.append("production_gate_state_inconsistent_with_allowed_noise")
     elif production_gate_passed is not True:
@@ -2745,6 +2883,7 @@ def _harness_condition_reasons(
             summary,
             mode=mode,
             exact_tier=exact_tier,
+            allow_local_pair_comparison_only=allow_local_pair_comparison_only,
         )
     )
     return reasons
@@ -2765,6 +2904,7 @@ def check_run_speed_summary(
     expected_flash_attn_version: int | None = None,
     expected_git_commit: str | None = None,
     expected_model_config_sha256: str | None = None,
+    expect_local_paired_comparison: bool = False,
 ) -> tuple[int, list[str]]:
     messages: list[str] = []
     if expected_tier is not None and expected_tier not in RUN_SPEED_TIERS:
@@ -2876,12 +3016,24 @@ def check_run_speed_summary(
     else:
         producer_gate_reasons = list(producer_gate_reasons_raw)
     gate_reasons = semantic_gate_reasons + producer_gate_reasons
-    unexpected_gate_reasons = [
-        reason
-        for reason in gate_reasons
-        if mode != "sparse"
-        or not _is_allowed_gate_noise(reason, exact_tier=exact_tier)
-    ]
+    local_pair_comparison_only = _is_documented_local_pair_comparison_only(
+        summary,
+        mode=mode,
+        exact_tier=exact_tier,
+        expect_local_paired_comparison=expect_local_paired_comparison,
+        semantic_gate_reasons=semantic_gate_reasons,
+        producer_gate_reasons=producer_gate_reasons,
+    )
+    unexpected_gate_reasons = (
+        []
+        if local_pair_comparison_only
+        else [
+            reason
+            for reason in gate_reasons
+            if mode != "sparse"
+            or not _is_allowed_gate_noise(reason, exact_tier=exact_tier)
+        ]
+    )
     documented_gate_noise_present = bool(
         mode == "sparse"
         and any(
@@ -2914,6 +3066,8 @@ def check_run_speed_summary(
             expected_flash_attn_version=expected_flash_attn_version,
             expected_git_commit=expected_git_commit,
             expected_model_config_sha256=expected_model_config_sha256,
+            expect_local_paired_comparison=expect_local_paired_comparison,
+            allow_local_pair_comparison_only=local_pair_comparison_only,
         )
     )
 
@@ -2958,7 +3112,11 @@ def check_run_speed_summary(
         messages.append(f"HARNESS FAILED: returncode={harness_returncode}")
         messages.append("SPEED RUN CHECK FAILED")
         return harness_returncode, messages
-    if harness_returncode == 2 and not documented_gate_noise_present:
+    if (
+        harness_returncode == 2
+        and not documented_gate_noise_present
+        and not local_pair_comparison_only
+    ):
         messages.append(
             "HARNESS returncode=2 rejected: current summary has no documented "
             "no-reference gate reason"
@@ -2977,12 +3135,26 @@ def check_run_speed_summary(
         return (2 if harness_returncode == 2 else 1), messages
 
     if harness_returncode == 2:
-        messages.append(
-            "HARNESS returncode=2 accepted: current summary contains only "
-            "the documented no-reference gate noise"
-        )
+        if local_pair_comparison_only:
+            messages.append(
+                "HARNESS returncode=2 accepted: local pair is valid; "
+                "production correctness remains failed on the documented "
+                "reference semantic mismatch"
+            )
+        else:
+            messages.append(
+                "HARNESS returncode=2 accepted: current summary contains only "
+                "the documented no-reference gate noise"
+            )
     if exact_tier and mode == "sparse":
         messages.append("SPARSE/DENSE PAIRED ENGINE-LOOP SPEEDUP OK")
+    elif local_pair_comparison_only:
+        messages.append(
+            "SPARSE/DENSE LOCAL PAIRED COMPARISON ONLY "
+            "(production correctness failed: reference_semantic_mismatch)"
+        )
+    elif expect_local_paired_comparison and mode == "sparse":
+        messages.append("SPARSE/DENSE LOCAL PAIRED COMPARISON OK")
     else:
         messages.append("SPEED ARM HEALTHY (single arm; no speedup claim)")
     return 0, messages
@@ -3006,6 +3178,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--expected-flash-attn-version", type=int, choices=(3, 4))
     parser.add_argument("--expected-git-commit")
     parser.add_argument("--expected-model-config-sha256")
+    parser.add_argument(
+        "--expect-local-paired-comparison",
+        action="store_true",
+        help=(
+            "Require an explicit local sparse/dense timed comparison. "
+            "Ratios must be finite and positive, but may be at or below one."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -3025,6 +3205,7 @@ def main() -> int:
         expected_flash_attn_version=args.expected_flash_attn_version,
         expected_git_commit=args.expected_git_commit,
         expected_model_config_sha256=args.expected_model_config_sha256,
+        expect_local_paired_comparison=args.expect_local_paired_comparison,
     )
     for message in messages:
         print(message)

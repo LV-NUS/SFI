@@ -30,7 +30,6 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 import torch
 
 from patches.refresh_runtime.entry import run_refresh_step
-from patches.refresh_runtime import deferred_p0_shadow
 from patches.runtime_contracts import ExecutionBackendLedger
 from patches.sparse_constants import (
     _CAPTURE_CHUNK,
@@ -49,6 +48,10 @@ _DeferredProducerLaunchIntent = Tuple[
     bool,
     _DeferredProducerJobSnapshot,
 ]
+
+_DEFER_BOOTSTRAP_PRODUCER_CACHED = (
+    os.environ.get("VLLM_SPARSE_DEFER_BOOTSTRAP_PRODUCER", "0") == "1"
+)
 
 
 
@@ -131,6 +134,10 @@ class WaitDeciderMixin:
         self._step_has_compact_consumer_cache_value: bool = False
         # bootstrap (prefill selector+compact build) completion confirmation
         self._bootstrap_pending_request_ids: Set[str] = set()
+        # Deterministic host-side transition ledger. Exact capture-plan
+        # finalizers are bound to their producer epoch; steady decode pays one
+        # empty-dict check instead of rescanning the scheduler batch.
+        self._bootstrap_submission_boundary_pending_epoch_by_id: Dict[str, int] = {}
         # one-shot group-ready graph waits use stable event handles. The graph
         # captures waits on these handles once; each prefill producer group
         # records the same handle for the current request before replay.
@@ -756,16 +763,6 @@ class WaitDeciderMixin:
             if adaptive_budget
             else int(groups_per_step)
         )
-        shadow_token = None
-        if deferred_p0_shadow.DEFERRED_P0_SHADOW_ENABLED:
-            shadow_token = deferred_p0_shadow.begin_deferred_submit_shadow(
-                self,
-                epoch=int(epoch),
-                only_request_ids=tuple(only_request_ids or tuple()),
-                allow_same_epoch=bool(allow_same_epoch),
-                groups_per_step=int(groups_per_step),
-                remaining_group_budget=int(remaining_group_budget),
-            )
         for rid, tracking in list(self.request_states.items()):
             if (adaptive_budget or groups_per_step > 0) and remaining_group_budget <= 0:
                 break
@@ -848,16 +845,6 @@ class WaitDeciderMixin:
                 max_groups_per_call=int(launch_group_budget),
             )
             after_group_index = int(getattr(job, "next_payload_group_index", 0) or 0)
-            if shadow_token is not None:
-                deferred_p0_shadow.record_deferred_actual_submit(
-                    shadow_token,
-                    request_id=str(rid),
-                    job=job,
-                    before_group_index=int(before_group_index),
-                    after_group_index=int(after_group_index),
-                    max_groups_per_call=int(launch_group_budget),
-                    completed=bool(completed),
-                )
             if adaptive_budget or groups_per_step > 0:
                 submitted_groups = max(0, int(after_group_index) - int(before_group_index))
                 remaining_group_budget -= int(submitted_groups)
@@ -865,8 +852,6 @@ class WaitDeciderMixin:
                 getattr(job, "completed", False)
             ):
                 launched += 1
-        if shadow_token is not None:
-            deferred_p0_shadow.finish_deferred_submit_shadow(self, shadow_token)
         return launched
 
     def _bootstrap_pending_requires_global_wait(self) -> bool:
@@ -1144,6 +1129,8 @@ class WaitDeciderMixin:
             pending_ep = int(tracking.bootstrap_pending_epoch)
             if pending_ep < 0 or pending_ep >= ep:
                 continue
+            if self._bootstrap_submission_boundary_blocks_publish(rid=rid):
+                continue
             if self._request_bridge_token_budget_remaining(str(rid)):
                 setattr(
                     tracking,
@@ -1207,6 +1194,90 @@ class WaitDeciderMixin:
             return False
         return bool(getattr(getattr(self, "config", None), "one_shot_bootstrap_only", False))
 
+    def _deferred_bootstrap_producer_enabled(self) -> bool:
+        if _DYNAMIC_ENV:
+            return (
+                os.environ.get("VLLM_SPARSE_DEFER_BOOTSTRAP_PRODUCER", "0")
+                == "1"
+            )
+        return bool(_DEFER_BOOTSTRAP_PRODUCER_CACHED)
+
+    def _bootstrap_submission_boundary_enabled(self) -> bool:
+        """Return whether request-local async prefill submission is required."""
+
+        return bool(
+            self._async_refresh_enabled()
+            and bool(
+                getattr(
+                    getattr(self, "config", None),
+                    "one_shot_bootstrap_only",
+                    False,
+                )
+            )
+            and not self._deferred_bootstrap_producer_enabled()
+        )
+
+    def _bootstrap_submission_boundary_blocks_publish(self, *, rid: str) -> bool:
+        """Keep publication behind the host submission transaction."""
+
+        pending_epoch_by_id = getattr(
+            self,
+            "_bootstrap_submission_boundary_pending_epoch_by_id",
+            None,
+        )
+        if not isinstance(pending_epoch_by_id, dict):
+            raise RuntimeError("E_TP_BOOTSTRAP_SUBMISSION_LEDGER_CORRUPT")
+        return str(rid) in pending_epoch_by_id
+
+    def _arm_prefill_submission_boundary(
+        self,
+        *,
+        request_ids: Sequence[str],
+        epoch: int,
+    ) -> int:
+        """Arm exact final-chunk producers for next-step publication.
+
+        The caller supplies ``finalize_req_ids`` from the immutable CPU capture
+        plan.  This avoids inferring producer existence from scheduler prompt
+        counters and leaves capture-disabled/continuous/deferred modes outside
+        the ledger entirely.
+        """
+
+        if not request_ids or not self._bootstrap_submission_boundary_enabled():
+            return 0
+        pending_epoch_by_id = getattr(
+            self,
+            "_bootstrap_submission_boundary_pending_epoch_by_id",
+            None,
+        )
+        if not isinstance(pending_epoch_by_id, dict):
+            raise RuntimeError("E_TP_BOOTSTRAP_SUBMISSION_LEDGER_CORRUPT")
+        arm_epoch = int(epoch)
+        if arm_epoch < 0:
+            raise RuntimeError("E_TP_BOOTSTRAP_SUBMISSION_LEDGER_EPOCH")
+        armed_ids = tuple(dict.fromkeys(str(rid) for rid in request_ids))
+        missing_ids = [rid for rid in armed_ids if rid not in self.request_states]
+        if missing_ids:
+            raise RuntimeError(
+                "E_TP_BOOTSTRAP_SUBMISSION_LEDGER_UNKNOWN_REQUEST: "
+                f"requests={missing_ids[:4]} count={len(missing_ids)}"
+            )
+        stale_ids = [
+            (rid, int(pending_epoch_by_id[rid]))
+            for rid in armed_ids
+            if rid in pending_epoch_by_id
+            and int(pending_epoch_by_id[rid]) != arm_epoch
+        ]
+        if stale_ids:
+            raise RuntimeError(
+                "E_TP_BOOTSTRAP_SUBMISSION_LEDGER_UNCONSUMED: "
+                f"armed_epoch={arm_epoch} prior={stale_ids[:4]}"
+            )
+        pending_epoch_by_id.update(
+            (rid, arm_epoch) for rid in armed_ids
+        )
+        return len(armed_ids)
+
     def _one_shot_group_ready_graph_wait_enabled(self) -> bool:
         if not self._one_shot_graph_async_bootstrap_enabled():
             return False
@@ -1262,6 +1333,120 @@ class WaitDeciderMixin:
             device=device,
         )
         return True
+
+    def _validate_prefill_submission_before_bootstrap_publish(
+        self,
+        *,
+        req_ids: Sequence[str],
+        epoch: int,
+    ) -> int:
+        """Validate the async-prefill submission boundary before publish.
+
+        ``bootstrap_done`` is a TP-visible routing decision.  The producer's
+        CUDA completion may differ across ranks, but the request must not expose
+        compact state until every rank has submitted its request-local final
+        event.  Submission is host-owned state: a device wait cannot create a
+        missing finalize record.  The transition ledger keeps steady decode
+        outside both the request scan and all CUDA work.
+        """
+        pending_epoch_by_id = getattr(
+            self,
+            "_bootstrap_submission_boundary_pending_epoch_by_id",
+            None,
+        )
+        if not isinstance(pending_epoch_by_id, dict):
+            raise RuntimeError("E_TP_BOOTSTRAP_SUBMISSION_LEDGER_CORRUPT")
+        if not pending_epoch_by_id:
+            return 0
+        if not self._bootstrap_submission_boundary_enabled():
+            raise RuntimeError(
+                "E_TP_BOOTSTRAP_SUBMISSION_LEDGER_SCOPE_DRIFT"
+            )
+
+        active_ids = {str(rid_raw) for rid_raw in req_ids}
+        candidates: List[Tuple[str, object, int]] = []
+        current_epoch = int(epoch)
+        for rid, arm_epoch_raw in tuple(pending_epoch_by_id.items()):
+            arm_epoch = int(arm_epoch_raw)
+            if arm_epoch > current_epoch:
+                raise RuntimeError(
+                    "E_TP_BOOTSTRAP_SUBMISSION_LEDGER_FUTURE_EPOCH: "
+                    f"request={rid!r} armed={arm_epoch} current={current_epoch}"
+                )
+            if arm_epoch == current_epoch:
+                # _prepare_inputs may re-enter in the producer's own dispatch.
+                # Validation belongs to the first later step, after attention
+                # had a chance to submit the request-local final event.
+                continue
+            if rid not in active_ids:
+                continue
+            tracking = self.request_states.get(rid)
+            if tracking is None:
+                raise RuntimeError(
+                    "E_TP_BOOTSTRAP_SUBMISSION_LEDGER_UNKNOWN_REQUEST: "
+                    f"request={rid!r}"
+                )
+            if bool(getattr(tracking, "bootstrap_done", False)):
+                raise RuntimeError(
+                    "E_TP_BOOTSTRAP_SUBMISSION_LEDGER_BYPASSED: "
+                    f"request={rid!r} bootstrap_done before validation"
+                )
+            if bool(getattr(tracking, "_was_short_dense", False)):
+                raise RuntimeError(
+                    "E_TP_BOOTSTRAP_SUBMISSION_LEDGER_SCOPE_DRIFT: "
+                    f"request={rid!r} is short-dense"
+                )
+            if bool(getattr(tracking, "bootstrap_bridge_active", False)):
+                raise RuntimeError(
+                    "E_TP_BOOTSTRAP_SUBMISSION_LEDGER_SCOPE_DRIFT: "
+                    f"request={rid!r} entered deferred bridge"
+                )
+            candidates.append((rid, tracking, arm_epoch))
+        if not candidates:
+            return 0
+
+        missing = []
+        for rid, tracking, arm_epoch in candidates:
+            if not bool(getattr(tracking, "bootstrap_pending", False)):
+                missing.append(rid)
+                continue
+            if int(getattr(tracking, "bootstrap_pending_epoch", -1)) != arm_epoch:
+                raise RuntimeError(
+                    "E_TP_BOOTSTRAP_SUBMISSION_LEDGER_EPOCH_DRIFT: "
+                    f"request={rid!r} armed={arm_epoch} pending="
+                    f"{int(getattr(tracking, 'bootstrap_pending_epoch', -1))}"
+                )
+            if not WaitDeciderMixin._bootstrap_request_events_submitted(
+                tracking=tracking
+            ):
+                missing.append(rid)
+                continue
+            ready_state = getattr(tracking, "producer_ready_state", None)
+            if ready_state is None:
+                raise RuntimeError(
+                    "E_TP_BOOTSTRAP_SUBMISSION_BOUNDARY: producer ready "
+                    f"state is missing for request={rid!r}"
+                )
+            from patches.refresh_runtime.producer_ready import (
+                validate_producer_ready_for_publish,
+            )
+
+            try:
+                validate_producer_ready_for_publish(ready_state)
+            except Exception as exc:
+                raise RuntimeError(
+                    "E_TP_BOOTSTRAP_SUBMISSION_BOUNDARY: producer ready "
+                    f"state is incomplete for request={rid!r}"
+                ) from exc
+        if missing:
+            raise RuntimeError(
+                "E_TP_BOOTSTRAP_SUBMISSION_BOUNDARY: long-request prefill "
+                "completed without a submitted request-local bootstrap event; "
+                f"epoch={int(epoch)} requests={missing[:4]} count={len(missing)}"
+            )
+        for rid, _tracking, _arm_epoch in candidates:
+            pending_epoch_by_id.pop(rid, None)
+        return len(candidates)
 
     def _wait_one_shot_group_ready_for_full_graph_replay(
         self,
@@ -1497,6 +1682,8 @@ class WaitDeciderMixin:
                 continue
             pending_ep = int(tracking.bootstrap_pending_epoch)
             if pending_ep < 0 or pending_ep >= ep:
+                continue
+            if self._bootstrap_submission_boundary_blocks_publish(rid=rid):
                 continue
             if self._request_bridge_token_budget_remaining(str(rid)):
                 setattr(

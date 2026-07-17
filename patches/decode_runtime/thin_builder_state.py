@@ -222,6 +222,28 @@ def classify_decode_runtime_mode(
     if current_delta.pending_refresh_state not in ("nil", "empty"):
         return DecodeRuntimeMode.FULL_RECOMPILE, "pending_refresh_not_steady"
     if current_delta.row_dynamic_signature != previous_delta.row_dynamic_signature:
+        # The five-field row signature is
+        # (slot, row_mode, use_compact, compact_valid, compact_offset).
+        # Only row_mode is a true row-table dynamic.  The other four fields
+        # select static launch-plan rows 0/1 and the compact offset mirror;
+        # apply_launch_template_row_delta updates rows 2..5 only.  Treating a
+        # bootstrap handoff (use_compact 0->1) as PAGE_BOUNDARY_DELTA reused the
+        # previous full-row layout, so RRP observed e.g. slot=2 with offset=0.
+        # Project/compare only on this already-cold mismatch branch: steady
+        # classification keeps its existing single tuple comparison.
+        previous_static = _row_static_layout_signature(
+            previous_delta.row_dynamic_signature
+        )
+        current_static = _row_static_layout_signature(
+            current_delta.row_dynamic_signature
+        )
+        # PAGE_BOUNDARY_DELTA is safe only when both signatures prove that
+        # every static launch field stayed identical.  Missing/malformed
+        # signatures are an absence of proof, not evidence of equality.
+        if previous_static is None or current_static is None:
+            return DecodeRuntimeMode.FULL_RECOMPILE, "row_static_layout_unproven"
+        if current_static != previous_static:
+            return DecodeRuntimeMode.FULL_RECOMPILE, "row_static_layout_changed"
         return DecodeRuntimeMode.PAGE_BOUNDARY_DELTA, "row_dynamic_layout_changed"
     if (
         current_delta.recent_first_page_by_row != previous_delta.recent_first_page_by_row
@@ -229,6 +251,18 @@ def classify_decode_runtime_mode(
     ):
         return DecodeRuntimeMode.PAGE_BOUNDARY_DELTA, "recent_window_changed"
     return DecodeRuntimeMode.STEADY_DELTA, "same_page_row_delta"
+
+
+def _row_static_layout_signature(
+    row_dynamic_signature: tuple[object, ...],
+) -> tuple[tuple[object, object, object, object], ...] | None:
+    """Project fields that cannot be updated by a launch-template row delta."""
+    projected = []
+    for raw_row in row_dynamic_signature:
+        if not isinstance(raw_row, (tuple, list)) or len(raw_row) != 5:
+            return None
+        projected.append((raw_row[0], raw_row[2], raw_row[3], raw_row[4]))
+    return tuple(projected) if projected else None
 
 
 def _page_aligned_recent_first_visible(

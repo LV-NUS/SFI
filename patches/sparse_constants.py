@@ -58,7 +58,7 @@ __all__ = [
     "_REPLAY_REFRESH_NOOP_FAST_SKIP_CACHED",
     "_REFRESH_REBUILD_MAX_DELAY_STEPS_CACHED",
     "_REFRESH_REBUILD_CHECK_CACHED",
-    "_PENDING_REBUILD_MAX_QUEUE_CACHED",
+    "_PENDING_REBUILD_MAX_QUEUE_OVERRIDE_CACHED",
     "_PREFILL_RELEASE_GRACE_STEPS",
     "_STEP_PROFILE_CACHED",
     "_STEP_PROFILE_DETAIL_CACHED",
@@ -69,7 +69,6 @@ __all__ = [
     "_SELECTOR_PIPELINE_WORKSPACE_CACHED",
     "_SELECTOR_FIXED_SHAPE_TOPK_CACHED",
     "_SELECTOR_KBUCKET_CACHED",
-    "_SELECTOR_KEY_NORMS_CACHE_CAP_CACHED",
     "_SELECTOR_TOPK_GRAPH_CACHED",
     "_SELECTED_OUT_RING_CACHED",
     "_SELECTED_OUT_RING_SLOTS_CACHED",
@@ -166,14 +165,6 @@ _WRITER_INPUT_BTABLE_CHECK_CACHED = (
 # batched_selection.canonicalize_selected_indices_pack_order 中无条件按逻辑
 # token index 升序规范化(无旋钮默认落地,换锚件)。
 _SELECTOR_TRUSTED_SHAPES_CACHED = os.environ.get("VLLM_SPARSE_SELECTOR_TRUSTED_SHAPES", "1") == "1"
-# Upper bound on distinct key_norms_all GPU buffers retained at once. Each is
-# [layers, batch, kv_heads, align_up(kv_len+1,4096)] fp16 = multi-GiB at long
-# contexts; without a cap the per-(bucket, slot-set) dict grows unbounded under a
-# variable-length server load and OOMs outside vLLM's util budget. 2 keeps the
-# active set + one in-flight transition; raise to disable bounding.
-_SELECTOR_KEY_NORMS_CACHE_CAP_CACHED: int = max(
-    1, int(os.environ.get("VLLM_SPARSE_SELECTOR_KEY_NORMS_CACHE_CAP", "2") or "2")
-)
 _SELECTOR_FAST_SIG_CACHED = os.environ.get("VLLM_SPARSE_SELECTOR_FAST_SIG", "1") == "1"
 _SELECTOR_CPP_PREPROC_CACHED = os.environ.get("VLLM_SPARSE_SELECTOR_CPP_PREPROC", "1") == "1"
 _SELECTOR_CPP_STACK_CACHED = os.environ.get("VLLM_SPARSE_SELECTOR_CPP_STACK", "1") == "1"
@@ -428,14 +419,35 @@ if _REFRESH_REBUILD_MAX_DELAY_STEPS_CACHED < 0:
     _REFRESH_REBUILD_MAX_DELAY_STEPS_CACHED = 0
 # [WRITER-RELEASE-STAGGER 2026-07-06] opt-in：同一 step 内背靠背入队的多个
 _REFRESH_REBUILD_CHECK_CACHED = os.environ.get("VLLM_SPARSE_REFRESH_REBUILD_CHECK", "0") == "1"
-try:
-    _PENDING_REBUILD_MAX_QUEUE_CACHED: int = int(
-        os.environ.get("VLLM_SPARSE_PENDING_REBUILD_MAX_QUEUE", "64") or "64"
-    )
-except ValueError:
-    _PENDING_REBUILD_MAX_QUEUE_CACHED = 64
-if _PENDING_REBUILD_MAX_QUEUE_CACHED < 0:
-    _PENDING_REBUILD_MAX_QUEUE_CACHED = 0
+def _parse_pending_rebuild_max_queue_override(
+    environ: Mapping[str, str],
+) -> Optional[int]:
+    """Return an explicit fail-closed queue ceiling, or runtime auto.
+
+    The default queue capacity is derived from the live request/layer-scope
+    ownership ledger.  A process-global population guess cannot represent
+    different batch sizes, model depths, or producer chunking.  The optional
+    override is retained only as a stricter diagnostic ceiling.
+    """
+    raw = environ.get("VLLM_SPARSE_PENDING_REBUILD_MAX_QUEUE", "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            "VLLM_SPARSE_PENDING_REBUILD_MAX_QUEUE must be a positive integer"
+        ) from exc
+    if value <= 0:
+        raise ValueError(
+            "VLLM_SPARSE_PENDING_REBUILD_MAX_QUEUE must be a positive integer"
+        )
+    return value
+
+
+_PENDING_REBUILD_MAX_QUEUE_OVERRIDE_CACHED: Optional[int] = (
+    _parse_pending_rebuild_max_queue_override(os.environ)
+)
 
 # Prefill buffer release grace period
 _PREFILL_RELEASE_GRACE_STEPS: int = 2
@@ -500,9 +512,11 @@ _SELECTOR_TOPK_GRAPH_CACHED = (
     and _SELECTOR_SELECTED_INDICES_OUT_CACHED
     and _SELECTOR_PIPELINE_WORKSPACE_CACHED
 )
-# [转正清理 2026-07-11] SELECTOR_GRAPH_LRU 旋钮下线(默认 OFF 从未转正;
-# population16 后合法稳态 key 全集 12<16 上限,清库臂本身罕至,LRU 分支
-# =死码。eviction 恒为 clear-all+thrash 联判)。
+# [SCOPE-OWNED GRAPH 2026-07-16] selector graph 不再使用全局/LRU/经验
+# population 上限。物理 ring 槽的 structural-shape scope 只持有当前 exact
+# graph，K/slice/storage 变化精确替换该 scope；热命中无 LRU touch。
+# 冷 exact key 仅记一个 scope candidate；同 key 再现才 capture，异构长度流
+# 因而不会为一次性 geometry 持续占用 CUDA private pool。
 # [SELECTED-OUT-RING 2026-07-09] pending-path selected_indices_out stable ring
 # (default ON). Replaces [SELECTED-PRIVATE-OUT 2026-07-07]'s per-run fresh
 # allocation with a bounded ring of data_ptr-stable buffers guarded by per-slot
@@ -516,13 +530,32 @@ _SELECTOR_TOPK_GRAPH_CACHED = (
 _SELECTED_OUT_RING_CACHED = (
     os.environ.get("VLLM_SPARSE_SELECTED_OUT_RING", "1") == "1"
 )
-# 槽数默认 3=世代 chunk 数对齐(begin_run preferred=chunk_id 稳定配对):
-# 每槽只服务一个 chunk 的层组形状族(形状恒定→容器零 realloc→指针稳定),
-# 3 chunk 在飞也不 spill;graph key 组合数≈chunk 数×capture 环深=6<8 上限。
-# (rv2g/rv3g 取证:自由/buf 配对下形状族交替致容器逐 run realloc,key 永
-# 不复现→64 窗 thrash 闩死 bypass。)容量超额走 spill(计数可见)。
-_SELECTED_OUT_RING_SLOTS_CACHED = int(
-    os.environ.get("VLLM_SPARSE_SELECTED_OUT_RING_SLOTS", "3") or "3"
+def _parse_selected_out_ring_slots_override(
+    environ: Mapping[str, str],
+) -> Optional[int]:
+    """Return the explicit ring-size override, or ``None`` for runtime auto."""
+    raw = environ.get("VLLM_SPARSE_SELECTED_OUT_RING_SLOTS", "").strip()
+    if not raw:
+        return None
+    try:
+        slots = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            "VLLM_SPARSE_SELECTED_OUT_RING_SLOTS must be a positive integer"
+        ) from exc
+    if slots <= 0:
+        raise ValueError(
+            "VLLM_SPARSE_SELECTED_OUT_RING_SLOTS must be a positive integer"
+        )
+    return slots
+
+
+# None means auto: the lazy construction site derives one stable owner slot per
+# actual layer chunk. This removes the former model-specific default of three
+# without adding a per-run calculation. An explicit positive override remains
+# available for controlled experiments.
+_SELECTED_OUT_RING_SLOTS_CACHED: Optional[int] = (
+    _parse_selected_out_ring_slots_override(os.environ)
 )
 
 
@@ -534,12 +567,24 @@ def _selected_out_ring_enabled() -> bool:
     return _SELECTED_OUT_RING_CACHED
 
 
-def _selected_out_ring_slots() -> int:
-    # [B2 双默认对齐 2026-07-11] 动态臂默认曾是 "4" vs 缓存臂 "3"——pytest 验证
-    # 的是生产永不使用、且顶在 thrash 边界注释警告值上的 4 槽形态。统一 "3"。
-    if _DYNAMIC_ENV:
-        return int(os.environ.get("VLLM_SPARSE_SELECTED_OUT_RING_SLOTS", "3") or "3")
-    return _SELECTED_OUT_RING_SLOTS_CACHED
+def _selected_out_ring_slots(*, layer_count: int, capture_chunk: int) -> int:
+    """Resolve one stable owner slot per real layer chunk, once at ring init."""
+    override = (
+        _parse_selected_out_ring_slots_override(os.environ)
+        if _DYNAMIC_ENV
+        else _SELECTED_OUT_RING_SLOTS_CACHED
+    )
+    if override is not None:
+        return int(override)
+    layers = int(layer_count)
+    chunk = int(capture_chunk)
+    if layers <= 0:
+        raise RuntimeError(
+            "selected-out ring requires registered model layers before construction"
+        )
+    if chunk <= 0:
+        raise RuntimeError("selected-out ring requires a positive capture chunk")
+    return (layers + chunk - 1) // chunk
 
 
 # ASYNC_PRODUCER_WRITER_GRAPH (task #9): capture the single fused compact WRITER launch into a

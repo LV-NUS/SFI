@@ -39,14 +39,6 @@ from patches.fa3_native.capture_ownership import (
 from patches.fa3_native.row_plan import MixedPageRowPlan
 from patches.sparse_types import CaptureForwardSideOutputs, StepCaptureLayout
 
-# Defensive upper bound on deferred/async-postprocess scratch buffers. The active
-# deferred key is chunk_id-based and normally stays at num_chunks after prebuild;
-# the cap remains for other extra-key families and future key-shape regressions.
-# record_stream-deferred eviction keeps it async-UAF-safe. Raise to disable bounding.
-_FA3_CAPTURE_SCRATCH_CACHE_CAP = max(
-    2, int(os.environ.get("VLLM_SPARSE_FA3_CAPTURE_SCRATCH_CACHE_CAP", "8") or "8")
-)
-
 # Default-off allocation provenance. Keep the path latched at import like the other
 # capture envs: production hot paths pay only one false branch, with no tensor readback,
 # synchronization, or file work when the probe is disabled.
@@ -55,6 +47,66 @@ _CAPTURE_SCRATCH_PROBE_LOG = str(
 ).strip()
 _CAPTURE_SCRATCH_PROBE_SEEN: set[tuple[str, str, str]] = set()
 _CAPTURE_SCRATCH_PROBE_LOCK = threading.Lock()
+
+
+def _capture_scratch_scope_key(scratch_key: tuple[object, ...]) -> tuple[object, ...]:
+    """Return the runtime owner scope for one exact scratch allocation key.
+
+    Shape is intentionally excluded: a model chunk/cohort on one device owns one
+    current exact shape. Legitimate distinct chunks remain distinct scopes.
+    """
+    if len(scratch_key) != 5:
+        raise RuntimeError("E_SFI_CAPTURE_SCRATCH_INVALID_KEY")
+    return (
+        scratch_key[0],
+        scratch_key[1],
+        scratch_key[2],
+        scratch_key[4],
+    )
+
+
+def _store_capture_scratch_cache_entry(
+    *,
+    cache_owner: object,
+    cache_map: dict[tuple[object, ...], torch.Tensor],
+    scratch_key: tuple[object, ...],
+    scratch_storage: torch.Tensor,
+) -> None:
+    """Cold-path scope replacement for prebuilt/live scratch allocations."""
+    scope_keys = getattr(cache_owner, "_fa3_capture_scratch_scope_keys", None)
+    if not isinstance(scope_keys, dict):
+        scope_keys = {}
+        setattr(cache_owner, "_fa3_capture_scratch_scope_keys", scope_keys)
+    scope = _capture_scratch_scope_key(scratch_key)
+    previous_key = scope_keys.get(scope)
+    if previous_key is not None and previous_key != scratch_key:
+        if scratch_storage.is_cuda and torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "E_SFI_CAPTURE_SCRATCH_SCOPE_CHANGE_DURING_CAPTURE: "
+                "prebuild the exact runtime shape"
+            )
+        previous = cache_map.pop(previous_key, None)
+        if previous is None:
+            raise RuntimeError("E_SFI_CAPTURE_SCRATCH_SCOPE_INDEX_CORRUPT")
+        if previous.is_cuda:
+            guard = getattr(
+                cache_owner, "_uaf_guard_record_streams_before_discard", None
+            )
+            if callable(guard):
+                guard(previous)
+            else:
+                streams = [torch.cuda.current_stream(device=previous.device)]
+                refresh_stream = getattr(cache_owner, "refresh_stream", None)
+                if refresh_stream is not None and all(
+                    refresh_stream != stream for stream in streams
+                ):
+                    streams.append(refresh_stream)
+                for stream in streams:
+                    previous.record_stream(stream)
+    elif previous_key == scratch_key and scratch_key not in cache_map:
+        raise RuntimeError("E_SFI_CAPTURE_SCRATCH_SCOPE_INDEX_CORRUPT")
+    cache_map[scratch_key] = scratch_storage
+    scope_keys[scope] = scratch_key
 
 
 def _cached_absent_phase_mapping(
@@ -904,46 +956,15 @@ def prepare_capture_forward_side_outputs(
                 if not isinstance(cache_map, dict):
                     cache_map = {}
                     setattr(scratch_cache_owner, "_fa3_capture_scratch_cache_by_key", cache_map)
-                cache_map[scratch_key] = scratch_storage
-                # _fa3_capture_scratch_cache LRU bound (DEFENSIVE, now mostly inert):
-                # the DEFER key is keyed by chunk_id (sync_fa4_capture_scratch_chunkid
-                # _reuse), NOT the per-step nonce, so this dict holds <= num_chunks (3)
-                # entries and the prebuild pre-populates them -> the cap is never hit on
-                # the capture path. Retained for OTHER extra_key kinds and any
-                # non-prebuilt fallback: evict oldest (FIFO) beyond the cap, record_
-                # stream on current + refresh streams so the allocator defers the free
-                # past any still-pending deferred read.
-                if len(cache_map) > _FA3_CAPTURE_SCRATCH_CACHE_CAP:
-                    _capturing = False
-                    try:
-                        _capturing = bool(torch.cuda.is_current_stream_capturing())
-                    except Exception:
-                        _capturing = False
-                    if not _capturing:
-                        _rs = getattr(scratch_cache_owner, "refresh_stream", None)
-                        _cur = (
-                            torch.cuda.current_stream(device=device)
-                            if device.type == "cuda"
-                            else None
-                        )
-                        for _ek in list(cache_map.keys()):
-                            if len(cache_map) <= _FA3_CAPTURE_SCRATCH_CACHE_CAP:
-                                break
-                            if _ek == scratch_key:
-                                continue
-                            _old = cache_map.pop(_ek, None)
-                            if (
-                                isinstance(_old, torch.Tensor)
-                                and _old.is_cuda
-                            ):
-                                if _cur is not None:
-                                    _old.record_stream(_cur)
-                                if _rs is not None:
-                                    try:
-                                        _old.record_stream(_rs)
-                                    except Exception:
-                                        pass
-                            del _old
+                # One current exact allocation per real chunk/cohort scope.
+                # Full-key hit above remains one dict lookup; scope bookkeeping
+                # and UAF-safe replacement run only on a cold shape change.
+                _store_capture_scratch_cache_entry(
+                    cache_owner=scratch_cache_owner,
+                    cache_map=cache_map,
+                    scratch_key=scratch_key,
+                    scratch_storage=scratch_storage,
+                )
     if _CAPTURE_SCRATCH_PROBE_LOG:
         _probe_key_kind = (
             str(scratch_cache_extra_key[0])

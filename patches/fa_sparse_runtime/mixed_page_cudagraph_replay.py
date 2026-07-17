@@ -146,6 +146,8 @@ class MixedPageForwardContextReplayStats:
     step_id: int
     graph_key: str
     ready_event_wait_count: int = 0
+    replay_generation_state: object | None = None
+    replay_generation: int = -1
 
 
 def iter_attention_metadata(attn_metadata: object) -> tuple[object, ...]:

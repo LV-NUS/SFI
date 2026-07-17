@@ -9,8 +9,34 @@ contract tests lives in tests/reference_log_f_prior.py.
 from __future__ import annotations
 
 import math
+import struct
 from dataclasses import dataclass
 from typing import Optional
+
+
+_GAMMA_ERROR = "gamma must be a finite non-negative number representable as CUDA float32"
+
+
+def normalize_cuda_float32_gamma(value: object) -> float:
+    """Return the exact coefficient passed through the CUDA ``float`` ABI."""
+
+    if type(value) not in (int, float):
+        raise TypeError(_GAMMA_ERROR)
+    try:
+        gamma = float(value)
+    except OverflowError as exc:
+        raise ValueError(_GAMMA_ERROR) from exc
+    if not math.isfinite(gamma) or gamma < 0.0:
+        raise ValueError(_GAMMA_ERROR)
+    if gamma == 0.0:
+        return 0.0
+    try:
+        effective = struct.unpack("=f", struct.pack("=f", gamma))[0]
+    except (OverflowError, struct.error) as exc:
+        raise ValueError(_GAMMA_ERROR) from exc
+    if not math.isfinite(effective) or effective == 0.0:
+        raise ValueError(_GAMMA_ERROR)
+    return effective
 
 
 @dataclass(slots=True)
@@ -18,7 +44,7 @@ class AlphaFairSelectorConfig:
     """Hyper-parameters controlling the alpha-fair selector."""
 
     alpha: float = 0.5
-    gamma: float = 0.5
+    gamma: float = 0.0
     prior_weight_l2: float = 1.0
     prior_weight_pos: float = 0.7
     prior_pos_power: float = 1.8
@@ -41,10 +67,14 @@ class AlphaFairSelectorConfig:
     query_norm_max_scale: float = 1.0
     eps: float = 1.0e-12
 
+    def __post_init__(self) -> None:
+        self.gamma = normalize_cuda_float32_gamma(self.gamma)
+
     def beta(self) -> float:
         return -math.log(max(self.prior_beta_theta, self.eps)) / max(self.prior_beta_p, self.eps)
 
 
 __all__ = [
     "AlphaFairSelectorConfig",
+    "normalize_cuda_float32_gamma",
 ]

@@ -55,6 +55,7 @@ class CaptureRingMixin:
     def _init_capture_ring_state(self) -> None:
         # capture_row_by_batch_row cache
         self._capture_rows_cache: Dict[Tuple[object, ...], torch.Tensor] = {}
+        self._capture_rows_cache_step_identity: Tuple[int, int, int] = (-1, -1, -1)
         # refresh CPU-side cache (per step)
         self._step_refresh_cpu_cache_epoch: int = -1
         self._step_refresh_cpu_cache_handle_id: int = -1
@@ -485,6 +486,12 @@ class CaptureRingMixin:
                     [max(0, int(s)) for s in seq_cpu], dtype=torch.long
                 )
 
+    def _clear_capture_rows_cache(self) -> None:
+        """Retire the current step's derived capture-row tensors safely."""
+        for stale in self._capture_rows_cache.values():
+            self._uaf_guard_record_streams_before_discard(stale)
+        self._capture_rows_cache.clear()
+
     def _capture_scores_ptrs_for_rows(
         self,
         *,
@@ -522,11 +529,18 @@ class CaptureRingMixin:
         rows_key = self._rows_cache_key_rows_tuple(rows_tuple=rows_tuple, row_index=row_index)
         dev_index = int(device.index) if device.index is not None else -1
         inv_ptr = int(inv.data_ptr()) if inv.numel() > 0 else 0
-        # P0: cache key 绑定 step identity，避免同 epoch 重入时复用旧 capture_row 映射。
-        cache_key = (
+        # P0: cache 生命周期绑定 exact step identity。同 step 内按 layout/rows
+        # 复用；step 换代时精确退休整代（带 UAF guard），不再靠“累计 128 个
+        # 大概够用”的全局 population 猜测。
+        step_identity = (
             int(layout.epoch),
             int(getattr(layout, "step_handle_id", -1)),
             int(getattr(layout, "step_handle_generation", -1)),
+        )
+        if self._capture_rows_cache_step_identity != step_identity:
+            self._clear_capture_rows_cache()
+            self._capture_rows_cache_step_identity = step_identity
+        cache_key = (
             int(layout.buf_id),
             int(inv_ptr),
             str(device.type),
@@ -542,13 +556,6 @@ class CaptureRingMixin:
         if not cache_hit:
             capture_rows_i32 = inv.index_select(0, row_index.to(device=device))
             capture_rows = capture_rows_i32.to(dtype=torch.int64)
-            if len(self._capture_rows_cache) > 128:
-                # [CAPTURE-ROWS-CLEAR-UAF-GUARD 2026-07-07] 与 ROW-CACHE-CLEAR
-                # 同族(P2-9):弃引用前三流守卫,消费者=writer ptrs 乘加(双上
-                # 下文);冷事件零热开销。
-                for _stale_t in self._capture_rows_cache.values():
-                    self._uaf_guard_record_streams_before_discard(_stale_t)
-                self._capture_rows_cache.clear()
             self._capture_rows_cache[cache_key] = capture_rows
         return capture_rows
 

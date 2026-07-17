@@ -3,20 +3,16 @@
 from __future__ import annotations
 
 import os
-import re
-import shutil
-import subprocess
-import sys
 from typing import Optional, Tuple
 
 import torch
 from torch.utils.cpp_extension import load_inline
+from utils.ext_toolchain import configure_jit_toolchain_or_raise
 from utils.torch_extension_cache import load_prebuilt_extension
 
 _MODULE: Optional[torch.nn.Module] = None
 _MODULE_FORCED: bool = False
 _LOAD_ERROR: Optional[Exception] = None
-_NVCC_RELEASE_RE = re.compile(r"release\s+(\d+)\.(\d+)")
 
 
 def _ensure_torch_cuda_arch_list() -> None:
@@ -29,82 +25,6 @@ def _ensure_torch_cuda_arch_list() -> None:
     except Exception:
         return
     os.environ["TORCH_CUDA_ARCH_LIST"] = f"{int(major)}.{int(minor)}"
-
-
-def _cuda_std_flag_for_nvcc_version(version_text: str) -> str:
-    match = _NVCC_RELEASE_RE.search(version_text)
-    if match is None:
-        return "-std=c++17"
-    major = int(match.group(1))
-    if major < 11:
-        return "-std=c++14"
-    return "-std=c++17"
-
-
-def _preferred_nvcc_path() -> Optional[str]:
-    explicit_nvcc = os.environ.get("PYTORCH_NVCC") or os.environ.get("CUDACXX")
-    if explicit_nvcc:
-        return explicit_nvcc
-
-    candidates = [os.path.join(os.path.dirname(sys.executable), "nvcc")]
-    for cuda_home_var in ("CUDA_HOME", "CUDA_PATH"):
-        cuda_home = os.environ.get(cuda_home_var)
-        if cuda_home:
-            candidates.append(os.path.join(cuda_home, "bin", "nvcc"))
-    candidates.extend(
-        [
-            "/usr/local/cuda/bin/nvcc",
-            "/usr/local/cuda-12.6/bin/nvcc",
-            "/usr/local/cuda-12.5/bin/nvcc",
-            "/usr/local/cuda-12.4/bin/nvcc",
-        ]
-    )
-    path_nvcc = shutil.which("nvcc")
-    if path_nvcc:
-        candidates.append(path_nvcc)
-
-    seen: set[str] = set()
-    for candidate in candidates:
-        if not candidate or candidate in seen:
-            continue
-        seen.add(candidate)
-        if os.path.exists(candidate):
-            return candidate
-    return None
-
-
-def _configure_torch_cuda_toolchain() -> None:
-    nvcc = _preferred_nvcc_path()
-    if not nvcc:
-        return
-    cuda_home = os.path.dirname(os.path.dirname(nvcc))
-    os.environ["PYTORCH_NVCC"] = nvcc
-    os.environ["CUDA_HOME"] = cuda_home
-    os.environ["CUDA_PATH"] = cuda_home
-    try:
-        import torch.utils.cpp_extension as torch_cpp_extension
-
-        torch_cpp_extension.CUDA_HOME = cuda_home
-    except Exception:
-        return
-
-
-def _cuda_std_flag_for_current_nvcc() -> str:
-    nvcc = _preferred_nvcc_path()
-    if not nvcc:
-        return "-std=c++17"
-    try:
-        completed = subprocess.run(
-            [nvcc, "--version"],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-    except Exception:
-        return "-std=c++17"
-    version_text = "\n".join(part for part in (completed.stdout, completed.stderr) if part)
-    return _cuda_std_flag_for_nvcc_version(version_text)
 
 
 def _dtype_code(dtype: torch.dtype) -> int:
@@ -967,17 +887,17 @@ void selector_key_norms_paged_layers_delta_cuda(
 
 """
 
-    _configure_torch_cuda_toolchain()
     _ensure_torch_cuda_arch_list()
     os.environ.setdefault("TORCH_EXTENSION_SKIP_NVCC_GEN_DEPENDENCIES", "1")
     try:
+        configure_jit_toolchain_or_raise(ext_name="selector_key_norms_ext")
         _MODULE = load_inline(
             name="selector_key_norms_ext",
             cpp_sources=cpp_source,
             cuda_sources=cuda_source,
             functions=None,
             extra_cflags=["-O3"],
-            extra_cuda_cflags=["-O3", "-lineinfo", _cuda_std_flag_for_current_nvcc()],
+            extra_cuda_cflags=["-O3", "-lineinfo", "-std=c++17"],
             with_cuda=True,
             verbose=False,
         )

@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import os
+import platform
 import re
 import stat
 import subprocess
@@ -20,6 +21,7 @@ PROVENANCE_NAME = "sfi_flash_attention_build_provenance.json"
 _SETUP_ASSIGNMENT_RE = re.compile(r'^([A-Z0-9_]+)="([^"]*)"$', re.MULTILINE)
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _TREE_RE = re.compile(r"^[0-9a-f]{40}$")
+_CUDA_RELEASE_RE = re.compile(r"\brelease\s+([0-9]+(?:\.[0-9]+)?)\b")
 _ARCH_CONTRACT = {
     "sm80": {
         "backend": "fa3",
@@ -94,8 +96,15 @@ def _setup_assignments(sfi_root: Path) -> dict[str, str]:
 
 
 def _git(root: Path, *args: str) -> str:
+    git_env = os.environ.copy()
+    for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"):
+        git_env.pop(name, None)
+    # Provenance validation is read-only.  Disabling Git's optional locks keeps
+    # concurrent launch checks from refreshing or locking the shared index.
+    git_env["GIT_OPTIONAL_LOCKS"] = "0"
     result = subprocess.run(
         ["git", "-C", str(root), *args],
+        env=git_env,
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -114,6 +123,73 @@ def _require_equal(payload: dict[str, Any], field: str, expected: object) -> Non
         raise BuildProvenanceError(
             f"build provenance {field} mismatch: actual={actual!r} expected={expected!r}"
         )
+
+
+def _canonical_payload_path(
+    payload: dict[str, Any],
+    field: str,
+    *,
+    directory: bool = False,
+    executable: bool = False,
+) -> Path:
+    raw = payload.get(field)
+    if not isinstance(raw, str) or not raw or not Path(raw).is_absolute():
+        raise BuildProvenanceError(
+            f"build provenance {field} must be a non-empty absolute path: {raw!r}"
+        )
+    try:
+        resolved = Path(raw).resolve(strict=True)
+    except OSError as exc:
+        raise BuildProvenanceError(
+            f"build provenance {field} does not exist: {raw!r}"
+        ) from exc
+    if raw != str(resolved):
+        raise BuildProvenanceError(
+            f"build provenance {field} is not canonical: {raw!r} != {str(resolved)!r}"
+        )
+    if directory and not resolved.is_dir():
+        raise BuildProvenanceError(f"build provenance {field} is not a directory: {resolved}")
+    if not directory and not resolved.is_file():
+        raise BuildProvenanceError(f"build provenance {field} is not a file: {resolved}")
+    if executable and not os.access(resolved, os.X_OK):
+        raise BuildProvenanceError(f"build provenance {field} is not executable: {resolved}")
+    return resolved
+
+
+def _nvcc_identity(cudacxx: Path) -> tuple[str, str, str]:
+    result = subprocess.run(
+        [str(cudacxx), "--version"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise BuildProvenanceError(
+            f"canonical CUDACXX --version failed: {cudacxx}: {result.stderr.strip()}"
+        )
+    version = result.stdout.strip()
+    match = _CUDA_RELEASE_RE.search(version)
+    if match is None:
+        raise BuildProvenanceError(
+            f"cannot parse CUDA compiler release from {cudacxx}: {version!r}"
+        )
+    release = match.group(1)
+    return version, release, release.split(".", 1)[0]
+
+
+def _cmake_cache_entries(cache: Path) -> dict[str, str]:
+    try:
+        lines = cache.read_text(encoding="utf-8", errors="strict").splitlines()
+    except (OSError, UnicodeError) as exc:
+        raise BuildProvenanceError(f"cannot read CMake cache {cache}: {exc}") from exc
+    entries: dict[str, str] = {}
+    for line in lines:
+        if not line or line.startswith(("#", "//")) or "=" not in line:
+            continue
+        typed_key, value = line.split("=", 1)
+        entries[typed_key.split(":", 1)[0]] = value
+    return entries
 
 
 def _patch_assets(sfi_root: Path) -> tuple[Path, Path]:
@@ -176,7 +252,7 @@ def validate_build_provenance(
         raise BuildProvenanceError(f"invalid expected patched tree: {expected_tree!r}")
 
     payload = _strict_json(provenance_path)
-    _require_equal(payload, "schema_version", 3)
+    _require_equal(payload, "schema_version", 4)
     _require_equal(payload, "architecture", architecture)
     _require_equal(payload, "backend", contract["backend"])
     _require_equal(payload, "base_commit", assignments["BASE_COMMIT"])
@@ -193,20 +269,146 @@ def validate_build_provenance(
             f"actual={detected_capability!r} expected={contract['capability']!r}"
         )
 
-    provenance_python = Path(str(payload.get("python_executable", "") or ""))
-    if not provenance_python.is_absolute() or provenance_python.resolve() != Path(
-        sys.executable
-    ).resolve():
+    provenance_python = _canonical_payload_path(
+        payload, "python_executable", executable=True
+    )
+    benchmark_python = Path(sys.executable).resolve(strict=True)
+    if provenance_python != benchmark_python:
         raise BuildProvenanceError(
             "build provenance Python differs from the benchmark interpreter: "
-            f"build={provenance_python} benchmark={Path(sys.executable).resolve()}"
+            f"build={provenance_python} benchmark={benchmark_python}"
         )
+    _require_equal(payload, "python_version", platform.python_version())
     try:
         import torch
     except Exception as exc:
         raise BuildProvenanceError(f"cannot import torch with benchmark Python: {exc}") from exc
     _require_equal(payload, "torch_version", str(torch.__version__))
     _require_equal(payload, "torch_cuda_version", str(torch.version.cuda or ""))
+
+    cuda_home = _canonical_payload_path(payload, "cuda_home", directory=True)
+    cuda_path = _canonical_payload_path(payload, "cuda_path", directory=True)
+    cudacxx = _canonical_payload_path(payload, "cudacxx", executable=True)
+    if cuda_path != cuda_home:
+        raise BuildProvenanceError(
+            f"build provenance CUDA_PATH differs from CUDA_HOME: {cuda_path} != {cuda_home}"
+        )
+    try:
+        root_nvcc = (cuda_home / "bin" / "nvcc").resolve(strict=True)
+    except OSError as exc:
+        raise BuildProvenanceError(
+            f"build provenance CUDA_HOME has no bin/nvcc: {cuda_home}"
+        ) from exc
+    if cudacxx != root_nvcc:
+        raise BuildProvenanceError(
+            f"build provenance CUDACXX is not owned by CUDA_HOME: {cudacxx} != {root_nvcc}"
+        )
+
+    nvcc_version, cuda_release, cuda_major = _nvcc_identity(cudacxx)
+    _require_equal(payload, "nvcc_version", nvcc_version)
+    _require_equal(payload, "cuda_compiler_release", cuda_release)
+    _require_equal(payload, "cuda_compiler_major", cuda_major)
+    torch_cuda_version = str(torch.version.cuda or "")
+    torch_cuda_major = torch_cuda_version.split(".", 1)[0] if torch_cuda_version else ""
+    _require_equal(payload, "torch_cuda_major", torch_cuda_major)
+    if not torch_cuda_major or cuda_major != torch_cuda_major:
+        raise BuildProvenanceError(
+            "CUDA compiler major differs from benchmark torch CUDA major: "
+            f"compiler={cuda_release} torch={torch_cuda_version or 'unknown'}"
+        )
+
+    cmake_build_temp_raw = payload.get("cmake_build_temp")
+    cmake_cache_raw = payload.get("cmake_cache_path")
+    cmake_compiler_raw = payload.get("cmake_cuda_compiler")
+    cmake_root_raw = payload.get("cmake_cuda_toolkit_root")
+    if architecture in {"sm80", "sm90"}:
+        cmake_build_temp = _canonical_payload_path(
+            payload, "cmake_build_temp", directory=True
+        )
+        cmake_cache = _canonical_payload_path(payload, "cmake_cache_path")
+        cmake_compiler = _canonical_payload_path(
+            payload, "cmake_cuda_compiler", executable=True
+        )
+        cmake_root = _canonical_payload_path(
+            payload, "cmake_cuda_toolkit_root", directory=True
+        )
+        expected_build_parent = (target / "build").resolve()
+        if (
+            cmake_build_temp.parent != expected_build_parent
+            or not cmake_build_temp.name.startswith(f"sfi-{architecture}.")
+        ):
+            raise BuildProvenanceError(
+                "build provenance cmake_build_temp is not a fresh run-scoped directory: "
+                f"{cmake_build_temp}"
+            )
+        try:
+            cmake_cache.relative_to(cmake_build_temp)
+        except ValueError as exc:
+            raise BuildProvenanceError(
+                f"build provenance CMake cache is outside build temp: {cmake_cache}"
+            ) from exc
+        caches = sorted(cmake_build_temp.rglob("CMakeCache.txt"))
+        if [path.resolve(strict=True) for path in caches] != [cmake_cache]:
+            raise BuildProvenanceError(
+                "build provenance fresh build temp must contain exactly its recorded "
+                f"CMake cache: found={caches} recorded={cmake_cache}"
+            )
+        if cmake_compiler != cudacxx:
+            raise BuildProvenanceError(
+                f"CMake CUDA compiler differs from CUDACXX: {cmake_compiler} != {cudacxx}"
+            )
+        if cmake_root != cuda_home:
+            raise BuildProvenanceError(
+                f"CMake CUDA toolkit root differs from CUDA_HOME: {cmake_root} != {cuda_home}"
+            )
+        cmake_entries = _cmake_cache_entries(cmake_cache)
+        cache_compiler_raw = cmake_entries.get("CMAKE_CUDA_COMPILER", "")
+        if not cache_compiler_raw:
+            raise BuildProvenanceError("recorded CMake cache has no CMAKE_CUDA_COMPILER")
+        try:
+            cache_compiler = Path(cache_compiler_raw).resolve(strict=True)
+        except OSError as exc:
+            raise BuildProvenanceError(
+                f"recorded CMake CUDA compiler does not exist: {cache_compiler_raw!r}"
+            ) from exc
+        if cache_compiler != cmake_compiler:
+            raise BuildProvenanceError(
+                f"recorded CMake cache compiler drift: {cache_compiler} != {cmake_compiler}"
+            )
+        root_keys = (
+            "CUDAToolkit_ROOT",
+            "CUDA_TOOLKIT_ROOT_DIR",
+            "CMAKE_CUDA_COMPILER_TOOLKIT_ROOT",
+        )
+        try:
+            cache_roots = {
+                Path(cmake_entries[key]).resolve(strict=True)
+                for key in root_keys
+                if cmake_entries.get(key)
+            }
+        except OSError as exc:
+            raise BuildProvenanceError(
+                "recorded CMake CUDA toolkit root does not exist"
+            ) from exc
+        if cache_roots != {cmake_root}:
+            raise BuildProvenanceError(
+                f"recorded CMake cache toolkit root drift: {cache_roots} != {{{cmake_root}}}"
+            )
+    else:
+        for field, actual in (
+            ("cmake_build_temp", cmake_build_temp_raw),
+            ("cmake_cache_path", cmake_cache_raw),
+            ("cmake_cuda_compiler", cmake_compiler_raw),
+            ("cmake_cuda_toolkit_root", cmake_root_raw),
+        ):
+            if actual != "":
+                raise BuildProvenanceError(
+                    f"SM100 source-only provenance must leave {field} empty: {actual!r}"
+                )
+        cmake_build_temp = None
+        cmake_cache = None
+        cmake_compiler = None
+        cmake_root = None
 
     patches = payload.get("patches")
     expected_patch_kinds = ["fa3_sm80_sm90_shared_base"]
@@ -228,7 +430,21 @@ def validate_build_provenance(
 
     head_commit = _git(target, "rev-parse", "HEAD")
     head_tree = _git(target, "rev-parse", "HEAD^{tree}")
-    index_tree = _git(target, "write-tree")
+    unmerged_index = _git(target, "ls-files", "--unmerged")
+    if unmerged_index:
+        raise BuildProvenanceError(
+            "FlashAttention index contains unmerged entries: "
+            f"{unmerged_index.splitlines()[:8]}"
+        )
+    index_diff = _git(
+        target,
+        "diff",
+        "--cached",
+        "--name-only",
+        expected_tree,
+        "--",
+    )
+    index_matches_expected = not bool(index_diff)
     tracked_diff = _git(target, "diff", "--name-only")
     if tracked_diff:
         raise BuildProvenanceError(
@@ -259,13 +475,13 @@ def validate_build_provenance(
             f"{unexpected_runtime[:8]}"
         )
     source_mode = str(payload.get("source_mode", "") or "")
-    if head_tree == expected_tree and index_tree == expected_tree:
+    if head_tree == expected_tree and index_matches_expected:
         if source_mode != "verified_patched_tree":
             raise BuildProvenanceError(
                 f"committed patched tree has inconsistent source_mode={source_mode!r}"
             )
         source_state = "committed_patched_tree"
-    elif head_commit == assignments["BASE_COMMIT"] and index_tree == expected_tree:
+    elif head_commit == assignments["BASE_COMMIT"] and index_matches_expected:
         allowed_modes = {
             "verified_applied_patch",
             f"fresh_applied_{architecture}_patch_stack",
@@ -278,7 +494,8 @@ def validate_build_provenance(
     else:
         raise BuildProvenanceError(
             "FlashAttention source tree does not match the current setup contract: "
-            f"head={head_commit} head_tree={head_tree} index_tree={index_tree} "
+            f"head={head_commit} head_tree={head_tree} "
+            f"index_diff={index_diff.splitlines()[:8]} "
             f"expected_tree={expected_tree}"
         )
 
@@ -324,6 +541,20 @@ def validate_build_provenance(
         "python_executable": str(Path(sys.executable).resolve()),
         "torch_version": str(torch.__version__),
         "torch_cuda_version": str(torch.version.cuda or ""),
+        "torch_cuda_major": torch_cuda_major,
+        "cuda_home": str(cuda_home),
+        "cuda_path": str(cuda_path),
+        "cudacxx": str(cudacxx),
+        "cuda_compiler_release": cuda_release,
+        "cuda_compiler_major": cuda_major,
+        "cmake_build_temp": (
+            str(cmake_build_temp) if cmake_build_temp is not None else ""
+        ),
+        "cmake_cache_path": str(cmake_cache) if cmake_cache is not None else "",
+        "cmake_cuda_compiler": (
+            str(cmake_compiler) if cmake_compiler is not None else ""
+        ),
+        "cmake_cuda_toolkit_root": str(cmake_root) if cmake_root is not None else "",
         "shared_object": str(so_path) if so_path is not None else "",
         "shared_object_sha256": actual_so_sha,
     }

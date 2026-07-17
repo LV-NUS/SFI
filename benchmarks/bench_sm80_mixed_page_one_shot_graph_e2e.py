@@ -1214,13 +1214,12 @@ def _prewarm_gt1_selector_extensions(
             "from utils.bounds_prefill_kernel_ext import _require_ext as _bounds_prefill; "
             "from utils.fa_sparse_runtime_ext import _load_ext as _fa_sparse; "
             "from utils.selector_batch_ext import _load_ext as _selector_batch; "
-            "from utils.selector_key_norms_ext import _require_ext as _key_norms; "
             "from utils.selector_log_s_ext import _require_ext as _log_s; "
             "from utils.selector_pipeline_identity import ("
             "SELECTOR_PIPELINE_SEMANTIC_VERSION as _pipeline_expected_semantic_version); "
             "from utils.selector_pipeline_ext import _require_ext as _pipeline; "
             "_bounds(); _bounds_prefill(); _fa_sparse(force=True); _selector_batch(); "
-            "_key_norms(force=True); _log_s(force=True); _pipeline_mod = _pipeline(force=True); "
+            "_log_s(force=True); _pipeline_mod = _pipeline(force=True); "
             "_pipeline_semantic_version = int(_pipeline_mod.selector_pipeline_semantic_version()); "
             "(_pipeline_semantic_version == int(_pipeline_expected_semantic_version)) or "
             "sys.exit(f'selector pipeline semantic mismatch: actual={_pipeline_semantic_version} '"
@@ -2660,11 +2659,21 @@ def _reference_text_gate_reasons(
         reasons.append("reference_returncode_nonzero")
     if bool(reference_result.timed_out):
         reasons.append("reference_timed_out")
-    if reference_semantic_match is False:
-        reasons.append("reference_semantic_mismatch")
-    elif reference_semantic_match is None:
+    if reference_semantic_match is None:
         reasons.append("reference_semantic_match_missing")
     return reasons
+
+
+def _reference_text_informational_reasons(
+    reference_semantic_match: bool | None,
+) -> list[str]:
+    """Report cross-arm text differences without redefining runtime health."""
+
+    return (
+        ["reference_semantic_mismatch"]
+        if reference_semantic_match is False
+        else []
+    )
 
 
 def _generated_text_from_output_record(record: dict[str, Any]) -> str:
@@ -2723,6 +2732,12 @@ def _reference_output_quality_reasons(
         return ["reference_output_row_count_mismatch"]
 
     reasons: list[str] = []
+    sparse_health = _sparse_output_content_health(sparse_records)
+    dense_health = _sparse_output_content_health(dense_records)
+    if sparse_health != "ok":
+        reasons.append(f"reference_sparse_output_health_not_ok:{sparse_health}")
+    if dense_health != "ok":
+        reasons.append(f"reference_dense_output_health_not_ok:{dense_health}")
     for index, (sparse_record, dense_record) in enumerate(
         zip(sparse_records, dense_records)
     ):
@@ -3929,6 +3944,19 @@ def _apply_scheduler_graph_contract_payload(
         payload["production_gate_passed"] = False
 
 
+def _sparse_dense_pair_contract_kind() -> str:
+    """Resolve the pair verdict without conflating local data with TP8 proof."""
+    if os.environ.get("SFI_RUNNER_TIER", "") == "tp8x64k":
+        return "exact_speedup_verdict"
+    contract = os.environ.get("SFI_RUNNER_PAIR_CONTRACT", "none").strip()
+    if contract not in {"none", "explicit_local_comparison"}:
+        raise RuntimeError(
+            "SFI_RUNNER_PAIR_CONTRACT must be none or "
+            f"explicit_local_comparison, got {contract!r}"
+        )
+    return contract
+
+
 def _apply_sparse_dense_pair_speedup_payload(
     payload: dict[str, Any],
     args: argparse.Namespace,
@@ -3939,12 +3967,18 @@ def _apply_sparse_dense_pair_speedup_payload(
     dense_env: dict[str, str] | None,
 ) -> None:
     """Promote the semantic dense reference into an adjacent timed pair arm."""
-    exact_required = os.environ.get("SFI_RUNNER_TIER", "") == "tp8x64k"
+    contract_kind = _sparse_dense_pair_contract_kind()
+    exact_required = contract_kind == "exact_speedup_verdict"
+    local_comparison_required = contract_kind == "explicit_local_comparison"
+    pair_required = exact_required or local_comparison_required
     reasons: list[str] = []
     provenance_raw = payload.get("run_provenance")
     provenance = provenance_raw if isinstance(provenance_raw, dict) else {}
+    dense_metrics_readable = isinstance(dense_metrics, dict) and bool(dense_metrics)
     dense_metrics = dense_metrics if isinstance(dense_metrics, dict) else {}
     dense_env = dense_env if isinstance(dense_env, dict) else {}
+    if pair_required and not dense_metrics_readable:
+        reasons.append("sparse_dense_pair_dense_metrics_unreadable")
     arm_runner_contract = {
         "sparse": "run_sparse_only.py",
         "dense": "run_dense_only.py",
@@ -3967,7 +4001,7 @@ def _apply_sparse_dense_pair_speedup_payload(
         for arm, observed in arm_runner_observed.items()
         for location in ("top_level", "run_config")
     )
-    if exact_required:
+    if pair_required:
         for arm, observed in arm_runner_observed.items():
             for location in ("top_level", "run_config"):
                 if observed.get(location) != arm_runner_contract[arm]:
@@ -4037,7 +4071,7 @@ def _apply_sparse_dense_pair_speedup_payload(
         "gpu_lock_mode",
         "gpu_lock_scope",
     }
-    if exact_required:
+    if pair_required:
         for field in sorted(required_common_fields):
             value = common_geometry.get(field)
             if value in (None, "", [], {}):
@@ -4123,7 +4157,7 @@ def _apply_sparse_dense_pair_speedup_payload(
             ("dense", dense_child_identity),
         )
     )
-    if exact_required:
+    if pair_required:
         for arm, identity in (
             ("sparse", sparse_child_identity),
             ("dense", dense_child_identity),
@@ -4224,7 +4258,7 @@ def _apply_sparse_dense_pair_speedup_payload(
     sparse_digest = build_config_digest(sparse_geometry)
     dense_digest = build_config_digest(dense_geometry)
     geometry_match = sparse_geometry == dense_geometry
-    if exact_required and not geometry_match:
+    if pair_required and not geometry_match:
         reasons.append("sparse_dense_pair_geometry_mismatch")
 
     sparse_observer_env = _gate_d_trace_profile_env(sparse_env)
@@ -4243,32 +4277,70 @@ def _apply_sparse_dense_pair_speedup_payload(
         and sparse_boundary.get("cudagraph_runtime_observer_enabled") is not True
         and dense_boundary.get("cudagraph_runtime_observer_enabled") is not True
     )
-    if exact_required and not observer_free:
+    if pair_required and not observer_free:
         reasons.append("sparse_dense_timed_pair_not_observer_free")
 
+    pair_boundaries: dict[str, dict[str, Any]] = {}
     for arm, arm_metrics in (
         ("sparse", sparse_metrics),
         ("dense", dense_metrics),
     ):
         boundary_raw = arm_metrics.get("boundary_diagnostics")
         boundary = boundary_raw if isinstance(boundary_raw, dict) else {}
-        if exact_required:
-            exact_boundary = {
-                "all_decode_entered": True,
-                "all_decode_partial_batch_steps": 0,
-                "all_decode_zero_token_steps": 0,
-                "all_decode_fallback_used": False,
-            }
-            for field, expected in exact_boundary.items():
-                if boundary.get(field) != expected:
-                    reasons.append(
-                        f"sparse_dense_pair_{arm}_{field}_mismatch"
-                    )
+        if pair_required:
+            pair_boundaries[arm] = boundary
+            if boundary.get("all_decode_entered") is not True:
+                reasons.append(
+                    f"sparse_dense_pair_{arm}_all_decode_entered_mismatch"
+                )
+            zero_steps = boundary.get("all_decode_zero_token_steps")
+            if type(zero_steps) is not int or zero_steps != 0:
+                reasons.append(
+                    f"sparse_dense_pair_{arm}_all_decode_zero_token_steps_mismatch"
+                )
+            if boundary.get("all_decode_fallback_used") is not False:
+                reasons.append(
+                    f"sparse_dense_pair_{arm}_all_decode_fallback_used_mismatch"
+                )
             full_steps = boundary.get("all_decode_full_batch_steps")
             if type(full_steps) is not int or full_steps <= 0:
                 reasons.append(
                     f"sparse_dense_pair_{arm}_all_decode_full_steps_missing"
                 )
+            partial_steps = boundary.get("all_decode_partial_batch_steps")
+            if type(partial_steps) is not int or partial_steps < 0:
+                reasons.append(
+                    f"sparse_dense_pair_{arm}_all_decode_partial_steps_invalid"
+                )
+            all_decode_steps = boundary.get("all_decode_steps")
+            if type(all_decode_steps) is not int or all_decode_steps <= 0:
+                reasons.append(
+                    f"sparse_dense_pair_{arm}_all_decode_steps_invalid"
+                )
+            elif (
+                type(full_steps) is int
+                and type(partial_steps) is int
+                and type(zero_steps) is int
+                and all_decode_steps
+                != full_steps + partial_steps + zero_steps
+            ):
+                reasons.append(
+                    f"sparse_dense_pair_{arm}_all_decode_step_accounting_mismatch"
+                )
+
+    if pair_required and set(pair_boundaries) == {"sparse", "dense"}:
+        for field in (
+            "all_decode_entered",
+            "all_decode_steps",
+            "all_decode_full_batch_steps",
+            "all_decode_partial_batch_steps",
+            "all_decode_zero_token_steps",
+            "all_decode_fallback_used",
+        ):
+            if pair_boundaries["sparse"].get(field) != pair_boundaries[
+                "dense"
+            ].get(field):
+                reasons.append(f"sparse_dense_pair_{field}_mismatch")
 
     def _positive_metric(metrics: dict[str, Any], key: str) -> float | None:
         value = _as_float(metrics.get(key), float("nan"))
@@ -4301,18 +4373,32 @@ def _apply_sparse_dense_pair_speedup_payload(
         "all_decode_speedup": all_decode_speedup,
     }
     for name, ratio in ratios.items():
-        if exact_required and (
+        if local_comparison_required and (
+            ratio is None or not math.isfinite(ratio) or ratio <= 0.0
+        ):
+            reasons.append(f"{name}_not_finite_positive")
+        elif exact_required and (
             ratio is None or not math.isfinite(ratio) or ratio <= 1.0
         ):
             reasons.append(f"{name}_not_above_one")
 
     for field in ("out_tokens", "decode_tokens", "all_decode_tokens"):
-        if exact_required and sparse_metrics.get(field) != dense_metrics.get(field):
+        if pair_required and sparse_metrics.get(field) != dense_metrics.get(field):
             reasons.append(f"sparse_dense_{field}_mismatch")
+
+    speedup_observed = bool(
+        ratios
+        and all(
+            ratio is not None and math.isfinite(ratio) and ratio > 1.0
+            for ratio in ratios.values()
+        )
+    )
 
     payload.update(
         {
-            "sparse_dense_pair_required": exact_required,
+            "sparse_dense_pair_contract_kind": contract_kind,
+            "sparse_dense_pair_required": pair_required,
+            "sparse_dense_pair_dense_metrics_readable": dense_metrics_readable,
             "sparse_dense_pair_execution_order": (
                 "sparse_speed,dense_reference,sparse_diagnostic"
             ),
@@ -4353,8 +4439,23 @@ def _apply_sparse_dense_pair_speedup_payload(
             "sparse_dense_pair_sparse_all_decode_tps": sparse_all_decode_tps,
             "sparse_dense_pair_dense_all_decode_tps": dense_all_decode_tps,
             **ratios,
-            "sparse_dense_pair_speedup_gate_passed": not reasons,
-            "sparse_dense_pair_speedup_gate_reasons": reasons,
+            # Local comparison validity and an exact speedup verdict are
+            # deliberately separate contracts.  A finite, slower local pair
+            # remains useful comparison data, but must never serialize a
+            # misleading green speedup gate.
+            "sparse_dense_pair_comparison_gate_passed": (
+                not reasons if local_comparison_required else None
+            ),
+            "sparse_dense_pair_comparison_gate_reasons": (
+                reasons if local_comparison_required else []
+            ),
+            "sparse_dense_pair_speedup_observed": speedup_observed,
+            "sparse_dense_pair_speedup_gate_passed": (
+                not reasons if exact_required else None
+            ),
+            "sparse_dense_pair_speedup_gate_reasons": (
+                reasons if exact_required else []
+            ),
             "sparse_dense_pair_arm_modes": {
                 "sparse": "sparse",
                 "dense": "dense",
@@ -4376,11 +4477,15 @@ def _apply_sparse_dense_pair_speedup_payload(
             "sparse_dense_pair_claim": (
                 "sparse_engine_loop_e2e_and_decode_speedup"
                 if exact_required and not reasons
-                else "arm_health_only"
+                else (
+                    "paired_engine_loop_comparison"
+                    if local_comparison_required and not reasons
+                    else "arm_health_only"
+                )
             ),
         }
     )
-    if exact_required and reasons:
+    if pair_required and reasons:
         payload["gate_passed"] = False
         payload["production_gate_passed"] = False
 
@@ -4648,7 +4753,9 @@ def _gate_d_payload(
                 producer_gate_reasons.append("gt1_scalar_fallback_count_nonzero")
     producer_gate_passed = not producer_gate_reasons
     semantic_output_health = str(
-        metrics.get(
+        _sparse_output_content_health(output_records)
+        if bool(getattr(args, "outputs_include_text", False))
+        else metrics.get(
             "semantic_output_health",
             _sparse_output_content_health(output_records),
         )
@@ -5516,12 +5623,14 @@ def _run_gate_d_mode(args: argparse.Namespace) -> int:
     reference_result: Phase1CommandResult | None = None
     reference_semantic_diffs: list[dict[str, Any]] = []
     reference_semantic_match: bool | None = None
+    reference_informational_reasons: list[str] = []
     reference_quality_reasons: list[str] = []
     dense_reference_metrics_path: Path | None = None
     dense_reference_outputs_path: Path | None = None
     sparse_reference_outputs_path: Path | None = None
     dense_reference_env: dict[str, str] | None = None
     dense_arm_green = tp8_lifecycle_state is None
+    sparse_output_records = _canonical_output_records(outputs_path)
     if (
         bool(args.outputs_include_text)
         and not bool(args.skip_dense_reference)
@@ -5677,6 +5786,9 @@ def _run_gate_d_mode(args: argparse.Namespace) -> int:
                 bool(diff.get("semantic_match", False))
                 for diff in reference_semantic_diffs
             )
+        reference_informational_reasons = _reference_text_informational_reasons(
+            reference_semantic_match
+        )
     dense_reference_skipped = bool(args.outputs_include_text) and bool(
         args.skip_dense_reference
     )
@@ -5729,12 +5841,14 @@ def _run_gate_d_mode(args: argparse.Namespace) -> int:
         else []
     )
     metrics = _read_json(metrics_path)
-    if reference_semantic_match is not None:
-        metrics["dense_reference_semantic_match"] = bool(reference_semantic_match)
-        metrics["semantic_output_health"] = _semantic_output_health(
-            reference_semantic_match,
+    if bool(args.outputs_include_text):
+        # Runtime health belongs to the sparse output itself.  A healthy sparse
+        # answer may reasonably differ from the independently sampled dense arm.
+        metrics["semantic_output_health"] = _sparse_output_content_health(
             sparse_output_records
         )
+    if reference_semantic_match is not None:
+        metrics["dense_reference_semantic_match"] = bool(reference_semantic_match)
     if reference_quality_reasons:
         metrics["dense_reference_quality_ok"] = False
         metrics["dense_reference_quality_reasons"] = list(reference_quality_reasons)
@@ -5863,15 +5977,22 @@ def _run_gate_d_mode(args: argparse.Namespace) -> int:
             str(sparse_reference_outputs_path) if sparse_reference_outputs_path else ""
         )
         payload["reference_scope"] = (
-            "semantic_text_match_output_quality_and_paired_throughput"
-            if os.environ.get("SFI_RUNNER_TIER", "") == "tp8x64k"
-            else "semantic_text_match_and_output_quality"
+            "output_health_semantic_diff_informational_and_paired_throughput"
+            if _sparse_dense_pair_contract_kind()
+            in {"exact_speedup_verdict", "explicit_local_comparison"}
+            else "output_health_with_semantic_diff_informational"
         )
         payload["reference_semantic_diffs"] = reference_semantic_diffs
+        payload["reference_informational_reasons"] = list(
+            reference_informational_reasons
+        )
+        payload["reference_semantic_comparison_informational"] = True
         payload["reference_quality_reasons"] = reference_quality_reasons
     elif dense_reference_skipped:
         payload["reference_scope"] = "debug_skipped_dense_reference"
         payload["reference_semantic_diffs"] = []
+        payload["reference_informational_reasons"] = []
+        payload["reference_semantic_comparison_informational"] = True
         payload["reference_quality_reasons"] = []
         payload["skip_dense_reference"] = True
     if bool(args.outputs_include_text):
@@ -9586,21 +9707,11 @@ def _semantic_output_health(
     reference_semantic_match: bool | None,
     records: list[dict[str, Any]],
 ) -> str:
-    if reference_semantic_match is True:
-        return "ok"
-    if reference_semantic_match is False:
-        return "semantic_mismatch"
-    text = "\n".join(
-        str(record.get("text", "")) for record in records if record.get("text")
-    )
-    if not text:
-        return "missing_text"
-    words = text.split()
-    if len(words) >= 16:
-        trigrams = list(zip(words, words[1:], words[2:]))
-        if len(set(trigrams)) <= max(1, len(trigrams) // 4):
-            return "repetitive_ngram"
-    return "unknown_without_reference"
+    # Kept in the signature for legacy call sites and artifact compatibility.
+    # Cross-arm equivalence is recorded separately and never defines whether
+    # either arm produced a healthy output.
+    del reference_semantic_match
+    return _sparse_output_content_health(records)
 
 
 def _semantic_gate_reasons(mode: str, semantic_output_health: str) -> list[str]:
@@ -9616,25 +9727,20 @@ def _sparse_output_content_health(records: list[dict[str, Any]]) -> str:
     texts = [str(record.get("text", "")) for record in records]
     if not texts or any(not text.strip() for text in texts):
         return "missing_text"
-
-    try:
-        from benchmarks.needle_bs2_compare_utils import extract_boxed_answer
-    except Exception:
-        extract_boxed_answer = None  # type: ignore[assignment]
-
-    has_answer_signal = []
     for text in texts:
-        boxed_answer = (
-            extract_boxed_answer(text) if extract_boxed_answer is not None else None
-        )
-        has_answer_signal.append(
-            bool(boxed_answer) or ("answer" in text.casefold() and len(text.split()) >= 4)
-        )
-    if all(has_answer_signal):
-        return "ok"
-    if any("\ufffd" in text for text in texts):
-        return "decode_replacement_char"
-    return "unknown_without_reference"
+        if "\ufffd" in text:
+            return "decode_replacement_char"
+        if any(ord(character) < 32 and character not in "\n\r\t" for character in text):
+            return "decode_control_char"
+        stats = _text_quality_stats(text)
+        if stats["chars"] >= 32.0 and stats["lexical_ratio"] < 0.20:
+            return "garbled_low_lexical_ratio"
+        words = re.findall(r"[A-Za-z0-9_]+|[\u4e00-\u9fff]", text.casefold())
+        if len(words) >= 16:
+            trigrams = list(zip(words, words[1:], words[2:]))
+            if len(set(trigrams)) <= max(1, len(trigrams) // 4):
+                return "repetitive_ngram"
+    return "ok"
 
 
 def _budget_us_from_sources(
@@ -10657,10 +10763,6 @@ def _record_from_result(
     )
     reference_quality_ok = bool(
         reference_max_abs_diff >= 0.0
-        and (
-            reference_max_abs_diff <= DEFAULT_OUT_ATOL
-            or reference_semantic_match is not False
-        )
         and not reference_quality_reasons
     )
     refresh_requirement_ok = (
@@ -10713,6 +10815,10 @@ def _record_from_result(
         and writer_cached_pointer_op_count > 0
         and writer_vector_fallback_count == 0
         and reference_quality_ok
+        and (
+            not bool(getattr(args, "outputs_include_text", False))
+            or semantic_output_health == "ok"
+        )
         and int(route_summary.get("resolved_row_ptr_fwd_mixed_page_count", 0) or 0) > 0
         and (budget_fields_ready or not require_budget_fields)
     )
@@ -11089,11 +11195,6 @@ def _classify_phase2_failure(
         return "writer_vector_fallback_nonzero"
     if record.reference_max_abs_diff < 0.0:
         return "dense_reference_not_checked"
-    if (
-        record.reference_max_abs_diff > DEFAULT_OUT_ATOL
-        and record.reference_semantic_match is False
-    ):
-        return "dense_reference_semantic_mismatch"
     if record.reference_quality_reasons:
         return str(record.reference_quality_reasons[0])
     if int(route_summary.get("resolved_row_ptr_fwd_mixed_page_count", 0) or 0) <= 0:

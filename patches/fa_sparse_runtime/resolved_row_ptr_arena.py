@@ -43,7 +43,7 @@ _ROW_SOURCE_KEYS = (
     "compact_full_native_fallback_rows",
 )
 SOURCE_COUNTER_SCHEMA_VERSION = 1
-LIVE_PAGES_PUBLISH_METRICS_SCHEMA_VERSION = 1
+LIVE_PAGES_PUBLISH_METRICS_SCHEMA_VERSION = 2
 _AFFINE_ROW_PTR_FALLBACK_SEGMENT_PAGES = -1
 # [ARENA-AFFINE-DEVICE-RETIRED 2026-07-03] The zero-consumer device tensors
 # affine_i32 / affine_row_consume_mode_i32 and everything that ONLY served
@@ -1231,21 +1231,30 @@ class ResolvedRowPtrArena:
     # __dict__; without it B1 cannot store its baseline.
     _b1_last_pages_by_row: object = field(default=None, init=False, repr=False)
     # [LIVE-PAGES-PINNED-ASYNC 2026-07-08] publish_live_rows pinned staging
-    # ring + persistent GPU staging (slots-declared for the same reason).
+    # pool + persistent GPU staging (slots-declared for the same reason).
+    # The pool starts with one carrier and grows only when the candidate's
+    # completion event proves it is still in flight.  Replaced pools remain
+    # referenced until a newer same-stream event establishes a safe lifetime
+    # watermark; normal publication never synchronizes the host.
     _live_pages_pinned_ring: object = field(default=None, init=False, repr=False)
     _live_pages_pinned_ring_events: object = field(default=None, init=False, repr=False)
     _live_pages_pinned_ring_page_counts: object = field(
         default=None, init=False, repr=False
     )
     _live_pages_pinned_ring_idx: int = field(default=0, init=False, repr=False)
+    _live_pages_pool_rows_capacity: int = field(default=0, init=False, repr=False)
+    _live_pages_pool_max_pages: int = field(default=0, init=False, repr=False)
     _live_pages_staging_gpu: object = field(default=None, init=False, repr=False)
+    _live_pages_retired_buffer_sets: object = field(
+        default=None, init=False, repr=False
+    )
     # The page-boundary publisher owns one GPU staging tensor. Reusing it is
     # ordered only when every publish is submitted by the same writer stream;
     # a stream change is therefore a contract violation, not a fallback case.
     _live_pages_writer_stream_id: int = field(default=-1, init=False, repr=False)
     # Always-on integer evidence is intentionally allocation-free on the hot
-    # path. Wall time is sampled only when a query proves that the host will
-    # block; it is a backpressure ceiling, never claimed as recoverable E2E.
+    # path.  Legacy wait/sync counters remain in schema v2 as compatibility
+    # zeros; busy candidates now grow the pool instead of blocking the host.
     _live_pages_publish_call_count: int = field(default=0, init=False, repr=False)
     _live_pages_publish_complete_count: int = field(default=0, init=False, repr=False)
     _live_pages_dirty_rows_total: int = field(default=0, init=False, repr=False)
@@ -1256,6 +1265,14 @@ class ResolvedRowPtrArena:
     _live_pages_slot_wait_ns_total: int = field(default=0, init=False, repr=False)
     _live_pages_cold_sync_count: int = field(default=0, init=False, repr=False)
     _live_pages_cold_sync_ns_total: int = field(default=0, init=False, repr=False)
+    _live_pages_slot_growth_count: int = field(default=0, init=False, repr=False)
+    _live_pages_max_ring_slot_count: int = field(default=0, init=False, repr=False)
+    _live_pages_buffer_retirement_count: int = field(
+        default=0, init=False, repr=False
+    )
+    _live_pages_buffer_reclaim_count: int = field(
+        default=0, init=False, repr=False
+    )
     _live_pages_writer_stream_change_count: int = field(default=0, init=False, repr=False)
     _live_pages_last_publish_epoch: int = field(default=-1, init=False, repr=False)
     _live_pages_last_dirty_rows_count: int = field(default=0, init=False, repr=False)
@@ -1767,8 +1784,64 @@ class ResolvedRowPtrArena:
                 f"GPU staging tensor: owner={owner} current={stream_id_i}"
             )
 
+    def _allocate_live_pages_pinned_slot(
+        self,
+        *,
+        rows_capacity: int,
+        max_pages: int,
+    ) -> torch.Tensor:
+        """Allocate one host carrier; called only on pool init or pressure."""
+
+        return torch.full(
+            (int(rows_capacity), int(max_pages)),
+            -1,
+            dtype=torch.int32,
+            pin_memory=self.row_table_i32.device.type == "cuda",
+        )
+
+    def _retire_live_pages_buffer_set(
+        self,
+        *,
+        ring: object,
+        events: object,
+        staging: object,
+    ) -> None:
+        """Keep an incompatible buffer set alive behind a later event fence.
+
+        CUDA publication is single-writer-stream. The first completion event
+        recorded by the replacement pool is therefore ordered after every use
+        of these buffers and can reclaim the whole retired prefix without a
+        host synchronization. CPU normally has no events and needs no such
+        retention; accepting an injected event keeps the lifecycle contract
+        directly testable without a GPU.
+        """
+
+        has_event = isinstance(events, list) and any(
+            event is not None for event in events
+        )
+        if self.row_table_i32.device.type != "cuda" and not has_event:
+            return
+        retired = self._live_pages_retired_buffer_sets
+        if not isinstance(retired, list):
+            retired = []
+            self._live_pages_retired_buffer_sets = retired
+        retired.append((ring, events, staging))
+        self._live_pages_buffer_retirement_count += 1
+
+    def _reclaim_live_pages_retired_buffer_sets(self) -> None:
+        """Drop buffers older than a completed current-pool event."""
+
+        retired = self._live_pages_retired_buffer_sets
+        if not isinstance(retired, list) or not retired:
+            return
+        self._live_pages_buffer_reclaim_count += len(retired)
+        retired.clear()
+
     def live_pages_publish_metrics_fields(self) -> dict[str, int | bool]:
         """Return a debug-only snapshot; callers decide when to allocate it."""
+
+        ring = self._live_pages_pinned_ring
+        retired = self._live_pages_retired_buffer_sets
 
         return {
             "rrp_live_pages_metrics_schema_version": (
@@ -1792,6 +1865,24 @@ class ResolvedRowPtrArena:
             "rrp_live_pages_cold_sync_observed_ns_total": (
                 self._live_pages_cold_sync_ns_total
             ),
+            "rrp_live_pages_slot_growth_count": (
+                self._live_pages_slot_growth_count
+            ),
+            "rrp_live_pages_ring_slot_count": (
+                len(ring) if isinstance(ring, list) else 0
+            ),
+            "rrp_live_pages_max_ring_slot_count": (
+                self._live_pages_max_ring_slot_count
+            ),
+            "rrp_live_pages_buffer_retirement_count": (
+                self._live_pages_buffer_retirement_count
+            ),
+            "rrp_live_pages_buffer_reclaim_count": (
+                self._live_pages_buffer_reclaim_count
+            ),
+            "rrp_live_pages_retired_buffer_set_count": (
+                len(retired) if isinstance(retired, list) else 0
+            ),
             "rrp_live_pages_writer_stream_id": self._live_pages_writer_stream_id,
             "rrp_live_pages_writer_stream_change_count": (
                 self._live_pages_writer_stream_change_count
@@ -1813,7 +1904,8 @@ class ResolvedRowPtrArena:
             "rrp_live_pages_last_direct_full_hkv1": (
                 self._live_pages_last_direct_full_hkv1
             ),
-            "rrp_live_pages_slot_wait_is_backpressure_ceiling": True,
+            "rrp_live_pages_slot_wait_is_backpressure_ceiling": False,
+            "rrp_live_pages_grow_on_busy_enabled": True,
         }
 
     def publish_live_rows(
@@ -1935,95 +2027,106 @@ class ResolvedRowPtrArena:
             )
             self._claim_live_pages_writer_stream(int(current_stream.cuda_stream))
 
-        ring = getattr(self, "_live_pages_pinned_ring", None)
-        if (
-            ring is None
-            or ring[0].shape[0] < len(dirty)
-            or ring[0].shape[1] != max_pages
-        ):
-            if ring is not None:
-                # Cold-path regeneration guard (batch growth only): the old
-                # pinned buffers may still feed an in-flight H2D; dropping the
-                # refs hands them to GC mid-copy (SLOT-STAGING-UAF family).
-                if current_stream is not None:
-                    cold_sync_start_ns = time.perf_counter_ns()
-                    current_stream.synchronize()
-                    self._live_pages_cold_sync_count += 1
-                    self._live_pages_cold_sync_ns_total += (
-                        time.perf_counter_ns() - cold_sync_start_ns
-                    )
-            depth = 4
-            rows_cap = max(len(dirty), int(self.batch_size))
-            pin_memory = self.row_table_i32.device.type == "cuda"
-            ring = [
-                torch.full(
-                    (rows_cap, max_pages),
-                    -1,
-                    dtype=torch.int32,
-                    pin_memory=pin_memory,
+        rows_cap = max(len(dirty), int(self.batch_size))
+        ring = self._live_pages_pinned_ring
+        events = self._live_pages_pinned_ring_events
+        ring_page_counts = self._live_pages_pinned_ring_page_counts
+        staging = self._live_pages_staging_gpu
+        # Capacity is a pool invariant maintained only by init/growth. Keep
+        # this O(1): inspecting every slot here would turn observed pressure
+        # into permanent per-publish Python overhead after the pool stabilizes.
+        pool_compatible = (
+            isinstance(ring, list)
+            and bool(ring)
+            and isinstance(events, list)
+            and len(events) == len(ring)
+            and isinstance(ring_page_counts, list)
+            and len(ring_page_counts) == len(ring)
+            and isinstance(staging, torch.Tensor)
+            and staging.device == self.row_table_i32.device
+            and self._live_pages_pool_rows_capacity >= len(dirty)
+            and self._live_pages_pool_max_pages == max_pages
+        )
+        if not pool_compatible:
+            if ring is not None or staging is not None:
+                # Do not drop an old pinned source or GPU staging tensor while
+                # prior same-stream work may still reference it. A completion
+                # event from the replacement pool will retire this prefix.
+                self._retire_live_pages_buffer_set(
+                    ring=ring,
+                    events=events,
+                    staging=staging,
                 )
-                for _ in range(depth)
+            ring = [
+                self._allocate_live_pages_pinned_slot(
+                    rows_capacity=rows_cap,
+                    max_pages=max_pages,
+                )
             ]
+            events = [None]
             self._live_pages_pinned_ring = ring
-            self._live_pages_pinned_ring_events = [None] * depth
-            self._live_pages_pinned_ring_page_counts = [
-                [0] * rows_cap for _ in range(depth)
-            ]
+            self._live_pages_pinned_ring_events = events
+            ring_page_counts = [[0] * rows_cap]
+            self._live_pages_pinned_ring_page_counts = ring_page_counts
             self._live_pages_pinned_ring_idx = 0
-            self._live_pages_staging_gpu = torch.full(
+            self._live_pages_pool_rows_capacity = rows_cap
+            self._live_pages_pool_max_pages = max_pages
+            staging = torch.full(
                 (rows_cap, max_pages),
                 -1,
                 dtype=torch.int32,
                 device=self.row_table_i32.device,
             )
-        events = getattr(self, "_live_pages_pinned_ring_events", None)
-        if not isinstance(events, list) or len(events) != len(ring):
-            # A live ring without completion events can only come from an
-            # in-process code reload. Drain once before adopting the guarded
-            # representation; otherwise an old slot may still feed an H2D.
-            if current_stream is not None:
-                cold_sync_start_ns = time.perf_counter_ns()
-                current_stream.synchronize()
-                self._live_pages_cold_sync_count += 1
-                self._live_pages_cold_sync_ns_total += (
-                    time.perf_counter_ns() - cold_sync_start_ns
-                )
-            events = [None] * len(ring)
-            self._live_pages_pinned_ring_events = events
-        ring_page_counts = getattr(
-            self, "_live_pages_pinned_ring_page_counts", None
-        )
-        if (
-            not isinstance(ring_page_counts, list)
-            or len(ring_page_counts) != len(ring)
-            or any(
-                not isinstance(slot_counts, list)
-                or len(slot_counts) < int(ring[0].shape[0])
-                for slot_counts in ring_page_counts
+            self._live_pages_staging_gpu = staging
+            self._live_pages_max_ring_slot_count = max(
+                self._live_pages_max_ring_slot_count,
+                1,
             )
-        ):
-            # In-process code reload compatibility: each old carrier row may
-            # contain a full-width prefix. Mark it as such so first reuse
-            # clears every byte not overwritten by the new source.
-            ring_page_counts = [
-                [max_pages] * int(ring[0].shape[0]) for _ in range(len(ring))
-            ]
-            self._live_pages_pinned_ring_page_counts = ring_page_counts
-        idx = int(getattr(self, "_live_pages_pinned_ring_idx", 0))
+        idx = int(self._live_pages_pinned_ring_idx) % len(ring)
+        next_oldest_idx = (idx + 1) % len(ring)
         evt = events[idx]
         if evt is not None:
+            # Cursor invariant: this is the oldest submitted carrier on the
+            # single writer stream. Busy growth appends the newest carrier and
+            # leaves the cursor here; completed reuse advances it once. Thus a
+            # busy oldest event proves every newer event is also incomplete,
+            # and one query is sufficient without a linear pool scan.
             self._live_pages_slot_query_count += 1
-            if not evt.query():
-                wait_start_ns = time.perf_counter_ns()
-                evt.synchronize()
-                wait_ns = time.perf_counter_ns() - wait_start_ns
-                self._live_pages_slot_wait_count += 1
-                self._live_pages_slot_wait_ns_total += wait_ns
-                self._live_pages_last_slot_wait_ns = wait_ns
+            if evt.query():
+                # This event belongs to the current pool and was recorded
+                # after every retired pool use on the single writer stream.
+                retired = self._live_pages_retired_buffer_sets
+                if isinstance(retired, list) and retired:
+                    self._reclaim_live_pages_retired_buffer_sets()
+            else:
+                # Busy is measured in-flight demand, not a reason to block the
+                # scheduler thread. Grow by exactly one observed slot; after
+                # the oldest candidate completes, circular reuse stabilizes.
+                oldest_idx = idx
+                # The cursor may be nonzero, so the physical list tail is not
+                # necessarily the temporal tail. Insert the new (newest)
+                # carrier immediately before the oldest cursor; the old oldest
+                # shifts right by one and circular FIFO order remains intact.
+                ring.insert(
+                    oldest_idx,
+                    self._allocate_live_pages_pinned_slot(
+                        rows_capacity=rows_cap,
+                        max_pages=max_pages,
+                    ),
+                )
+                events.insert(oldest_idx, None)
+                ring_page_counts.insert(oldest_idx, [0] * rows_cap)
+                idx = oldest_idx
+                next_oldest_idx = oldest_idx + 1
+                evt = None
+                self._live_pages_slot_growth_count += 1
+                self._live_pages_max_ring_slot_count = max(
+                    self._live_pages_max_ring_slot_count,
+                    len(ring),
+                )
         pinned = ring[idx]
         pinned_page_counts = ring_page_counts[idx]
-        self._live_pages_pinned_ring_idx = (idx + 1) % len(ring)
-        staging = self._live_pages_staging_gpu
+        self._live_pages_pinned_ring_idx = next_oldest_idx
         previous_page_counts = tuple(
             int(pinned_page_counts[i]) for i in range(len(dirty))
         )

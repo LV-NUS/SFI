@@ -1678,6 +1678,9 @@ def _build_step_ticket(
 
 _PREPARE_PATCHED: bool = False
 _ORIGINAL_PREPARE_INPUTS = None
+_BATCH_EXECUTION_ADMISSION_PATCHED: bool = False
+_ORIGINAL_DETERMINE_BATCH_EXECUTION = None
+_INSTALLED_DETERMINE_BATCH_EXECUTION_WRAPPER = None
 _DUMMY_RUN_PATCHED: bool = False
 _ORIGINAL_DUMMY_RUN = None
 _UPDATE_STATES_PATCHED: bool = False
@@ -3006,6 +3009,14 @@ def _ensure_step_prologue(
     """
     if step_bound_meta.prologue_done_for_identity_token == step_bound_meta.step_identity_token:
         return
+    from patches.fa_sparse_runtime.compact_mixed_page_route import (
+        bind_compact_arena_consumer_stream_for_step,
+    )
+
+    bind_compact_arena_consumer_stream_for_step(
+        step_bound_meta=step_bound_meta,
+        device=device,
+    )
 
     from patches.fa_sparse_runtime.mixed_prefill_decode_owner import (
         resolve_mixed_prefill_decode_owner_plan,
@@ -3669,10 +3680,10 @@ def _patch_prepare_inputs() -> None:
                     and prompt_array is not None
                     and num_tokens_no_spec_cpu is not None
                 ):
-                    # 热路径预算（O(1)/请求）：悬挂占位符 ≤ stash 深度(4) 且必然
-                    # 聚在已写区尾部（vLLM 每 async 步恰写一个、FIFO 修复恰消一
-                    # 个），故只扫 6 元素尾窗；prompt 长度直接查 num_prompt_tokens
-                    # 数组，零每步分配。
+                    # 待修占位符必然聚在已写区尾部（vLLM 每 async 步恰写一个、
+                    # FIFO 修复恰消一个）。扫描宽度直接取本次真实 stash 深度+1，
+                    # 不再假设“最多滞后 5 步”；稳态深度=2 时只扫 3 格，复杂调度
+                    # 下则覆盖全部真实 backlog，不漏修也不做全输出历史扫描。
                     # [HARVEST-FIXED-LAG 2026-07-08] 消费"除最新一档外"全部档。
                     # 原 [TP-DET-HARVEST-COUNT] 把 query→break 改成必消到空,
                     # rank 无关性正确,但最新档的 D2H 上游=本批 forward+采样:
@@ -3686,6 +3697,7 @@ def _patch_prepare_inputs() -> None:
                     # 容忍,水位只推已喂部分),-1 回填 6 元素尾窗容纳 stash 深
                     # 度 4≥2。query/synchronize 臂保留=正确性护栏(老档理应已
                     # 完成,GPU 极端落后时正确等待,绝不读半成品缓冲)。
+                    _repair_tail_span = len(_stash) + 1
                     while len(_stash) > 1:
                         _ids_cpu, _ready_evt, _prev_map = _stash[0]
                         if _ready_evt is not None:
@@ -3713,7 +3725,7 @@ def _patch_prepare_inputs() -> None:
                                 "E_TP2_TOKEN_SOURCE_INCOMPLETE: async sampled ids "
                                 f"max_gen_len={int(_ids_cpu.shape[-1])} != 1 (spec "
                                 "decode unsupported with sparse TP async); rerun "
-                                "with --sync-scheduling"
+                                "with --scheduling-mode sync"
                             )
                         # [TPX-D1] 档级一次 numpy 零拷贝视图：torch CPU 标量索引
                         # ~3.3µs/请求 vs 视图索引 ~0.1µs（event 已就绪后才读，
@@ -3749,10 +3761,9 @@ def _patch_prepare_inputs() -> None:
                             _p_len = int(prompt_array[_cur])
                             if _row_end <= _p_len:
                                 continue
-                            _lo = _p_len if _row_end - _p_len < 6 else _row_end - 6
-                            # [TPX-D2] 找最老 -1 槽位首个命中即写：≤6 元素硬界窗，
-                            # 逐标量扫 ~0.5µs vs asarray+flatnonzero 三调度 ~2.4µs；
-                            # 无 -1（resume 重建全实值行）则不写，与旧语义等价。
+                            _lo = max(_p_len, _row_end - int(_repair_tail_span))
+                            # [TPX-D2] 找最老 -1 槽位首个命中即写；窗口由真实
+                            # backlog 派生。无 -1（resume 重建全实值行）则不写。
                             for _j in range(_lo, _row_end):
                                 if token_ids_cpu[_cur, _j] < 0:
                                     token_ids_cpu[_cur, _j] = _tok
@@ -3854,11 +3865,283 @@ def _patch_prepare_inputs() -> None:
                         _refresh_mixed_page_resolver_replay_carriers_from_attn_metadata(
                             attn_metadata_obj
                         )
+            # The graph dispatcher runs immediately after _prepare_inputs.
+            # Arm a request-local, step-identity-bound admission ticket only
+            # when the CPU prefill plan contains an actual capture producer.
+            admission_step_authority = getattr(
+                controller,
+                "step_authority",
+                None,
+            )
+            if bool(
+                getattr(admission_step_authority, "has_prefill_row", False)
+            ):
+                _arm_prefill_capture_cudagraph_admission(self, controller)
         return result
 
     GPUModelRunner._prepare_inputs = _sparse_prepare_inputs  # type: ignore[assignment]
     _ORIGINAL_PREPARE_INPUTS = original_prepare
     _PREPARE_PATCHED = True
+
+
+_PREFILL_CAPTURE_CUDAGRAPH_ADMISSION_ATTR = (
+    "_sfi_prefill_capture_cudagraph_admission_identity"
+)
+
+
+def _resolve_active_prefill_capture_admission(
+    controller: object,
+) -> Optional[Tuple[Tuple[int, int, int, int], Tuple[str, ...]]]:
+    """Return current CPU identity and exact finalizing prefill producers.
+
+    FULL graph replay cannot execute the request-local Python attention
+    producer.  This predicate is deliberately evaluated after
+    ``prepare_step_context``: the prefill plan is then a step-scoped CPU truth,
+    and steady decode exits after the ``has_prefill_row`` branch without
+    scanning requests or touching CUDA.
+    """
+    step_context = getattr(controller, "step_context", None)
+    step_authority = getattr(controller, "step_authority", None)
+    if step_context is None or step_authority is None:
+        return None
+    if not bool(getattr(step_authority, "has_prefill_row", False)):
+        return None
+    if getattr(step_context, "step_authority", None) is not step_authority:
+        raise RuntimeError(
+            "E_PREFILL_CAPTURE_GRAPH_ADMISSION: step authority ownership drift"
+        )
+    get_plan = getattr(controller, "get_step_prefill_plan_by_req", None)
+    if not callable(get_plan):
+        raise RuntimeError(
+            "E_PREFILL_CAPTURE_GRAPH_ADMISSION: active prefill has no "
+            "capture-plan authority"
+        )
+    capture_plan_by_req, finalize_req_ids = get_plan(step_context=step_context)
+    if not capture_plan_by_req:
+        return None
+    return (
+        (
+            int(getattr(step_authority, "epoch", -1)),
+            int(getattr(step_authority, "step_handle_id", -1)),
+            int(getattr(step_authority, "step_handle_generation", -1)),
+            int(getattr(step_authority, "step_identity_token", -1)),
+        ),
+        tuple(str(rid) for rid in finalize_req_ids),
+    )
+
+
+def _active_prefill_capture_admission_identity(
+    controller: object,
+) -> Optional[Tuple[int, int, int, int]]:
+    admission = _resolve_active_prefill_capture_admission(controller)
+    return admission[0] if admission is not None else None
+
+
+def _arm_prefill_capture_cudagraph_admission(
+    runner: object,
+    controller: object,
+) -> None:
+    # Steady decode stops here.  Keep the full step-context/plan identity
+    # validation on the rare prefill branch rather than paying that helper
+    # call and its extra attribute reads on every decode step.
+    step_authority = getattr(controller, "step_authority", None)
+    if step_authority is None or not bool(
+        getattr(step_authority, "has_prefill_row", False)
+    ):
+        return
+    admission = _resolve_active_prefill_capture_admission(controller)
+    if admission is not None:
+        identity, finalize_req_ids = admission
+        if finalize_req_ids:
+            arm_submission_boundary = getattr(
+                controller,
+                "_arm_prefill_submission_boundary",
+                None,
+            )
+            if not callable(arm_submission_boundary):
+                raise RuntimeError(
+                    "E_TP_BOOTSTRAP_SUBMISSION_LEDGER_UNAVAILABLE"
+                )
+            arm_submission_boundary(
+                request_ids=finalize_req_ids,
+                epoch=int(identity[0]),
+            )
+        setattr(
+            runner,
+            _PREFILL_CAPTURE_CUDAGRAPH_ADMISSION_ATTR,
+            (
+                int(getattr(runner, "_sparse_worker_dispatch_token", -1)),
+                identity,
+            ),
+        )
+
+
+class _FullCudagraphIneligibleDispatcher:
+    """A call-scoped dispatcher view that preserves PIECEWISE/NONE fallback."""
+
+    __slots__ = ("_dispatcher", "_full_mode")
+
+    def __init__(self, dispatcher: object, full_mode: object) -> None:
+        self._dispatcher = dispatcher
+        self._full_mode = full_mode
+
+    def dispatch(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        invalid_modes = kwargs.get("invalid_modes")
+        if invalid_modes is None:
+            kwargs["invalid_modes"] = frozenset((self._full_mode,))
+        elif self._full_mode not in invalid_modes:
+            kwargs["invalid_modes"] = frozenset(invalid_modes) | frozenset(
+                (self._full_mode,)
+            )
+        return self._dispatcher.dispatch(*args, **kwargs)
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._dispatcher, name)
+
+
+def _preflight_batch_execution_admission_hook_lease() -> None:
+    """Validate admission-hook ownership before install reuse or teardown."""
+
+    original_present = _ORIGINAL_DETERMINE_BATCH_EXECUTION is not None
+    wrapper_present = _INSTALLED_DETERMINE_BATCH_EXECUTION_WRAPPER is not None
+    if not _BATCH_EXECUTION_ADMISSION_PATCHED:
+        if original_present or wrapper_present:
+            raise RuntimeError(
+                "E_PREFILL_CAPTURE_GRAPH_ADMISSION: patch lease state corrupt"
+            )
+        return
+    if not original_present or not wrapper_present:
+        raise RuntimeError(
+            "E_PREFILL_CAPTURE_GRAPH_ADMISSION: patch lease state corrupt"
+        )
+    try:
+        from vllm.v1.worker.gpu_model_runner import GPUModelRunner  # type: ignore[import]
+    except Exception as exc:
+        raise RuntimeError(
+            "E_PREFILL_CAPTURE_GRAPH_ADMISSION: patch lease interface unavailable"
+        ) from exc
+    if (
+        GPUModelRunner._determine_batch_execution_and_padding
+        is not _INSTALLED_DETERMINE_BATCH_EXECUTION_WRAPPER
+    ):
+        raise RuntimeError(
+            "E_PREFILL_CAPTURE_GRAPH_ADMISSION: patch lease lost"
+        )
+
+
+def _patch_batch_execution_cudagraph_admission() -> None:
+    """Exclude FULL only for a step with a live Python prefill producer.
+
+    The wrapper's common path is one absent instance-attribute read.  The
+    proxy allocation and dispatcher swap exist only for the rare capture
+    window step, are restored in ``finally``, and never evict or recapture a
+    graph.
+    """
+    global _BATCH_EXECUTION_ADMISSION_PATCHED
+    global _ORIGINAL_DETERMINE_BATCH_EXECUTION
+    global _INSTALLED_DETERMINE_BATCH_EXECUTION_WRAPPER
+    _preflight_batch_execution_admission_hook_lease()
+    if _BATCH_EXECUTION_ADMISSION_PATCHED:
+        return
+    try:
+        from vllm.config import CUDAGraphMode  # type: ignore[import]
+        from vllm.v1.worker.gpu_model_runner import GPUModelRunner  # type: ignore[import]
+    except Exception as exc:
+        raise RuntimeError(
+            "E_PREFILL_CAPTURE_GRAPH_ADMISSION: required vLLM graph "
+            "admission interface is unavailable"
+        ) from exc
+
+    original_determine = GPUModelRunner._determine_batch_execution_and_padding
+
+    def _sparse_determine_batch_execution(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        admission_ticket = getattr(
+            self,
+            _PREFILL_CAPTURE_CUDAGRAPH_ADMISSION_ATTR,
+            None,
+        )
+        if admission_ticket is None:
+            return original_determine(self, *args, **kwargs)
+        delattr(self, _PREFILL_CAPTURE_CUDAGRAPH_ADMISSION_ATTR)
+
+        if (
+            not isinstance(admission_ticket, tuple)
+            or len(admission_ticket) != 2
+            or not isinstance(admission_ticket[1], tuple)
+            or len(admission_ticket[1]) != 4
+        ):
+            raise RuntimeError(
+                "E_PREFILL_CAPTURE_GRAPH_ADMISSION: malformed admission ticket"
+            )
+        armed_dispatch_token = int(admission_ticket[0])
+        identity = tuple(int(v) for v in admission_ticket[1])
+
+        # A ticket belongs to exactly one execute_model dispatch.  If prepare
+        # armed it but determine never consumed it, the next regular dispatch
+        # has a new worker token; dummy/profile work is explicitly outside the
+        # live request policy.  Both cases self-retire the stale ticket without
+        # penalizing the absent-ticket steady path with a cleanup lookup.
+        current_dispatch_token = int(
+            getattr(self, "_sparse_worker_dispatch_token", -1)
+        )
+        controller = _GLOBAL_CONTROLLER
+        if (
+            armed_dispatch_token != current_dispatch_token
+            or _is_vllm_dummy_run_active(controller)
+        ):
+            return original_determine(self, *args, **kwargs)
+
+        current_identity = (
+            _active_prefill_capture_admission_identity(controller)
+            if controller is not None
+            else None
+        )
+        if current_identity is None:
+            # Same-dispatch prepare reentry can legitimately retire a plan
+            # before graph admission.  Current CPU policy is authoritative.
+            return original_determine(self, *args, **kwargs)
+        if current_identity != identity:
+            raise RuntimeError(
+                "E_PREFILL_CAPTURE_GRAPH_ADMISSION: stale step admission; "
+                f"armed={identity!r} current={current_identity!r}"
+            )
+
+        dispatcher = getattr(self, "cudagraph_dispatcher", None)
+        if dispatcher is None:
+            raise RuntimeError(
+                "E_PREFILL_CAPTURE_GRAPH_ADMISSION: runner dispatcher missing"
+            )
+        admission_dispatcher = _FullCudagraphIneligibleDispatcher(
+            dispatcher,
+            CUDAGraphMode.FULL,
+        )
+        self.cudagraph_dispatcher = admission_dispatcher
+        try:
+            result = original_determine(self, *args, **kwargs)
+            if (
+                isinstance(result, tuple)
+                and result
+                and result[0] == CUDAGraphMode.FULL
+            ):
+                raise RuntimeError(
+                    "E_PREFILL_CAPTURE_GRAPH_ADMISSION: active prefill was "
+                    "still admitted to FULL replay"
+                )
+            return result
+        finally:
+            # Restore the predecessor even when dispatch itself raises.  The
+            # call-scoped capability view must never leak into a later step or
+            # obscure the original exception with cleanup diagnostics.
+            self.cudagraph_dispatcher = dispatcher
+
+    GPUModelRunner._determine_batch_execution_and_padding = (  # type: ignore[assignment]
+        _sparse_determine_batch_execution
+    )
+    _ORIGINAL_DETERMINE_BATCH_EXECUTION = original_determine
+    _INSTALLED_DETERMINE_BATCH_EXECUTION_WRAPPER = (
+        _sparse_determine_batch_execution
+    )
+    _BATCH_EXECUTION_ADMISSION_PATCHED = True
 
 
 def _capture_profile_device_properties(device: torch.device):
@@ -4052,7 +4335,6 @@ def _prebuild_capture_buffers(runner, controller) -> None:
         prepare_capture_cohort_tape,
     )
     from patches.fa3_native.postprocess import (
-        TILED_CAPTURE_POSTPROCESS_MAX_SLOT_COUNT,
         plan_tiled_capture_postprocess_resources,
         prepare_tiled_capture_postprocess_resources,
     )
@@ -4173,15 +4455,19 @@ def _prebuild_capture_buffers(runner, controller) -> None:
         refresh_stream = getattr(controller, "refresh_stream", None)
     async_owner_available = bool(refresh_stream is not None)
 
-    # Both owners may use the dynamic tiled selector kernel.  Plan the exact
-    # persistent device footprint before choosing ownership so the 5% budget
-    # compares complete live allocations rather than scratch alone.  ring_early
-    # launches one layer at a time and keeps the bounded host-staging ring;
-    # chunk_cohort launches at most C*rows in one sequence and needs only the
-    # configured in-flight depth.  The policy zeros these costs when the tiled
-    # kernel is structurally ineligible for the stamped geometry.
+    # Both owners may use the dynamic tiled selector kernel.  Budget the exact
+    # structural GPU-owner concurrency before profile work: ring_early owns one
+    # workspace per scratch lane; chunk_cohort owns one per configured in-flight
+    # bank.  The sealed live path never grows this GPU footprint.  Pinned H2D
+    # metadata sources are a separate small FIFO and therefore cannot duplicate
+    # a giant tiled workspace merely because a prior host source is still busy.
+    ring_structural_slots = (
+        int(_CAPTURE_REDUCE_GROUP) * int(_CAPTURE_IN_FLIGHT)
+        if int(_CAPTURE_REDUCE_GROUP) > 0
+        else int(_CAPTURE_CHUNK) * int(_CAPTURE_IN_FLIGHT)
+    )
     ring_tiled_resources = plan_tiled_capture_postprocess_resources(
-        slot_count=int(TILED_CAPTURE_POSTPROCESS_MAX_SLOT_COUNT),
+        slot_count=max(1, ring_structural_slots),
         num_rows_capacity=int(producer_rows_worst),
         num_query_heads=int(num_heads),
         logical_k_capacity=int(kv_max_bucket),
@@ -4228,6 +4514,16 @@ def _prebuild_capture_buffers(runner, controller) -> None:
         target_tape_device_bytes=int(cohort_tape_report.total_device_bytes),
         configured_device_bytes=int(configured_device_bytes),
     )
+    if (
+        int(ring_tiled_resources.structural_slot_count)
+        != int(ownership_plan.baseline_depth)
+        or int(cohort_tiled_resources.structural_slot_count)
+        != int(ownership_plan.in_flight)
+    ):
+        raise RuntimeError(
+            "E_SFI_CAPTURE_TILED_OWNERSHIP: structural workspace slots "
+            "disagree with the immutable scratch-owner concurrency"
+        )
 
     # (finding-5 fail-safe) The live buckets (kv / last_n / rows) are stamped LAST,
     # only after the arena reserve + every per-chunk scratch slab is resident (see the
@@ -4410,8 +4706,17 @@ def _prebuild_capture_buffers(runner, controller) -> None:
         )
         scratch_cache_hit = cache_map.get(scratch_key) is not None
         if not scratch_cache_hit:
-            cache_map[scratch_key] = torch.empty(
-                scratch_storage_shape, device=dev, dtype=scratch_dtype
+            from patches.fa3_native.forward_capture import (
+                _store_capture_scratch_cache_entry,
+            )
+
+            _store_capture_scratch_cache_entry(
+                cache_owner=controller,
+                cache_map=cache_map,
+                scratch_key=scratch_key,
+                scratch_storage=torch.empty(
+                    scratch_storage_shape, device=dev, dtype=scratch_dtype
+                ),
             )
         from patches.fa3_native.forward_capture import log_capture_scratch_probe
 
@@ -4695,6 +5000,7 @@ def _patch_dummy_run() -> None:
 def _patch_update_states() -> None:
     global _UPDATE_STATES_PATCHED, _ORIGINAL_UPDATE_STATES
     global _INSTALLED_UPDATE_STATES_WRAPPER
+    _preflight_update_states_hook_lease()
     if _UPDATE_STATES_PATCHED:
         return
     try:
@@ -4759,12 +5065,13 @@ def is_exact_sparse_update_states_predecessor(candidate: object) -> bool:
 def _preflight_update_states_hook_lease() -> None:
     """Reject out-of-order teardown before any sparse state is mutated."""
 
+    original_present = _ORIGINAL_UPDATE_STATES is not None
+    wrapper_present = _INSTALLED_UPDATE_STATES_WRAPPER is not None
     if not _UPDATE_STATES_PATCHED:
+        if original_present or wrapper_present:
+            raise RuntimeError("E_SPARSE_UPDATE_STATES_HOOK_LEASE_STATE")
         return
-    if (
-        _ORIGINAL_UPDATE_STATES is None
-        or _INSTALLED_UPDATE_STATES_WRAPPER is None
-    ):
+    if not original_present or not wrapper_present:
         raise RuntimeError("E_SPARSE_UPDATE_STATES_HOOK_LEASE_STATE")
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner  # type: ignore[import]
 
@@ -6521,7 +6828,7 @@ def _wait_prebound_rrp_ready_event_from_graph_state(
     forward_context: object,
     state: dict[str, object],
     profile_pre_timing: Optional[dict[str, float]] = None,
-) -> int | None:
+) -> object:
     from patches.fa_sparse_runtime.mixed_page_cudagraph_replay import (
         validate_resolved_row_ptr_ready_state,
     )
@@ -6630,16 +6937,6 @@ def _wait_prebound_rrp_ready_event_from_graph_state(
         )
     else:
         setattr(controller, "_prebound_rrp_observed_ready_state", None)
-    # This is the exact descriptor generation the immediately following graph
-    # replay will consume.  Unlike the same-stream proof above it remains valid
-    # when raw stream identity is unavailable, because the post-replay event is
-    # the ordering authority for the next writer.
-    setattr(
-        controller,
-        "_prebound_rrp_replay_generation",
-        (state, int(generation)),
-    )
-
     _t_attr_publish_ns = _full_cudagraph_pre_timing_start(profile_pre_timing)
     previous_total = int(
         getattr(
@@ -6663,13 +6960,17 @@ def _wait_prebound_rrp_ready_event_from_graph_state(
         "pre_ready_event_attr_publish_us",
         _t_attr_publish_ns,
     )
-    return int(wait_count)
+    # Return the already-created validated state.  The caller stores its exact
+    # generation in the existing immutable replay-stats object, avoiding a new
+    # per-replay proof container on the hot path.
+    return ready_state
 
 
 def _record_prebound_rrp_replay_consumed_generation(
     *,
     controller: object,
     state: dict[str, object] | None,
+    replay_proof: object,
 ) -> int:
     if state is None or not torch.cuda.is_available():
         return 0
@@ -6685,6 +6986,7 @@ def _record_prebound_rrp_replay_consumed_generation(
         record_rrp_replay_consumed_generation(
             controller,
             state=state,
+            replay_proof=replay_proof,
             stream=stream,
             stream_identity=int(stream_identity),
             event_factory=lambda: torch.cuda.Event(
@@ -6699,6 +7001,7 @@ def _prebound_rrp_replay_consumed_by_nested_wrapper(
     *,
     controller: object,
     state: dict[str, object] | None,
+    replay_proof: object,
     previous_consumed_state: object,
 ) -> bool:
     if state is None:
@@ -6711,6 +7014,7 @@ def _prebound_rrp_replay_consumed_by_nested_wrapper(
         replay_consumed_generation_was_recorded_since(
             controller,
             state=state,
+            replay_proof=replay_proof,
             previous_consumed_state=previous_consumed_state,
         )
     )
@@ -7469,14 +7773,18 @@ def _mark_prebound_rrp_full_cudagraph_replay(
     step_id = -1 if step_id_value is None else int(step_id_value)
     carrier_publish = None
     _t_wait_ns = _full_cudagraph_pre_timing_start(profile_pre_timing)
-    ready_event_wait_count = (
-        _wait_prebound_rrp_ready_event_from_graph_state(
-            controller=controller,
-            forward_context=forward_context,
-            state=state,
-            profile_pre_timing=profile_pre_timing,
+    replay_ready_state = _wait_prebound_rrp_ready_event_from_graph_state(
+        controller=controller,
+        forward_context=forward_context,
+        state=state,
+        profile_pre_timing=profile_pre_timing,
+    )
+    ready_event_wait_count = int(
+        getattr(
+            forward_context,
+            "mixed_page_resolver_replay_ready_event_wait_count",
+            0,
         )
-        or 0
     )
     _full_cudagraph_pre_timing_add(
         profile_pre_timing,
@@ -7519,6 +7827,8 @@ def _mark_prebound_rrp_full_cudagraph_replay(
         step_id,
         graph_key,
         int(ready_event_wait_count),
+        state,
+        int(replay_ready_state.generation),
     )
     _full_cudagraph_pre_timing_add(
         profile_pre_timing,
@@ -9917,6 +10227,7 @@ def _patch_cuda_graph_wrapper_for_sparse_cudagraph() -> None:
             profile_step_identity_payload = {}
             profile_prebound_identity_payload = {}
         profile_prebound_rrp_graph_state = None
+        profile_prebound_rrp_replay_proof = None
         _t_forward_context_ns = _full_cudagraph_pre_timing_start(profile_pre_timing)
         forward_context_available = bool(is_forward_context_available())
         pre_call_batch_descriptor = None
@@ -10244,6 +10555,10 @@ def _patch_cuda_graph_wrapper_for_sparse_cudagraph() -> None:
                                 prevalidated_rrp_graph_state is not None
                             ),
                         )
+                        profile_prebound_rrp_graph_state = (
+                            prebound_stats.replay_generation_state
+                        )
+                        profile_prebound_rrp_replay_proof = prebound_stats
                         _evt_bisect_mark("post_prebind", controller)
                         _full_cudagraph_pre_timing_add(
                             profile_pre_timing,
@@ -10382,6 +10697,7 @@ def _patch_cuda_graph_wrapper_for_sparse_cudagraph() -> None:
             _record_prebound_rrp_replay_consumed_generation(
                 controller=controller,
                 state=profile_prebound_rrp_graph_state,
+                replay_proof=profile_prebound_rrp_replay_proof,
             )
         # Cut A: run the deferred writer-ready commit now (post-replay), BEFORE
         # the deferred-replay drain + post-replay enqueue below -- those mutate /
@@ -10709,6 +11025,7 @@ def _patch_gpu_ubatch_wrapper_for_sparse_cudagraph() -> None:
         profile_reason = "refresh_disabled" if not refresh_enabled else ""
         profile_graph_key = ""
         profile_prebound_rrp_graph_state = None
+        profile_prebound_rrp_replay_proof = None
         if diagnostic_enabled:
             _t_step_identity_ns = _full_cudagraph_pre_timing_start(profile_pre_timing)
             profile_step_identity_payload = _mixed_page_full_cudagraph_step_identity_payload(controller)
@@ -10843,6 +11160,10 @@ def _patch_gpu_ubatch_wrapper_for_sparse_cudagraph() -> None:
                                 metadata_items=(),
                                 binding_is_current_prevalidated=True,
                             )
+                            profile_prebound_rrp_graph_state = (
+                                prebound_stats.replay_generation_state
+                            )
+                            profile_prebound_rrp_replay_proof = prebound_stats
                             _full_cudagraph_pre_timing_add(
                                 profile_pre_timing,
                                 "pre_prebound_mark_us",
@@ -10987,12 +11308,14 @@ def _patch_gpu_ubatch_wrapper_for_sparse_cudagraph() -> None:
             _prebound_rrp_replay_consumed_by_nested_wrapper(
                 controller=controller,
                 state=profile_prebound_rrp_graph_state,
+                replay_proof=profile_prebound_rrp_replay_proof,
                 previous_consumed_state=prebound_consumed_state_before,
             )
         ):
             _record_prebound_rrp_replay_consumed_generation(
                 controller=controller,
                 state=profile_prebound_rrp_graph_state,
+                replay_proof=profile_prebound_rrp_replay_proof,
             )
         if refresh_enabled and profile_reason == "prebound_rrp_graph_state":
             if (
@@ -11179,11 +11502,8 @@ def _patch_gpu_ubatch_wrapper_for_sparse_cudagraph() -> None:
     _UBATCH_WRAPPER_PATCHED = True
 
 
-# [HARVEST-FIXED-LAG 2026-07-08] 4→5:消费改"留最新一档"后稳态残留 0→1,
-# 同样的"连续 push 无排水窗"容忍度需 +1 补偿(守卫语义不变=修复通道断流即炸)。
-# -1 回填 6 元素尾窗按 6>5 仍覆盖满深度。
-_ASYNC_SAMPLED_STASH_MAX = 5
 _ORIGINAL_SET_ASYNC_SAMPLED_TOKEN_IDS = None
+_INSTALLED_SET_ASYNC_SAMPLED_TOKEN_IDS_WRAPPER = None
 
 
 def _read_async_sampled_token(
@@ -11252,6 +11572,8 @@ def _install_async_sampled_token_stash() -> None:
     占位符。仅 TP>1 时收集（TP=1 走 enginecore sentence hook，语义同构）。
     """
     global _ORIGINAL_SET_ASYNC_SAMPLED_TOKEN_IDS
+    global _INSTALLED_SET_ASYNC_SAMPLED_TOKEN_IDS_WRAPPER
+    _preflight_async_sampled_token_stash_hook_lease()
     if _ORIGINAL_SET_ASYNC_SAMPLED_TOKEN_IDS is not None:
         return
     try:
@@ -11283,13 +11605,6 @@ def _install_async_sampled_token_stash() -> None:
                 if stash is None:
                     stash = deque()
                     controller._async_sampled_stash = stash
-                if len(stash) >= _ASYNC_SAMPLED_STASH_MAX:
-                    raise RuntimeError(
-                        "E_TP2_TOKEN_SOURCE_INCOMPLETE: async sampled-token stash "
-                        f"overflow (repair lag > {_ASYNC_SAMPLED_STASH_MAX} steps); "
-                        "worker repair pass is not draining. Escape hatch: rerun "
-                        "with --sync-scheduling / VLLM_SPARSE_SYNC_SCHEDULING=1"
-                    )
                 stash.append(
                     (sampled_token_ids_cpu, async_copy_ready_event, prev_map)
                 )
@@ -11297,6 +11612,31 @@ def _install_async_sampled_token_stash() -> None:
 
     InputBatch.set_async_sampled_token_ids = _patched_set_async_sampled_token_ids  # type: ignore[assignment]
     _ORIGINAL_SET_ASYNC_SAMPLED_TOKEN_IDS = original_set
+    _INSTALLED_SET_ASYNC_SAMPLED_TOKEN_IDS_WRAPPER = (
+        _patched_set_async_sampled_token_ids
+    )
+
+
+def _preflight_async_sampled_token_stash_hook_lease() -> None:
+    """Validate ownership of the async sampled-token hook on cold paths."""
+
+    original_present = _ORIGINAL_SET_ASYNC_SAMPLED_TOKEN_IDS is not None
+    wrapper_present = _INSTALLED_SET_ASYNC_SAMPLED_TOKEN_IDS_WRAPPER is not None
+    if not original_present and not wrapper_present:
+        return
+    if not original_present or not wrapper_present:
+        raise RuntimeError("E_TP_ASYNC_TOKEN_STASH_HOOK_LEASE_STATE")
+    try:
+        from vllm.v1.worker.gpu_input_batch import InputBatch  # type: ignore[import]
+    except Exception as exc:
+        raise RuntimeError(
+            "E_TP_ASYNC_TOKEN_STASH_HOOK_LEASE_INTERFACE"
+        ) from exc
+    if (
+        InputBatch.set_async_sampled_token_ids
+        is not _INSTALLED_SET_ASYNC_SAMPLED_TOKEN_IDS_WRAPPER
+    ):
+        raise RuntimeError("E_TP_ASYNC_TOKEN_STASH_HOOK_LEASE_LOST")
 
 
 def _patch_request_append() -> None:
@@ -11636,6 +11976,50 @@ def _restore_compact_page_residency_core_patch() -> None:
         _log.error("Failed to clear compact page lease transport", exc_info=True)
 
 
+def _preflight_controller_hook_leases() -> None:
+    """Validate every hook with an explicit ownership lease before mutation."""
+
+    patch_installed = bool(_PATCH_INSTALLED)
+    fa3_installed = bool(_FLASH_ATTN_FORWARD_PATCHED)
+    if patch_installed != fa3_installed:
+        raise RuntimeError("E_SFI_FA3_GATEWAY_INSTALL_STATE")
+    fa3_predecessors = (
+        _ORIGINAL_V1_FLASH_ATTN_VARLEN_FUNC,
+        _ORIGINAL_V1_FLASH_ATTN_FORWARD,
+        _ORIGINAL_V1_FLASH_ATTN_GET_SCHEDULER_METADATA,
+        _ORIGINAL_V1_FLASH_ATTN_GET_FLASH_ATTN_VERSION,
+        _ORIGINAL_FA_UTILS_FLASH_ATTN_VARLEN_FUNC,
+        _ORIGINAL_FA_UTILS_GET_SCHEDULER_METADATA,
+        _ORIGINAL_FA_UTILS_GET_FLASH_ATTN_VERSION,
+        _ORIGINAL_V1_FLASH_METADATA_FULL_CUDAGRAPH_SUPPORTED,
+    )
+    if not fa3_installed:
+        if any(value is not None for value in fa3_predecessors):
+            raise RuntimeError("E_SFI_FA3_GATEWAY_INSTALL_STATE")
+    else:
+        if _ORIGINAL_V1_FLASH_ATTN_FORWARD is None:
+            raise RuntimeError("E_SFI_FA3_GATEWAY_INSTALL_STATE")
+        try:
+            from vllm.v1.attention.backends import flash_attn as v1_flash_attn
+
+            if getattr(v1_flash_attn, "FlashAttentionImpl", None) is None:
+                raise AttributeError("FlashAttentionImpl is unavailable")
+            if any(
+                value is not None
+                for value in (
+                    _ORIGINAL_FA_UTILS_FLASH_ATTN_VARLEN_FUNC,
+                    _ORIGINAL_FA_UTILS_GET_SCHEDULER_METADATA,
+                    _ORIGINAL_FA_UTILS_GET_FLASH_ATTN_VERSION,
+                )
+            ):
+                import_fa_utils_module()
+        except Exception as exc:
+            raise RuntimeError("E_SFI_FA3_GATEWAY_LEASE_INTERFACE") from exc
+    _preflight_update_states_hook_lease()
+    _preflight_batch_execution_admission_hook_lease()
+    _preflight_async_sampled_token_stash_hook_lease()
+
+
 def _set_controller(config: SparseControllerConfig) -> "VLLMSparseController":
     from patches.vllm_sparse_patch import VLLMSparseController  # lazy: avoid circular
     global _GLOBAL_CONTROLLER
@@ -11643,6 +12027,7 @@ def _set_controller(config: SparseControllerConfig) -> "VLLMSparseController":
     controller = VLLMSparseController(config)
     _GLOBAL_CONTROLLER = controller
     _patch_prepare_inputs()
+    _patch_batch_execution_cudagraph_admission()
     _patch_dummy_run()
     _patch_update_states()
     _patch_model_forward_refresh_owner()
@@ -11661,9 +12046,7 @@ def _ensure_controller() -> Optional["VLLMSparseController"]:
     config = _deserialize_config(payload)
     if config is None or not config.enabled:
         return None
-    controller = _set_controller(config)
-    _install_patch()
-    return controller
+    return _install_controller_patch_transaction(config)
 
 
 
@@ -11761,6 +12144,11 @@ def _install_patch() -> None:
     _patch_worker_busy_loop_tp_exception_failfast()
     global _PATCH_INSTALLED
     if _PATCH_INSTALLED:
+        if not _FLASH_ATTN_FORWARD_PATCHED:
+            raise RuntimeError(
+                "E_SFI_FA3_GATEWAY_INSTALL_STATE: patch is marked installed "
+                "without the required FA3 forward gateway"
+            )
         _patch_compact_page_residency_core()
         return
     _patch_cuda_graph_wrapper_for_sparse_cudagraph()
@@ -11768,6 +12156,11 @@ def _install_patch() -> None:
     _patch_compact_page_residency_core()
     try:
         _patch_flash_attention_forward_and_helpers()
+        if not _FLASH_ATTN_FORWARD_PATCHED:
+            raise RuntimeError(
+                "E_SFI_FA3_GATEWAY_INSTALL_STATE: required FA3 forward "
+                "gateway did not publish its installed state"
+            )
         _PATCH_INSTALLED = True
         import patches.vllm_sparse_patch as _main
         _main._CURRENT_UNIFIED_ATTENTION_MODE = "default"
@@ -13332,15 +13725,10 @@ def _run_capture_only_mixed_forward(
                             ready_cohort.jobs,
                             meta_cache_owner=controller,
                         )
-                        cohort_completion_event = torch.cuda.Event(
-                            enable_timing=False
-                        )
-                        cohort_completion_event.record(refresh_stream)
                         fence = getattr(controller, "_ring_war_fence", None)
                         publish_capture_cohort_completion(
                             ready_cohort,
                             ran_count=int(ran_count),
-                            completion_event=cohort_completion_event,
                             fence=fence,
                         )
                     postprocess_ran = True
@@ -13984,11 +14372,11 @@ def _patch_flash_attention_forward_and_helpers() -> None:
     try:
         from vllm.v1.attention.backends import flash_attn as v1_flash_attn
         fa_utils = import_fa_utils_module()
-    except Exception:
-        _log.warning(
-            "Cannot import flash_attn/fa_utils for forward/helper patch, skipping"
-        )
-        return
+    except Exception as exc:
+        raise RuntimeError(
+            "E_SFI_FA3_GATEWAY_INTERFACE: required flash_attn/fa_utils "
+            "interface is unavailable"
+        ) from exc
 
     from patches.fa3_native.install import (
         build_vendored_get_flash_attn_version,
@@ -14001,8 +14389,9 @@ def _patch_flash_attention_forward_and_helpers() -> None:
     native_get_flash_attn_version = build_vendored_get_flash_attn_version(bridge)
     impl_cls = getattr(v1_flash_attn, "FlashAttentionImpl", None)
     if impl_cls is None:
-        _log.warning("FlashAttentionImpl missing on v1 flash_attn backend, skipping")
-        return
+        raise RuntimeError(
+            "E_SFI_FA3_GATEWAY_INTERFACE: FlashAttentionImpl is unavailable"
+        )
 
     old_fa_utils_flash = getattr(fa_utils, "flash_attn_varlen_func", None)
     old_fa_utils_scheduler = getattr(fa_utils, "get_scheduler_metadata", None)
@@ -14023,8 +14412,9 @@ def _patch_flash_attention_forward_and_helpers() -> None:
         None,
     )
     if old_forward is None:
-        _log.warning("FlashAttentionImpl.forward missing on v1 flash_attn backend, skipping")
-        return
+        raise RuntimeError(
+            "E_SFI_FA3_GATEWAY_INTERFACE: FlashAttentionImpl.forward is unavailable"
+        )
     sfi_flash_gateway = _build_sfi_flash_attn_varlen_gateway(
         bridge,
         dense_fallback=old_v1_flash,
@@ -14053,17 +14443,6 @@ def _patch_flash_attention_forward_and_helpers() -> None:
             fa_utils.get_scheduler_metadata = _sm80_get_scheduler_metadata_none  # type: ignore[assignment]
         if old_v1_scheduler is not None:
             v1_flash_attn.get_scheduler_metadata = _sm80_get_scheduler_metadata_none  # type: ignore[assignment]
-        _v1_fa_backend_mod = sys.modules.get("vllm.v1.attention.backends.flash_attn")
-        old_backend_scheduler = getattr(
-            _v1_fa_backend_mod, "get_scheduler_metadata", None
-        )
-        old_backend_varlen = getattr(
-            _v1_fa_backend_mod, "flash_attn_varlen_func", None
-        )
-        if old_backend_scheduler is not None:
-            _v1_fa_backend_mod.get_scheduler_metadata = _sm80_get_scheduler_metadata_none  # type: ignore[union-attr]
-        if old_backend_varlen is not None:
-            _v1_fa_backend_mod.flash_attn_varlen_func = sfi_flash_gateway  # type: ignore[union-attr]
         if old_fa_utils_get_version is not None:
             fa_utils.get_flash_attn_version = native_get_flash_attn_version  # type: ignore[assignment]
         if old_v1_get_version is not None:
@@ -14089,10 +14468,6 @@ def _patch_flash_attention_forward_and_helpers() -> None:
             v1_flash_attn.get_scheduler_metadata = old_v1_scheduler  # type: ignore[assignment]
         if old_v1_get_version is not None:
             v1_flash_attn.get_flash_attn_version = old_v1_get_version  # type: ignore[assignment]
-        if _v1_fa_backend_mod is not None and old_backend_scheduler is not None:
-            _v1_fa_backend_mod.get_scheduler_metadata = old_backend_scheduler  # type: ignore[union-attr]
-        if _v1_fa_backend_mod is not None and old_backend_varlen is not None:
-            _v1_fa_backend_mod.flash_attn_varlen_func = old_backend_varlen  # type: ignore[union-attr]
         if metadata_builder_cls is not None and old_full_cudagraph_supported is not None:
             metadata_builder_cls.full_cudagraph_supported = old_full_cudagraph_supported  # type: ignore[assignment]
         impl_cls.forward = old_forward  # type: ignore[assignment]
@@ -14212,22 +14587,47 @@ def _install_controller_patch_transaction(
         Tuple[Tuple[bool, Optional[str]], Tuple[bool, Optional[str]]]
     ] = None,
 ) -> "VLLMSparseController":
+    controller_before = _GLOBAL_CONTROLLER
+    mutation_started = False
     try:
+        # Phase 1 is read-only.  A rejected reapply must preserve the old live
+        # controller and hooks instead of entering teardown with a lost lease.
+        _preflight_controller_hook_leases()
         _preflight_controller_config_contract(config)
         controller = _set_controller(config)
+        mutation_started = True
         _install_patch()
         _patch_flash_metadata_builder()
         return controller
-    except Exception:
-        try:
-            disable_vllm_sparse_patch()
-        except Exception:
-            _log.error(
-                "Failed to roll back vLLM sparse patch after install failure",
-                exc_info=True,
-            )
-        if env_snapshot is not None:
+    except Exception as install_exc:
+        rollback_needed = bool(
+            mutation_started or _GLOBAL_CONTROLLER is not controller_before
+        )
+        rollback_exc: Optional[BaseException] = None
+        if rollback_needed:
+            try:
+                disable_vllm_sparse_patch()
+            except Exception as exc:
+                rollback_exc = exc
+                _log.error(
+                    "Failed to roll back vLLM sparse patch after install failure",
+                    exc_info=True,
+                )
+        if rollback_needed:
+            os.environ.pop(_SERIALIZED_CONFIG_ENV, None)
+            if env_snapshot is not None:
+                # A post-activation failure tears the runtime down fail-closed;
+                # restoring an old enabled JSON would permit a zombie lazy
+                # reinstall.  Preserve only the caller's PYTHONPATH contract.
+                _restore_env_var("PYTHONPATH", env_snapshot[1])
+        elif env_snapshot is not None:
             _restore_sparse_patch_entry_env(env_snapshot)
+        if rollback_exc is not None:
+            raise RuntimeError(
+                "vLLM sparse patch install failed "
+                f"({type(install_exc).__name__}: {install_exc}) and rollback "
+                "also failed"
+            ) from rollback_exc
         raise
 
 
@@ -14268,6 +14668,9 @@ def ensure_vllm_sparse_patch_from_env() -> Optional["VLLMSparseController"]:
 def disable_vllm_sparse_patch() -> None:
     global _GLOBAL_CONTROLLER, _PATCH_INSTALLED
     global _PREPARE_PATCHED, _ORIGINAL_PREPARE_INPUTS
+    global _BATCH_EXECUTION_ADMISSION_PATCHED
+    global _ORIGINAL_DETERMINE_BATCH_EXECUTION
+    global _INSTALLED_DETERMINE_BATCH_EXECUTION_WRAPPER
     global _DUMMY_RUN_PATCHED, _ORIGINAL_DUMMY_RUN
     global _FLASH_METADATA_PATCHED, _ORIGINAL_FLASH_METADATA_BUILD
     global _REQUEST_PATCHED, _ORIGINAL_APPEND_OUTPUT_TOKEN_IDS
@@ -14288,7 +14691,9 @@ def disable_vllm_sparse_patch() -> None:
     global _COMPACT_PAGE_RESIDENCY_PATCHED, _ORIGINAL_KV_CACHE_MANAGER_INIT
     global _ORIGINAL_BLOCK_POOL_METHODS, _COMPACT_PAGE_BLOCK_POOL_CLS
     global _COMPACT_PAGE_KV_CACHE_MANAGER_CLS
-    _preflight_update_states_hook_lease()
+    global _ORIGINAL_SET_ASYNC_SAMPLED_TOKEN_IDS
+    global _INSTALLED_SET_ASYNC_SAMPLED_TOKEN_IDS_WRAPPER
+    _preflight_controller_hook_leases()
     _GLOBAL_CONTROLLER = None
     if _SERIALIZED_CONFIG_ENV in os.environ:
         del os.environ[_SERIALIZED_CONFIG_ENV]
@@ -14326,12 +14731,28 @@ def disable_vllm_sparse_patch() -> None:
             raise
     _MODEL_FORWARD_REFRESH_OWNER_PATCHED = False
     _ORIGINAL_MODEL_FORWARD_FOR_REFRESH_OWNER = None
-    if _ORIGINAL_V1_FLASH_ATTN_VARLEN_FUNC is not None:
+    if _FLASH_ATTN_FORWARD_PATCHED:
+        if _ORIGINAL_V1_FLASH_ATTN_FORWARD is None:
+            raise RuntimeError(
+                "E_SFI_FA3_GATEWAY_INSTALL_STATE: installed FA3 gateway has "
+                "no forward predecessor"
+        )
         try:
             from vllm.v1.attention.backends import flash_attn as v1_flash_attn
-            v1_flash_attn.flash_attn_varlen_func = _ORIGINAL_V1_FLASH_ATTN_VARLEN_FUNC  # type: ignore[assignment]
-            if _ORIGINAL_V1_FLASH_ATTN_FORWARD is not None:
-                v1_flash_attn.FlashAttentionImpl.forward = _ORIGINAL_V1_FLASH_ATTN_FORWARD  # type: ignore[assignment]
+            needs_fa_utils_restore = any(
+                value is not None
+                for value in (
+                    _ORIGINAL_FA_UTILS_FLASH_ATTN_VARLEN_FUNC,
+                    _ORIGINAL_FA_UTILS_GET_SCHEDULER_METADATA,
+                    _ORIGINAL_FA_UTILS_GET_FLASH_ATTN_VERSION,
+                )
+            )
+            fa_utils = (
+                import_fa_utils_module() if needs_fa_utils_restore else None
+            )
+            if _ORIGINAL_V1_FLASH_ATTN_VARLEN_FUNC is not None:
+                v1_flash_attn.flash_attn_varlen_func = _ORIGINAL_V1_FLASH_ATTN_VARLEN_FUNC  # type: ignore[assignment]
+            v1_flash_attn.FlashAttentionImpl.forward = _ORIGINAL_V1_FLASH_ATTN_FORWARD  # type: ignore[assignment]
             if _ORIGINAL_V1_FLASH_ATTN_GET_SCHEDULER_METADATA is not None:
                 v1_flash_attn.get_scheduler_metadata = _ORIGINAL_V1_FLASH_ATTN_GET_SCHEDULER_METADATA  # type: ignore[assignment]
             if _ORIGINAL_V1_FLASH_ATTN_GET_FLASH_ATTN_VERSION is not None:
@@ -14342,10 +14763,6 @@ def disable_vllm_sparse_patch() -> None:
                 and _ORIGINAL_V1_FLASH_METADATA_FULL_CUDAGRAPH_SUPPORTED is not None
             ):
                 metadata_builder_cls.full_cudagraph_supported = _ORIGINAL_V1_FLASH_METADATA_FULL_CUDAGRAPH_SUPPORTED  # type: ignore[assignment]
-            try:
-                fa_utils = import_fa_utils_module()
-            except Exception:
-                fa_utils = None
             if fa_utils is not None:
                 if _ORIGINAL_FA_UTILS_FLASH_ATTN_VARLEN_FUNC is not None:
                     fa_utils.flash_attn_varlen_func = _ORIGINAL_FA_UTILS_FLASH_ATTN_VARLEN_FUNC  # type: ignore[assignment]
@@ -14386,6 +14803,20 @@ def disable_vllm_sparse_patch() -> None:
         _UPDATE_STATES_PATCHED = False
         _ORIGINAL_UPDATE_STATES = None
         _INSTALLED_UPDATE_STATES_WRAPPER = None
+    if _ORIGINAL_SET_ASYNC_SAMPLED_TOKEN_IDS is not None:
+        try:
+            from vllm.v1.worker.gpu_input_batch import InputBatch  # type: ignore[import]
+
+            InputBatch.set_async_sampled_token_ids = (  # type: ignore[assignment]
+                _ORIGINAL_SET_ASYNC_SAMPLED_TOKEN_IDS
+            )
+        except Exception:
+            _log.error(
+                "Failed to restore async sampled-token stash hook during patch uninstall"
+            )
+            raise
+    _ORIGINAL_SET_ASYNC_SAMPLED_TOKEN_IDS = None
+    _INSTALLED_SET_ASYNC_SAMPLED_TOKEN_IDS_WRAPPER = None
     if _PREPARE_PATCHED and _ORIGINAL_PREPARE_INPUTS is not None:
         try:
             from vllm.v1.worker.gpu_model_runner import GPUModelRunner  # type: ignore[import]
@@ -14395,6 +14826,29 @@ def disable_vllm_sparse_patch() -> None:
             raise
     _PREPARE_PATCHED = False
     _ORIGINAL_PREPARE_INPUTS = None
+    if _BATCH_EXECUTION_ADMISSION_PATCHED:
+        try:
+            from vllm.v1.worker.gpu_model_runner import GPUModelRunner  # type: ignore[import]
+
+            if (
+                GPUModelRunner._determine_batch_execution_and_padding
+                is not _INSTALLED_DETERMINE_BATCH_EXECUTION_WRAPPER
+            ):
+                raise RuntimeError(
+                    "E_PREFILL_CAPTURE_GRAPH_ADMISSION: patch lease lost"
+                )
+            GPUModelRunner._determine_batch_execution_and_padding = (  # type: ignore[assignment]
+                _ORIGINAL_DETERMINE_BATCH_EXECUTION
+            )
+        except Exception:
+            _log.error(
+                "Failed to restore batch execution cudagraph admission patch",
+                exc_info=True,
+            )
+            raise
+    _BATCH_EXECUTION_ADMISSION_PATCHED = False
+    _ORIGINAL_DETERMINE_BATCH_EXECUTION = None
+    _INSTALLED_DETERMINE_BATCH_EXECUTION_WRAPPER = None
     if _DUMMY_RUN_PATCHED and _ORIGINAL_DUMMY_RUN is not None:
         try:
             from vllm.v1.worker.gpu_model_runner import GPUModelRunner  # type: ignore[import]

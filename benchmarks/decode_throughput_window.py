@@ -41,6 +41,22 @@ class CustomAllReduceDecision:
         }
 
 
+def _cuda_device_runtime_state() -> dict[str, object]:
+    """Return the worker-local CUDA identity used by cold runtime proofs."""
+    import torch
+
+    device_index = int(torch.cuda.current_device())
+    properties = torch.cuda.get_device_properties(device_index)
+    capability = torch.cuda.get_device_capability(device_index)
+    return {
+        "current_device": device_index,
+        "capability": f"{int(capability[0])}.{int(capability[1])}",
+        "name": str(getattr(properties, "name", "")),
+        "total_memory_bytes": int(getattr(properties, "total_memory", 0)),
+        "uuid": str(getattr(properties, "uuid", "") or ""),
+    }
+
+
 def _worker_custom_all_reduce_runtime_state(
     worker: object,
     required_num_tokens: int,
@@ -223,6 +239,7 @@ def _worker_custom_all_reduce_runtime_state(
         "tp_world_size": int(getattr(tp_group, "world_size")),
         "local_rank": int(getattr(tp_group, "local_rank")),
         "device": str(getattr(tp_group, "device", "")),
+        "cuda_device_runtime": _cuda_device_runtime_state(),
         "worker_class": type(worker).__name__,
         "parallel_config_disable_custom_all_reduce": config_disabled,
         "device_communicator_class": (
@@ -421,7 +438,6 @@ def _worker_engine_runtime_contract_state(
     """
     from collections import Counter
 
-    import torch
     from vllm.distributed.parallel_state import get_tp_group
 
     integers = {
@@ -440,18 +456,7 @@ def _worker_engine_runtime_contract_state(
         )
 
     tp_group = get_tp_group()
-    cuda_device_index = int(torch.cuda.current_device())
-    cuda_properties = torch.cuda.get_device_properties(cuda_device_index)
-    cuda_capability = torch.cuda.get_device_capability(cuda_device_index)
-    cuda_device_runtime = {
-        "current_device": cuda_device_index,
-        "capability": f"{int(cuda_capability[0])}.{int(cuda_capability[1])}",
-        "name": str(getattr(cuda_properties, "name", "")),
-        "total_memory_bytes": int(
-            getattr(cuda_properties, "total_memory", 0)
-        ),
-        "uuid": str(getattr(cuda_properties, "uuid", "") or ""),
-    }
+    cuda_device_runtime = _cuda_device_runtime_state()
     model_runner = getattr(worker, "model_runner", None)
     if model_runner is None:
         raise RuntimeError("E_ENGINE_RUNTIME_CONTRACT_UNAVAILABLE: model_runner")

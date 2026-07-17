@@ -23,10 +23,12 @@ sparse 若静默退化成 dense(触发为零/patch 未装/路由回落),精度�
      env 未设,与"装了但零活性"是不同的病,分开点名);--run-since 给出
      run 起点 epoch 时,产物 mtime 早于它=残留文件(append 模式的假 PASS
      陷阱),判红。
-  R1 世代活性: refresh flush 记录中 refresh_payloads>0 的世代发布次数
-     ≥ --min-world-publish(=0 即从未 sparse 化,decode 恒 dense)。
-  R2 触发活性: sentence 触发意图>0(interval 触发不在本记录,靠 R1 免
-     误报:interval-only 配置下 R1>0 即活)。
+  R1 世代活性: refresh flush 记录中 refresh_payloads>0 的世代发布次数，或
+     replay-batched 路径的正 refresh-payload-enqueue route 事件，二者之一
+     ≥ --min-world-publish。后者是当前 runtime 明确不写 per-chunk profile
+     时的同源提交证据，不能把健康 replay 误判为 decode 恒 dense。
+  R2 触发活性: sentence 触发意图>0；interval-only 配置由 R1 的世代活性
+     覆盖，replay-batched 路径也读取 route 事件中的 refresh_reason。
   R3 路由活性(两源,mmap 优先):
      a) --route-counter-mmap: 每个 TP rank 独占 10×int64 槽
         (total/kind4/has_rrp/kind0..4/compact_steps/compact_rows)，聚合前
@@ -35,8 +37,9 @@ sparse 若静默退化成 dense(触发为零/patch 未装/路由回落),精度�
         (长请求 sparse 化率;短请求低于阈值恒 dense 是设计内,聚合占比
         才有判读价值)。
   R4 请求级 fallback: --step-trace 提供 fa3_step_state 时按 PID/request
-     重建相位。prefill、bootstrap 未完成与显式 refresh 行允许 dense/native；
-     已进入 compact 的请求若回到 mature decode dense 则判红。已知长请求可用
+     重建相位。prefill、bootstrap 未完成的 dense 行与显式 refresh（包括
+     bootstrap refresh）允许 dense/native；已进入 compact 的请求若回到
+     mature decode dense 则判红。已知长请求可用
      --require-mature-decode-compact 收紧为所有 mature decode 都必须 compact。
   配置组合防护(启动期,非本判官):dual-gen×residency 缺失/FORCE_DENSE
      冲突=安装事务 fail-fast;residency slots<max_num_seqs=profile
@@ -47,6 +50,7 @@ sparse 若静默退化成 dense(触发为零/patch 未装/路由回落),精度�
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import struct
@@ -122,6 +126,46 @@ def _read_route_counter_mmap(path: str):
     }
 
 
+def _read_replay_batched_refresh_evidence(
+    path: str, *, offset: int = 0
+) -> dict[str, int]:
+    """Read fresh generation evidence emitted before replay-batched deferral.
+
+    The normal profile path records ``refresh_payloads`` at this same enqueue
+    boundary.  Replay-batched flush intentionally omits per-chunk profile
+    records, so this route event is its equivalent producer-commit evidence.
+    """
+    publishes = 0
+    payloads = 0
+    sentence_intents = 0
+    malformed = 0
+    parse_errors: list[str] = []
+    for event in _iter_json_records(
+        path,
+        offset=offset,
+        parse_errors=parse_errors,
+    ):
+        if event.get("event") != (
+            "mixed_page_full_cudagraph_replay_refresh_payload_enqueue"
+        ):
+            continue
+        payload_count = event.get("payload_count")
+        if type(payload_count) is not int or payload_count <= 0:
+            malformed += 1
+            continue
+        publishes += 1
+        payloads += payload_count
+        if str(event.get("refresh_reason", "")) == "sentence":
+            sentence_intents += 1
+    return {
+        "publishes": publishes,
+        "payloads": payloads,
+        "sentence_intents": sentence_intents,
+        "malformed": malformed,
+        "parse_errors": len(parse_errors),
+    }
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--refresh-profile-log", required=True)
@@ -134,6 +178,12 @@ def main() -> int:
         type=int,
         default=0,
         help="只判定该字节偏移之后的新 refresh 记录",
+    )
+    ap.add_argument(
+        "--route-trace-offset",
+        type=int,
+        default=0,
+        help="只判定该字节偏移之后的新 route 记录",
     )
     ap.add_argument(
         "--baseline-compact-row-steps",
@@ -177,6 +227,9 @@ def main() -> int:
     profile_offset = max(0, args.refresh_profile_offset)
     if args.refresh_profile_offset < 0:
         fails.append("R0: --refresh-profile-offset 必须非负")
+    route_trace_offset = max(0, args.route_trace_offset)
+    if args.route_trace_offset < 0:
+        fails.append("R0: --route-trace-offset 必须非负")
     step_trace_offset = max(0, args.step_trace_offset)
     if args.step_trace_offset < 0:
         fails.append("R0: --step-trace-offset 必须非负")
@@ -233,7 +286,12 @@ def main() -> int:
         True,
         minimum_size=profile_offset,
     )
-    trace_ok = _r0_check(args.route_trace, "route trace", False)
+    trace_ok = _r0_check(
+        args.route_trace,
+        "route trace",
+        False,
+        minimum_size=route_trace_offset,
+    )
     mmap_ok = _r0_check(args.route_counter_mmap, "route counter mmap", False)
     require_step_trace = bool(
         args.reject_request_fallback or args.require_mature_decode_compact
@@ -246,8 +304,11 @@ def main() -> int:
     )
 
     # ---- R1/R2 世代与触发活性 ----
-    world_publishes = 0
-    payloads_total = 0
+    # ``refresh_payloads`` is the physical profile source.  On the documented
+    # replay-batched path no per-chunk profile record exists, while the same
+    # logical producer generation emits a positive route enqueue event.
+    profile_world_publishes = 0
+    profile_payloads_total = 0
     reasons = Counter()
     pids = set()
     if profile_ok:
@@ -258,25 +319,78 @@ def main() -> int:
             pids.add(pid)
             rp = int(rec.get("refresh_payloads", 0) or 0)
             if rp > 0:
-                world_publishes += 1
-                payloads_total += rp
+                profile_world_publishes += 1
+                profile_payloads_total += rp
             reasons["sentence"] += int(rec.get("sentence_trigger_intents", 0) or 0)
-        print(
-            f"R1 世代活性: world_publish={world_publishes} "
-            f"payloads_total={payloads_total} pids={len(pids)}"
+
+    replay_evidence = {
+        "publishes": 0,
+        "payloads": 0,
+        "sentence_intents": 0,
+        "malformed": 0,
+        "parse_errors": 0,
+    }
+    if trace_ok:
+        replay_evidence = _read_replay_batched_refresh_evidence(
+            args.route_trace,
+            offset=route_trace_offset,
         )
-        if world_publishes < args.min_world_publish:
-            fails.append(
-                f"R1: refresh 世代发布 {world_publishes} < {args.min_world_publish}"
-                " —— decode 从未 sparse 化(疑触发哑火/请求全短于阈值)"
+
+    # Profile remains authoritative whenever it observed a physical publish.
+    # Otherwise the replay enqueue is the only observable logical generation;
+    # do not double-count a generation visible through both sources.
+    if profile_world_publishes > 0:
+        generation_count = profile_world_publishes
+        payloads_total = profile_payloads_total
+        generation_source = "refresh_profile"
+    elif replay_evidence["publishes"] > 0:
+        generation_count = replay_evidence["publishes"]
+        payloads_total = replay_evidence["payloads"]
+        generation_source = "replay_batched_route"
+    else:
+        generation_count = 0
+        payloads_total = 0
+        generation_source = "none"
+    sentence_intents = max(
+        int(reasons.get("sentence", 0)),
+        int(replay_evidence["sentence_intents"]),
+    )
+
+    if profile_ok:
+        print(
+            f"R1 世代活性: generation_count={generation_count} "
+            f"payloads_total={payloads_total} pids={len(pids)} "
+            f"source={generation_source} profile_world_publish="
+            f"{profile_world_publishes} replay_enqueue_events="
+            f"{replay_evidence['publishes']} replay_payloads_total="
+            f"{replay_evidence['payloads']}"
+        )
+        if (
+            generation_source == "replay_batched_route"
+            and (
+                replay_evidence["malformed"] > 0
+                or replay_evidence["parse_errors"] > 0
             )
-        if reasons.get("sentence", 0) <= 0 and world_publishes <= 0:
-            fails.append("R2: 触发意图为零(sentence=0 且无世代发布)")
+        ):
+            fails.append(
+                "R1: replay route 证据不完整: "
+                f"invalid_payload_count={replay_evidence['malformed']} "
+                f"json_parse_errors={replay_evidence['parse_errors']}"
+            )
+        if generation_count < args.min_world_publish:
+            fails.append(
+                f"R1: logical refresh 世代 {generation_count} < "
+                f"{args.min_world_publish} —— 本相位没有新的 selector refresh "
+                "generation；sparse 读侧是否工作由 R3c/R4 独立判定"
+            )
+        if sentence_intents <= 0 and generation_count <= 0:
+            fails.append("R2: 触发意图为零(sentence=0 且无逻辑世代)")
         else:
-            print(f"R2 触发活性: sentence_intents={reasons.get('sentence', 0)}")
+            print(f"R2 触发活性: sentence_intents={sentence_intents}")
 
     # ---- R3a 路由活性(mmap 结构化计数,主判据) ----
     compact_row_steps = -1
+    route_rank_slots = 0
     if mmap_ok:
         counters = _read_route_counter_mmap(args.route_counter_mmap)
         if counters is None:
@@ -285,6 +399,7 @@ def main() -> int:
                 "(损坏/旧 64B 合同/未初始化)"
             )
         else:
+            route_rank_slots = int(counters["rank_slots"])
             total = counters["total"]
             kind4 = counters["kind4"]
             compact_row_steps = int(counters.get("compact_row_steps", -1))
@@ -315,7 +430,7 @@ def main() -> int:
                     f"R3c 读侧活性(step 计数): compact_row_steps="
                     f"{compact_row_steps} compact_rows={counters['compact_rows']}"
                 )
-                if compact_row_steps == 0 and world_publishes > 0:
+                if compact_row_steps == 0 and generation_count > 0:
                     fails.append(
                         "R3c: 世代已发布但没有任何 step 存在 compact 读行 "
                         "——写而不读(读侧装配断点)"
@@ -409,11 +524,35 @@ def main() -> int:
         precompact_dense_rows = 0
         fallback_rows: list[str] = []
         step_trace_parse_errors: list[str] = []
+        tp_step_pids: set[int] = set()
+        tp_step_groups: dict[int, tuple[str, int, set[int]]] = {}
+        tp_parity_mismatches: list[str] = []
+        tp_duplicate_events: list[str] = []
+        tp_missing_fields: list[str] = []
+        tp_parity_mismatch_count = 0
+        tp_duplicate_event_count = 0
+        tp_missing_field_count = 0
         vector_fields = (
             "req_ids",
             "is_prefill_by_row",
             "bootstrap_done_by_row",
             "use_compact_by_row",
+            "row_mode_by_row",
+            "layer_effective_refresh_by_row",
+        )
+        tp_parity_fields = (
+            "epoch",
+            "step_handle_id",
+            "step_handle_generation",
+            "step_identity_token",
+            "batch_size",
+            "rows_traced",
+            "req_ids",
+            "is_prefill_by_row",
+            "bootstrap_done_by_row",
+            "use_compact_by_row",
+            "dispatch_logf_producer_by_row",
+            "logits_last_n_by_row",
             "row_mode_by_row",
             "layer_effective_refresh_by_row",
         )
@@ -454,6 +593,56 @@ def main() -> int:
                     "R4: fa3_step_state 必须完整覆盖 batch_size 且行向量等长"
                 )
                 continue
+            tp_step_pids.add(pid)
+            missing_parity = tuple(
+                field for field in tp_parity_fields if field not in event
+            )
+            if missing_parity:
+                tp_missing_field_count += 1
+                if len(tp_missing_fields) < 8:
+                    tp_missing_fields.append(
+                        f"pid={pid} missing={missing_parity}"
+                    )
+            else:
+                identity_token = event["step_identity_token"]
+                if type(identity_token) is not int:
+                    tp_missing_field_count += 1
+                    if len(tp_missing_fields) < 8:
+                        tp_missing_fields.append(
+                            f"pid={pid} step_identity_token 非整数"
+                        )
+                else:
+                    parity_payload = {
+                        field: event[field] for field in tp_parity_fields
+                    }
+                    digest = hashlib.sha256(
+                        json.dumps(
+                            parity_payload,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                            ensure_ascii=False,
+                        ).encode("utf-8")
+                    ).hexdigest()
+                    group = tp_step_groups.get(identity_token)
+                    if group is None:
+                        tp_step_groups[identity_token] = (digest, pid, {pid})
+                    else:
+                        reference_digest, reference_pid, seen_pids = group
+                        if pid in seen_pids:
+                            tp_duplicate_event_count += 1
+                            if len(tp_duplicate_events) < 8:
+                                tp_duplicate_events.append(
+                                    f"token={identity_token} pid={pid}"
+                                )
+                        else:
+                            seen_pids.add(pid)
+                        if digest != reference_digest:
+                            tp_parity_mismatch_count += 1
+                            if len(tp_parity_mismatches) < 8:
+                                tp_parity_mismatches.append(
+                                    f"token={identity_token} "
+                                    f"reference_pid={reference_pid} pid={pid}"
+                                )
             traced_rows += rows
             for row in range(rows):
                 req_id = vectors["req_ids"][row]
@@ -500,15 +689,10 @@ def main() -> int:
                         continue
                     prefill_dense_rows += 1
                     continue
-                if not bootstrap_done:
-                    if row_mode != 0 or layer_refresh:
-                        fails.append(
-                            f"R4: req={req_id!r} bootstrap 相位非法 "
-                            f"row_mode={row_mode} refresh={layer_refresh}"
-                        )
-                        continue
-                    bootstrap_dense_rows += 1
-                    continue
+                # Keep the judge's phase precedence identical to
+                # resolve_decode_row_policy(): an explicit decode refresh is
+                # legal before bootstrap_done because that refresh is what
+                # materializes the first compact generation.
                 if row_mode == 3:
                     if not layer_refresh:
                         fails.append(
@@ -521,6 +705,15 @@ def main() -> int:
                     fails.append(
                         f"R4: req={req_id!r} 显式 refresh 行未使用 row_mode=3"
                     )
+                    continue
+                if not bootstrap_done:
+                    if row_mode != 0:
+                        fails.append(
+                            f"R4: req={req_id!r} bootstrap 相位非法 "
+                            f"row_mode={row_mode} refresh={layer_refresh}"
+                        )
+                        continue
+                    bootstrap_dense_rows += 1
                     continue
                 if row_mode == 1:
                     compact_seen.add(key)
@@ -564,6 +757,78 @@ def main() -> int:
             fails.append(
                 "R4: 检出非预期 mature decode dense/native fallback: "
                 f"count={len(fallback_rows)} sample=[{sample}]"
+            )
+
+        # ---- R5 TP step semantics: aggregate counters can prove a final
+        # mismatch but cannot identify a transient compact/native split.  The
+        # step identity is scheduler-derived and must carry byte-identical row
+        # policy on every rank.  Only a possibly split first/last JSONL group
+        # is tolerated because offset snapshots and a live writer may cut at a
+        # rank boundary; any interior incompleteness is terminal.
+        expected_tp_ranks = (
+            route_rank_slots if route_rank_slots > 0 else len(tp_step_pids)
+        )
+        if expected_tp_ranks > 1:
+            incomplete_tokens: list[str] = []
+            incomplete_token_count = 0
+            if tp_step_groups:
+                boundary_tokens = {
+                    min(tp_step_groups),
+                    max(tp_step_groups),
+                }
+                for token, (_digest, _reference_pid, seen_pids) in (
+                    tp_step_groups.items()
+                ):
+                    if len(seen_pids) != expected_tp_ranks and token not in boundary_tokens:
+                        incomplete_token_count += 1
+                        if len(incomplete_tokens) < 8:
+                            incomplete_tokens.append(
+                                f"token={token} pids={sorted(seen_pids)}"
+                            )
+            complete_groups = sum(
+                1
+                for _digest, _reference_pid, seen_pids in tp_step_groups.values()
+                if len(seen_pids) == expected_tp_ranks
+            )
+            print(
+                "R5 TP step 语义一致性: "
+                f"expected_ranks={expected_tp_ranks} "
+                f"observed_pids={sorted(tp_step_pids)} "
+                f"groups={len(tp_step_groups)} complete={complete_groups} "
+                f"mismatch={tp_parity_mismatch_count} "
+                f"interior_incomplete={incomplete_token_count}"
+            )
+            if len(tp_step_pids) != expected_tp_ranks:
+                fails.append(
+                    "R5: step trace 的 TP PID 数与 route mmap 不一致: "
+                    f"expected={expected_tp_ranks} observed={sorted(tp_step_pids)}"
+                )
+            if tp_missing_field_count:
+                fails.append(
+                    "R5: TP step trace 缺少一致性字段: "
+                    f"count={tp_missing_field_count} sample={tp_missing_fields}"
+                )
+            if tp_duplicate_event_count:
+                fails.append(
+                    "R5: 同一 TP rank 重复写入 step identity: "
+                    f"count={tp_duplicate_event_count} sample={tp_duplicate_events}"
+                )
+            if tp_parity_mismatch_count:
+                fails.append(
+                    "R5: TP rank 的逐 step row-policy 语义分叉: "
+                    f"count={tp_parity_mismatch_count} sample={tp_parity_mismatches}"
+                )
+            if incomplete_token_count:
+                fails.append(
+                    "R5: TP step trace 中段缺 rank 事件: "
+                    f"count={incomplete_token_count} sample={incomplete_tokens}"
+                )
+            if not tp_step_groups:
+                fails.append("R5: TP>1 但没有可比较的 step identity")
+        elif step_events > 0:
+            print(
+                "R5 TP step 语义一致性: single-rank run, "
+                f"observed_pids={sorted(tp_step_pids)}"
             )
     elif require_step_trace:
         fails.append("R4: 请求了 fallback 判定但 request-level step trace 不可用")

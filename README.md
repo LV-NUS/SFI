@@ -65,9 +65,9 @@ fi
 RUN_ID="sfi_$(date +%Y%m%d_%H%M%S)"
 PYTHON="${PYTHON}" TORCH_EXTENSIONS_DIR="${PWD}/tmp/torch_extensions/${RUN_ID}" MML=16384 bash scripts/run_one_shot.sh "${GPU}" "${MODEL}" "oneshot_${RUN_ID}"
 
-# Paired throughput measurement on the same exclusive GPU and preset.
-PYTHON="${PYTHON}" bash scripts/run_speed.sh "${GPU}" "${MODEL}" bs8x12k sparse "pair_sparse_${RUN_ID}"
-PYTHON="${PYTHON}" bash scripts/run_speed.sh "${GPU}" "${MODEL}" bs8x12k dense  "pair_dense_${RUN_ID}"
+# Self-contained sparse/dense pair on the same exclusive GPU and preset.
+WITH_DENSE_REFERENCE=1 PYTHON="${PYTHON}" \
+  bash scripts/run_speed.sh "${GPU}" "${MODEL}" bs8x12k sparse "pair_${RUN_ID}"
 ```
 
 The one-shot run must end with:
@@ -77,9 +77,9 @@ child_returncode=0 gate_passed=True production_gate_passed=True producer_gate_pa
 ONE-SHOT PASS
 ```
 
-The speed runs must end with `SPEED RUN OK`. Compare the two fresh summary
-files under `out/`; do not compare results from different models, context
-shapes, GPU occupancy, or software environments.
+The speed run must end with `SPEED RUN OK`. Its summary contains the adjacent
+observer-free dense reference and sparse diagnostic arms; do not splice arms
+from different runs, models, shapes, GPU occupancy, or software environments.
 
 ### Three independent validation terms
 
@@ -91,7 +91,7 @@ one throughput number, or a dense fallback is not sufficient.
 |:--|:--|:--|:--|
 | One-shot output | `scripts/run_one_shot.sh` | `ONE-SHOT PASS` | Complete output plus producer, lifecycle, backend and real sparse-route evidence on the fixed long workload; it is not the LongBench quality score |
 | LongBench quality | `scripts/serve_sparse.sh` then `scripts/run_longbench_v2.sh` | `PASS: official LongBench v2 sparse liveness, completeness and scoring` plus `result.txt` | Official 503-sample score, complete responses, and fresh sparse producer/compact-read evidence in server mode |
-| Paired speed | two `scripts/run_speed.sh` runs | `SPEED RUN OK` for both dense and sparse | Same-workload end-to-end throughput with output, route and fallback gates; use alternating pairs for a claim |
+| Paired speed | one `WITH_DENSE_REFERENCE=1 scripts/run_speed.sh` run | `SPEED RUN OK` with all three arms accepted | Adjacent same-process-contract sparse speed, observer-free dense reference and sparse diagnostic evidence |
 
 The detailed commands are independent: use [one-shot](#1-fresh-one-shot-output-and-sparse-route-gate),
 [paired speed](#2-paired-speed-gate), or [LongBench](#5-longbench-v2-external-evaluation).
@@ -204,8 +204,10 @@ Before building, verify the environment:
 ```bash
 export PYTHON="/absolute/path/to/environment/bin/python"
 export PATH="$(dirname "${PYTHON}"):${PATH}"
-export CUDA_HOME="/absolute/path/to/cuda"
-export PATH="${CUDA_HOME}/bin:${PATH}"
+export CUDA_HOME="$(realpath -e /absolute/path/to/cuda-12.x)"
+export CUDA_PATH="${CUDA_HOME}"
+export CUDACXX="${CUDA_HOME}/bin/nvcc"
+export PATH="${CUDA_HOME}/bin:$(dirname "${PYTHON}"):${PATH}"
 
 "${PYTHON}" - <<'PY'
 import shutil
@@ -229,8 +231,10 @@ Use the selected GPU as the source of truth:
 ```bash
 export PYTHON="/absolute/path/to/environment/bin/python"
 export PATH="$(dirname "${PYTHON}"):${PATH}"
-export CUDA_HOME="/absolute/path/to/cuda"
-export PATH="${CUDA_HOME}/bin:${PATH}"
+export CUDA_HOME="$(realpath -e /absolute/path/to/cuda-12.x)"
+export CUDA_PATH="${CUDA_HOME}"
+export CUDACXX="${CUDA_HOME}/bin/nvcc"
+export PATH="${CUDA_HOME}/bin:$(dirname "${PYTHON}"):${PATH}"
 export GPU="0"
 
 PYTHON="${PYTHON}" NVCC_THREADS=4 MAX_JOBS=8 \
@@ -247,6 +251,10 @@ SM80/SM90 setup applies the FA3 patch and builds
 and then the FA4 CuTe overlay; it prepares runtime-JIT sources and therefore
 does not require an FA3 shared object. Every path emits
 `sfi_flash_attention_build_provenance.json` in the patched checkout.
+That provenance owns the canonical `CUDA_HOME`, `CUDA_PATH`, `CUDACXX`,
+compiler release and, for FA3, the actual CMake compiler/root. One-shot,
+speed, and server entrypoints validate it before deriving helper-cache
+identities or starting JIT; conflicting caller CUDA variables fail closed.
 
 To inspect the patch application manually, reproduce the same source order
 against the pinned upstream base printed by the setup script:
@@ -398,17 +406,16 @@ capacity_tokens_per_request > context_tokens + max_new_tokens
 scheduler serialize requests and recompute prefill, roughly doubling decode
 steps without an immediate OOM. `run_speed.sh` checks this before launch.
 
-The speed runner's default `KV_TOKEN_BYTES=147456/TP` is specific to the
-current Qwen3-4B BF16 shape. For another model, set the per-rank value before
-benchmarking:
+The speed runner derives `kv_bytes_per_token` from `MODEL/config.json` for
+every TP tier:
 
 ```text
 KV_TOKEN_BYTES = layers * KV_heads_per_rank * head_dim * 2(K+V) * dtype_bytes
 ```
 
-For example, export `KV_TOKEN_BYTES` explicitly when KV heads do not shard
-evenly across `TP`. A wrong value can either reject a valid shape or allow a
-shape that later serializes.
+If `KV_TOKEN_BYTES` is supplied for audit compatibility, it must exactly equal
+the derived value. KV heads that cannot shard evenly across `TP` fail closed;
+the runner never guesses or accepts a memory value for a different model.
 
 Use these controls in order:
 
@@ -458,8 +465,8 @@ export PYTHON="/absolute/path/to/environment/bin/python"
 export MODEL="/absolute/path/to/qwen3-model"
 PAIR_ID="pair_$(date +%Y%m%d_%H%M%S)"
 
-PYTHON="${PYTHON}" bash scripts/run_speed.sh 0 "${MODEL}" bs8x12k sparse "${PAIR_ID}_sparse"
-PYTHON="${PYTHON}" bash scripts/run_speed.sh 0 "${MODEL}" bs8x12k dense  "${PAIR_ID}_dense"
+WITH_DENSE_REFERENCE=1 PYTHON="${PYTHON}" \
+  bash scripts/run_speed.sh 0 "${MODEL}" bs8x12k sparse "${PAIR_ID}"
 ```
 
 The built-in tiers are A100-40GB starting points:
@@ -478,10 +485,10 @@ artifact identity. Dense/sparse comparisons must use the same generated corpus
 and all other workload parameters; changing the corpus starts a new baseline.
 
 On SM90/SM100, another model, or a GPU with different memory capacity, treat
-the tier only as a workload shape and override `BS`, `CTX`, `KVB`, `MML`,
-`MAX_NEW`, and `KV_TOKEN_BYTES` for the target. The runner detects the
-architecture and selects FA3 or FA4, but it does not infer a safe memory
-budget for an unfamiliar model or GPU.
+the tier only as a workload shape and override `BS`, `CTX`, `KVB`, `MML`, and
+`MAX_NEW` for the target. The runner derives per-rank KV bytes from the model,
+detects the architecture, and selects FA3 or FA4; it does not infer a safe
+memory budget for an unfamiliar model or GPU.
 
 Only compare runs that use:
 
@@ -492,8 +499,10 @@ Only compare runs that use:
 - complete outputs, expected decode length, route proof, and zero unexpected
   fallback.
 
-Use at least three alternating sparse/dense pairs for a performance claim.
-`decode_tps` is the end-to-end decode-window metric.
+Use at least three independent self-contained pairs for a performance claim.
+Each pair has the fixed order `sparse_speed`, `dense_reference`, then
+`sparse_diagnostic`; never combine standalone arms. `decode_tps` is the
+end-to-end decode-window metric.
 `all_decode_tps` isolates the window after every request has completed
 chunked prefill; report both rather than selecting the more favorable one.
 
@@ -506,9 +515,9 @@ of listed GPUs must equal `TP`, and `KVB` remains per GPU:
 export PYTHON="/absolute/path/to/environment/bin/python"
 export MODEL="/absolute/path/to/qwen3-model"
 
-PYTHON="${PYTHON}" TP=2 BS=2 CTX=128000 KVB=20401094656 MML=132096 bash scripts/run_speed.sh "0,1" "${MODEL}" bs2x30k sparse "tp2_sparse"
-
-PYTHON="${PYTHON}" TP=2 BS=2 CTX=128000 KVB=20401094656 MML=132096 bash scripts/run_speed.sh "0,1" "${MODEL}" bs2x30k dense "tp2_dense"
+WITH_DENSE_REFERENCE=1 PYTHON="${PYTHON}" TP=2 BS=2 CTX=128000 \
+  KVB=20401094656 MML=132096 \
+  bash scripts/run_speed.sh "0,1" "${MODEL}" bs2x30k sparse "tp2_pair"
 ```
 
 The runner probes topology and avoids vLLM custom all-reduce on unsupported
@@ -736,6 +745,7 @@ SFI/
 | `PYTHON env required` or wrong extension ABI | export one executable absolute `PYTHON`; do not mix environments or reuse a cache built by another ABI |
 | setup fails before compilation or JIT preparation | verify the selected GPU, `CUDA_HOME`, `nvcc --version`, host compiler, `ninja`, PyTorch CUDA visibility, and writable build paths |
 | no `_vllm_fa3_C*.so` after SM80/SM90 setup | the FA3 build did not complete; rerun setup and do not launch until the shared object exists |
+| `ModuleNotFoundError` under `patches.*`, `utils.model_kv_contract`, or `scripts.*` | the release checkout is incomplete; use a clean current `cuda-kernel` commit and never create local stubs |
 | SM100 setup has no `_vllm_fa3_C*.so` | expected: SM100 uses the patched FA4 CuTe runtime-JIT source; require the one-shot/FA4 preflight instead |
 | helper-extension JIT fails | ensure `ninja` exists and `TORCH_EXTENSIONS_DIR` is writable and ABI-isolated |
 | architecture mismatch or heterogeneous TP | every selected rank must have exact homogeneous CC 8.0, 9.0, or 10.0; make explicit `SFI_CUDA_ARCH` match it |

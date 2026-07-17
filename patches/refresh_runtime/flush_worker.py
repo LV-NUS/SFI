@@ -29,8 +29,22 @@ from patches.refresh_runtime.producer_workspace import (
     build_refresh_producer_work_item,
     get_refresh_producer_workspace,
 )
-from patches.refresh_runtime import deferred_p0_shadow
 from patches.sparse_types import SelectorBatchPayload
+from patches.sparse_utils import _submission_slot_owner_snapshot
+
+
+def _prefill_submission_req_ids_by_slot(
+    payloads: Sequence[SelectorBatchPayload],
+    slot_list: Sequence[int],
+) -> Dict[int, str]:
+    """Resolve immutable submission-step request identities for a prefill flush."""
+    return dict(
+        _submission_slot_owner_snapshot(
+            payloads,
+            slot_list,
+            stage="prefill payload",
+        )
+    )
 
 
 def _sentence_trigger_intents_from_refresh_payloads(
@@ -1008,15 +1022,18 @@ def flush_prefill_batches_impl(
             )
             finalize_req_id_set = set(finalize_req_ids)
             finalize_slot_set: set[int] = set()
-            batch_request_ids = tuple(
-                getattr(first.state, "batch_request_ids", tuple())
+            submission_req_id_by_slot = _prefill_submission_req_ids_by_slot(
+                prefill_payloads,
+                slot_list_full,
             )
             if finalize_req_id_set:
                 for slot_i in slot_list_full:
-                    if 0 <= int(slot_i) < len(batch_request_ids):
-                        req_id = batch_request_ids[int(slot_i)]
-                        if req_id in finalize_req_id_set and (not _is_free_slot_id(req_id)):
-                            finalize_slot_set.add(int(slot_i))
+                    req_id = submission_req_id_by_slot.get(int(slot_i))
+                    if (
+                        req_id in finalize_req_id_set
+                        and (not _is_free_slot_id(req_id))
+                    ):
+                        finalize_slot_set.add(int(slot_i))
             if bool(getattr(getattr(self, "config", None), "one_shot_bootstrap_only", False)):
                 selector_slot_list = tuple(sorted(finalize_slot_set))
             else:
@@ -1051,11 +1068,7 @@ def flush_prefill_batches_impl(
                     if 0 <= row < len(logits_last_n_by_row):
                         ln = int(logits_last_n_by_row[row])
                 if ln <= 0:
-                    req_id = (
-                        first.state.batch_request_ids[slot_i]
-                        if 0 <= slot_i < len(first.state.batch_request_ids)
-                        else None
-                    )
+                    req_id = submission_req_id_by_slot.get(slot_i)
                     if req_id is None or _is_free_slot_id(req_id):
                         continue
                     ln = int(plan_by_req.get(str(req_id), 0) or 0)
@@ -1140,16 +1153,16 @@ def flush_prefill_batches_impl(
                 )
                 cohort_tape_tokens_by_slot = {}
                 for slot_i in registered_consumer_slots:
-                    if slot_i < 0 or slot_i >= len(batch_request_ids):
+                    if slot_i not in submission_req_id_by_slot:
                         raise RuntimeError(
                             "E_SFI_CAPTURE_COHORT_CONSUMER: finalize slot is "
-                            "outside batch_request_ids"
+                            "outside the submission-step payload"
                         )
-                    request_id = batch_request_ids[slot_i]
+                    request_id = submission_req_id_by_slot[slot_i]
                     if request_id is None or _is_free_slot_id(request_id):
                         raise RuntimeError(
                             "E_SFI_CAPTURE_COHORT_CONSUMER: finalize slot has "
-                            "no live request identity"
+                            "no submission-step request identity"
                         )
                     cohort_tape_tokens_by_slot[slot_i] = (
                         capture_cohort_consumer_token(
@@ -1179,7 +1192,11 @@ def flush_prefill_batches_impl(
                     payloads=prefill_payloads,
                     consumer_tokens=tuple(cohort_tape_tokens_by_slot.values()),
                     lastn1_row_positions=lastn1_row_positions,
-                    stream=torch.cuda.current_stream(device=device),
+                    # The prebuilt tape owns a generation bank on the dedicated
+                    # refresh stream.  CUDAGraph execution can make the ambient
+                    # current stream differ even inside this flush, so submitting
+                    # the snapshot there violates the tape lease contract.
+                    stream=self.refresh_stream,
                 )
                 cohort_snapshot_copy_event = (
                     cohort_snapshot.copy_completion_event
@@ -1776,13 +1793,6 @@ def flush_prefill_batches_impl(
                             timeline_log_path,
                         )
 
-                        batch_request_ids_for_timeline = tuple(
-                            getattr(
-                                group_payloads[0].state,
-                                "batch_request_ids",
-                                tuple(),
-                            )
-                        )
                         ts_ns = (
                             time.perf_counter_ns()
                             if timestamp_ns is None
@@ -1790,9 +1800,7 @@ def flush_prefill_batches_impl(
                         )
                         for slot in slots_use:
                             slot_i = int(slot)
-                            if slot_i < 0 or slot_i >= len(batch_request_ids_for_timeline):
-                                continue
-                            req_id = batch_request_ids_for_timeline[slot_i]
+                            req_id = submission_req_id_by_slot.get(slot_i)
                             if req_id is None or _is_free_slot_id(req_id):
                                 continue
                             append_one_shot_timeline(
@@ -1816,9 +1824,6 @@ def flush_prefill_batches_impl(
                             "VLLM_SPARSE_ATTRIB_PREFILL_PRODUCER requires "
                             "VLLM_SPARSE_FORCE_COMPACT_OFF=1"
                         )
-                    batch_request_ids = tuple(
-                        getattr(group_payloads[0].state, "batch_request_ids", tuple())
-                    )
                     for payload in group_payloads:
                         state = getattr(payload, "state", None)
                         compact_kv_len = getattr(state, "compact_kv_len", None)
@@ -1833,9 +1838,7 @@ def flush_prefill_batches_impl(
                                 )
                     for slot in slots_use:
                         slot_i = int(slot)
-                        if slot_i < 0 or slot_i >= len(batch_request_ids):
-                            continue
-                        req_id = batch_request_ids[slot_i]
+                        req_id = submission_req_id_by_slot.get(slot_i)
                         if req_id is None or _is_free_slot_id(req_id):
                             continue
                         tracking = self._ensure_request(req_id)
@@ -1909,14 +1912,9 @@ def flush_prefill_batches_impl(
                             "evict_recapture_once",
                         )
                     )
-                    batch_request_ids = tuple(
-                        getattr(group_payloads[0].state, "batch_request_ids", tuple())
-                    )
                     for slot in slots_use:
                         slot_i = int(slot)
-                        if slot_i < 0 or slot_i >= len(batch_request_ids):
-                            continue
-                        req_id = batch_request_ids[slot_i]
+                        req_id = submission_req_id_by_slot.get(slot_i)
                         if req_id is None or _is_free_slot_id(req_id):
                             continue
                         # [CHUNKED-CAPTURE-ACCUMULATE 2026-07-06] 捕获窗跨 chunk
@@ -2440,7 +2438,6 @@ def flush_prefill_batches_impl(
                 publish_t0_ns: Optional[int] = (
                     time.perf_counter_ns() if do_profile and prof is not None else None
                 )
-                batch_request_ids = tuple(getattr(group_payloads[0].state, "batch_request_ids", tuple()))
                 if one_shot_bootstrap_only:
                     from patches.refresh_runtime.producer_ready import (
                         ProducerReadyState,
@@ -2549,9 +2546,7 @@ def flush_prefill_batches_impl(
                                 )
                             for slot in slots_use:
                                 slot_i = int(slot)
-                                if slot_i < 0 or slot_i >= len(batch_request_ids):
-                                    continue
-                                req_id = batch_request_ids[slot_i]
+                                req_id = submission_req_id_by_slot.get(slot_i)
                                 if req_id is None or _is_free_slot_id(req_id):
                                     continue
                                 tracking = self._ensure_request(req_id)
@@ -2728,9 +2723,7 @@ def flush_prefill_batches_impl(
                         slot_i = int(slot)
                         if slot_i not in finalize_slot_set:
                             continue
-                        if slot_i < 0 or slot_i >= len(batch_request_ids):
-                            continue
-                        req_id = batch_request_ids[slot_i]
+                        req_id = submission_req_id_by_slot.get(slot_i)
                         if req_id is None or _is_free_slot_id(req_id):
                             continue
                         tracking = self._ensure_request(req_id)
@@ -2850,7 +2843,13 @@ def flush_prefill_batches_impl(
                 _run_prefill_group_contiguous_runs(slots_lastn_gt1, use_denoms=True)
             else:
                 use_denoms = bool(slots_lastn_gt1)
-                _run_prefill_group(slot_list_full, use_denoms=use_denoms)
+                # In one-shot mode selector_slot_list contains only requests
+                # whose prompt finalizes in this flush.  Falling back to the
+                # full payload here would rebuild partial chunk-prefill rows;
+                # those rows are deliberately below the compact threshold and
+                # have no publishable bootstrap buffer yet.  Non-one-shot mode
+                # already defines selector_slot_list as slot_list_full.
+                _run_prefill_group(selector_slot_list, use_denoms=use_denoms)
             if do_profile and t0_ns is not None:
                 prof.prefill_cpu_us = (time.perf_counter_ns() - t0_ns) / 1000.0
                 if prof.prefill_evt1 is not None:
@@ -2908,12 +2907,12 @@ def flush_prefill_batches_impl(
                     # step's resolved descriptors (row_table / seqused / affine) on refresh_stream,
                     # and the NEXT step's prefill reads them on main_stream. Without ordering, main
                     # can dereference a half-written page table (the fill_(-1) window) and hit
-                    # cudaErrorIllegalAddress. Order them with the descriptor-ready event recorded
-                    # right after _run_prefill above -- the same event mechanism the decode replay
-                    # path uses. It waits only for the descriptor writes, not the selector / compact
-                    # rebuild / capture, so it is far lighter than draining the whole stream. Only
-                    # prefill flushes carry this: decode refresh steps and the decode hot path are
-                    # untouched, and prefill stays ASYNC (not force-synced).
+                    # cudaErrorIllegalAddress. `prefill_done_evt` is intentionally recorded before
+                    # `_run_refresh`, so it cannot fence descriptor or compact writes published by
+                    # that phase. `chunk_done_evt` is recorded after `_run_refresh` and compact-meta
+                    # staging; it is the precise GPU-side completion fence for this RAW boundary.
+                    # Only prefill flushes carry this: decode refresh steps and the decode hot path
+                    # are untouched, and prefill stays ASYNC (not force-synced).
                     if prefill_payloads:
                         cohort_deferred_overlap_proven = bool(
                             chunk_cohort_stamped
@@ -2932,54 +2931,11 @@ def flush_prefill_batches_impl(
                             # may be rewritten. Selector/rebuild remain deferred and
                             # therefore overlap the next main-stream forward.
                             main_stream.wait_event(cohort_snapshot_copy_event)
-                        # CLEAN-BASELINE FIX: gold's prefill_done_evt gate is recorded BEFORE
-                        # _run_refresh, so it does NOT cover descriptor writes the native-lifecycle
-                        # / compact rebuild performs during _run_refresh on refresh_stream. Wait on
-                        # the WHOLE refresh_stream (the existing fallback primitive) so main never
-                        # launches a forward while a descriptor write is still in flight. Ordering
-                        # family (gold-proven); bootstrap-only; decode hot path untouched.
-                        if cohort_deferred_overlap_proven:
-                            pass
-                        elif __import__("os").environ.get("VLLM_SPARSE_STRICT_FLUSH_GATE", "1") == "1":
-                            if deferred_p0_shadow.DEFERRED_P0_SHADOW_ENABLED:
-                                shadow_wait = deferred_p0_shadow.begin_prefill_blanket_wait_shadow(
-                                    self,
-                                    epoch=int(getattr(self, "step_context_epoch", -1)),
-                                    buf_id=int(buf),
-                                    prefill_payload_count=len(prefill_payloads),
-                                    refresh_payload_count=len(refresh_payloads),
-                                    source_event=self.chunk_done_evt[buf],
-                                    wait_kind="strict_refresh_stream",
-                                )
-                                try:
-                                    main_stream.wait_stream(self.refresh_stream)
-                                finally:
-                                    deferred_p0_shadow.finish_prefill_blanket_wait_shadow(
-                                        shadow_wait
-                                    )
-                            else:
-                                main_stream.wait_stream(self.refresh_stream)
-                        elif self.prefill_done_evt:
-                            main_stream.wait_event(self.prefill_done_evt[buf])
                         else:
-                            if deferred_p0_shadow.DEFERRED_P0_SHADOW_ENABLED:
-                                shadow_wait = deferred_p0_shadow.begin_prefill_blanket_wait_shadow(
-                                    self,
-                                    epoch=int(getattr(self, "step_context_epoch", -1)),
-                                    buf_id=int(buf),
-                                    prefill_payload_count=len(prefill_payloads),
-                                    refresh_payload_count=len(refresh_payloads),
-                                    source_event=self.chunk_done_evt[buf],
-                                    wait_kind="fallback_refresh_stream",
-                                )
-                                try:
-                                    main_stream.wait_stream(self.refresh_stream)
-                                finally:
-                                    deferred_p0_shadow.finish_prefill_blanket_wait_shadow(
-                                        shadow_wait
-                                    )
-                            else:
-                                main_stream.wait_stream(self.refresh_stream)
+                            # The event was recorded on refresh_stream immediately above after all
+                            # prefill/refresh work for this buf. This enqueues an ordering edge only;
+                            # it neither blocks the host nor drains later work on refresh_stream.
+                            main_stream.wait_event(self.chunk_done_evt[buf])
                     # WAR FIX(bs8 async-prefill compact arena): compact_arena_k/v/pos is
                     # SLOT-keyed but chunk_done_evt/_buf_pending_work_flags are BUF-keyed, so the
                     # consumer's flags==0 early-return can skip the wait -> torn compact read ->
@@ -3339,14 +3295,8 @@ def flush_prefill_batches_impl(
                             -1,
                         )
                     ),
-                    deadline_rebuild_drain_submit_decode_steps=tuple(
-                        sorted(
-                            getattr(
-                                self,
-                                "_deadline_rebuild_drain_submit_decode_steps",
-                                set(),
-                            )
-                        )
+                    deadline_rebuild_drain_submit_decode_steps=(
+                        self._take_deadline_rebuild_drain_submit_decode_steps()
                     ),
                     deadline_deferred_selector_compute_count=int(
                         getattr(
@@ -4273,13 +4223,7 @@ def flush_prefill_batches_impl(
                         )
                     ),
                     "deadline_rebuild_drain_submit_decode_steps": list(
-                        sorted(
-                            getattr(
-                                self,
-                                "_deadline_rebuild_drain_submit_decode_steps",
-                                set(),
-                            )
-                        )
+                        self._take_deadline_rebuild_drain_submit_decode_steps()
                     ),
                     "deadline_async_producer_body_count": int(
                         getattr(self, "_deadline_async_producer_body_count", 0)

@@ -1,111 +1,299 @@
-"""[EXT-NVCC-GUARD 2026-07-09] JIT 工具链统一守护(安装坑根修)。
+"""Fail-closed CUDA toolkit selection for project-owned JIT extensions.
 
-已知坑(坑录 2026-07-08 §5.1):删 tmp/torch_extensions 构建缓存后,bench
-child 现场 JIT 会沿 PATH 摸到系统 /usr/bin/nvcc(10.1)→ 编译秒死,报错被
-包进 "root_cause=<CalledProcessError>" 难以定位。此前仅 selector_key_norms_ext
-/ selector_log_s_ext 各自内置了 nvcc 定位守护,其余 load_inline 站点裸奔。
-
-本模块把守护统一成一个调用:JIT 触发前 pin 可用 nvcc(优先 PYTORCH_NVCC/
-CUDACXX 显式指定 → python 同目录 → CUDA_HOME/CUDA_PATH → /usr/local/cuda*
-→ PATH),并做版本预检——nvcc 主版本 <11 或找不到 nvcc 直接抛可操作
-RuntimeError(fail-fast,不留给 torch 报难懂错)。只在 JIT 回落路径调用
-(prebuilt 命中不经过此门,无 nvcc 的纯 prebuilt 环境不受影响)。
+The resolver runs only when a JIT build or cache identity is initialized.  It
+selects one canonical toolkit, validates it against the Torch CUDA major, then
+normalizes every CUDA compiler alias so subsequent extension builds cannot
+silently switch toolchains.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import os
+from pathlib import Path
 import re
 import shutil
 import subprocess
 import sys
-from typing import Optional
 
 
-def preferred_nvcc_path() -> Optional[str]:
-    explicit_nvcc = os.environ.get("PYTORCH_NVCC") or os.environ.get("CUDACXX")
-    if explicit_nvcc:
-        return explicit_nvcc
+_NVCC_RELEASE_RE = re.compile(r"release\s+(\d+)\.(\d+)")
+_TORCH_CUDA_RELEASE_RE = re.compile(r"^(\d+)(?:\.(\d+))?")
+_CONVENTIONAL_CUDA_HOME = "/usr/local/cuda"
+_COMPILER_ALIASES = ("PYTORCH_NVCC", "CUDACXX")
+_HOME_ALIASES = ("CUDA_HOME", "CUDA_PATH")
 
-    candidates = [os.path.join(os.path.dirname(sys.executable), "nvcc")]
-    for cuda_home_var in ("CUDA_HOME", "CUDA_PATH"):
-        cuda_home = os.environ.get(cuda_home_var)
-        if cuda_home:
-            candidates.append(os.path.join(cuda_home, "bin", "nvcc"))
-    # 本机工具链锚=12.4(/usr/local/cuda 软链亦指 12.4;生产脚本恒
-    # CUDA_HOME=/usr/local/cuda-12.4)。12.4 排在更高版本之前:CUDA_HOME
-    # 缺席时也钉住项目锚版本,不被偶然装上的新 toolkit 抢先。
-    candidates.extend(
-        [
-            "/usr/local/cuda/bin/nvcc",
-            "/usr/local/cuda-12.4/bin/nvcc",
-            "/usr/local/cuda-12.6/bin/nvcc",
-            "/usr/local/cuda-12.5/bin/nvcc",
-        ]
+
+@dataclass(frozen=True)
+class CudaToolchain:
+    """Canonical identity of the CUDA toolkit selected for this process."""
+
+    nvcc_path: str
+    cuda_home: str
+    release: str
+    major: int
+    minor: int
+
+
+def _contract_error(owner: str, detail: str) -> RuntimeError:
+    return RuntimeError(f"{owner}: invalid CUDA JIT toolchain: {detail}")
+
+
+def _canonical_executable(path_value: str, *, alias: str, owner: str) -> str:
+    candidate = Path(path_value)
+    if not candidate.is_absolute():
+        raise _contract_error(
+            owner,
+            f"{alias} must be an absolute nvcc path, got {path_value!r}",
+        )
+    canonical = Path(os.path.realpath(candidate))
+    if not canonical.is_file() or not os.access(canonical, os.X_OK):
+        raise _contract_error(
+            owner,
+            f"{alias} does not name an executable file: {canonical}",
+        )
+    return str(canonical)
+
+
+def _canonical_cuda_home(
+    path_value: str,
+    *,
+    alias: str,
+    owner: str,
+) -> tuple[str, str]:
+    candidate = Path(path_value)
+    if not candidate.is_absolute():
+        raise _contract_error(
+            owner,
+            f"{alias} must be an absolute CUDA toolkit path, got {path_value!r}",
+        )
+    canonical_home = Path(os.path.realpath(candidate))
+    if not canonical_home.is_dir():
+        raise _contract_error(
+            owner,
+            f"{alias} does not name a directory: {canonical_home}",
+        )
+    nvcc = _canonical_executable(
+        str(canonical_home / "bin" / "nvcc"),
+        alias=f"{alias}/bin/nvcc",
+        owner=owner,
     )
-    path_nvcc = shutil.which("nvcc")
-    if path_nvcc:
-        candidates.append(path_nvcc)
+    return str(canonical_home), nvcc
 
-    seen: set[str] = set()
-    for candidate in candidates:
-        if not candidate or candidate in seen:
+
+def _one_canonical_value(
+    values: dict[str, str],
+    *,
+    kind: str,
+    owner: str,
+) -> str | None:
+    if not values:
+        return None
+    canonical_values = set(values.values())
+    if len(canonical_values) != 1:
+        rendered = ", ".join(f"{name}={value}" for name, value in values.items())
+        raise _contract_error(owner, f"conflicting explicit {kind} aliases: {rendered}")
+    return next(iter(canonical_values))
+
+
+def _explicit_compiler(*, owner: str) -> str | None:
+    values = {
+        alias: _canonical_executable(raw, alias=alias, owner=owner)
+        for alias in _COMPILER_ALIASES
+        if (raw := os.environ.get(alias))
+    }
+    return _one_canonical_value(
+        values,
+        kind="compiler",
+        owner=owner,
+    )
+
+
+def _explicit_cuda_home(*, owner: str) -> tuple[str, str] | None:
+    homes: dict[str, str] = {}
+    nvccs: dict[str, str] = {}
+    for alias in _HOME_ALIASES:
+        raw = os.environ.get(alias)
+        if not raw:
             continue
-        seen.add(candidate)
-        if os.path.exists(candidate):
-            return candidate
-    return None
+        home, nvcc = _canonical_cuda_home(raw, alias=alias, owner=owner)
+        homes[alias] = home
+        nvccs[alias] = nvcc
+    home = _one_canonical_value(homes, kind="CUDA home", owner=owner)
+    if home is None:
+        return None
+    nvcc = _one_canonical_value(nvccs, kind="CUDA home compiler", owner=owner)
+    assert nvcc is not None
+    return home, nvcc
 
 
-def _nvcc_major_version(nvcc: str) -> Optional[int]:
+def _discovered_nvcc(path: Path, *, alias: str, owner: str) -> str | None:
+    if not os.path.lexists(path):
+        return None
+    return _canonical_executable(str(path), alias=alias, owner=owner)
+
+
+def _cuda_home_from_nvcc(nvcc_path: str, *, owner: str) -> str:
+    nvcc = Path(nvcc_path)
+    if nvcc.name != "nvcc" or nvcc.parent.name != "bin":
+        raise _contract_error(
+            owner,
+            "canonical nvcc must use a <CUDA_HOME>/bin/nvcc layout, got "
+            f"{nvcc}",
+        )
+    cuda_home = Path(os.path.realpath(nvcc.parent.parent))
+    if not cuda_home.is_dir():
+        raise _contract_error(owner, f"derived CUDA_HOME is not a directory: {cuda_home}")
+    return str(cuda_home)
+
+
+def _nvcc_release(nvcc_path: str, *, owner: str) -> tuple[str, int, int]:
     try:
         completed = subprocess.run(
-            [nvcc, "--version"],
+            [nvcc_path, "--version"],
             check=False,
             capture_output=True,
             text=True,
             timeout=5,
         )
-    except Exception:
-        return None
-    text = "\n".join(part for part in (completed.stdout, completed.stderr) if part)
-    match = re.search(r"release\s+(\d+)\.(\d+)", text)
-    if not match:
-        return None
-    return int(match.group(1))
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise _contract_error(
+            owner,
+            f"failed to execute {nvcc_path} --version: {type(exc).__name__}: {exc}",
+        ) from exc
+    version_text = "\n".join(
+        part for part in (completed.stdout, completed.stderr) if part
+    )
+    if completed.returncode != 0:
+        raise _contract_error(
+            owner,
+            f"{nvcc_path} --version exited {completed.returncode}: "
+            f"{version_text.strip() or 'no output'}",
+        )
+    match = _NVCC_RELEASE_RE.search(version_text)
+    if match is None:
+        raise _contract_error(
+            owner,
+            f"cannot parse CUDA release from {nvcc_path} --version output",
+        )
+    major, minor = (int(match.group(1)), int(match.group(2)))
+    return f"{major}.{minor}", major, minor
+
+
+def _torch_cuda_major(*, owner: str) -> tuple[str, int]:
+    try:
+        import torch
+    except Exception as exc:
+        raise _contract_error(owner, f"cannot import Torch: {exc}") from exc
+    torch_cuda = getattr(torch.version, "cuda", None)
+    if not torch_cuda:
+        raise _contract_error(owner, "Torch is not a CUDA build (torch.version.cuda is empty)")
+    release = str(torch_cuda)
+    match = _TORCH_CUDA_RELEASE_RE.match(release)
+    if match is None:
+        raise _contract_error(owner, f"cannot parse torch.version.cuda={release!r}")
+    return release, int(match.group(1))
+
+
+def resolve_cuda_toolchain_or_raise(*, owner: str) -> CudaToolchain:
+    """Resolve and validate exactly one CUDA toolkit without mutating the env."""
+
+    explicit_compiler = _explicit_compiler(owner=owner)
+    explicit_home = _explicit_cuda_home(owner=owner)
+
+    if explicit_compiler is not None:
+        if explicit_home is not None and explicit_compiler != explicit_home[1]:
+            raise _contract_error(
+                owner,
+                "explicit compiler aliases disagree with CUDA_HOME/CUDA_PATH: "
+                f"compiler={explicit_compiler}, home_nvcc={explicit_home[1]}",
+            )
+        nvcc_path = explicit_compiler
+        cuda_home = (
+            explicit_home[0]
+            if explicit_home is not None
+            else _cuda_home_from_nvcc(nvcc_path, owner=owner)
+        )
+    elif explicit_home is not None:
+        cuda_home, nvcc_path = explicit_home
+    else:
+        interpreter_nvcc = Path(sys.executable).resolve().parent / "nvcc"
+        nvcc_path = _discovered_nvcc(
+            interpreter_nvcc,
+            alias="interpreter-adjacent nvcc",
+            owner=owner,
+        )
+        if nvcc_path is None:
+            conventional_home = Path(_CONVENTIONAL_CUDA_HOME)
+            nvcc_path = _discovered_nvcc(
+                conventional_home / "bin" / "nvcc",
+                alias=f"{_CONVENTIONAL_CUDA_HOME}/bin/nvcc",
+                owner=owner,
+            )
+        if nvcc_path is None:
+            path_nvcc = shutil.which("nvcc")
+            if path_nvcc:
+                nvcc_path = _canonical_executable(
+                    path_nvcc,
+                    alias="PATH nvcc",
+                    owner=owner,
+                )
+        if nvcc_path is None:
+            raise _contract_error(
+                owner,
+                "no nvcc found; set absolute matching PYTORCH_NVCC/CUDACXX or "
+                "CUDA_HOME/CUDA_PATH",
+            )
+        cuda_home = _cuda_home_from_nvcc(nvcc_path, owner=owner)
+
+    release, major, minor = _nvcc_release(nvcc_path, owner=owner)
+    if major < 12:
+        raise _contract_error(
+            owner,
+            f"nvcc {nvcc_path} is CUDA {release}; CUDA >=12 is required",
+        )
+    torch_release, torch_major = _torch_cuda_major(owner=owner)
+    if major != torch_major:
+        raise _contract_error(
+            owner,
+            "nvcc/Torch CUDA major mismatch: "
+            f"nvcc={release} ({nvcc_path}), torch={torch_release}",
+        )
+    return CudaToolchain(
+        nvcc_path=nvcc_path,
+        cuda_home=cuda_home,
+        release=release,
+        major=major,
+        minor=minor,
+    )
+
+
+def _prepend_cuda_bin(path_value: str, cuda_bin: str) -> str:
+    entries = [entry for entry in path_value.split(os.pathsep) if entry]
+    entries = [entry for entry in entries if entry != cuda_bin]
+    return os.pathsep.join((cuda_bin, *entries))
+
+
+def configure_cuda_toolchain_or_raise(*, owner: str) -> CudaToolchain:
+    """Resolve one toolkit and normalize every process-global CUDA alias."""
+
+    toolchain = resolve_cuda_toolchain_or_raise(owner=owner)
+    cuda_bin = str(Path(toolchain.cuda_home) / "bin")
+    os.environ["PYTORCH_NVCC"] = toolchain.nvcc_path
+    os.environ["CUDACXX"] = toolchain.nvcc_path
+    os.environ["CUDA_HOME"] = toolchain.cuda_home
+    os.environ["CUDA_PATH"] = toolchain.cuda_home
+    os.environ["PATH"] = _prepend_cuda_bin(os.environ.get("PATH", ""), cuda_bin)
+
+    try:
+        import torch.utils.cpp_extension as torch_cpp_extension
+    except Exception as exc:
+        raise _contract_error(owner, f"cannot import torch CUDA extension support: {exc}") from exc
+    torch_cpp_extension.CUDA_HOME = toolchain.cuda_home
+    return toolchain
 
 
 def configure_jit_toolchain_or_raise(*, ext_name: str) -> str:
-    """JIT 回落路径的工具链门:pin nvcc + 版本预检,失败即抛可操作错误。
+    """Backward-compatible JIT entrypoint returning the canonical nvcc path."""
 
-    返回选定的 nvcc 路径(诊断用)。副作用:设 PYTORCH_NVCC/CUDA_HOME/
-    CUDA_PATH 并同步 torch.utils.cpp_extension.CUDA_HOME,令本进程内所有
-    后续 JIT 一致走同一工具链。
-    """
-    nvcc = preferred_nvcc_path()
-    if nvcc is None:
-        raise RuntimeError(
-            f"{ext_name}: no usable nvcc found for JIT build. Set "
-            "CUDA_HOME=/usr/local/cuda-12.x (or PYTORCH_NVCC=<path-to-nvcc>) "
-            "before launching, or restore the prebuilt extension cache under "
-            "tmp/torch_extensions/."
-        )
-    major = _nvcc_major_version(nvcc)
-    if major is not None and major < 11:
-        raise RuntimeError(
-            f"{ext_name}: refusing JIT build with ancient nvcc {nvcc} "
-            f"(major={major}; the system /usr/bin/nvcc 10.x pit). Set "
-            "CUDA_HOME=/usr/local/cuda-12.x or PYTORCH_NVCC to a CUDA>=11 "
-            "toolchain."
-        )
-    cuda_home = os.path.dirname(os.path.dirname(nvcc))
-    os.environ["PYTORCH_NVCC"] = nvcc
-    os.environ["CUDA_HOME"] = cuda_home
-    os.environ["CUDA_PATH"] = cuda_home
-    try:
-        import torch.utils.cpp_extension as torch_cpp_extension
-
-        torch_cpp_extension.CUDA_HOME = cuda_home
-    except Exception:
-        pass
-    return nvcc
+    return configure_cuda_toolchain_or_raise(owner=ext_name).nvcc_path

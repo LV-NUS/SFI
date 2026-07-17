@@ -7234,7 +7234,7 @@ index d0c595d..a0e10a0 100644
 \ No newline at end of file
 +)
 diff --git a/vllm_flash_attn/flash_attn_interface.py b/vllm_flash_attn/flash_attn_interface.py
-index a61d0f9..9780e96 100644
+index a61d0f9..0cfcbfe 100644
 --- a/vllm_flash_attn/flash_attn_interface.py
 +++ b/vllm_flash_attn/flash_attn_interface.py
 @@ -1,5 +1,10 @@
@@ -7385,7 +7385,7 @@ index a61d0f9..9780e96 100644
      return True, None
  
  def _is_fa4_supported(device = None) -> Tuple[bool, Optional[str]]:
-@@ -90,6 +175,1211 @@ def fa_version_unsupported_reason(fa_version: int, device = None) \
+@@ -90,6 +175,1206 @@ def fa_version_unsupported_reason(fa_version: int, device = None) \
  def maybe_contiguous(x):
      return x.contiguous() if x is not None and x.stride(-1) != 1 else x
  
@@ -8047,11 +8047,6 @@ index a61d0f9..9780e96 100644
 +            carrier_batch_size = int(block_table.shape[0])
 +        elif len(k.shape) >= 1:
 +            carrier_batch_size = int(k.shape[0])
-+        if not getattr(kv_batch_idx, "is_cuda", False) and int(kv_batch_idx.numel()) > 0:
-+            min_kv_batch = int(kv_batch_idx.min().item())
-+            max_kv_batch = int(kv_batch_idx.max().item())
-+            if min_kv_batch < 0 or max_kv_batch >= carrier_batch_size:
-+                raise ValueError("kv_batch_idx entries must be within the effective KV batch")
 +
 +    selected_page_table_layout_class, selected_page_table_batch_stride, selected_page_table_head_stride = (
 +        _resolve_carrier_strides(
@@ -8597,7 +8592,7 @@ index a61d0f9..9780e96 100644
  # NOTE only used in FA3
  def get_scheduler_metadata(
      batch_size, max_seqlen_q, max_seqlen_k, num_heads_q, num_heads_kv, headdim,
-@@ -107,11 +1397,19 @@ def get_scheduler_metadata(
+@@ -107,11 +1392,19 @@ def get_scheduler_metadata(
      num_splits=0,    # Can be tuned for speed
      pack_gqa=None,   # Can be tuned for speed
      sm_margin=0,     # Can be tuned if some SMs are used for communication
@@ -8618,7 +8613,7 @@ index a61d0f9..9780e96 100644
          batch_size, max_seqlen_q, max_seqlen_k, num_heads_q, num_heads_kv, headdim, headdim_v,
          qkv_dtype,
          cache_seqlens,
-@@ -129,8 +1427,25 @@ def get_scheduler_metadata(
+@@ -129,8 +1422,25 @@ def get_scheduler_metadata(
          pack_gqa,
          sm_margin,
      )
@@ -8646,7 +8641,7 @@ index a61d0f9..9780e96 100644
  
  
  def flash_attn_varlen_func(
-@@ -276,7 +1591,7 @@ def flash_attn_varlen_func(
+@@ -276,7 +1586,7 @@ def flash_attn_varlen_func(
          )
      elif fa_version == 3:
          assert alibi_slopes is None, "Alibi is not supported in FA3"
@@ -8655,7 +8650,7 @@ index a61d0f9..9780e96 100644
              q, k, v,
              None, None,       # k_new, v_new
              q_v,
-@@ -305,6 +1620,7 @@ def flash_attn_varlen_func(
+@@ -305,6 +1615,7 @@ def flash_attn_varlen_func(
              cp_rank,
              cp_tot_seqused_k,
          )

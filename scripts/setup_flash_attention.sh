@@ -5,12 +5,12 @@ set -euo pipefail
 SFI_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 UPSTREAM_URL="https://github.com/vllm-project/flash-attention.git"
 BASE_COMMIT="f5bc33cfc02c744d24a2e9d50e6db656de40611c"
-EXPECTED_PATCH_SHA256="919c11b88317c3af9e2eb5d3021cad01029a774d95dce1bdf0e09dd5ef7f9b3a"
-EXPECTED_PATCHED_TREE="65d3695a0e88611616b0d6a51ea0fc931f206d65"
+EXPECTED_PATCH_SHA256="bea3e377f7335e9ebde7e6d50a9c5ab2c5dc6ed950eca2dcc0fb73c25116d500"
+EXPECTED_PATCHED_TREE="4329bcb986a5ac0427f126c50aae8164e1f668b0"
 # Filled from the checked-in rebased FA4 patch.  FA4 is applied after FA3 so
 # SM100 shares the same current wrapper/dispatch base as SM80 and SM90.
 EXPECTED_FA4_PATCH_SHA256="d5668e7ed8beb63acc698eadc5ffea01247bf48b154ea042e85b23741698a0c4"
-EXPECTED_FA4_PATCHED_TREE="e33196e5f697b809fac88e67d5c9d3c92b233c5e"
+EXPECTED_FA4_PATCHED_TREE="60a0be233fc416d84774563eac84ae062fd362f3"
 
 TARGET="${SFI_ROOT}/third_party_upstreams/vllm-project-flash-attention"
 PROVENANCE_OUTPUT=""
@@ -103,16 +103,16 @@ PY="$(realpath -e -- "${PY}")"
 detect_capability() {
   local output
   if [[ -n "${GPU}" ]]; then
-    output="$({ CUDA_VISIBLE_DEVICES="${GPU}" "${PY}" -c \
+    output="$(CUDA_VISIBLE_DEVICES="${GPU}" "${PY}" -c \
       'import torch; assert torch.cuda.is_available(), "CUDA is unavailable"; major, minor = torch.cuda.get_device_capability(0); print(f"{major}.{minor}")'
-    } 2>&1)" || {
+    )" || {
       echo "FAIL: cannot inspect selected GPU ${GPU}: ${output}" >&2
       exit 69
     }
   else
     output="$("${PY}" -c \
-      'import torch; assert torch.cuda.is_available(), "CUDA is unavailable"; major, minor = torch.cuda.get_device_capability(0); print(f"{major}.{minor}")' \
-      2>&1)" || {
+      'import torch; assert torch.cuda.is_available(), "CUDA is unavailable"; major, minor = torch.cuda.get_device_capability(0); print(f"{major}.{minor}")'
+    )" || {
       echo "FAIL: cannot inspect the first CUDA-visible GPU: ${output}" >&2
       exit 69
     }
@@ -151,24 +151,51 @@ case "${ARCH}" in
   sm100) DEFAULT_ARCH_LIST="" ; BACKEND="fa4_cute" ;;
 esac
 
-resolve_fa3_cuda_toolkit() {
-  if [[ "${SKIP_BUILD}" == "1" || "${BACKEND}" != "fa3" ]]; then
-    return
-  fi
-
+resolve_cuda_toolchain() {
+  local -a cuda_candidate_labels=()
+  local -a cuda_candidate_nvcc=()
+  local candidate_index
+  local cuda_compiler_name
+  local cuda_compiler_value
+  local cuda_root_name
+  local cuda_root_value
   local nvcc_path=""
-  if [[ -n "${CUDACXX:-}" ]]; then
-    if [[ "${CUDACXX}" != /* || ! -x "${CUDACXX}" ]]; then
-      echo "FAIL: CUDACXX must be an executable absolute path: ${CUDACXX}" >&2
+  for cuda_compiler_name in CUDACXX PYTORCH_NVCC; do
+    cuda_compiler_value="${!cuda_compiler_name:-}"
+    if [[ -z "${cuda_compiler_value}" ]]; then
+      continue
+    fi
+    if [[ "${cuda_compiler_value}" != /* || ! -x "${cuda_compiler_value}" ]]; then
+      echo "FAIL: ${cuda_compiler_name} must be an executable absolute path: ${cuda_compiler_value}" >&2
       exit 64
     fi
-    nvcc_path="$(realpath -e -- "${CUDACXX}")"
-  elif [[ -n "${CUDA_HOME:-}" ]]; then
-    if [[ "${CUDA_HOME}" != /* || ! -x "${CUDA_HOME}/bin/nvcc" ]]; then
-      echo "FAIL: CUDA_HOME must be absolute and contain bin/nvcc: ${CUDA_HOME}" >&2
+    cuda_candidate_labels+=("${cuda_compiler_name}")
+    cuda_candidate_nvcc+=("$(realpath -e -- "${cuda_compiler_value}")")
+  done
+  for cuda_root_name in CUDA_HOME CUDA_PATH; do
+    cuda_root_value="${!cuda_root_name:-}"
+    if [[ -z "${cuda_root_value}" ]]; then
+      continue
+    fi
+    if [[ "${cuda_root_value}" != /* || ! -x "${cuda_root_value}/bin/nvcc" ]]; then
+      echo "FAIL: ${cuda_root_name} must be absolute and contain bin/nvcc: ${cuda_root_value}" >&2
       exit 64
     fi
-    nvcc_path="$(realpath -e -- "${CUDA_HOME}/bin/nvcc")"
+    cuda_candidate_labels+=("${cuda_root_name}")
+    cuda_candidate_nvcc+=("$(realpath -e -- "${cuda_root_value}/bin/nvcc")")
+  done
+
+  if (( ${#cuda_candidate_nvcc[@]} > 0 )); then
+    nvcc_path="${cuda_candidate_nvcc[0]}"
+    for ((candidate_index = 1; candidate_index < ${#cuda_candidate_nvcc[@]}; candidate_index++)); do
+      if [[ "${cuda_candidate_nvcc[candidate_index]}" != "${nvcc_path}" ]]; then
+        echo "FAIL: explicit CUDA toolchain conflict" >&2
+        echo "  ${cuda_candidate_labels[0]} -> ${nvcc_path}" >&2
+        echo "  ${cuda_candidate_labels[candidate_index]} -> ${cuda_candidate_nvcc[candidate_index]}" >&2
+        echo "CUDA_HOME, CUDA_PATH, CUDACXX, and PYTORCH_NVCC must select one canonical toolkit." >&2
+        exit 64
+      fi
+    done
   elif [[ -x "/usr/local/cuda/bin/nvcc" ]]; then
     # Prefer the conventional toolkit symlink over PATH: multi-toolkit hosts
     # commonly leave an obsolete distro nvcc under /usr/bin.
@@ -176,7 +203,7 @@ resolve_fa3_cuda_toolkit() {
   elif command -v nvcc >/dev/null 2>&1; then
     nvcc_path="$(realpath -e -- "$(command -v nvcc)")"
   else
-    echo "FAIL: no CUDA compiler found; set CUDA_HOME or CUDACXX explicitly" >&2
+    echo "FAIL: no CUDA compiler found; set CUDA_HOME, CUDA_PATH, CUDACXX, or PYTORCH_NVCC explicitly" >&2
     exit 69
   fi
 
@@ -185,16 +212,14 @@ resolve_fa3_cuda_toolkit() {
   local nvcc_major
   local torch_cuda_major
   resolved_home="$(dirname "$(dirname "${nvcc_path}")")"
-  if [[ -n "${CUDA_HOME:-}" ]]; then
-    CUDA_HOME="$(realpath -e -- "${CUDA_HOME}")"
-    if [[ "$(realpath -e -- "${CUDA_HOME}/bin/nvcc")" != "${nvcc_path}" ]]; then
-      echo "FAIL: CUDA_HOME and CUDACXX select different CUDA toolkits" >&2
-      exit 64
-    fi
-  else
-    CUDA_HOME="${resolved_home}"
+  if [[ "$(realpath -e -- "${resolved_home}/bin/nvcc")" != "${nvcc_path}" ]]; then
+    echo "FAIL: selected CUDA compiler is not owned by its derived toolkit root: ${nvcc_path}" >&2
+    exit 64
   fi
+  CUDA_HOME="${resolved_home}"
+  CUDA_PATH="${resolved_home}"
   CUDACXX="${nvcc_path}"
+  PYTORCH_NVCC="${nvcc_path}"
 
   nvcc_release="$({ "${CUDACXX}" --version; } | sed -n 's/.*release \([^,]*\).*/\1/p' | tail -1)"
   if [[ ! "${nvcc_release}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
@@ -203,24 +228,32 @@ resolve_fa3_cuda_toolkit() {
   fi
   nvcc_major="${nvcc_release%%.*}"
   if (( 10#${nvcc_major} < 12 )); then
-    echo "FAIL: FA3 build requires CUDA 12.0 or newer; selected ${CUDACXX} reports ${nvcc_release}" >&2
+    echo "FAIL: SFI CUDA runtime requires CUDA 12.0 or newer; selected ${CUDACXX} reports ${nvcc_release}" >&2
     exit 69
   fi
   torch_cuda_major="$("${PY}" -c 'import torch; value = str(torch.version.cuda or ""); print(value.split(".", 1)[0])')"
   if [[ ! "${torch_cuda_major}" =~ ^[0-9]+$ || "${torch_cuda_major}" != "${nvcc_major}" ]]; then
     echo "FAIL: CUDA compiler ${nvcc_release} is incompatible with torch CUDA ${torch_cuda_major:-unknown}.x" >&2
-    echo "Set CUDA_HOME or CUDACXX to a toolkit with the same major version." >&2
+    echo "Set CUDA_HOME, CUDA_PATH, CUDACXX, or PYTORCH_NVCC to a toolkit with the same major version." >&2
     exit 69
   fi
   # Caffe2's legacy FindCUDA pass consults PATH independently of CUDACXX.
   # Keep compiler, headers and libraries on one toolkit instead of accepting
   # a CUDACXX=12.x / PATH nvcc=10.x split configuration.
   PATH="${CUDA_HOME}/bin:${PATH}"
-  export CUDA_HOME CUDACXX PATH
+  if [[ "$(realpath -e -- "$(command -v nvcc)")" != "${CUDACXX}" ]]; then
+    echo "FAIL: PATH did not resolve to the canonical CUDA compiler: $(command -v nvcc)" >&2
+    exit 69
+  fi
+  CUDA_COMPILER_RELEASE="${nvcc_release}"
+  CUDA_COMPILER_MAJOR="${nvcc_major}"
+  export CUDA_HOME CUDA_PATH CUDACXX PYTORCH_NVCC PATH
   echo "==> CUDA toolkit: home=${CUDA_HOME} nvcc=${CUDACXX} release=${nvcc_release}"
 }
 
-resolve_fa3_cuda_toolkit
+CUDA_COMPILER_RELEASE=""
+CUDA_COMPILER_MAJOR=""
+resolve_cuda_toolchain
 
 if [[ "${TARGET}" != /* ]]; then
   echo "FAIL: --target must be absolute: ${TARGET}" >&2
@@ -376,6 +409,10 @@ git -C "${TARGET}" submodule update --init csrc/cutlass
 
 BUILD_STATUS="patch_only"
 SO_PATH=""
+BUILD_TEMP=""
+CMAKE_CACHE_PATH=""
+CMAKE_CUDA_COMPILER=""
+CMAKE_CUDA_TOOLKIT_ROOT=""
 if [[ "${ARCH}" == "sm100" ]]; then
   for required_source in \
     "${TARGET}/flash_attn/cute/interface.py" \
@@ -392,8 +429,73 @@ elif [[ "${SKIP_BUILD}" != "1" ]]; then
     exit 64
   fi
   export TORCH_CUDA_ARCH_LIST="${DEFAULT_ARCH_LIST}"
+  mkdir -p "${TARGET}/build"
+  BUILD_TEMP="$(mktemp -d "${TARGET}/build/sfi-${ARCH}.XXXXXXXX")"
   echo "==> Build FA3 with PYTHON=${PY} TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}"
-  (cd "${TARGET}" && "${PY}" setup.py build_ext --inplace)
+  echo "    build_temp=${BUILD_TEMP}"
+  (cd "${TARGET}" && "${PY}" setup.py build_ext --inplace --build-temp "${BUILD_TEMP}")
+
+  if ! CMAKE_IDENTITY_TSV="$(
+    "${PY}" - "${BUILD_TEMP}" "${CUDACXX}" "${CUDA_HOME}" <<'PY'
+from __future__ import annotations
+
+from pathlib import Path
+import sys
+
+
+build_temp = Path(sys.argv[1]).resolve(strict=True)
+expected_compiler = Path(sys.argv[2]).resolve(strict=True)
+expected_root = Path(sys.argv[3]).resolve(strict=True)
+caches = sorted(build_temp.rglob("CMakeCache.txt"))
+if len(caches) != 1:
+    raise SystemExit(
+        f"expected exactly one fresh CMakeCache.txt under {build_temp}, found {len(caches)}"
+    )
+cache = caches[0].resolve(strict=True)
+entries: dict[str, str] = {}
+for line in cache.read_text(encoding="utf-8", errors="strict").splitlines():
+    if not line or line.startswith(("#", "//")) or "=" not in line:
+        continue
+    typed_key, value = line.split("=", 1)
+    key = typed_key.split(":", 1)[0]
+    entries[key] = value
+
+compiler_raw = entries.get("CMAKE_CUDA_COMPILER", "")
+if not compiler_raw:
+    raise SystemExit(f"fresh CMake cache has no CMAKE_CUDA_COMPILER: {cache}")
+compiler = Path(compiler_raw).resolve(strict=True)
+if compiler != expected_compiler:
+    raise SystemExit(
+        f"fresh CMake cache selected wrong CUDA compiler: {compiler} != {expected_compiler}"
+    )
+
+root_keys = (
+    "CUDAToolkit_ROOT",
+    "CUDA_TOOLKIT_ROOT_DIR",
+    "CMAKE_CUDA_COMPILER_TOOLKIT_ROOT",
+)
+roots = {
+    Path(entries[key]).resolve(strict=True)
+    for key in root_keys
+    if entries.get(key)
+}
+if not roots:
+    raise SystemExit(f"fresh CMake cache has no CUDA toolkit root: {cache}")
+if roots != {expected_root}:
+    rendered = ", ".join(sorted(str(root) for root in roots))
+    raise SystemExit(
+        f"fresh CMake cache selected wrong CUDA toolkit root: [{rendered}] != {expected_root}"
+    )
+
+print("\t".join((str(cache), str(compiler), str(expected_root))))
+PY
+  )"; then
+    echo "FAIL: cannot prove the CUDA compiler selected by the fresh FA3 CMake configure" >&2
+    exit 69
+  fi
+  IFS=$'\t' read -r \
+    CMAKE_CACHE_PATH CMAKE_CUDA_COMPILER CMAKE_CUDA_TOOLKIT_ROOT \
+    <<< "${CMAKE_IDENTITY_TSV}"
   SO_PATH="$(find "${TARGET}/vllm_flash_attn" -maxdepth 1 -type f -name '_vllm_fa3_C*.so' -print -quit)"
   if [[ -z "${SO_PATH}" ]]; then
     echo "FAIL: build completed without _vllm_fa3_C*.so" >&2
@@ -417,7 +519,15 @@ SFI_PROV_SOURCE_MODE="${SOURCE_MODE}" \
 SFI_PROV_BUILD_STATUS="${BUILD_STATUS}" \
 SFI_PROV_SO_PATH="${SO_PATH}" \
 SFI_PROV_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-}" \
-SFI_PROV_CUDA_HOME="${CUDA_HOME:-}" \
+SFI_PROV_CUDA_HOME="${CUDA_HOME}" \
+SFI_PROV_CUDA_PATH="${CUDA_PATH}" \
+SFI_PROV_CUDACXX="${CUDACXX}" \
+SFI_PROV_CUDA_COMPILER_RELEASE="${CUDA_COMPILER_RELEASE}" \
+SFI_PROV_CUDA_COMPILER_MAJOR="${CUDA_COMPILER_MAJOR}" \
+SFI_PROV_BUILD_TEMP="${BUILD_TEMP}" \
+SFI_PROV_CMAKE_CACHE_PATH="${CMAKE_CACHE_PATH}" \
+SFI_PROV_CMAKE_CUDA_COMPILER="${CMAKE_CUDA_COMPILER}" \
+SFI_PROV_CMAKE_CUDA_TOOLKIT_ROOT="${CMAKE_CUDA_TOOLKIT_ROOT}" \
 SFI_PROV_OUTPUT="${PROVENANCE_OUTPUT}" \
 "${PY}" - <<'PY'
 from __future__ import annotations
@@ -443,9 +553,11 @@ try:
 except Exception:
     torch_version = ""
     torch_cuda = ""
+    torch_cuda_major = ""
 else:
     torch_version = str(torch.__version__)
     torch_cuda = str(torch.version.cuda or "")
+    torch_cuda_major = torch_cuda.split(".", 1)[0] if torch_cuda else ""
 
 patches = [
     {
@@ -464,7 +576,7 @@ if os.environ["SFI_PROV_FA4_PATCH_PATH"]:
     )
 
 payload = {
-    "schema_version": 3,
+    "schema_version": 4,
     "created_utc": datetime.now(timezone.utc).isoformat(),
     "architecture": os.environ["SFI_PROV_ARCH"],
     "backend": os.environ["SFI_PROV_BACKEND"],
@@ -477,13 +589,22 @@ payload = {
     "target": os.environ["SFI_PROV_TARGET"],
     "source_mode": os.environ["SFI_PROV_SOURCE_MODE"],
     "build_status": os.environ["SFI_PROV_BUILD_STATUS"],
-    "python_executable": sys.executable,
+    "python_executable": str(Path(sys.executable).resolve(strict=True)),
     "python_version": platform.python_version(),
     "torch_version": torch_version,
     "torch_cuda_version": torch_cuda,
+    "torch_cuda_major": torch_cuda_major,
     "cuda_home": os.environ["SFI_PROV_CUDA_HOME"],
+    "cuda_path": os.environ["SFI_PROV_CUDA_PATH"],
+    "cudacxx": os.environ["SFI_PROV_CUDACXX"],
+    "cuda_compiler_release": os.environ["SFI_PROV_CUDA_COMPILER_RELEASE"],
+    "cuda_compiler_major": os.environ["SFI_PROV_CUDA_COMPILER_MAJOR"],
     "torch_cuda_arch_list": os.environ["SFI_PROV_ARCH_LIST"],
-    "nvcc_version": command(os.environ.get("CUDACXX", "nvcc"), "--version"),
+    "nvcc_version": command(os.environ["SFI_PROV_CUDACXX"], "--version"),
+    "cmake_build_temp": os.environ["SFI_PROV_BUILD_TEMP"],
+    "cmake_cache_path": os.environ["SFI_PROV_CMAKE_CACHE_PATH"],
+    "cmake_cuda_compiler": os.environ["SFI_PROV_CMAKE_CUDA_COMPILER"],
+    "cmake_cuda_toolkit_root": os.environ["SFI_PROV_CMAKE_CUDA_TOOLKIT_ROOT"],
     "shared_object": str(so_path) if so_path is not None else "",
     "shared_object_sha256": (
         sha256(so_path.read_bytes()).hexdigest()

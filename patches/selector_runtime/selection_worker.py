@@ -29,6 +29,7 @@ from patches.sparse_constants import (
 )
 from patches.selector_runtime.selected_out_ring import SelectedOutRing, SlotStableOverrides
 from patches.sparse_types import SelectorBatchPayload, continuous_producer_enabled
+from patches.sparse_utils import _submission_slot_owner_snapshot
 from utils.selector_pipeline_identity import SELECTOR_PIPELINE_SEMANTIC_VERSION
 import time as _sw_time
 
@@ -72,23 +73,9 @@ def _producer_detail_marker(controller):
 # 合同不变:值仍恒取自 host 权威快照（slot_list/row_list/seq_lens_cpu_ref）,
 # 且 graph ON 下 writer 消费的是 _ensure_selector_writer_* stable buffer,
 # 这些张量只是同流 copy_ 的瞬时 src——复用无 deferred 消费者腐蚀面。
-# row_list 错峰下可按层不同,用有界值键 dict（命中即免 H2D）而非单槽 staging。
-_REBUILD_ROW_TENSOR_CACHE_ATTR = "_rebuild_row_tensor_value_cache"
-# [ROW-CACHE-CLEAR-UAF-FIX] env 旋钮化:调小可放大 clear 频率做归因复现
-# (黄金 0.6b 世代 ~6 从不触发默认上界,4B 长跑世代 ~百级必反复触发)。
-_REBUILD_ROW_TENSOR_CACHE_MAX = int(
-    os.environ.get("VLLM_SPARSE_REBUILD_ROW_CACHE_MAX", "32")
-)
-# [JUDGE-REPLAY-AWARE 2026-07-09] Env-gated compact-residency poison probe. Read
-# once; when unset the rebuild loop pays one cached-bool check per layer and
-# never imports the probe. See patches/debug/compact_poison_probe.py.
-_COMPACT_POISON_PROBE_ARMED = bool(
-    os.environ.get("VLLM_SPARSE_DEBUG_COMPACT_POISON")
-)
-
-
-
-
+# row_list 错峰下可按层不同。staging 由 LayerState 的真实生命周期持有，
+# 每层只保留当前权威值；同一 fused 调用中的同值 layer 共享一个 tensor。
+# 稳态仍按值命中免 H2D，且不再累计历史组合或依赖经验 population 上限。
 def _compact_gather_stride_tokens(owner: object, state: object, block_size: int) -> int:
     if getattr(state, "compact_page_residency", None) is not None:
         if int(getattr(state, "compact_stride_block_size", block_size)) != int(block_size):
@@ -187,7 +174,6 @@ def rebuild_compact_slots_batched_layers_from_selection_impl(
         # per-call = wr_*/wr_calls 才可信(相对占比不受影响)。
         _pd_wd = self._deadline_deferred_producer_detail_us
         _pd_wd["wr_calls"] = float(_pd_wd.get("wr_calls", 0.0) or 0.0) + 1.0
-    setattr(self, "_last_writer_kernel_variant", "")
     if defer_compact_meta_publish and compact_meta_commit_log is None:
         raise RuntimeError("deferred compact metadata publish requires commit log")
     if not payloads:
@@ -219,6 +205,13 @@ def rebuild_compact_slots_batched_layers_from_selection_impl(
     batch = len(slot_list)
     if batch == 0:
         return True
+    slot_owner_snapshot: Tuple[Tuple[int, str], ...] = tuple()
+    if defer_compact_meta_publish:
+        slot_owner_snapshot = _submission_slot_owner_snapshot(
+            payloads,
+            slot_list,
+            stage=f"deferred {phase} compact metadata",
+        )
     device = first.key_cache.device
     if selected_indices.device != device:
         return _fail_rebuild_contract("selected_indices_device_mismatch")
@@ -252,6 +245,10 @@ def rebuild_compact_slots_batched_layers_from_selection_impl(
                     f"layer_sig={cur_slot_sig}"
                 )
 
+    # 诊断状态不得抢在输入契约之前写入：fail-fast 调用方可能只提供一个
+    # 最小 self 来验证跨层 slot 一致性。通过全部结构校验后，真实 controller
+    # 仍在原有有效路径上恰好重置一次该字段，零额外热路径分支。
+    setattr(self, "_last_writer_kernel_variant", "")
     threshold = self._compact_threshold_tokens()
     cfg = self.config
     semantic_snapshot = self._get_step_semantic_snapshot() if cfg is not None else None
@@ -409,49 +406,14 @@ def rebuild_compact_slots_batched_layers_from_selection_impl(
         setattr(self, "_last_writer_effective_io_gbps", -1.0)
     layer_infos: List[Tuple] = []  # tuple: (payload, has_rebuild, row_tensor, reset_slot_commits)
     # [DETERMINISTIC-SLOT-SOURCE 2026-07-03] row_list 值→device 张量缓存。
-    # [REBUILD-H2D-STAGING] writer-graph ON（默认）时从"本次调用内"升级为
-    # controller 级有界值键缓存:值键=tuple(row_list)（错峰下各层可不同,dict 按值
-    # 分条目）,稳态命中即免 pageable H2D 的流阻塞。张量按值只写一次后只读,
-    # ON 下 writer 消费 stable buffer,此处只是 copy_ 的瞬时 src——复用无腐蚀面。
-    # OFF 逃生旋钮下 launch_args 直接持张量引用（deferred 消费）,回退 per-call
-    # dict（原语义,每世代独立分配）。上界 clear() 仅在 ON 下执行:释放后 allocator
-    # 同流（refresh_stream 上下文）复用受流序保护,stable copy 已完成无 deferred 读者。
-    if _ASYNC_PRODUCER_WRITER_GRAPH_CACHED:
-        _row_cache = getattr(self, _REBUILD_ROW_TENSOR_CACHE_ATTR, None)
-        if _row_cache is None:
-            _row_cache = {}
-            setattr(self, _REBUILD_ROW_TENSOR_CACHE_ATTR, _row_cache)
-        elif len(_row_cache) > _REBUILD_ROW_TENSOR_CACHE_MAX:
-            # 防御上界:批组成高频变化时防无界增长;清空后本世代重建（miss 一次）。
-            # [ROW-CACHE-CLEAR-UAF-FIX 2026-07-07] 弃引用前对每条目做双流
-            # record_stream:上方注释的旧安全前提"释放后 allocator 同流
-            # (refresh_stream 上下文)复用受流序保护"已被 deferred-drain 主流化
-            # 打破——本函数(条目创建与 stable copy_ 消费)在主流 drain 与
-            # refresh_stream off-loop 两种流上下文交替执行,条目创建流与在飞
-            # 消费流可以不同;clear 直接 GC 时 allocator 只按创建流序回收,
-            # 另一流的未决读者读到被复用/解映射(expandable segment 收缩)的
-            # storage = illegal address。row_list 随 decode 推进每世代都是新
-            # 值键→4B 长跑必反复触发本分支,黄金 0.6b 世代 ~6 从不触发,
-            # 与"仅 4B 崩"的模型选择性一致。record_stream 覆盖两个可能的
-            # 消费流,让 allocator 等其进度;仅 clear 时执行(稀有),µs 级。
-            # 覆盖集={refresh_stream, 当前流, default 流}:body 的两种执行
-            # 上下文是主流 drain(decode 前向流,常规=default)与 refresh_stream
-            # off-loop,消费只发生在这两类流;clear 时当前流只是其一,三者取
-            # 并集防"clear 在 off-loop 而主流仍有未决 src 读"的反向窗。
-            _uaf_guard_streams = []
-            _rs = getattr(self, "refresh_stream", None)
-            if _rs is not None:
-                _uaf_guard_streams.append(_rs)
-            for _cand in (torch.cuda.current_stream(), torch.cuda.default_stream()):
-                if all(_cand != s for s in _uaf_guard_streams):
-                    _uaf_guard_streams.append(_cand)
-            for _stale_row_t in _row_cache.values():
-                for _s in _uaf_guard_streams:
-                    _stale_row_t.record_stream(_s)
-            _row_cache.clear()
-        _row_tensor_by_key: Dict[Tuple[int, ...], torch.Tensor] = _row_cache
-    else:
-        _row_tensor_by_key = {}
+    # writer-graph ON 时，每个 LayerState 持有其当前 row 值的 staging tensor；
+    # 本调用的 dict 只负责让同值 layer 共享同一 tensor。值不变时没有 H2D、
+    # rebind 或 graph capture；值变化时仅换代对应 layer，旧 storage 在冷路径
+    # 做跨流 UAF 守卫。缓存规模由实际 LayerState 数量天然限定，不保存历史
+    # row 组合，也没有 clear-all。OFF 逃生旋钮仍保持 per-call 独立张量语义。
+    _row_tensor_by_key: Dict[Tuple[int, ...], torch.Tensor] = {}
+    _row_h2d_sources: List[torch.Tensor] = []
+    _row_guarded_old_tensor_ids: Set[int] = set()
     max_len = 0
     flat_k_strides: Optional[Tuple[int, int, int]] = None
     flat_v_strides: Optional[Tuple[int, int, int]] = None
@@ -615,18 +577,6 @@ def rebuild_compact_slots_batched_layers_from_selection_impl(
         head_dim = head_dim_ref
         state = payload.state
 
-        if _COMPACT_POISON_PROBE_ARMED:
-            # Register this layer's pool KV tensors (the compact arena is a view
-            # of exactly these at the reserved blocks). First-seen is enough;
-            # pool tensors are process-stable. Env-gated: unset -> not reached.
-            from patches.debug.compact_poison_probe import maybe_register_layer_kv
-
-            maybe_register_layer_kv(
-                int(getattr(payload, "layer_index", layer_idx)),
-                payload.key_cache,
-                payload.value_cache,
-            )
-
         if layer_idx == 0:
             # 首层：完整检查
             if [int(slot) for slot in payload.slot_list] != slot_list:
@@ -728,8 +678,36 @@ def rebuild_compact_slots_batched_layers_from_selection_impl(
         # 相同时只发一次 H2D。
         _row_key = tuple(int(r) for r in payload.row_list)
         _row_tensor_layer = _row_tensor_by_key.get(_row_key)
-        if _row_tensor_layer is None:
-            _row_tensor_layer = torch.tensor(payload.row_list, device=device, dtype=torch.int32)
+        if _ASYNC_PRODUCER_WRITER_GRAPH_CACHED:
+            _state_row_key = getattr(state, "_rebuild_row_tensor_cache_key", None)
+            _state_row_tensor = getattr(state, "_rebuild_row_tensor_cache", None)
+            if _row_tensor_layer is None:
+                if _state_row_key == _row_key and isinstance(_state_row_tensor, torch.Tensor):
+                    _row_tensor_layer = _state_row_tensor
+                else:
+                    _row_cpu_pin = _new_pinned_i32_tensor(_row_key)
+                    _row_tensor_layer = torch.empty(
+                        (len(_row_key),), device=device, dtype=torch.int32
+                    )
+                    _row_tensor_layer.copy_(_row_cpu_pin, non_blocking=True)
+                    # Hold the pinned source through all stable-buffer copies
+                    # enqueued by this call.
+                    _row_h2d_sources.append(_row_cpu_pin)
+                _row_tensor_by_key[_row_key] = _row_tensor_layer
+            if _state_row_tensor is not _row_tensor_layer:
+                if (
+                    isinstance(_state_row_tensor, torch.Tensor)
+                    and _state_row_tensor.is_cuda
+                    and id(_state_row_tensor) not in _row_guarded_old_tensor_ids
+                ):
+                    self._uaf_guard_record_streams_before_discard(_state_row_tensor)
+                    _row_guarded_old_tensor_ids.add(id(_state_row_tensor))
+                state._rebuild_row_tensor_cache_key = _row_key
+                state._rebuild_row_tensor_cache = _row_tensor_layer
+        elif _row_tensor_layer is None:
+            _row_tensor_layer = torch.tensor(
+                payload.row_list, device=device, dtype=torch.int32
+            )
             _row_tensor_by_key[_row_key] = _row_tensor_layer
         # info[4]=layer_cache_sig：本层签名只算一次，第二遍 per-layer 校验循环复用。
         layer_infos.append((payload, has_rebuild, _row_tensor_layer, reset_slot_commits, layer_cache_sig))
@@ -755,6 +733,7 @@ def rebuild_compact_slots_batched_layers_from_selection_impl(
                                 bootstrap_slots_by_layer[layer_idx] or tuple()
                             )
                         ),
+                        "slot_owner_snapshot": slot_owner_snapshot,
                     }
                 )
         return True
@@ -1165,12 +1144,46 @@ def rebuild_compact_slots_batched_layers_from_selection_impl(
     writer_token_tile_arg = (
         int(writer_token_tile) if int(writer_token_tile) > 0 else int(stride_tokens_ref)
     )
+    # [WRITER-GRAPH-KEY v6] Canonicalize the host-only max_total_tokens scalar
+    # to the CUDA launch geometry it actually produces. The extension uses this
+    # scalar only to derive safe_tile_tokens and grid.z; it is NOT a kernel
+    # argument. Therefore all raw prompt lengths in the same
+    # (safe_tile_tokens, token_tiles) class are one exact CUDA graph identity.
+    # Passing the class ceiling below emits the identical grid and identical
+    # kernel arguments: no extra CTA, kernel, synchronization, or tensor work.
+    _writer_requested_tile_tokens = max(1, int(writer_token_tile_arg))
+    _writer_stride_tokens_i32 = max(1, int(stride_tokens_ref))
+    _writer_active_tokens_i32 = min(
+        _writer_stride_tokens_i32,
+        max(1, int(writer_active_max_tokens)),
+    )
+    _writer_max_grid_z = 65535
+    _writer_min_tile_for_grid_z = (
+        _writer_active_tokens_i32 + _writer_max_grid_z - 1
+    ) // _writer_max_grid_z
+    writer_safe_tile_tokens = max(
+        _writer_requested_tile_tokens,
+        _writer_min_tile_for_grid_z,
+    )
+    writer_graph_token_tiles = max(
+        1,
+        (
+            _writer_active_tokens_i32
+            + int(writer_safe_tile_tokens)
+            - 1
+        )
+        // int(writer_safe_tile_tokens),
+    )
+    writer_graph_max_tokens = min(
+        _writer_stride_tokens_i32,
+        int(writer_graph_token_tiles) * int(writer_safe_tile_tokens),
+    )
     if _pd_mark is not None:
         _pd_mark("wr_stable_copies")
     writer_launch_args = (
         *ptr_gather_args,
         int(writer_token_tile_arg),
-        int(writer_active_max_tokens),
+        int(writer_graph_max_tokens),
         int(sink_cap),
         int(recent_cfg),
         int(k_head_cfg),
@@ -1277,29 +1290,33 @@ def rebuild_compact_slots_batched_layers_from_selection_impl(
                 and min(_writer_group_layer_ids) < 0
             ),
             key_fields=(
-                int(writer_active_max_tokens),
+                # [WRITER-GRAPH-KEY v6] bounded ownership scope prefix.
+                # _capture_writer_graph keeps one current exact graph per
+                # (batch, layer-group), so BS8 x three legal groups is bounded
+                # by construction instead of a guessed global cache size.
+                int(batch),
+                int(_writer_group_layer_ids[0] if _writer_group_layer_ids else -1),
+                int(_writer_group_layer_ids[-1] if _writer_group_layer_ids else -1),
+                int(hash(_writer_group_layer_ids) & 0x7FFFFFFFFFFFFFFF),
+                # Exact CUDA launch geometry (raw prompt length is host-only).
+                int(writer_safe_tile_tokens),
+                int(writer_graph_token_tiles),
                 int(selected_cuda.data_ptr()),
                 int(seq_lens_cuda.data_ptr()),
                 int(row_tensor_cuda.data_ptr()),
                 int(slot_tensor_cuda.data_ptr()),
                 int(layers),
-                int(batch),
                 int(num_kv_heads),
                 int(sink_cap),
                 int(recent_cfg),
                 int(k_head_cfg),
                 int(threshold),
-                int(writer_token_tile_arg),
                 int(stride_tokens_ref),
                 int(block_size_ref),
                 int(head_dim_ref),
                 int(block_table_cols),
                 int(block_table_strides[0]),
                 int(block_table_strides[1]),
-                # #9-KEY v5: layer-group identity (first, last, segment hash).
-                int(_writer_group_layer_ids[0] if _writer_group_layer_ids else -1),
-                int(_writer_group_layer_ids[-1] if _writer_group_layer_ids else -1),
-                int(hash(_writer_group_layer_ids) & 0x7FFFFFFFFFFFFFFF),
             ),
         )
 
@@ -1391,11 +1408,14 @@ def rebuild_compact_slots_batched_layers_from_selection_impl(
                 and int(state.compact_pad_zeroed_len[slot]) == int(kv_len)
             )
             if defer_compact_meta_publish:
-                if not same_lengths:
-                    assert slot_meta_commits is not None
-                    slot_meta_commits.append(
-                        (int(slot), int(sink_len), int(persist_len), int(kv_len))
-                    )
+                # Deferred publication crosses a mutable slot-state boundary.
+                # Carry a complete transaction instead of a live-state diff;
+                # cleanup/rebind between staging and commit must not erase an
+                # "unchanged" field that the writer has just made authoritative.
+                assert slot_meta_commits is not None
+                slot_meta_commits.append(
+                    (int(slot), int(sink_len), int(persist_len), int(kv_len))
+                )
                 if not (same_lengths and pad_marker_matched):
                     marker, task = _plan_pad_cleanup_commit(
                         state, int(slot), int(kv_len), stride_tokens_int
@@ -1436,6 +1456,7 @@ def rebuild_compact_slots_batched_layers_from_selection_impl(
                     "dual_gen_flip_slots": (
                         tuple(int(s) for s in rebuild_slots_ref) if _dg_on else tuple()
                     ),
+                    "slot_owner_snapshot": slot_owner_snapshot,
                 }
             )
             for slot, pad_start, pad_end in pad_cleanup_tasks:

@@ -1308,6 +1308,12 @@ class ProfileMixin:
         record["selector_topk_graph_capture_count"] = int(
             getattr(self, "_selector_topk_graph_capture_count", 0)
         )
+        record["selector_topk_graph_scope_replacement_count"] = int(
+            getattr(self, "_selector_topk_graph_scope_replacement_count", 0)
+        )
+        record["selector_topk_graph_admission_deferred_count"] = int(
+            getattr(self, "_selector_topk_graph_admission_deferred_count", 0)
+        )
         _sor = getattr(self, "_selected_out_ring", None)
         record["selected_out_ring_acquire_count"] = (
             int(_sor.acquire_count) if _sor is not None else 0

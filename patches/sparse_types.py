@@ -1044,6 +1044,13 @@ class StepMeta:
     prologue_owner_plan: Optional[object] = None  # MixedPrefillDecodeOwnerPlan
     prologue_rail_decision: Optional[object] = None  # CompactRecentRailDecision
     prologue_selected_row_plan: Optional[object] = None  # build_mixed_page_row_plan(...)
+    # Consumer-stream binding for the compact-arena producer fence.  The
+    # prologue resolves it once per step; layer dispatch performs only host
+    # identity/generation comparisons and never queries CUDA for the stream.
+    compact_ready_consumer_stream: Optional[object] = None
+    compact_ready_consumer_stream_key: Optional[Tuple[int, int]] = None
+    compact_ready_consumer_stream_identity_token: int = -1
+    compact_ready_consumer_waited_generation: int = -1
     # True when a decode-only not-ready step is intentionally encoded as
     # full-KV rows inside the same mixed-page/RRP carrier family.
     prologue_full_kv_handoff: bool = False
@@ -1128,6 +1135,12 @@ class StepBoundMeta:
     prologue_owner_plan: Optional[object] = None  # MixedPrefillDecodeOwnerPlan
     prologue_rail_decision: Optional[object] = None  # CompactRecentRailDecision
     prologue_selected_row_plan: Optional[object] = None  # build_mixed_page_row_plan(...)
+    # Bound once by the step prologue so the layer hot path can establish the
+    # compact-arena RAW edge without a per-layer current-stream query.
+    compact_ready_consumer_stream: Optional[object] = None
+    compact_ready_consumer_stream_key: Optional[Tuple[int, int]] = None
+    compact_ready_consumer_stream_identity_token: int = -1
+    compact_ready_consumer_waited_generation: int = -1
     # True when a decode-only not-ready step is intentionally encoded as
     # full-KV rows inside the same mixed-page/RRP carrier family.
     prologue_full_kv_handoff: bool = False

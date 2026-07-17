@@ -14,6 +14,7 @@ from patches.fa3_native.mixed_page_graph_descriptor import (
     ResolverGraphDescriptor,
 )
 from patches.fa3_native.runtime_bridge import validate_mixed_page_resolver_replay
+from patches.page_kv_residency import CompactPageLease
 from patches.sparse_constants import _DYNAMIC_ENV
 from patches.fa_sparse_runtime.compact_mixed_page_overlay import (
     CompactMixedPageOverlay,
@@ -114,30 +115,23 @@ def _lease(state: object) -> object:
     return lease
 
 
-# [RESERVED-IDS-CACHE] lease.reserved_manager_block_ids 在 lease 生命周期内不可变
-# （frozen dataclass，创建时已强制逐元素 int/正/连续），但旧实现每 layer×每 eager
-# 步做三遍逐元素递归校验（slots×blocks=1152 元素实测 ~1ms/层×36 层≈47ms/eager 步，
-# 是 refresh 等待残差的最大已定位切片）。缓存持有已校验 tuple 的强引用（id 在持有
-# 引用期间恒有效），命中 = 一次 dict 查找 + 一次身份比较，O(1)。
-_RESERVED_IDS_CACHE: dict[int, tuple[int, ...]] = {}
-
-
 def _compact_reserved_ids(state: object) -> tuple[int, ...]:
-    ids = getattr(_lease(state), "reserved_manager_block_ids", None)
+    lease = _lease(state)
+    ids = getattr(lease, "reserved_manager_block_ids", None)
     if ids is None:
         raise RuntimeError("compact mixed-page overlay requires reserved manager blocks")
-    cached = _RESERVED_IDS_CACHE.get(id(ids))
-    if cached is not None and cached is ids:
-        return cached
+    # Production owner CompactPageLease is frozen and validates/canonicalizes
+    # every id once in __post_init__. Trust that construction proof directly:
+    # no per-layer scan, global identity cache, population guess, or clear-all.
+    if isinstance(lease, CompactPageLease):
+        return lease.reserved_manager_block_ids
+    # Duck-typed test/integration leases do not carry the construction proof;
+    # retain the generic fail-closed validation for those cold paths.
     validated = tuple(
         _as_int("reserved_manager_block_ids", value)
         for value in _metadata_tuple("reserved_manager_block_ids", ids)
     )
     if type(ids) is tuple and validated == ids:
-        # 只缓存与校验结果逐位一致的原 tuple（保引用 → id 稳定）；异类容器每次重验。
-        if len(_RESERVED_IDS_CACHE) >= 64:
-            _RESERVED_IDS_CACHE.clear()  # lease 数量级为个位数；防御性上界
-        _RESERVED_IDS_CACHE[id(ids)] = ids
         return ids
     return validated
 
@@ -288,10 +282,91 @@ def _mixed_page_backend_label(fa_version: int) -> str:
     return f"fa{fa_version}"
 
 
+def _compact_arena_consumer_stream_key(
+    stream: object,
+    *,
+    device: torch.device,
+) -> tuple[int, int]:
+    """Return the proven device-local raw CUDA stream identity."""
+
+    raw_stream = getattr(stream, "cuda_stream", None)
+    if (
+        isinstance(raw_stream, bool)
+        or not isinstance(raw_stream, int)
+        or raw_stream < 0
+    ):
+        raise RuntimeError(
+            "compact-ready consumer requires a non-negative raw CUDA stream identity"
+        )
+    device_index = device.index
+    stream_device = getattr(stream, "device", None)
+    stream_device_index = getattr(stream_device, "index", None)
+    if (
+        device_index is not None
+        and stream_device_index is not None
+        and int(device_index) != int(stream_device_index)
+    ):
+        raise RuntimeError("compact-ready consumer stream device does not match q")
+    resolved_device_index = (
+        stream_device_index if stream_device_index is not None else device_index
+    )
+    return (
+        -1 if resolved_device_index is None else int(resolved_device_index),
+        int(raw_stream),
+    )
+
+
+def bind_compact_arena_consumer_stream_for_step(
+    *,
+    step_bound_meta: object,
+    device: torch.device,
+) -> None:
+    """Bind one CUDA consumer stream to one immutable step identity.
+
+    A model step is stream-affine: its layer calls execute serially on one
+    consumer stream.  Resolving that stream in the existing step prologue
+    keeps the per-layer compact-arena fence path free of current-stream CUDA
+    queries while still allowing different steps/graph contexts to bind
+    different consumer streams.
+    """
+
+    if getattr(device, "type", "") != "cuda":
+        return
+    step_token = int(getattr(step_bound_meta, "step_identity_token", -1))
+    bound_token = int(
+        getattr(
+            step_bound_meta,
+            "compact_ready_consumer_stream_identity_token",
+            -2,
+        )
+    )
+    if bound_token == step_token:
+        if (
+            getattr(step_bound_meta, "compact_ready_consumer_stream", None) is None
+            or not isinstance(
+                getattr(
+                    step_bound_meta,
+                    "compact_ready_consumer_stream_key",
+                    None,
+                ),
+                tuple,
+            )
+        ):
+            raise RuntimeError("compact-ready step stream binding is malformed")
+        return
+    stream = torch.cuda.current_stream(device=device)
+    stream_key = _compact_arena_consumer_stream_key(stream, device=device)
+    step_bound_meta.compact_ready_consumer_stream = stream
+    step_bound_meta.compact_ready_consumer_stream_key = stream_key
+    step_bound_meta.compact_ready_consumer_stream_identity_token = step_token
+    step_bound_meta.compact_ready_consumer_waited_generation = -1
+
+
 def _wait_for_compact_arena_if_needed(
     *,
     controller: object,
     state: object,
+    step_bound_meta: object,
     device: torch.device,
 ) -> None:
     # The compact-ready generation is a correctness fence, not an optional
@@ -302,20 +377,81 @@ def _wait_for_compact_arena_if_needed(
     if getattr(device, "type", "") == "cuda":
         _car_evt = getattr(controller, "_compact_arena_ready_evt", None)
         _car_gen = int(getattr(controller, "_compact_arena_ready_gen", 0))
-        _car_waited = int(getattr(controller, "_compact_arena_ready_waited_gen", -1))
-        if _car_gen < 0 or _car_waited < -1 or _car_waited > _car_gen:
+        if _car_gen < 0:
             raise RuntimeError("compact-ready generation state is malformed")
         if _car_gen > 0 and _car_evt is None:
             raise RuntimeError(
                 "compact-ready generation requires its producer event"
             )
-        if (
-            _car_evt is not None
-            and _car_gen > max(0, _car_waited)
-            and not torch.cuda.is_current_stream_capturing()
-        ):
-            torch.cuda.current_stream(device=device).wait_event(_car_evt)
-            controller._compact_arena_ready_waited_gen = _car_gen
+        if _car_evt is not None and _car_gen > 0:
+            step_token = int(getattr(step_bound_meta, "step_identity_token", -1))
+            bound_token = int(
+                getattr(
+                    step_bound_meta,
+                    "compact_ready_consumer_stream_identity_token",
+                    -2,
+                )
+            )
+            if bound_token != step_token:
+                raise RuntimeError(
+                    "compact-ready consumer stream is not bound to the current step"
+                )
+            step_waited_generation = getattr(
+                step_bound_meta,
+                "compact_ready_consumer_waited_generation",
+                -1,
+            )
+            if (
+                isinstance(step_waited_generation, bool)
+                or not isinstance(step_waited_generation, int)
+                or step_waited_generation < -1
+                or step_waited_generation > _car_gen
+            ):
+                raise RuntimeError("compact-ready step wait generation is malformed")
+            if step_waited_generation != _car_gen:
+                consumer_stream = getattr(
+                    step_bound_meta,
+                    "compact_ready_consumer_stream",
+                    None,
+                )
+                stream_key = getattr(
+                    step_bound_meta,
+                    "compact_ready_consumer_stream_key",
+                    None,
+                )
+                if (
+                    consumer_stream is None
+                    or not isinstance(stream_key, tuple)
+                    or len(stream_key) != 2
+                ):
+                    raise RuntimeError("compact-ready step stream binding is malformed")
+                waited_by_stream = getattr(
+                    controller,
+                    "_compact_arena_ready_waited_gen_by_stream",
+                    None,
+                )
+                if waited_by_stream is None:
+                    waited_by_stream = {}
+                    controller._compact_arena_ready_waited_gen_by_stream = waited_by_stream
+                if not isinstance(waited_by_stream, dict):
+                    raise RuntimeError("compact-ready per-stream wait state is malformed")
+                waited_generation = waited_by_stream.get(stream_key, -1)
+                if (
+                    isinstance(waited_generation, bool)
+                    or not isinstance(waited_generation, int)
+                    or waited_generation < -1
+                    or waited_generation > _car_gen
+                ):
+                    raise RuntimeError("compact-ready per-stream generation is malformed")
+                if (
+                    _car_gen > max(0, waited_generation)
+                    and not torch.cuda.is_current_stream_capturing()
+                ):
+                    consumer_stream.wait_event(_car_evt)
+                    waited_by_stream[stream_key] = _car_gen
+                    step_bound_meta.compact_ready_consumer_waited_generation = _car_gen
+                elif waited_generation == _car_gen:
+                    step_bound_meta.compact_ready_consumer_waited_generation = _car_gen
 
     from patches.fa_sparse_runtime.compact_recent_dispatch import (
         _maybe_wait_for_async_compact_arena,
@@ -627,6 +763,7 @@ def run_compact_mixed_page_overlay_route(
     _wait_for_compact_arena_if_needed(
         controller=controller,
         state=state,
+        step_bound_meta=step_bound_meta,
         device=q.device,
     )
     page_size_i = _as_int("page_size", page_size)

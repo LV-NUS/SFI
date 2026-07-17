@@ -874,6 +874,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 #include <limits>
 #include <sstream>
 #include <string>
+#include <type_traits>
 #include <unistd.h>
 
 static inline torch::Tensor ensure_contig(const torch::Tensor& t) {
@@ -910,6 +911,21 @@ static inline torch::Tensor to_flat_contig(const torch::Tensor& t, at::IntArrayR
         return t;
     }
     return ensure_contig(t).reshape(shape);
+}
+
+static inline torch::Tensor prepare_pipeline_key_norms(
+    const torch::Tensor& key_norms,
+    at::IntArrayRef shape,
+    double gamma) {
+    if (gamma == 0.0) {
+        // Explicit no-keynorm ABI: the false CUDA specialization ignores this
+        // tensor, so callers may pass a zero-numel sentinel on any device.
+        return key_norms;
+    }
+    TORCH_CHECK(
+        key_norms.defined() && key_norms.numel() > 0,
+        "gamma != 0 requires non-empty key_norms");
+    return to_flat_contig(key_norms, shape);
 }
 
 static inline torch::Tensor ensure_f32_contig(const torch::Tensor& t) {
@@ -1122,7 +1138,27 @@ __device__ __forceinline__ float sigmoid_tanh_clip(float x) {
 
 } // namespace
 
-template <typename scalar_t, typename key_norms_t>
+template <bool UseKeyNorms, typename key_norms_t>
+__device__ __forceinline__ float key_norm_log_prior(
+    const key_norms_t* __restrict__ key_norms,
+    int64_t offset,
+    float eps,
+    float gamma) {
+    if constexpr (UseKeyNorms) {
+        float kn = static_cast<float>(key_norms[offset]);
+        kn = fmaxf(kn, eps);
+        return -gamma * logf(kn);
+    } else {
+        return 0.0f;
+    }
+}
+
+template <typename T>
+struct selector_type_tag {
+    using type = T;
+};
+
+template <typename scalar_t, typename key_norms_t, bool UseKeyNorms>
 __global__ void fused_log_f_prior_kernel(
     const scalar_t* __restrict__ scores,
     const float* __restrict__ denom,
@@ -1372,9 +1408,11 @@ __global__ void fused_log_f_prior_kernel(
                 }
             }
 
-            float kn = static_cast<float>(key_norms[(int64_t)m * stride_kn_m + k * stride_kn_k]);
-            kn = fmaxf(kn, eps);
-            float log_pi = -gamma * logf(kn);
+            float log_pi = key_norm_log_prior<UseKeyNorms>(
+                key_norms,
+                (int64_t)m * stride_kn_m + k * stride_kn_k,
+                eps,
+                gamma);
             float pos_norm = (static_cast<float>(k - token_lo)) * inv_denom_pos;
             pos_norm = fmaxf(0.0f, fminf(1.0f, pos_norm));
             float pos_norm_pos = fmaxf(pos_norm, eps);
@@ -1420,9 +1458,11 @@ __global__ void fused_log_f_prior_kernel(
         if (log_r_cache != nullptr) {
             log_r_raw = log_r_cache[(int64_t)m * K + k];
         } else {
-            float kn = static_cast<float>(key_norms[(int64_t)m * stride_kn_m + k * stride_kn_k]);
-            kn = fmaxf(kn, eps);
-            float log_pi = -gamma * logf(kn);
+            float log_pi = key_norm_log_prior<UseKeyNorms>(
+                key_norms,
+                (int64_t)m * stride_kn_m + k * stride_kn_k,
+                eps,
+                gamma);
             float pos_norm = (static_cast<float>(k - token_lo)) * inv_denom_pos;
             pos_norm = fmaxf(0.0f, fminf(1.0f, pos_norm));
             float pos_norm_pos = fmaxf(pos_norm, eps);
@@ -1465,9 +1505,11 @@ __global__ void fused_log_f_prior_kernel(
         if (log_r_cache != nullptr) {
             log_r_raw = log_r_cache[(int64_t)m * K + k];
         } else {
-            float kn = static_cast<float>(key_norms[(int64_t)m * stride_kn_m + k * stride_kn_k]);
-            kn = fmaxf(kn, eps);
-            float log_pi = -gamma * logf(kn);
+            float log_pi = key_norm_log_prior<UseKeyNorms>(
+                key_norms,
+                (int64_t)m * stride_kn_m + k * stride_kn_k,
+                eps,
+                gamma);
             float pos_norm = (static_cast<float>(k - token_lo)) * inv_denom_pos;
             pos_norm = fmaxf(0.0f, fminf(1.0f, pos_norm));
             float pos_norm_pos = fmaxf(pos_norm, eps);
@@ -1553,9 +1595,11 @@ __global__ void fused_log_f_prior_kernel(
         if (log_r_cache != nullptr) {
             log_r_raw = log_r_cache[(int64_t)m * K + k];
         } else {
-            float kn = static_cast<float>(key_norms[(int64_t)m * stride_kn_m + k * stride_kn_k]);
-            kn = fmaxf(kn, eps);
-            float log_pi = -gamma * logf(kn);
+            float log_pi = key_norm_log_prior<UseKeyNorms>(
+                key_norms,
+                (int64_t)m * stride_kn_m + k * stride_kn_k,
+                eps,
+                gamma);
             float pos_norm = (static_cast<float>(k - token_lo)) * inv_denom_pos;
             pos_norm = fmaxf(0.0f, fminf(1.0f, pos_norm));
             float pos_norm_pos = fmaxf(pos_norm, eps);
@@ -2321,7 +2365,14 @@ torch::Tensor run_log_s(
     auto row_hi_c = ensure_int32_contig(row_hi);
     auto token_lo_c = ensure_int32_contig(token_lo);
     auto token_hi_c = ensure_int32_contig(token_hi);
-    auto key_norms_c = ensure_contig(key_norms);
+    const bool use_key_norms = gamma != 0.0;
+    torch::Tensor key_norms_c;
+    if (use_key_norms) {
+        TORCH_CHECK(
+            key_norms.defined() && key_norms.numel() > 0,
+            "gamma != 0 requires non-empty key_norms");
+        key_norms_c = ensure_contig(key_norms);
+    }
 
     int64_t M = scores_c.size(0);
     int64_t R = scores_c.size(1);
@@ -2342,7 +2393,11 @@ torch::Tensor run_log_s(
     TORCH_CHECK(row_hi_c.size(0) == M && row_hi_c.size(1) == R, "row_hi shape mismatch");
     TORCH_CHECK(token_lo_c.numel() == M, "token_lo shape mismatch");
     TORCH_CHECK(token_hi_c.numel() == M, "token_hi shape mismatch");
-    TORCH_CHECK(key_norms_c.size(0) == M && key_norms_c.size(1) == K, "key_norms shape mismatch");
+    if (use_key_norms) {
+        TORCH_CHECK(
+            key_norms_c.dim() == 2 && key_norms_c.size(0) == M && key_norms_c.size(1) == K,
+            "key_norms shape mismatch");
+    }
     TORCH_CHECK(R <= 128, "rows (R) must be <=128");
 
     auto out = workspace_2d_or_empty(
@@ -2398,111 +2453,106 @@ torch::Tensor run_log_s(
         + sizeof(int) * 2 + sizeof(float) * 2;
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    if (denom.has_value()) {
-        auto denom_f = denom.value();
+    const bool use_denom = denom.has_value();
+    torch::Tensor denom_f;
+    if (use_denom) {
+        denom_f = denom.value();
         if (denom_f.scalar_type() != torch::kFloat32) {
             denom_f = denom_f.to(torch::kFloat32);
         }
         TORCH_CHECK(denom_f.dim() == 2, "denom must be [M, R]");
         TORCH_CHECK(denom_f.size(0) == M && denom_f.size(1) == R, "denom shape mismatch");
-        AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, scores_c.scalar_type(), "fused_log_f_prior_pre_denom", [&] {
-            using score_t = scalar_t;
-            AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, key_norms_c.scalar_type(), "fused_log_f_prior_pre_denom_key_norms", [&] {
-                using key_norm_t = scalar_t;
-                fused_log_f_prior_kernel<score_t, key_norm_t><<<blocks, threads, shm_size, stream>>>(
-                    scores_c.data_ptr<score_t>(),
-                    denom_f.data_ptr<float>(),
-                    row_lo_c.data_ptr<int32_t>(),
-                    row_hi_c.data_ptr<int32_t>(),
-                    token_lo_c.data_ptr<int32_t>(),
-                    token_hi_c.data_ptr<int32_t>(),
-                    key_norms_c.data_ptr<key_norm_t>(),
-                    static_cast<int>(M),
-                    static_cast<int>(R),
-                    static_cast<int>(K),
-                    block_k,
-                    num_blocks_bucket,
-                    static_cast<int>(scores_c.stride(0)),
-                    static_cast<int>(scores_c.stride(1)),
-                    static_cast<int>(scores_c.stride(2)),
-                    static_cast<int>(denom_f.stride(0)),
-                    static_cast<int>(denom_f.stride(1)),
-                    static_cast<int>(row_lo_c.stride(0)),
-                    static_cast<int>(row_lo_c.stride(1)),
-                    static_cast<int>(row_hi_c.stride(0)),
-                    static_cast<int>(row_hi_c.stride(1)),
-                    static_cast<int>(token_lo_c.stride(0)),
-                    static_cast<int>(token_hi_c.stride(0)),
-                    static_cast<int>(key_norms_c.stride(0)),
-                    static_cast<int>(key_norms_c.stride(1)),
-                    true,
-                    static_cast<float>(alpha),
-                    static_cast<float>(eps),
-                    static_cast<float>(gamma),
-                    static_cast<float>(prior_weight_l2),
-                    static_cast<float>(prior_weight_pos),
-                    static_cast<float>(prior_pos_power),
-                    static_cast<float>(prior_pos_eta),
-                    static_cast<float>(beta),
-                    static_cast<float>(lambda_clip_single),
-                    static_cast<float>(lambda_clip_multi),
-                    static_cast<float>(lambda_tail_kappa),
-                    static_cast<float>(lambda_tail_pivot),
-                    lambda_soft,
-                    log_r_cache_ptr,
-                    out.data_ptr<float>());
-            });
-        });
-    } else {
-        AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, scores_c.scalar_type(), "fused_log_f_prior_logits", [&] {
-            using score_t = scalar_t;
-            AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, key_norms_c.scalar_type(), "fused_log_f_prior_logits_key_norms", [&] {
-                using key_norm_t = scalar_t;
-                fused_log_f_prior_kernel<score_t, key_norm_t><<<blocks, threads, shm_size, stream>>>(
-                    scores_c.data_ptr<score_t>(),
-                    nullptr,
-                    row_lo_c.data_ptr<int32_t>(),
-                    row_hi_c.data_ptr<int32_t>(),
-                    token_lo_c.data_ptr<int32_t>(),
-                    token_hi_c.data_ptr<int32_t>(),
-                    key_norms_c.data_ptr<key_norm_t>(),
-                    static_cast<int>(M),
-                    static_cast<int>(R),
-                    static_cast<int>(K),
-                    block_k,
-                    num_blocks_bucket,
-                    static_cast<int>(scores_c.stride(0)),
-                    static_cast<int>(scores_c.stride(1)),
-                    static_cast<int>(scores_c.stride(2)),
-                    0,
-                    0,
-                    static_cast<int>(row_lo_c.stride(0)),
-                    static_cast<int>(row_lo_c.stride(1)),
-                    static_cast<int>(row_hi_c.stride(0)),
-                    static_cast<int>(row_hi_c.stride(1)),
-                    static_cast<int>(token_lo_c.stride(0)),
-                    static_cast<int>(token_hi_c.stride(0)),
-                    static_cast<int>(key_norms_c.stride(0)),
-                    static_cast<int>(key_norms_c.stride(1)),
-                    false,
-                    static_cast<float>(alpha),
-                    static_cast<float>(eps),
-                    static_cast<float>(gamma),
-                    static_cast<float>(prior_weight_l2),
-                    static_cast<float>(prior_weight_pos),
-                    static_cast<float>(prior_pos_power),
-                    static_cast<float>(prior_pos_eta),
-                    static_cast<float>(beta),
-                    static_cast<float>(lambda_clip_single),
-                    static_cast<float>(lambda_clip_multi),
-                    static_cast<float>(lambda_tail_kappa),
-                    static_cast<float>(lambda_tail_pivot),
-                    lambda_soft,
-                    log_r_cache_ptr,
-                    out.data_ptr<float>());
-            });
-        });
     }
+    const float* denom_ptr = use_denom ? denom_f.data_ptr<float>() : nullptr;
+    const int denom_stride_m = use_denom ? static_cast<int>(denom_f.stride(0)) : 0;
+    const int denom_stride_r = use_denom ? static_cast<int>(denom_f.stride(1)) : 0;
+
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        at::kHalf,
+        at::kBFloat16,
+        scores_c.scalar_type(),
+        "fused_log_f_prior",
+        [&] {
+            using score_t = scalar_t;
+            auto launch_for_key_norm_type = [&] (
+                auto use_key_norms_tag,
+                auto key_norms_type_tag) {
+                constexpr bool kUseKeyNorms = decltype(use_key_norms_tag)::value;
+                using key_norm_t = typename decltype(key_norms_type_tag)::type;
+                const key_norm_t* key_norms_ptr = nullptr;
+                int key_norms_stride_m = 0;
+                int key_norms_stride_k = 0;
+                if constexpr (kUseKeyNorms) {
+                    key_norms_ptr = key_norms_c.data_ptr<key_norm_t>();
+                    key_norms_stride_m = static_cast<int>(key_norms_c.stride(0));
+                    key_norms_stride_k = static_cast<int>(key_norms_c.stride(1));
+                }
+                fused_log_f_prior_kernel<score_t, key_norm_t, kUseKeyNorms>
+                    <<<blocks, threads, shm_size, stream>>>(
+                        scores_c.data_ptr<score_t>(),
+                        denom_ptr,
+                        row_lo_c.data_ptr<int32_t>(),
+                        row_hi_c.data_ptr<int32_t>(),
+                        token_lo_c.data_ptr<int32_t>(),
+                        token_hi_c.data_ptr<int32_t>(),
+                        key_norms_ptr,
+                        static_cast<int>(M),
+                        static_cast<int>(R),
+                        static_cast<int>(K),
+                        block_k,
+                        num_blocks_bucket,
+                        static_cast<int>(scores_c.stride(0)),
+                        static_cast<int>(scores_c.stride(1)),
+                        static_cast<int>(scores_c.stride(2)),
+                        denom_stride_m,
+                        denom_stride_r,
+                        static_cast<int>(row_lo_c.stride(0)),
+                        static_cast<int>(row_lo_c.stride(1)),
+                        static_cast<int>(row_hi_c.stride(0)),
+                        static_cast<int>(row_hi_c.stride(1)),
+                        static_cast<int>(token_lo_c.stride(0)),
+                        static_cast<int>(token_hi_c.stride(0)),
+                        key_norms_stride_m,
+                        key_norms_stride_k,
+                        use_denom,
+                        static_cast<float>(alpha),
+                        static_cast<float>(eps),
+                        static_cast<float>(gamma),
+                        static_cast<float>(prior_weight_l2),
+                        static_cast<float>(prior_weight_pos),
+                        static_cast<float>(prior_pos_power),
+                        static_cast<float>(prior_pos_eta),
+                        static_cast<float>(beta),
+                        static_cast<float>(lambda_clip_single),
+                        static_cast<float>(lambda_clip_multi),
+                        static_cast<float>(lambda_tail_kappa),
+                        static_cast<float>(lambda_tail_pivot),
+                        lambda_soft,
+                        log_r_cache_ptr,
+                        out.data_ptr<float>());
+            };
+
+            if (use_key_norms) {
+                AT_DISPATCH_FLOATING_TYPES_AND2(
+                    at::kHalf,
+                    at::kBFloat16,
+                    key_norms_c.scalar_type(),
+                    "fused_log_f_prior_key_norms",
+                    [&] {
+                        using key_norm_t = scalar_t;
+                        launch_for_key_norm_type(
+                            std::true_type{},
+                            selector_type_tag<key_norm_t>{});
+                    });
+            } else {
+                // The false instantiation receives no tensor pointer or strides.
+                // Its if-constexpr device helper removes key-norm loads/logf from
+                // the generated gamma=0 kernel rather than branching per token.
+                launch_for_key_norm_type(
+                    std::false_type{},
+                    selector_type_tag<at::Half>{});
+            }
+        });
     return out;
 }
 
@@ -2877,7 +2927,7 @@ std::vector<torch::Tensor> selector_pipeline_logits_topk_cuda(
     // 避免 {M}->{L*B,H}->{M} 的往返 reshape)。
     auto row_lo_flat = to_flat_i32(row_lo, {M, R});
     auto row_hi_flat = to_flat_i32(row_hi, {M, R});
-    auto key_norms_flat = to_flat_contig(key_norms, {M, K});
+    auto key_norms_flat = prepare_pipeline_key_norms(key_norms, {M, K}, gamma);
     auto token_lo_flat = to_flat_i32(token_lo, {L * B, H});
     auto token_hi_flat = to_flat_i32(token_hi, {L * B, H});
     auto token_lo_flat_full = to_flat_i32(token_lo, {M});
@@ -3063,7 +3113,7 @@ std::vector<torch::Tensor> selector_pipeline_pre_denom_topk_cuda(
     // [刀A ENSURE-DEDUP 2026-07-12] 同 logits 版：精确形态直通(见 to_flat_* 头注)。
     auto row_lo_flat = to_flat_i32(row_lo, {M, R});
     auto row_hi_flat = to_flat_i32(row_hi, {M, R});
-    auto key_norms_flat = to_flat_contig(key_norms, {M, K});
+    auto key_norms_flat = prepare_pipeline_key_norms(key_norms, {M, K}, gamma);
     auto token_lo_flat = to_flat_i32(token_lo, {L * B, H});
     auto token_hi_flat = to_flat_i32(token_hi, {L * B, H});
     auto token_lo_flat_full = to_flat_i32(token_lo, {M});
@@ -3342,7 +3392,7 @@ std::vector<torch::Tensor> selector_pipeline_logits_topk_lazy_fused(
     // ========================================
     auto scores_kv = scores.reshape({L, B, H, G, W, K});
     auto scores_flat = scores_kv.reshape({M, R, K});
-    auto key_norms_flat = ensure_contig(key_norms).reshape({M, K});
+    auto key_norms_flat = prepare_pipeline_key_norms(key_norms, {M, K}, gamma);
 
     // token_lo = head_sink, token_hi = recent_start
     auto token_lo_flat = head_sink.reshape({M});
@@ -3489,8 +3539,8 @@ std::vector<torch::Tensor> selector_pipeline_logits_topk_with_bounds_impl(
     auto token_lo = to_flat_i32(head_sink, {M});
     auto token_hi = to_flat_i32(recent_start, {M});
 
-    // Key norms: [L, B, H_kv, K] is already correct shape
-    auto key_norms_c = ensure_contig(key_norms);
+    // Downstream prepare_pipeline_key_norms owns the gamma/sentinel contract.
+    auto key_norms_c = key_norms;
 
     // Call the pipeline CUDA kernel
     auto idx_result = selector_pipeline_logits_topk_cuda(
@@ -3798,7 +3848,7 @@ std::vector<torch::Tensor> selector_pipeline_pre_denom_topk_with_bounds_impl(
 
     auto token_lo = to_flat_i32(head_sink, {M});
     auto token_hi = to_flat_i32(recent_start, {M});
-    auto key_norms_c = ensure_contig(key_norms);
+    auto key_norms_c = key_norms;
 
     auto idx_result = selector_pipeline_pre_denom_topk_cuda(
         scores_kv,
@@ -4138,6 +4188,9 @@ def pipeline_logits_topk_fused(
         seq_full: Pre-created seq_full tensor [L, B, H_kv] or None.
                   Caller (vllm_sparse_patch.py) should prepare this to avoid
                   repeated tensor creation overhead.
+        key_norms_full: [L, B, H_kv, K] key norms when gamma != 0. When
+                        gamma == 0, a zero-numel tensor sentinel is accepted
+                        and the CUDA specialization does not read key norms.
 
     Returns:
         (selected_indices, head_sink, recent_start, kv_len_head, allowed_lengths)
@@ -4241,7 +4294,8 @@ def pipeline_logits_topk_with_bounds(
         capture_scores: [L, B, H_total, W, K] logits scores
         row_lo: [M, G] or [M, G*W] pre-computed row lower bounds (M = L*B*H_kv)
         row_hi: [M, G] or [M, G*W] pre-computed row upper bounds
-        key_norms_full: [L, B, H_kv, K] key norms
+        key_norms_full: [L, B, H_kv, K] key norms when gamma != 0; a
+                        zero-numel tensor sentinel is accepted when gamma == 0
         head_sink: [L, B, H_kv] token lower bounds
         recent_start: [L, B, H_kv] token upper bounds
         num_kv_heads: H_kv
@@ -4379,7 +4433,9 @@ def pipeline_pre_denom_topk_with_bounds(
     """Bounds-first pre-denom pipeline (decode path, W=1).
 
     This entry removes fused denom-expand behavior and requires caller-provided bounds.
-    Any unsupported layout triggers fail-fast in C++.
+    When gamma == 0, key_norms_full may be a zero-numel tensor sentinel; the
+    specialized CUDA kernel does not read it. Any unsupported layout triggers
+    fail-fast in C++.
     """
     mod = _require_ext()
     _fuse_fire_trace()

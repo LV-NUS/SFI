@@ -3,15 +3,13 @@
 from __future__ import annotations
 
 import os
-import re
-import shutil
-import subprocess
 import sys
 from pathlib import Path
 from typing import Optional, Tuple
 
 import torch
 from torch.utils.cpp_extension import load_inline
+from utils.ext_toolchain import configure_jit_toolchain_or_raise
 from utils.selector_log_s_identity import (
     SELECTOR_LOG_S_EXTENSION_NAME,
     SELECTOR_LOG_S_SEMANTIC_IDENTITY,
@@ -37,7 +35,6 @@ _REQUIRED_EXT_SYMBOLS = (
     # cols 8/9），必须拒载触发 load_inline 重编（同 fixed-shape topk 先例）。
     "reduce_log_f_pre_scratch_accum_supported",
 )
-_NVCC_RELEASE_RE = re.compile(r"release\s+(\d+)\.(\d+)")
 
 LOG_F_R2_TILED_TILE_K = 2_048
 LOG_F_R2_TILED_ROWS = 2
@@ -248,84 +245,6 @@ def _ensure_torch_cuda_arch_list() -> None:
     except Exception:
         return
     os.environ["TORCH_CUDA_ARCH_LIST"] = f"{int(major)}.{int(minor)}"
-
-
-def _cuda_std_flag_for_nvcc_version(version_text: str) -> str:
-    match = _NVCC_RELEASE_RE.search(version_text)
-    if match is None:
-        return "-std=c++17"
-    major = int(match.group(1))
-    if major < 11:
-        return "-std=c++14"
-    return "-std=c++17"
-
-
-def _preferred_nvcc_path() -> Optional[str]:
-    explicit_nvcc = os.environ.get("PYTORCH_NVCC") or os.environ.get("CUDACXX")
-    if explicit_nvcc:
-        return explicit_nvcc
-
-    candidates = []
-    env_nvcc = os.path.join(os.path.dirname(sys.executable), "nvcc")
-    candidates.append(env_nvcc)
-    for cuda_home_var in ("CUDA_HOME", "CUDA_PATH"):
-        cuda_home = os.environ.get(cuda_home_var)
-        if cuda_home:
-            candidates.append(os.path.join(cuda_home, "bin", "nvcc"))
-    candidates.extend(
-        [
-            "/usr/local/cuda/bin/nvcc",
-            "/usr/local/cuda-12.6/bin/nvcc",
-            "/usr/local/cuda-12.5/bin/nvcc",
-            "/usr/local/cuda-12.4/bin/nvcc",
-        ]
-    )
-    path_nvcc = shutil.which("nvcc")
-    if path_nvcc:
-        candidates.append(path_nvcc)
-
-    seen: set[str] = set()
-    for candidate in candidates:
-        if not candidate or candidate in seen:
-            continue
-        seen.add(candidate)
-        if os.path.exists(candidate):
-            return candidate
-    return None
-
-
-def _configure_torch_cuda_toolchain() -> None:
-    nvcc = _preferred_nvcc_path()
-    if not nvcc:
-        return
-    cuda_home = os.path.dirname(os.path.dirname(nvcc))
-    os.environ["PYTORCH_NVCC"] = nvcc
-    os.environ["CUDA_HOME"] = cuda_home
-    os.environ["CUDA_PATH"] = cuda_home
-    try:
-        import torch.utils.cpp_extension as torch_cpp_extension
-
-        torch_cpp_extension.CUDA_HOME = cuda_home
-    except Exception:
-        return
-
-
-def _cuda_std_flag_for_current_nvcc() -> str:
-    nvcc = _preferred_nvcc_path()
-    if not nvcc:
-        return "-std=c++17"
-    try:
-        completed = subprocess.run(
-            [nvcc, "--version"],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-    except Exception:
-        return "-std=c++17"
-    version_text = "\n".join(part for part in (completed.stdout, completed.stderr) if part)
-    return _cuda_std_flag_for_nvcc_version(version_text)
 
 
 def _load_ext(*, force: bool = False) -> Optional[torch.nn.Module]:
@@ -4407,20 +4326,16 @@ void reduce_log_f_pre_scratch_scalar_cuda(
 """
 
     fast_math = os.environ.get("VLLM_SPARSE_SELECTOR_LOGS_FAST_MATH", "0") == "1"
-    extra_cuda_cflags = ["-lineinfo", _cuda_std_flag_for_current_nvcc()]
+    extra_cuda_cflags = ["-lineinfo", "-std=c++17"]
     if fast_math:
         extra_cuda_cflags.append("--use_fast_math")
-    _configure_torch_cuda_toolchain()
     _ensure_torch_cuda_arch_list()
-    # Torch may emit NVCC depfile flags unsupported by older toolchains (for
-    # example CUDA 10.1 on this cluster). Skipping depfile generation keeps the
-    # selector log_s CUDA extension buildable without changing math behavior.
+    # Match the other project-owned JIT loaders so identical source does not
+    # alternate between depfile/no-depfile build.ninja commands by import order.
     os.environ.setdefault("TORCH_EXTENSION_SKIP_NVCC_GEN_DEPENDENCIES", "1")
-    # Torch appends -std=c++17 unless an explicit CUDA std flag is already
-    # present. Older nvcc toolchains on this cluster reject c++17 entirely, so
-    # choose the lowest compatible standard at the loader boundary.
 
     try:
+        configure_jit_toolchain_or_raise(ext_name=SELECTOR_LOG_S_EXTENSION_NAME)
         loaded_module = load_inline(
             name=SELECTOR_LOG_S_EXTENSION_NAME,
             cpp_sources=cpp_source,

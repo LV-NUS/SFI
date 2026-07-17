@@ -7,7 +7,7 @@ off-loop 体对七个 override 载体逐 pending 装新鲜 dict)保证了 pendin
 key(编码全部消费/产出指针)在生产 pending 路径永 miss,且
 _selector_topk_graph_stable_active 看到裸 dict 恒 bypass。
 
-本环 v2:N 个槽,每槽持有一套**持久 override 容器**(SlotStableOverrides,
+本环 v3:N 个槽,每槽持有一套**按物理槽生命周期持久的 override 容器**(SlotStableOverrides,
 形态与私有 dict 完全同=get-or-alloc,shape 键控),外加 key_norms 有效键集:
 
 1. 私有语义不变:槽绑定 pending(selected_out_ring_slot 字段),终局唯一
@@ -17,10 +17,14 @@ _selector_topk_graph_stable_active 看到裸 dict 恒 bypass。
 2. 指针稳定:同槽稳态复用同 buffer → graph key 可命中(out/bounds/ws/
    key_norms 指针全在 key 内;logf ws 不在 key 但随槽稳定,shape 变化必然
    带动 key 内字段变化 → 新 key 新捕获,烘焙指针恒一致)。
-3. 内容新鲜(评审清单·快照票据):key_norms 有条件重填快路径(reallocated/
+3. 资源有界:请求换代不改变物理槽的 storage owner。大尺寸、随 K 变化的
+   key-norm/workspace 由各 ensure helper 以单个最大容量载体复用；图缓存按
+   ``(slot, structural-shape)`` 精确替换。因此既不按请求重捕图，也不按
+   exact-K 在槽内累计资源。
+4. 内容新鲜(评审清单·快照票据):key_norms 有条件重填快路径(reallocated/
    valid_keys 门),槽容器持久会让旧内容跨 run 存活——acquire 时**清空该槽
    valid_keys 集**强制每 run 重填(pack),指针稳定与内容新鲜两全。
-4. 跨流序(评审清单·原位覆写臂):begin_run 在新 run 当前流对槽存的全部
+5. 跨流序(评审清单·原位覆写臂):begin_run 在新 run 当前流对槽存的全部
    release 事件 wait_event——produce 事件(end_run 无条件现记)管 WAW;
    pending.writer_done_event+释放点现记事件管 WAR(含 inline writer 臂)。
    换代臂:容器内 buffer 换代由 ensure 的 override 分支过 UAF 守卫。
@@ -92,7 +96,6 @@ class SelectedOutRingSlot:
                             return item.device
         return None
 
-
 class SelectedOutRing:
     __slots__ = (
         "_slots",
@@ -126,7 +129,17 @@ class SelectedOutRing:
     def run_open(self) -> bool:
         return bool(self._run_open)
 
-    def begin_run(self, *, preferred: int = -1) -> Optional[SelectedOutRingSlot]:
+    @property
+    def current_slot_index(self) -> Optional[int]:
+        """当前 run 的物理 graph-owner 槽（spill=None）。"""
+        slot = self._current_slot
+        return int(slot.index) if slot is not None else None
+
+    def begin_run(
+        self,
+        *,
+        preferred: int = -1,
+    ) -> Optional[SelectedOutRingSlot]:
         """开 run 窗口并占用一个空闲槽;容量满返回 None(spill=旧行为原路)。
 
         preferred(通常传 pending.buf_id):优先取 preferred%N 号槽——把槽
@@ -135,6 +148,9 @@ class SelectedOutRing:
         rv2g 取证实锤=capture 64/replay 0)。占用时:在当前流(=本 run 的
         发射流)对槽存的全部 release 事件 wait_event(WAW/WAR 序),并清空
         该槽 key_norms valid 集(强制本 run 重填=内容新鲜)。
+        请求身份不是 storage 生命周期；同一物理槽跨请求继续复用。随 K
+        变化的大资源由 ensure helper 在槽内做最大容量替换，图按结构 scope
+        精确替换。
         """
         if self._run_open:
             raise RuntimeError(

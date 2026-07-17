@@ -72,6 +72,8 @@ if ! command -v mktemp >/dev/null 2>&1; then
   exit 69
 fi
 PY="$(realpath -e -- "${PY}")"
+PYTHON="${PY}"
+export PYTHON
 MODEL="$(realpath -e -- "${MODEL}")"
 if [[ ! -d "${MODEL}" ]]; then
   echo "FAIL: MODEL_PATH must be a readable local directory: ${MODEL}" >&2
@@ -81,9 +83,9 @@ fi
 FA_ROOT="${VLLM_SPARSE_FA3_UPSTREAM_ROOT:-${SFI_ROOT}/third_party_upstreams/vllm-project-flash-attention}"
 FA_ROOT="$(realpath -ms -- "${FA_ROOT}")"
 FA3_INTERFACE="${FA_ROOT}/vllm_flash_attn/flash_attn_interface.py"
-CAPABILITY="$({ CUDA_VISIBLE_DEVICES="${GPU}" "${PY}" -c \
+CAPABILITY="$(CUDA_VISIBLE_DEVICES="${GPU}" "${PY}" -c \
   'import torch; assert torch.cuda.is_available(), "CUDA is unavailable"; major, minor = torch.cuda.get_device_capability(0); print(f"{major}.{minor}")'
-} 2>&1)" || {
+)" || {
   echo "FAIL: cannot inspect selected GPU ${GPU}: ${CAPABILITY}" >&2
   exit 69
 }
@@ -96,6 +98,30 @@ case "${CAPABILITY}" in
     exit 78
     ;;
 esac
+
+CUDA_TOOLCHAIN_RESOLVER="${SFI_ROOT}/scripts/resolve_flash_attention_toolchain.py"
+BUILD_PROVENANCE_CHECKER="${SFI_ROOT}/scripts/check_flash_attention_build_provenance.py"
+if [[ ! -f "${CUDA_TOOLCHAIN_RESOLVER}" ]]; then
+  echo "FAIL: CUDA toolchain resolver is missing: ${CUDA_TOOLCHAIN_RESOLVER}" >&2
+  exit 66
+fi
+if [[ ! -f "${BUILD_PROVENANCE_CHECKER}" ]]; then
+  echo "FAIL: FlashAttention build-provenance checker is missing: ${BUILD_PROVENANCE_CHECKER}" >&2
+  exit 66
+fi
+if ! CUDA_TOOLCHAIN_EXPORTS="$(
+  "${PY}" -I "${CUDA_TOOLCHAIN_RESOLVER}" \
+    --sfi-root "${SFI_ROOT}" \
+    --target "${FA_ROOT}" \
+    --architecture "${ARCH}" \
+    --checker "${BUILD_PROVENANCE_CHECKER}"
+)"; then
+  echo "FAIL: FlashAttention CUDA toolchain preflight failed" >&2
+  exit 78
+fi
+eval "${CUDA_TOOLCHAIN_EXPORTS}"
+unset CUDA_TOOLCHAIN_EXPORTS
+echo "==> CUDA toolchain: home=${CUDA_HOME} compiler=${CUDACXX} release=${SFI_RUNNER_CUDA_COMPILER_RELEASE}"
 
 if [[ "${ARCH}" == "sm100" ]]; then
   FA4_INTERFACE="${FA_ROOT}/flash_attn/cute/interface.py"
@@ -119,18 +145,25 @@ else
   FA_PREFLIGHT_STATUS="fa3_shared_object_ready"
 fi
 
-# The selector loader caches by module name.  Partition its default build cache
-# by the exact interpreter/Torch/CUDA ABI selected above.
-if [[ -n "${TORCH_EXTENSIONS_DIR:-}" ]]; then
-  SELECTOR_CACHE_ROOT="$(realpath -ms -- "${TORCH_EXTENSIONS_DIR}")"
-else
-  SELECTOR_CACHE_ABI_KEY="$("${PY}" "${SFI_ROOT}/utils/selector_cache_identity.py")"
-  if [[ ! "${SELECTOR_CACHE_ABI_KEY}" =~ ^[0-9a-f]{16}$ ]]; then
-    echo "FAIL: invalid selector cache ABI identity: ${SELECTOR_CACHE_ABI_KEY}" >&2
-    exit 70
-  fi
-  SELECTOR_CACHE_ROOT="${SFI_ROOT}/tmp/torch_extensions/${ARCH}_${SELECTOR_CACHE_ABI_KEY}"
+# The selector loader caches by module name.  A caller-supplied directory is a
+# base, never a final cache owner: every launch appends the exact
+# Python/Torch/CUDA ABI derived after toolchain normalization.
+if ! SELECTOR_CACHE_ABI_KEY="$(
+  "${PY}" "${SFI_ROOT}/utils/selector_cache_identity.py"
+)"; then
+  echo "FAIL: selected PYTHON cannot derive the selector cache ABI identity: ${PY}" >&2
+  exit 70
 fi
+if [[ ! "${SELECTOR_CACHE_ABI_KEY}" =~ ^[0-9a-f]{16}$ ]]; then
+  echo "FAIL: invalid selector cache ABI identity: ${SELECTOR_CACHE_ABI_KEY}" >&2
+  exit 70
+fi
+if [[ -n "${TORCH_EXTENSIONS_DIR:-}" ]]; then
+  SELECTOR_CACHE_BASE="$(realpath -ms -- "${TORCH_EXTENSIONS_DIR}")"
+else
+  SELECTOR_CACHE_BASE="${SFI_ROOT}/tmp/torch_extensions"
+fi
+SELECTOR_CACHE_ROOT="${SELECTOR_CACHE_BASE}/${ARCH}_${SELECTOR_CACHE_ABI_KEY}"
 mkdir -p "${SELECTOR_CACHE_ROOT}"
 export TORCH_EXTENSIONS_DIR="${SELECTOR_CACHE_ROOT}"
 export SFI_RUNNER_SELECTOR_CACHE_ROOT="${SELECTOR_CACHE_ROOT}"
@@ -193,6 +226,8 @@ echo "    selector_cache=${SELECTOR_CACHE_ROOT}"
 cd "${SFI_ROOT}"
 set +e
 CUDA_VISIBLE_DEVICES="${GPU}" \
+VLLM_FLASH_ATTN_VERSION="${EXPECTED_FA_VERSION}" \
+VLLM_SPARSE_FA3_UPSTREAM_ROOT="${FA_ROOT}" \
 PYTHONPATH="${FA_ROOT}:${SFI_ROOT}${PYTHONPATH:+:${PYTHONPATH}}" \
 "${PY}" -m "${BENCHMARK_MODULE}" \
   --mode sparse --producer-mode full-open-gt1 --preset bs2long-cap128 \
@@ -205,9 +240,13 @@ PYTHONPATH="${FA_ROOT}:${SFI_ROOT}${PYTHONPATH:+:${PYTHONPATH}}" \
   --run-nonce "${RUN_NONCE}" \
   --route-trace-output "${ROUTE_PATH}" \
   2>&1 | tee "${LOG_PATH}" >/dev/null
-PIPELINE_STATUS=("${PIPESTATUS[@]}")
-CHILD_RC="${PIPELINE_STATUS[0]}"
-TEE_RC="${PIPELINE_STATUS[1]}"
+# Expand the special array once, before any assignment command can replace it
+# with that assignment's one-element status.
+IFS=' ' read -r CHILD_RC TEE_RC <<< "${PIPESTATUS[*]}"
+if [[ ! "${CHILD_RC}" =~ ^[0-9]+$ || ! "${TEE_RC}" =~ ^[0-9]+$ ]]; then
+  echo "FAIL: could not capture benchmark/tee pipeline status" >&2
+  exit 70
+fi
 set -e
 
 set +e

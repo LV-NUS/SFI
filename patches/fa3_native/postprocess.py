@@ -50,8 +50,6 @@ _LOG_F_WORKSPACE_I64_MAX_BYTES = (1 << 63) - 1
 # grid-x limit.  The tiled owner uses only portable 256-thread CUDA kernels;
 # unlike the resident owner, it has no exact-architecture instruction contract.
 _LOG_F_PORTABLE_GRID_X_MAX = (1 << 31) - 1
-TILED_CAPTURE_POSTPROCESS_MAX_SLOT_COUNT = 16
-_LOG_F_R2_TILED_RESOURCE_RING_DEPTH = TILED_CAPTURE_POSTPROCESS_MAX_SLOT_COUNT
 _PROCESS_LOG_F_ROUTE_COUNTS = {route: 0 for route in SELECTOR_LOG_F_ROUTES}
 _PROCESS_LOG_F_LAST_ROUTE = "none"
 _PROCESS_LOG_F_LAST_DISPATCH_REASON = "none"
@@ -63,11 +61,15 @@ _PROCESS_TILED_JOB_COUNT = 0
 _PROCESS_TILED_DIRECT_COUNT = 0
 _PROCESS_TILED_KERNEL_LAUNCH_COUNT = 0
 _PROCESS_TILED_ADMISSION_FAILURE_COUNT = 0
-_PROCESS_TILED_RESOURCE_CACHE: dict[tuple[int, int, int, int, int], dict[str, Any]] = {}
 _PROCESS_TILED_RESOURCE_CACHE_LOCK = threading.Lock()
-_PROCESS_TILED_RESOURCE_CACHE_CONDITION = threading.Condition(
-    _PROCESS_TILED_RESOURCE_CACHE_LOCK
-)
+
+
+class _ProcessMetaStagingOwner:
+    pass
+
+
+_PROCESS_META_STAGING_OWNER = _ProcessMetaStagingOwner()
+_PROCESS_META_STAGING_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,6 +97,7 @@ class _LogFReduceAdmission:
     capability: tuple[int, ...]
     cpu_authority_validated: bool
     local_same_device: bool
+    tiled_resource_available: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,6 +127,7 @@ class _TiledJobPlan:
     num_query_heads: int
     logical_k_max: int
     capability: tuple[int, int]
+    tiled_resource_available: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,7 +142,13 @@ class _TouchedByteInterval:
 
 @dataclass(frozen=True, slots=True)
 class TiledCapturePostprocessResourceReport:
-    """Allocation-free capacity/byte contract shared by profile and runtime."""
+    """Profile-time geometry and exact structural GPU resource report.
+
+    ``slot_count`` is the proven owner-concurrency bound.  Every workspace and
+    device-metadata buffer is resident before profile work and sealed live
+    acquisition never grows that GPU footprint.  Pinned H2D source carriers
+    have a separate lightweight lifetime pool and are not GPU resource slots.
+    """
 
     num_rows_capacity: int
     num_query_heads_capacity: int
@@ -152,6 +162,22 @@ class TiledCapturePostprocessResourceReport:
     total_device_meta_bytes: int
     total_host_meta_bytes: int
     total_device_bytes: int
+
+    @property
+    def structural_slot_count(self) -> int:
+        """Explicit name for the exact owner-concurrency ``slot_count``."""
+
+        return int(self.slot_count)
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedTiledResourceSnapshot:
+    """Immutable call-boundary proof for one prepared device/stream pool."""
+
+    device: torch.device
+    stream: torch.cuda.Stream
+    key: Optional[tuple[int, int, int, int, int]]
+    report: Optional[TiledCapturePostprocessResourceReport]
 
 
 def _tensor_contract(tensor: torch.Tensor) -> _LogFTensorContract:
@@ -227,17 +253,18 @@ def _log_f_admission_identity(
     """Hash the small canonical contract without pointers or tensor reprs."""
 
     digest = hashlib.sha256()
-    digest.update(b"sfi.selector_log_f.admission.v2\0")
+    digest.update(b"sfi.selector_log_f.admission.v3\0")
     _digest_text(digest, SELECTOR_LOG_S_EXTENSION_NAME)
     _digest_text(digest, route)
     _digest_text(digest, reason)
     digest.update(
         struct.pack(
-            "<qd??",
+            "<qd???",
             -1 if resident_k_bucket is None else int(resident_k_bucket),
             float(admission.alpha),
             bool(admission.cpu_authority_validated),
             bool(admission.local_same_device),
+            bool(admission.tiled_resource_available),
         )
     )
     _digest_i64_sequence(digest, admission.capability)
@@ -629,16 +656,25 @@ def _resolve_log_f_reduce_dispatch(
             route = _LOG_F_GENERIC_ROUTE
             reason = _LOG_F_GENERIC_ACCUM_REASON
         elif all_large_k:
-            tiled_resource_reasons = _log_f_r2_tiled_resource_reasons(
-                meta_i32_rows=rows,
-                num_query_heads=int(scratch.shape[1]),
-            )
-            if tiled_resource_reasons:
+            if type(admission.tiled_resource_available) is not bool:
+                _selector_log_f_contract_error(
+                    "RESOURCE_AUTHORITY",
+                    "tiled_resource_available must be an immutable CPU boolean",
+                )
+            if not admission.tiled_resource_available:
                 route = _LOG_F_GENERIC_ROUTE
                 reason = _LOG_F_GENERIC_RESOURCE_REASON
             else:
-                route = _LOG_F_R2_TILED_ROUTE
-                reason = _LOG_F_TILED_REASON
+                tiled_resource_reasons = _log_f_r2_tiled_resource_reasons(
+                    meta_i32_rows=rows,
+                    num_query_heads=int(scratch.shape[1]),
+                )
+                if tiled_resource_reasons:
+                    route = _LOG_F_GENERIC_ROUTE
+                    reason = _LOG_F_GENERIC_RESOURCE_REASON
+                else:
+                    route = _LOG_F_R2_TILED_ROUTE
+                    reason = _LOG_F_TILED_REASON
         elif resident_candidate is not None and capability == (8, 0):
             resident_k_bucket = resident_candidate
             route = _LOG_F_R2_RESIDENT_ROUTE
@@ -1066,6 +1102,19 @@ def _stage_meta_rows(
     cache_owner: Optional[object],
     cache_name: str,
 ) -> torch.Tensor:
+    if cache_owner is None:
+        # The explicit-owner production path remains lock-free.  The public
+        # ownerless path shares one process cache, so serialize that exceptional
+        # API boundary to preserve carrier reservation across Torch calls that
+        # may release the GIL.
+        with _PROCESS_META_STAGING_LOCK:
+            return _stage_meta_rows(
+                rows,
+                dtype=dtype,
+                device=device,
+                cache_owner=_PROCESS_META_STAGING_OWNER,
+                cache_name=cache_name,
+            )
     row_count = len(rows)
     if row_count <= 0:
         return torch.empty((0, 0), dtype=dtype, device=device)
@@ -1076,63 +1125,103 @@ def _stage_meta_rows(
         if len(row) != col_count:
             raise ValueError("capture postprocess metadata rows must have fixed width")
 
+    device_index = -1 if device.index is None else int(device.index)
+    current_stream = None
+    stream_identity = -1
+    if device.type == "cuda":
+        current_stream = torch.cuda.current_stream(device=device)
+        if device_index < 0:
+            stream_device = getattr(current_stream, "device", None)
+            stream_device_index = getattr(stream_device, "index", None)
+            if stream_device_index is None:
+                stream_device_index = torch.cuda.current_device()
+            device_index = int(stream_device_index)
+        stream_identity = int(
+            getattr(current_stream, "cuda_stream", id(current_stream))
+        )
     key = (
         str(device.type),
-        -1 if device.index is None else int(device.index),
+        device_index,
+        stream_identity,
         dtype,
         row_count,
         col_count,
     )
-    # [STAGE-RING-FIX 2026-07-02] The old single cached (cpu_stage, gpu_stage)
-    # pair had a host-side WAR race: `copy_(cpu_stage, non_blocking=True)` from
-    # PINNED memory returns immediately, and the NEXT call (flush fires the
-    # postprocess for ~28 layers back-to-back) rewrote the same pinned buffer
-    # while the previous H2D was still in flight. The meta rows carry kv_len,
-    # strides and RAW out-tensor pointers, so a torn/stale transfer made the
-    # reduce/copy kernels write the wrong rows/addresses -- the source of the
-    # run-to-run capture-content jitter (and OOB reads) that survived every
-    # producer-side snapshot fix. Fix: a small ring of staging slots with one
-    # H2D-completion event per slot; a slot is rewritten only after ITS event
-    # has completed (a ring-depth of transfers earlier -- in practice already
-    # done, so the sync is a ~1us no-op and the pipeline never stalls).
-    # [ASYNC-HIDE 2026-07-07] 4→16: 稳态 refresh 走 direct-capture 跳过本段,
-    # 但 chunked prefill(远端 4B 常态配方)每片×每层仍经此环——host 连发领先
-    # GPU >4 槽时 WAR 护栏(evt.synchronize)变真实节流。加深环让护栏在连发
-    # 窗内不再命中(hide 而非 wait);每槽 KB 级 pinned+GPU 元数据,×4 可忽略,
-    # 撕裂防线语义不变。
-    ring_depth = 16
-    slots_attr = f"_fa3_capture_postprocess_{cache_name}_ring"
-    state = getattr(cache_owner, slots_attr, None) if cache_owner is not None else None
-    if not isinstance(state, dict) or state.get("key") != key:
-        state = {"key": key, "slots": [], "next": 0}
-        if cache_owner is not None:
-            setattr(cache_owner, slots_attr, state)
+    # A pinned source cannot be rewritten until its non-blocking H2D has
+    # completed.  Fixed-depth rings turned that lifetime rule into a host
+    # synchronize whenever CPU submission outran an empirical slot count.
+    # Keep independent pools for every stream/shape contract.  A key is owned
+    # by one CUDA stream, so submission order gives the slots a FIFO: the
+    # cursor is always the oldest carrier.  One event query therefore proves
+    # whether that carrier is reusable; a busy carrier grows the pool at the
+    # temporal tail without a scan, arbitrary cap, or host-blocking fallback.
+    # Stream identity also protects each slot's GPU metadata consumer through
+    # same-stream ordering.
+    pools_attr = f"_fa3_capture_postprocess_{cache_name}_pools"
+    pools = getattr(cache_owner, pools_attr, None)
+    if pools is None:
+        pools = {}
+        setattr(cache_owner, pools_attr, pools)
+    elif not isinstance(pools, dict):
+        raise RuntimeError("capture postprocess metadata staging pool is invalid")
+    state = pools.get(key)
+    if state is None:
+        state = {"slots": [], "next": 0}
+        pools[key] = state
+    elif not isinstance(state, dict) or not isinstance(state.get("slots"), list):
+        raise RuntimeError("capture postprocess metadata staging state is invalid")
+
     slots = state["slots"]
-    if len(slots) < ring_depth:
-        try:
-            cpu_stage = torch.empty((row_count, col_count), dtype=dtype, device="cpu", pin_memory=True)
-        except RuntimeError:
-            cpu_stage = torch.empty((row_count, col_count), dtype=dtype, device="cpu")
+    slot = None
+    next_oldest_index = 0
+    if slots:
+        oldest_index = int(state.get("next", 0)) % len(slots)
+        candidate = slots[oldest_index]
+        if not isinstance(candidate, dict):
+            raise RuntimeError("capture postprocess metadata staging slot is invalid")
+        candidate_event = candidate.get("evt")
+        if candidate_event is None or candidate_event.query():
+            slot = candidate
+            next_oldest_index = (oldest_index + 1) % len(slots)
+
+    if slot is None:
+        # CUDA non-blocking H2D requires a pinned source for the latency and
+        # lifetime contract used below.  A pageable fallback can silently turn
+        # this call into a host-blocking transfer, so allocation failure is a
+        # deployment error and propagates unchanged.
+        cpu_stage = torch.empty(
+            (row_count, col_count),
+            dtype=dtype,
+            device="cpu",
+            pin_memory=device.type == "cuda",
+        )
         gpu_stage = torch.empty((row_count, col_count), dtype=dtype, device=device)
         slot = {"cpu": cpu_stage, "gpu": gpu_stage, "evt": None}
-        slots.append(slot)
+        if slots:
+            # Insert the newest carrier immediately before the oldest physical
+            # index.  The old oldest shifts right and remains the cursor, which
+            # preserves circular temporal order even when the cursor is nonzero.
+            oldest_index = int(state.get("next", 0)) % len(slots)
+            slots.insert(oldest_index, slot)
+            next_oldest_index = oldest_index + 1
+        else:
+            slots.append(slot)
+            next_oldest_index = 0
     else:
-        slot = slots[int(state["next"]) % ring_depth]
-        state["next"] = int(state["next"]) + 1
-        evt = slot.get("evt")
-        if evt is not None:
-            evt.synchronize()
         cpu_stage = slot["cpu"]
         gpu_stage = slot["gpu"]
+    state["next"] = next_oldest_index
 
     # [META-STAGE-BULK 2026-07-06] 逐元素 Python setitem（rows×cols×36 层/步）
     # 换 C 层一次构造+整块拷贝：值/位置逐位等价，纯 host 构造提速 ~10×。
     cpu_stage.copy_(torch.tensor(rows, dtype=dtype))
     gpu_stage.copy_(cpu_stage, non_blocking=True)
-    if device.type == "cuda":
-        evt = torch.cuda.Event(enable_timing=False)
-        evt.record(torch.cuda.current_stream(device=device))
-        slot["evt"] = evt
+    if current_stream is not None:
+        evt = slot.get("evt")
+        if evt is None:
+            evt = torch.cuda.Event(enable_timing=False)
+            slot["evt"] = evt
+        evt.record(current_stream)
     return gpu_stage
 
 
@@ -1160,16 +1249,13 @@ def plan_tiled_capture_postprocess_resources(
     num_query_heads: int,
     logical_k_capacity: int,
 ) -> TiledCapturePostprocessResourceReport:
-    """Return the canonical sealed-resource geometry without allocating."""
+    """Return canonical geometry for an exact structural GPU slot count."""
 
     from utils import selector_log_s_ext
 
     slots = int(slot_count)
-    if slots <= 0 or slots > TILED_CAPTURE_POSTPROCESS_MAX_SLOT_COUNT:
-        raise ValueError(
-            "tiled slot_count must be in [1, "
-            f"{TILED_CAPTURE_POSTPROCESS_MAX_SLOT_COUNT}]"
-        )
+    if slots <= 0:
+        raise ValueError("tiled structural slot count must be positive")
     n_capacity = _tiled_n_capacity(num_rows_capacity)
     h_capacity = int(num_query_heads)
     if h_capacity <= 0:
@@ -1218,11 +1304,114 @@ def _tiled_resource_key(
     )
 
 
+def _is_tiled_tensor_contract_candidate(
+    *,
+    scratch: torch.Tensor,
+    output: torch.Tensor,
+    denom: torch.Tensor,
+    alpha: float,
+) -> bool:
+    """Check non-row tiled semantics after the existing loop proves large K."""
+
+    return (
+        scratch.dtype == torch.float16
+        and output.dtype == torch.float16
+        and bool(scratch.is_contiguous())
+        and bool(output.is_contiguous())
+        and bool(denom.is_contiguous())
+        and float(alpha) == 0.5
+    )
+
+
+def _snapshot_prepared_tiled_resource(
+    *,
+    cache_owner: Optional[object],
+    device: torch.device,
+) -> _PreparedTiledResourceSnapshot:
+    """Freeze one current-stream seal proof without locks or allocation."""
+
+    device = torch.device(device)
+    stream = torch.cuda.current_stream(device=device)
+    unavailable = _PreparedTiledResourceSnapshot(
+        device=device,
+        stream=stream,
+        key=None,
+        report=None,
+    )
+    if cache_owner is None:
+        return unavailable
+    seal = getattr(cache_owner, "_selector_log_f_r2_tiled_resource_seal", None)
+    if not isinstance(seal, dict):
+        return unavailable
+    report = seal.get("report")
+    key = seal.get("key")
+    if not isinstance(report, TiledCapturePostprocessResourceReport):
+        return unavailable
+    if not isinstance(key, tuple) or len(key) != 5:
+        return unavailable
+    expected_key = _tiled_resource_key(
+        device=device,
+        stream=stream,
+        n_capacity=report.num_rows_capacity,
+        h_capacity=report.num_query_heads_capacity,
+        k_capacity=report.logical_k_capacity,
+    )
+    if key != expected_key:
+        return unavailable
+    return _PreparedTiledResourceSnapshot(
+        device=device,
+        stream=stream,
+        key=key,
+        report=report,
+    )
+
+
+def _prepared_tiled_resource_snapshot_for_device(
+    *,
+    snapshots: dict[torch.device, _PreparedTiledResourceSnapshot],
+    cache_owner: Optional[object],
+    device: torch.device,
+) -> _PreparedTiledResourceSnapshot:
+    """Resolve at most one immutable resource snapshot per device and call."""
+
+    device = torch.device(device)
+    snapshot = snapshots.get(device)
+    if snapshot is None:
+        snapshot = _snapshot_prepared_tiled_resource(
+            cache_owner=cache_owner,
+            device=device,
+        )
+        snapshots[device] = snapshot
+    return snapshot
+
+
+def _prepared_tiled_resource_available(
+    *,
+    snapshot: _PreparedTiledResourceSnapshot,
+    device: torch.device,
+    num_rows: int,
+    num_query_heads: int,
+    logical_k_max: int,
+) -> bool:
+    """Prove the frozen prepared resource covers this live tiled geometry."""
+
+    report = snapshot.report
+    key = snapshot.key
+    return bool(
+        isinstance(report, TiledCapturePostprocessResourceReport)
+        and isinstance(key, tuple)
+        and snapshot.device == torch.device(device)
+        and 0 < int(num_rows) <= report.num_rows_capacity
+        and 0 < int(num_query_heads) <= report.num_query_heads_capacity
+        and 0 < int(logical_k_max) <= report.logical_k_capacity
+    )
+
+
 def _tiled_resource_cache_for_owner_locked(
     cache_owner: Optional[object],
 ) -> dict[tuple[int, int, int, int, int], dict[str, Any]]:
     if cache_owner is None:
-        return _PROCESS_TILED_RESOURCE_CACHE
+        raise RuntimeError("E_SELECTOR_LOG_F_TILED_RESOURCE_OWNER_REQUIRED")
     cache = getattr(cache_owner, "_selector_log_f_r2_tiled_resources", None)
     if cache is None:
         cache = {}
@@ -1230,6 +1419,43 @@ def _tiled_resource_cache_for_owner_locked(
     if not isinstance(cache, dict):
         raise RuntimeError("E_SELECTOR_LOG_F_TILED_RESOURCE_CACHE_DRIFT")
     return cache
+
+
+def _new_tiled_resource_state() -> dict[str, Any]:
+    return {
+        "slots": [],
+        "free_slots": [],
+        "reserved_count": 0,
+        "next_reservation_id": 1,
+    }
+
+
+def _tiled_resource_free_slots_locked(
+    state: dict[str, Any],
+) -> list[dict[str, Any]]:
+    slots = state.get("slots")
+    free_slots = state.get("free_slots")
+    reserved_count = state.get("reserved_count")
+    if (
+        not isinstance(slots, list)
+        or not isinstance(free_slots, list)
+        or isinstance(reserved_count, bool)
+        or not isinstance(reserved_count, int)
+        or reserved_count < 0
+        or len(free_slots) + reserved_count != len(slots)
+    ):
+        raise RuntimeError("E_SELECTOR_LOG_F_TILED_RESOURCE_STATE_DRIFT")
+    return free_slots
+
+
+def _bind_tiled_resource_slot_locked(
+    state: dict[str, Any],
+    slot: dict[str, Any],
+) -> None:
+    if not isinstance(slot, dict) or slot.get("_pool_state") is not None:
+        raise RuntimeError("E_SELECTOR_LOG_F_TILED_RESOURCE_SLOT_DRIFT")
+    slot["_pool_state"] = state
+    slot["reservation_id"] = None
 
 
 def _allocate_tiled_resource_slot(
@@ -1242,12 +1468,6 @@ def _allocate_tiled_resource_slot(
     from utils import selector_log_s_ext
 
     return {
-        "cpu_i32": torch.empty(
-            (n_capacity, 10), dtype=torch.int32, device="cpu", pin_memory=True
-        ),
-        "cpu_i64": torch.empty(
-            (n_capacity, 4), dtype=torch.int64, device="cpu", pin_memory=True
-        ),
         "gpu_i32": torch.empty(
             (n_capacity, 10), dtype=torch.int32, device=device
         ),
@@ -1260,9 +1480,34 @@ def _allocate_tiled_resource_slot(
             num_query_heads_capacity=h_capacity,
             logical_k_capacity=k_capacity,
         ),
-        "meta_copy_event": torch.cuda.Event(enable_timing=False),
-        "meta_copy_recorded": False,
-        "completion_event": None,
+        # GPU storage is structurally bounded and same-stream reusable as soon
+        # as its launch sequence is enqueued.  The pinned H2D source has a
+        # different lifetime: it cannot be rewritten until both copies finish.
+        # Keep that small carrier in an independent pressure-observed FIFO so a
+        # busy host source never duplicates this slot's large workspace.
+        "meta_carriers": [_allocate_tiled_meta_carrier(n_capacity=n_capacity)],
+        "meta_next": 0,
+        "reserved": False,
+        "reservation_stream": None,
+    }
+
+
+def _allocate_tiled_meta_carrier(*, n_capacity: int) -> dict[str, Any]:
+    return {
+        "cpu_i32": torch.empty(
+            (int(n_capacity), 10),
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=True,
+        ),
+        "cpu_i64": torch.empty(
+            (int(n_capacity), 4),
+            dtype=torch.int64,
+            device="cpu",
+            pin_memory=True,
+        ),
+        "copy_event": torch.cuda.Event(enable_timing=False),
+        "copy_recorded": False,
         "reserved": False,
     }
 
@@ -1276,7 +1521,7 @@ def prepare_tiled_capture_postprocess_resources(
     num_query_heads: int,
     logical_k_capacity: int,
 ) -> TiledCapturePostprocessResourceReport:
-    """Build and seal the exact profile-stamped tiled resource pool."""
+    """Preallocate and seal one exact stream/geometry GPU resource pool."""
 
     from utils import selector_log_s_ext
 
@@ -1300,7 +1545,7 @@ def prepare_tiled_capture_postprocess_resources(
     )
     selector_log_s_ext._require_ext(force=True)
 
-    with _PROCESS_TILED_RESOURCE_CACHE_CONDITION:
+    with _PROCESS_TILED_RESOURCE_CACHE_LOCK:
         cache = _tiled_resource_cache_for_owner_locked(meta_cache_owner)
         seal = getattr(
             meta_cache_owner, "_selector_log_f_r2_tiled_resource_seal", None
@@ -1314,8 +1559,22 @@ def prepare_tiled_capture_postprocess_resources(
             if (
                 seal.get("report") != report
                 or not isinstance(state, dict)
-                or int(state.get("sealed_slot_count", -1)) != report.slot_count
-                or len(state.get("slots", ())) != report.slot_count
+                or int(state.get("structural_slot_count", -1))
+                != report.structural_slot_count
+                or len(state.get("slots", ())) != report.structural_slot_count
+            ):
+                raise RuntimeError("E_SELECTOR_LOG_F_TILED_RESOURCE_SEAL_DRIFT")
+            free_slots = _tiled_resource_free_slots_locked(state)
+            if (
+                int(state["reserved_count"]) != 0
+                or len(free_slots) != len(state["slots"])
+                or any(
+                    not isinstance(slot, dict)
+                    or slot.get("_pool_state") is not state
+                    or bool(slot.get("reserved", False))
+                    or slot.get("reservation_id") is not None
+                    for slot in state["slots"]
+                )
             ):
                 raise RuntimeError("E_SELECTOR_LOG_F_TILED_RESOURCE_SEAL_DRIFT")
             return report
@@ -1323,24 +1582,39 @@ def prepare_tiled_capture_postprocess_resources(
             raise RuntimeError("E_SELECTOR_LOG_F_TILED_RESOURCE_PREBUILD_KEY_DRIFT")
         state = cache.get(key)
         if state is None:
-            state = {"slots": [], "next": 0}
+            state = _new_tiled_resource_state()
             cache[key] = state
-        if not isinstance(state, dict) or not isinstance(state.get("slots"), list):
+        if not isinstance(state, dict):
             raise RuntimeError("E_SELECTOR_LOG_F_TILED_RESOURCE_STATE_DRIFT")
+        free_slots = _tiled_resource_free_slots_locked(state)
         if bool(state.get("prebuilding", False)):
             raise RuntimeError("E_SELECTOR_LOG_F_TILED_RESOURCE_PREBUILD_REENTRY")
         slots = state["slots"]
-        if len(slots) > report.slot_count or any(
-            bool(slot.get("reserved", False)) for slot in slots
+        if (
+            state.get("structural_slot_count") is not None
+            or any(
+                not isinstance(slot, dict)
+                or slot.get("_pool_state") is not state
+                or bool(slot.get("reserved", False))
+                or slot.get("reservation_id") is not None
+                for slot in slots
+            )
+            or int(state["reserved_count"]) != 0
+            or len(free_slots) != len(slots)
         ):
             raise RuntimeError("E_SELECTOR_LOG_F_TILED_RESOURCE_PREBUILD_STATE")
+        if len(slots) > report.structural_slot_count:
+            raise RuntimeError(
+                "E_SELECTOR_LOG_F_TILED_RESOURCE_PREBUILD_CAPACITY_DRIFT"
+            )
         state["prebuilding"] = True
         setattr(
             meta_cache_owner,
             "_selector_log_f_r2_tiled_resource_prebuild_key",
             key,
         )
-        missing = report.slot_count - len(slots)
+        slot_count_before = len(slots)
+        missing = report.structural_slot_count - slot_count_before
 
     try:
         new_slots = tuple(
@@ -1353,28 +1627,37 @@ def prepare_tiled_capture_postprocess_resources(
             for _ in range(missing)
         )
     except BaseException:
-        with _PROCESS_TILED_RESOURCE_CACHE_CONDITION:
+        with _PROCESS_TILED_RESOURCE_CACHE_LOCK:
             state["prebuilding"] = False
             setattr(
                 meta_cache_owner,
                 "_selector_log_f_r2_tiled_resource_prebuild_key",
                 None,
             )
-            _PROCESS_TILED_RESOURCE_CACHE_CONDITION.notify_all()
         raise
 
-    with _PROCESS_TILED_RESOURCE_CACHE_CONDITION:
-        if cache.get(key) is not state or len(state["slots"]) + missing != report.slot_count:
+    with _PROCESS_TILED_RESOURCE_CACHE_LOCK:
+        if cache.get(key) is not state or len(state["slots"]) != slot_count_before:
             state["prebuilding"] = False
             setattr(
                 meta_cache_owner,
                 "_selector_log_f_r2_tiled_resource_prebuild_key",
                 None,
             )
-            _PROCESS_TILED_RESOURCE_CACHE_CONDITION.notify_all()
             raise RuntimeError("E_SELECTOR_LOG_F_TILED_RESOURCE_PREBUILD_RACE")
+        for slot in new_slots:
+            _bind_tiled_resource_slot_locked(state, slot)
         state["slots"].extend(new_slots)
-        state["sealed_slot_count"] = report.slot_count
+        state["free_slots"].extend(new_slots)
+        if len(state["slots"]) != report.structural_slot_count:
+            state["prebuilding"] = False
+            setattr(
+                meta_cache_owner,
+                "_selector_log_f_r2_tiled_resource_prebuild_key",
+                None,
+            )
+            raise RuntimeError("E_SELECTOR_LOG_F_TILED_RESOURCE_PREBUILD_RACE")
+        state["structural_slot_count"] = report.structural_slot_count
         state["prebuilding"] = False
         setattr(
             meta_cache_owner,
@@ -1386,7 +1669,6 @@ def prepare_tiled_capture_postprocess_resources(
             "_selector_log_f_r2_tiled_resource_prebuild_key",
             None,
         )
-        _PROCESS_TILED_RESOURCE_CACHE_CONDITION.notify_all()
     return report
 
 
@@ -1398,14 +1680,17 @@ def _acquire_tiled_resource_slot(
     num_rows: int,
     num_query_heads: int,
     logical_k_max: int,
-) -> tuple[dict[str, Any], int, int, int]:
+) -> tuple[dict[str, Any], int, int, int, int]:
     """Load and reserve reusable tiled storage before any job is claimed."""
 
     from utils import selector_log_s_ext
 
-    # Compilation, binary loading and all capacity allocations are intentionally
-    # outside lifecycle locks.  An unavailable optimized owner is a deployment
-    # error, never a reason to mutate a job and then fall back.
+    if cache_owner is None:
+        raise RuntimeError("E_SELECTOR_LOG_F_TILED_RESOURCE_OWNER_REQUIRED")
+    # Resolve the immutable extension before touching resource ownership.  The
+    # production sealed path performs only O(1) free-stack bookkeeping under
+    # the lock and cannot allocate.  An unavailable optimized owner is a
+    # deployment error, never a reason to mutate a job and then fall back.
     selector_log_s_ext._require_ext(force=True)
     actual_rows = int(num_rows)
     actual_heads = int(num_query_heads)
@@ -1420,58 +1705,34 @@ def _acquire_tiled_resource_slot(
         -1 if device.index is None else int(device.index),
         int(stream.cuda_stream),
     )
-    with _PROCESS_TILED_RESOURCE_CACHE_CONDITION:
+    with _PROCESS_TILED_RESOURCE_CACHE_LOCK:
         cache = _tiled_resource_cache_for_owner_locked(cache_owner)
-        seal = (
-            None
-            if cache_owner is None
-            else getattr(
-                cache_owner, "_selector_log_f_r2_tiled_resource_seal", None
-            )
+        seal = getattr(
+            cache_owner, "_selector_log_f_r2_tiled_resource_seal", None
         )
-        prebuild_key = (
-            None
-            if cache_owner is None
-            else getattr(
+        if seal is None:
+            if getattr(
                 cache_owner,
                 "_selector_log_f_r2_tiled_resource_prebuild_key",
                 None,
-            )
-        )
-        if seal is not None:
-            if not isinstance(seal, dict):
-                raise RuntimeError("E_SELECTOR_LOG_F_TILED_RESOURCE_SEAL_DRIFT")
-            report = seal.get("report")
-            key = seal.get("key")
-            if (
-                not isinstance(report, TiledCapturePostprocessResourceReport)
-                or not isinstance(key, tuple)
-                or len(key) != 5
-            ):
-                raise RuntimeError("E_SELECTOR_LOG_F_TILED_RESOURCE_SEAL_DRIFT")
-            n_capacity = report.num_rows_capacity
-            h_capacity = report.num_query_heads_capacity
-            k_capacity = report.logical_k_capacity
-        elif prebuild_key is not None:
-            if not isinstance(prebuild_key, tuple) or len(prebuild_key) != 5:
-                raise RuntimeError("E_SELECTOR_LOG_F_TILED_RESOURCE_SEAL_DRIFT")
-            key = prebuild_key
-            n_capacity, h_capacity, k_capacity = (
-                int(key[2]),
-                int(key[3]),
-                int(key[4]),
-            )
-        else:
-            n_capacity = _tiled_n_capacity(actual_rows)
-            h_capacity = actual_heads
-            k_capacity = _tiled_k_capacity(actual_logical_k)
-            key = _tiled_resource_key(
-                device=device,
-                stream=stream,
-                n_capacity=n_capacity,
-                h_capacity=h_capacity,
-                k_capacity=k_capacity,
-            )
+            ) is not None:
+                raise RuntimeError(
+                    "E_SELECTOR_LOG_F_TILED_RESOURCE_PREBUILD_IN_PROGRESS"
+                )
+            raise RuntimeError("E_SELECTOR_LOG_F_TILED_RESOURCE_SEAL_REQUIRED")
+        if not isinstance(seal, dict):
+            raise RuntimeError("E_SELECTOR_LOG_F_TILED_RESOURCE_SEAL_DRIFT")
+        report = seal.get("report")
+        key = seal.get("key")
+        if (
+            not isinstance(report, TiledCapturePostprocessResourceReport)
+            or not isinstance(key, tuple)
+            or len(key) != 5
+        ):
+            raise RuntimeError("E_SELECTOR_LOG_F_TILED_RESOURCE_SEAL_DRIFT")
+        n_capacity = report.num_rows_capacity
+        h_capacity = report.num_query_heads_capacity
+        k_capacity = report.logical_k_capacity
         if tuple(key[:2]) != requested_prefix:
             raise RuntimeError(
                 "E_SELECTOR_LOG_F_TILED_RESOURCE_SEALED_KEY_MISMATCH"
@@ -1486,75 +1747,89 @@ def _acquire_tiled_resource_slot(
             )
         state = cache.get(key)
         if state is None:
-            if prebuild_key is not None:
-                raise RuntimeError("E_SELECTOR_LOG_F_TILED_RESOURCE_SLOT_MISSING")
-            state = {"slots": [], "next": 0}
-            cache[key] = state
-        if not isinstance(state, dict) or not isinstance(state.get("slots"), list):
+            raise RuntimeError("E_SELECTOR_LOG_F_TILED_RESOURCE_SLOT_MISSING")
+        if not isinstance(state, dict):
             raise RuntimeError("E_SELECTOR_LOG_F_TILED_RESOURCE_STATE_DRIFT")
-        while bool(state.get("prebuilding", False)):
-            _PROCESS_TILED_RESOURCE_CACHE_CONDITION.wait()
-        if cache_owner is not None:
-            seal = getattr(
-                cache_owner, "_selector_log_f_r2_tiled_resource_seal", seal
+        free_slots = _tiled_resource_free_slots_locked(state)
+        if bool(state.get("prebuilding", False)):
+            raise RuntimeError("E_SELECTOR_LOG_F_TILED_RESOURCE_PREBUILD_IN_PROGRESS")
+        structural_slot_count = state.get("structural_slot_count")
+        if (
+            int(structural_slot_count or -1) != report.structural_slot_count
+            or len(state["slots"]) != report.structural_slot_count
+        ):
+            raise RuntimeError("E_SELECTOR_LOG_F_TILED_RESOURCE_SLOT_MISSING")
+        slot = free_slots.pop() if free_slots else None
+        if slot is None:
+            # Every sealed slot represents one structurally budgeted owner
+            # lane.  Exhaustion means ownership escaped that proof; never hide
+            # it by allocating an unprofiled giant workspace.
+            raise RuntimeError(
+                "E_SELECTOR_LOG_F_TILED_RESOURCE_OWNERSHIP_CAPACITY_DRIFT"
             )
-        sealed_slot_count = state.get("sealed_slot_count")
-        if seal is not None:
-            report = seal.get("report")
-            if (
-                not isinstance(report, TiledCapturePostprocessResourceReport)
-                or int(sealed_slot_count or -1) != report.slot_count
-                or len(state["slots"]) != report.slot_count
-            ):
-                raise RuntimeError("E_SELECTOR_LOG_F_TILED_RESOURCE_SLOT_MISSING")
-            slot_limit = report.slot_count
-        else:
-            if sealed_slot_count is not None:
-                raise RuntimeError("E_SELECTOR_LOG_F_TILED_RESOURCE_SEAL_DRIFT")
-            slot_limit = _LOG_F_R2_TILED_RESOURCE_RING_DEPTH
-        slots = state["slots"]
-        slot: dict[str, Any] | None = None
-        while slot is None:
-            start = int(state.get("next", 0)) % slot_limit
-            for offset in range(len(slots)):
-                candidate_index = (start + offset) % len(slots)
-                candidate = slots[candidate_index]
-                if bool(candidate.get("reserved", False)):
-                    continue
-                # Device metadata/workspace are stream-owned and this cache key
-                # pins one stream, so enqueue order is the WAR dependency.  Do
-                # not host-wait for the prior four-stage completion.
-                slot = candidate
-                state["next"] = candidate_index + 1
-                break
-            if slot is not None:
-                break
-            if len(slots) >= slot_limit:
-                _PROCESS_TILED_RESOURCE_CACHE_CONDITION.wait()
-                continue
-            # Sealed pools reach this branch only on state corruption, caught
-            # above.  Unsealed/debug owners retain the bounded lazy behavior.
-            slot = _allocate_tiled_resource_slot(
-                device=device,
-                n_capacity=n_capacity,
-                h_capacity=h_capacity,
-                k_capacity=k_capacity,
-            )
-            slots.append(slot)
-            state["next"] = len(slots)
+        if (
+            not isinstance(slot, dict)
+            or slot.get("_pool_state") is not state
+            or bool(slot.get("reserved", False))
+            or slot.get("reservation_id") is not None
+        ):
+            raise RuntimeError("E_SELECTOR_LOG_F_TILED_RESOURCE_SLOT_DRIFT")
+        reservation_id = int(state.get("next_reservation_id", 0))
+        if reservation_id <= 0:
+            raise RuntimeError("E_SELECTOR_LOG_F_TILED_RESOURCE_STATE_DRIFT")
+        state["next_reservation_id"] = reservation_id + 1
+        state["reserved_count"] = int(state["reserved_count"]) + 1
         slot["reserved"] = True
-        meta_copy_event = slot.get("meta_copy_event")
-        meta_copy_recorded = bool(slot.get("meta_copy_recorded", False))
-    if (
-        meta_copy_recorded
-        and meta_copy_event is not None
-        and not bool(meta_copy_event.query())
-    ):
-        # CPU may rewrite pinned staging only after its previous H2D DMA.  This
-        # event is recorded before the four compute kernels, so the rare host
-        # wait is bounded by metadata copy rather than full cohort completion.
-        meta_copy_event.synchronize()
-    return slot, n_capacity, h_capacity, k_capacity
+        slot["reservation_id"] = reservation_id
+        slot["reservation_stream"] = stream
+    return slot, reservation_id, n_capacity, h_capacity, k_capacity
+
+
+def _acquire_tiled_meta_carrier(slot: dict[str, Any]) -> dict[str, Any]:
+    """Reserve one pinned H2D source with one oldest-event query at steady state."""
+
+    carriers = slot.get("meta_carriers")
+    if not isinstance(carriers, list):
+        raise RuntimeError("E_SELECTOR_LOG_F_TILED_META_CARRIER_STATE_DRIFT")
+    carrier: dict[str, Any] | None = None
+    next_oldest_index = 0
+    oldest_index = 0
+    if carriers:
+        oldest_index = int(slot.get("meta_next", 0)) % len(carriers)
+        candidate = carriers[oldest_index]
+        if not isinstance(candidate, dict):
+            raise RuntimeError("E_SELECTOR_LOG_F_TILED_META_CARRIER_DRIFT")
+        copy_event = candidate.get("copy_event")
+        if copy_event is None:
+            raise RuntimeError("E_SELECTOR_LOG_F_TILED_META_EVENT_MISSING")
+        candidate_ready = not bool(candidate.get("reserved", False))
+        if candidate_ready and bool(candidate.get("copy_recorded", False)):
+            # Same-stream submissions preserve carrier age.  The oldest event
+            # being busy proves every later recorded carrier is newer, so one
+            # query is the complete steady-state readiness check.
+            candidate_ready = bool(copy_event.query())
+        if candidate_ready:
+            carrier = candidate
+            next_oldest_index = (oldest_index + 1) % len(carriers)
+
+    if carrier is None:
+        gpu_i32 = slot.get("gpu_i32")
+        if not isinstance(gpu_i32, torch.Tensor) or gpu_i32.dim() != 2:
+            raise RuntimeError("E_SELECTOR_LOG_F_TILED_META_CAPACITY_DRIFT")
+        carrier = _allocate_tiled_meta_carrier(n_capacity=int(gpu_i32.shape[0]))
+        if not isinstance(carrier, dict) or carrier.get("copy_event") is None:
+            raise RuntimeError("E_SELECTOR_LOG_F_TILED_META_EVENT_MISSING")
+        if carriers:
+            # Append temporally newest before the physical oldest; the shifted
+            # old oldest remains the cursor even when it was nonzero.
+            carriers.insert(oldest_index, carrier)
+            next_oldest_index = oldest_index + 1
+        else:
+            carriers.append(carrier)
+            next_oldest_index = 0
+    slot["meta_next"] = next_oldest_index
+    carrier["reserved"] = True
+    return carrier
 
 
 def _stage_tiled_meta_rows(
@@ -1568,39 +1843,92 @@ def _stage_tiled_meta_rows(
     row_count = len(meta_i32_rows)
     if row_count <= 0 or len(meta_i64_rows) != row_count:
         raise ValueError("tiled metadata rows must be non-empty and aligned")
-    cpu_i32 = slot["cpu_i32"]
-    cpu_i64 = slot["cpu_i64"]
     gpu_i32 = slot["gpu_i32"]
     gpu_i64 = slot["gpu_i64"]
-    if row_count > int(cpu_i32.shape[0]) or row_count > int(cpu_i64.shape[0]):
-        raise RuntimeError("E_SELECTOR_LOG_F_TILED_META_CAPACITY_DRIFT")
-    cpu_i32[:row_count].copy_(torch.tensor(meta_i32_rows, dtype=torch.int32))
-    cpu_i64[:row_count].copy_(torch.tensor(meta_i64_rows, dtype=torch.int64))
-    req_meta_i32 = gpu_i32[:row_count]
-    req_meta_i64 = gpu_i64[:row_count]
-    req_meta_i32.copy_(cpu_i32[:row_count], non_blocking=True)
-    req_meta_i64.copy_(cpu_i64[:row_count], non_blocking=True)
-    meta_copy_event = slot.get("meta_copy_event")
-    if meta_copy_event is None:
+    reservation_stream = slot.get("reservation_stream")
+    if reservation_stream is None:
+        raise RuntimeError("E_SELECTOR_LOG_F_TILED_RESERVATION_STREAM_MISSING")
+    carrier = _acquire_tiled_meta_carrier(slot)
+    cpu_i32 = carrier["cpu_i32"]
+    cpu_i64 = carrier["cpu_i64"]
+    copy_event = carrier.get("copy_event")
+    if copy_event is None:
         raise RuntimeError("E_SELECTOR_LOG_F_TILED_META_EVENT_MISSING")
-    meta_copy_event.record(torch.cuda.current_stream(device=gpu_i32.device))
-    slot["meta_copy_recorded"] = True
+    try:
+        if row_count > int(cpu_i32.shape[0]) or row_count > int(cpu_i64.shape[0]):
+            raise RuntimeError("E_SELECTOR_LOG_F_TILED_META_CAPACITY_DRIFT")
+        req_meta_i32 = gpu_i32[:row_count]
+        req_meta_i64 = gpu_i64[:row_count]
+        cpu_i32[:row_count].copy_(torch.tensor(meta_i32_rows, dtype=torch.int32))
+        cpu_i64[:row_count].copy_(torch.tensor(meta_i64_rows, dtype=torch.int64))
+        req_meta_i32.copy_(cpu_i32[:row_count], non_blocking=True)
+        req_meta_i64.copy_(cpu_i64[:row_count], non_blocking=True)
+    finally:
+        # This record must follow both H2D enqueues.  Recording even on an
+        # exceptional partial-copy path fences whatever reached the stream
+        # before the pinned source can become reusable.
+        copy_event.record(reservation_stream)
+        carrier["copy_recorded"] = True
+        carrier["reserved"] = False
     return req_meta_i32, req_meta_i64
 
 
-def _mark_tiled_resource_complete(
+def _release_tiled_resource_slot(
     slot: dict[str, Any],
     *,
     stream: torch.cuda.Stream,
-) -> torch.cuda.Event:
-    event = torch.cuda.Event(enable_timing=False)
-    event.record(stream)
-    with _PROCESS_TILED_RESOURCE_CACHE_CONDITION:
+    reservation_id: int,
+) -> None:
+    """Release same-stream storage without creating a publication fence."""
+
+    with _PROCESS_TILED_RESOURCE_CACHE_LOCK:
+        state = slot.get("_pool_state")
+        if not isinstance(state, dict):
+            raise RuntimeError("E_SELECTOR_LOG_F_TILED_RESOURCE_SLOT_DRIFT")
+        free_slots = _tiled_resource_free_slots_locked(state)
         if not bool(slot.get("reserved", False)):
             raise RuntimeError("E_SELECTOR_LOG_F_TILED_SLOT_NOT_RESERVED")
-        slot["completion_event"] = event
+        if int(slot.get("reservation_id") or -1) != int(reservation_id):
+            raise RuntimeError("E_SELECTOR_LOG_F_TILED_RESERVATION_ID_DRIFT")
+        reservation_stream = slot.get("reservation_stream")
+        if reservation_stream is None or int(reservation_stream.cuda_stream) != int(
+            stream.cuda_stream
+        ):
+            raise RuntimeError("E_SELECTOR_LOG_F_TILED_RESERVATION_STREAM_DRIFT")
+        reserved_count = int(state["reserved_count"])
+        if reserved_count <= 0:
+            raise RuntimeError("E_SELECTOR_LOG_F_TILED_RESOURCE_STATE_DRIFT")
         slot["reserved"] = False
-        _PROCESS_TILED_RESOURCE_CACHE_CONDITION.notify_all()
+        slot["reservation_id"] = None
+        slot["reservation_stream"] = None
+        state["reserved_count"] = reserved_count - 1
+        free_slots.append(slot)
+        if len(free_slots) + int(state["reserved_count"]) != len(state["slots"]):
+            raise RuntimeError("E_SELECTOR_LOG_F_TILED_RESOURCE_STATE_DRIFT")
+
+
+def _publish_tiled_resource_completion(
+    slot: dict[str, Any],
+    *,
+    stream: torch.cuda.Stream,
+    reservation_id: int,
+) -> torch.cuda.Event:
+    """Publish one immutable job fence, then release its same-stream slot.
+
+    A completion event escapes through deferred jobs and may be waited long
+    after this storage slot becomes reusable.  Re-recording a slot-owned event
+    would make such a delayed wait observe a later publication.  Publication
+    events are therefore one-shot identities; only each private pinned
+    metadata carrier's copy-lifetime event is persistent.
+    """
+
+    event = torch.cuda.Event(enable_timing=False)
+    event.record(stream)
+    _release_tiled_resource_slot(
+        slot,
+        stream=stream,
+        reservation_id=reservation_id,
+    )
     return event
 
 
@@ -1629,6 +1957,9 @@ def postprocess_prefill_capture_scores(
     row_capture_accum_prev_rows_cpu: Optional[Sequence[int]] = None,
     row_capture_accum_prev_capacity_cpu: Optional[Sequence[int]] = None,
     meta_cache_owner: Optional[object] = None,
+    prepared_tiled_resource_snapshot: Optional[
+        _PreparedTiledResourceSnapshot
+    ] = None,
     alpha: float,
     debug_epoch: Optional[int] = None,
     debug_layer_index: Optional[int] = None,
@@ -1994,19 +2325,31 @@ def postprocess_prefill_capture_scores(
     scratch_row_stride = int(scratch_capture_scores.stride(2))
     meta_i32_rows: list[list[int]] = []
     meta_i64_rows: list[list[int]] = []
+    all_large_k = True
+    tiled_row_shape_candidate = True
+    logical_k_max = 0
     for scratch_row, batch_row, capture_row, effective_kv_len in gt1_prefill_rows:
         last_n = int(row_capture_last_n_tuple[batch_row])
         # The capture store clamps to the same CPU-authored effective K, so the
         # reducer never reads beyond graph-frozen scratch storage.
         accum_prev = _accum_prev_rows_for(int(batch_row))
         flags = 8 | (16 if accum_prev >= 0 else 0)
+        effective_k = int(effective_kv_len)
+        all_large_k = bool(
+            all_large_k and effective_k > _LOG_F_R2_TILED_MIN_K_EXCLUSIVE
+        )
+        tiled_row_shape_candidate = bool(
+            tiled_row_shape_candidate
+            and (last_n == 2 or (flags == 24 and last_n == 1))
+        )
+        logical_k_max = max(logical_k_max, effective_k)
         meta_i32_rows.append(
             [
-                int(effective_kv_len),
+                effective_k,
                 scratch_head_stride,
                 last_n,
                 0,
-                int(effective_kv_len),
+                effective_k,
                 int(flags),
                 int(prefill_out_capture_scores.stride(1)),
                 scratch_row_stride,
@@ -2021,6 +2364,31 @@ def postprocess_prefill_capture_scores(
                 int(prefill_out_capture_scores[int(capture_row)].data_ptr()),
                 int(prefill_out_log_f_denoms[int(capture_row)].data_ptr()),
             ]
+        )
+
+    tiled_resource_snapshot = prepared_tiled_resource_snapshot
+    tiled_resource_available = True
+    if (
+        all_large_k
+        and tiled_row_shape_candidate
+        and _is_tiled_tensor_contract_candidate(
+            scratch=scratch_capture_scores,
+            output=prefill_out_capture_scores,
+            denom=prefill_out_log_f_denoms,
+            alpha=float(alpha),
+        )
+    ):
+        if tiled_resource_snapshot is None:
+            tiled_resource_snapshot = _snapshot_prepared_tiled_resource(
+                cache_owner=meta_cache_owner,
+                device=device,
+            )
+        tiled_resource_available = _prepared_tiled_resource_available(
+            snapshot=tiled_resource_snapshot,
+            device=device,
+            num_rows=len(meta_i32_rows),
+            num_query_heads=int(scratch_capture_scores.shape[1]),
+            logical_k_max=logical_k_max,
         )
 
     admission = _LogFReduceAdmission(
@@ -2042,6 +2410,7 @@ def postprocess_prefill_capture_scores(
             == prefill_out_capture_scores.device
             == prefill_out_log_f_denoms.device
         ),
+        tiled_resource_available=tiled_resource_available,
     )
     dispatch = _resolve_log_f_reduce_dispatch(admission)
     reduce_route = dispatch.route
@@ -2088,7 +2457,7 @@ def postprocess_prefill_capture_scores(
         "layer": event_layer,
         "row_count": len(meta_i32_rows),
         "num_query_heads": int(scratch_capture_scores.shape[1]),
-        "effective_kv_len_max": max(int(row[0]) for row in meta_i32_rows),
+        "effective_kv_len_max": logical_k_max,
         "last_n_max": max(int(row[2]) for row in meta_i32_rows),
         "log_f_out_fp32": bool(prefill_out_capture_scores.dtype == torch.float32),
         "alpha": float(alpha),
@@ -2098,19 +2467,27 @@ def postprocess_prefill_capture_scores(
         "admission_identity": dispatch.admission_identity,
     }
     tiled_slot: Optional[dict[str, Any]] = None
+    tiled_reservation_id: Optional[int] = None
     tiled_capacities: Optional[tuple[int, int, int]] = None
+    tiled_stream: Optional[torch.cuda.Stream] = None
     if reduce_route == _LOG_F_R2_TILED_ROUTE:
-        tiled_stream = torch.cuda.current_stream(device=device)
-        tiled_slot, n_capacity, h_capacity, k_capacity = (
+        if tiled_resource_snapshot is None:
+            _selector_log_f_contract_error(
+                "RESOURCE_AUTHORITY",
+                "tiled dispatch is missing its prepared stream proof",
+            )
+        tiled_stream = tiled_resource_snapshot.stream
+        tiled_slot, tiled_reservation_id, n_capacity, h_capacity, k_capacity = (
             _acquire_tiled_resource_slot(
                 cache_owner=meta_cache_owner,
                 device=device,
                 stream=tiled_stream,
                 num_rows=len(meta_i32_rows),
                 num_query_heads=int(scratch_capture_scores.shape[1]),
-                logical_k_max=max(int(row[0]) for row in meta_i32_rows),
+                logical_k_max=logical_k_max,
             )
         )
+        assert tiled_reservation_id is not None
         tiled_capacities = (n_capacity, h_capacity, k_capacity)
         direct_plan = _TiledJobPlan(
             job=None,
@@ -2124,15 +2501,20 @@ def postprocess_prefill_capture_scores(
             job_key=(-1, -1, -1),
             event_epoch=event_epoch,
             num_query_heads=int(scratch_capture_scores.shape[1]),
-            logical_k_max=max(int(row[0]) for row in meta_i32_rows),
+            logical_k_max=logical_k_max,
             capability=tuple(int(value) for value in admission.capability),
+            tiled_resource_available=bool(admission.tiled_resource_available),
         )
         try:
             _validate_tiled_cohort_aliases(
                 (direct_plan,), workspace=tiled_slot["workspace"]
             )
         except BaseException:
-            _mark_tiled_resource_complete(tiled_slot, stream=tiled_stream)
+            _release_tiled_resource_slot(
+                tiled_slot,
+                stream=tiled_stream,
+                reservation_id=tiled_reservation_id,
+            )
             raise
 
         def _stage_gt1_meta() -> tuple[torch.Tensor, torch.Tensor]:
@@ -2144,9 +2526,11 @@ def postprocess_prefill_capture_scores(
                     meta_i64_rows=meta_i64_rows,
                 )
             except BaseException:
-                _mark_tiled_resource_complete(
+                assert tiled_stream is not None
+                _release_tiled_resource_slot(
                     tiled_slot,
-                    stream=torch.cuda.current_stream(device=device),
+                    stream=tiled_stream,
+                    reservation_id=tiled_reservation_id,
                 )
                 raise
 
@@ -2167,13 +2551,15 @@ def postprocess_prefill_capture_scores(
             )
             return
         if reduce_route == _LOG_F_R2_TILED_ROUTE:
-            assert tiled_slot is not None and tiled_capacities is not None
+            assert (
+                tiled_slot is not None
+                and tiled_capacities is not None
+                and tiled_stream is not None
+                and tiled_reservation_id is not None
+            )
             n_capacity, h_capacity, k_capacity = tiled_capacities
             workspace = tiled_slot["workspace"]
-            current_stream = torch.cuda.current_stream(device=device)
             try:
-                for tensor in (req_meta_i32, req_meta_i64, workspace):
-                    tensor.record_stream(current_stream)
                 selector_log_s_ext.reduce_log_f_pre_scratch_r2_alpha0p5_fp16_tiled_cuda(
                     req_meta_i32=req_meta_i32,
                     req_meta_i64=req_meta_i64,
@@ -2185,9 +2571,17 @@ def postprocess_prefill_capture_scores(
                     logical_k_capacity=k_capacity,
                 )
             except BaseException:
-                _mark_tiled_resource_complete(tiled_slot, stream=current_stream)
+                _release_tiled_resource_slot(
+                    tiled_slot,
+                    stream=tiled_stream,
+                    reservation_id=tiled_reservation_id,
+                )
                 raise
-            _mark_tiled_resource_complete(tiled_slot, stream=current_stream)
+            _release_tiled_resource_slot(
+                tiled_slot,
+                stream=tiled_stream,
+                reservation_id=tiled_reservation_id,
+            )
             return
         selector_log_s_ext.reduce_log_f_pre_scratch_cuda(
             req_meta_i32=req_meta_i32,
@@ -2457,7 +2851,14 @@ def _validate_payload_job_identity(payload: object, job: Any) -> tuple[int, int,
     return job_key
 
 
-def _build_tiled_job_plan(job: Any) -> Optional[_TiledJobPlan]:
+def _build_tiled_job_plan(
+    job: Any,
+    *,
+    meta_cache_owner: Optional[object],
+    prepared_resource_snapshots: dict[
+        torch.device, _PreparedTiledResourceSnapshot
+    ],
+) -> Optional[_TiledJobPlan]:
     """Return a tiled plan only when the complete valid job has no other work."""
 
     if job is None or bool(getattr(job, "completed", False)):
@@ -2599,6 +3000,9 @@ def _build_tiled_job_plan(job: Any) -> Optional[_TiledJobPlan]:
     scratch_rows: list[int] = []
     output_rows: list[int] = []
     has_non_tiled_work = str(getattr(job, "direct_capture_phase", "")) == "prefill"
+    all_large_k = True
+    tiled_row_shape_candidate = True
+    logical_k_max = 0
     for scratch_row, batch_row in enumerate(producer_rows):
         if batch_row < 0 or batch_row >= batch_size:
             _selector_log_f_contract_error(
@@ -2637,6 +3041,14 @@ def _build_tiled_job_plan(job: Any) -> Optional[_TiledJobPlan]:
             continue
         accum_prev = int(accum_rows[batch_row])
         flags = 8 | (16 if accum_prev >= 0 else 0)
+        all_large_k = bool(
+            all_large_k and effective_k > _LOG_F_R2_TILED_MIN_K_EXCLUSIVE
+        )
+        tiled_row_shape_candidate = bool(
+            tiled_row_shape_candidate
+            and (last_n == 2 or (flags == 24 and last_n == 1))
+        )
+        logical_k_max = max(logical_k_max, effective_k)
         meta_i32_rows.append(
             (
                 effective_k,
@@ -2657,6 +3069,30 @@ def _build_tiled_job_plan(job: Any) -> Optional[_TiledJobPlan]:
             has_non_tiled_work = True
     if not meta_i32_rows:
         return None
+    alpha = float(getattr(job, "alpha", 0.0) or 0.0)
+    tiled_resource_available = True
+    if (
+        all_large_k
+        and tiled_row_shape_candidate
+        and _is_tiled_tensor_contract_candidate(
+            scratch=scratch,
+            output=output,
+            denom=denom,
+            alpha=alpha,
+        )
+    ):
+        resource_snapshot = _prepared_tiled_resource_snapshot_for_device(
+            snapshots=prepared_resource_snapshots,
+            cache_owner=meta_cache_owner,
+            device=scratch.device,
+        )
+        tiled_resource_available = _prepared_tiled_resource_available(
+            snapshot=resource_snapshot,
+            device=scratch.device,
+            num_rows=len(meta_i32_rows),
+            num_query_heads=int(scratch.shape[1]),
+            logical_k_max=logical_k_max,
+        )
     admission = _LogFReduceAdmission(
         meta_i32_rows=tuple(meta_i32_rows),
         scratch_row_indices=tuple(scratch_rows),
@@ -2664,12 +3100,13 @@ def _build_tiled_job_plan(job: Any) -> Optional[_TiledJobPlan]:
         scratch=_tensor_contract(scratch),
         output=_tensor_contract(output),
         denom=_tensor_contract(denom),
-        alpha=float(getattr(job, "alpha", 0.0) or 0.0),
+        alpha=alpha,
         capability=tuple(
             int(value) for value in torch.cuda.get_device_capability(scratch.device)
         ),
         cpu_authority_validated=True,
         local_same_device=bool(scratch.device == output.device == denom.device),
+        tiled_resource_available=tiled_resource_available,
     )
     dispatch = _resolve_log_f_reduce_dispatch(admission)
     if has_non_tiled_work or dispatch.route != _LOG_F_R2_TILED_ROUTE:
@@ -2687,8 +3124,9 @@ def _build_tiled_job_plan(job: Any) -> Optional[_TiledJobPlan]:
         job_key=job_key,
         event_epoch=int(getattr(job, "debug_epoch", -1)),
         num_query_heads=int(scratch.shape[1]),
-        logical_k_max=max(int(row[0]) for row in meta_i32_rows),
+        logical_k_max=logical_k_max,
         capability=tuple(int(value) for value in admission.capability),
+        tiled_resource_available=bool(admission.tiled_resource_available),
     )
 
 
@@ -2737,6 +3175,7 @@ def _revalidate_tiled_job_plan_locked(plan: _TiledJobPlan) -> _TiledJobPlan:
         local_same_device=bool(
             plan.scratch.device == output.device == denom.device
         ),
+        tiled_resource_available=plan.tiled_resource_available,
     )
     dispatch = _resolve_log_f_reduce_dispatch(admission)
     if dispatch.route != _LOG_F_R2_TILED_ROUTE:
@@ -2758,6 +3197,7 @@ def _revalidate_tiled_job_plan_locked(plan: _TiledJobPlan) -> _TiledJobPlan:
         num_query_heads=plan.num_query_heads,
         logical_k_max=plan.logical_k_max,
         capability=plan.capability,
+        tiled_resource_available=plan.tiled_resource_available,
     )
 
 
@@ -2981,6 +3421,9 @@ def _run_tiled_capture_postprocess_job_cohort(
     *,
     meta_cache_owner: Optional[object],
     initial_plans: Optional[Sequence[_TiledJobPlan]] = None,
+    prepared_resource_snapshot: Optional[
+        _PreparedTiledResourceSnapshot
+    ] = None,
 ) -> int:
     """Claim one compatible job sequence and submit one four-kernel cohort."""
 
@@ -2991,9 +3434,19 @@ def _run_tiled_capture_postprocess_job_cohort(
     jobs = tuple(jobs)
     if not jobs:
         return 0
+    prepared_resource_snapshots: dict[
+        torch.device, _PreparedTiledResourceSnapshot
+    ] = {}
     raw_initial_plans: tuple[Optional[_TiledJobPlan], ...]
     if initial_plans is None:
-        raw_initial_plans = tuple(_build_tiled_job_plan(job) for job in jobs)
+        raw_initial_plans = tuple(
+            _build_tiled_job_plan(
+                job,
+                meta_cache_owner=meta_cache_owner,
+                prepared_resource_snapshots=prepared_resource_snapshots,
+            )
+            for job in jobs
+        )
     else:
         supplied_plans = tuple(initial_plans)
         if len(supplied_plans) != len(jobs) or any(
@@ -3016,15 +3469,36 @@ def _run_tiled_capture_postprocess_job_cohort(
             "INCOMPATIBLE", "jobs must share one device and local head count"
         )
     device = plans[0].scratch.device
-    stream = torch.cuda.current_stream(device=device)
+    if prepared_resource_snapshot is None:
+        prepared_resource_snapshot = prepared_resource_snapshots.get(device)
+    if prepared_resource_snapshot is None:
+        prepared_resource_snapshot = _snapshot_prepared_tiled_resource(
+            cache_owner=meta_cache_owner,
+            device=device,
+        )
+    stream = prepared_resource_snapshot.stream
     total_rows = sum(len(plan.meta_i32_rows) for plan in plans)
-    slot, n_capacity, h_capacity, k_capacity = _acquire_tiled_resource_slot(
-        cache_owner=meta_cache_owner,
+    logical_k_max = max(plan.logical_k_max for plan in plans)
+    if not _prepared_tiled_resource_available(
+        snapshot=prepared_resource_snapshot,
         device=device,
-        stream=stream,
         num_rows=total_rows,
         num_query_heads=plans[0].num_query_heads,
-        logical_k_max=max(plan.logical_k_max for plan in plans),
+        logical_k_max=logical_k_max,
+    ):
+        _reject_tiled_cohort(
+            "RESOURCE",
+            "prepared stream geometry does not cover the merged cohort",
+        )
+    slot, reservation_id, n_capacity, h_capacity, k_capacity = (
+        _acquire_tiled_resource_slot(
+            cache_owner=meta_cache_owner,
+            device=device,
+            stream=stream,
+            num_rows=total_rows,
+            num_query_heads=plans[0].num_query_heads,
+            logical_k_max=logical_k_max,
+        )
     )
     resource_published = False
     try:
@@ -3099,8 +3573,6 @@ def _run_tiled_capture_postprocess_job_cohort(
                 prefill_out_denoms=plan.denom,
             )
         workspace = slot["workspace"]
-        for tensor in (req_meta_i32, req_meta_i64, workspace):
-            tensor.record_stream(stream)
 
         from utils import selector_log_s_ext
 
@@ -3126,7 +3598,11 @@ def _run_tiled_capture_postprocess_job_cohort(
             num_query_heads_capacity=h_capacity,
             logical_k_capacity=k_capacity,
         )
-        completion_event = _mark_tiled_resource_complete(slot, stream=stream)
+        completion_event = _publish_tiled_resource_completion(
+            slot,
+            stream=stream,
+            reservation_id=reservation_id,
+        )
         resource_published = True
         _PROCESS_TILED_COHORT_COUNT += 1
         _PROCESS_TILED_JOB_COUNT += len(jobs)
@@ -3155,15 +3631,22 @@ def _run_tiled_capture_postprocess_job_cohort(
         return len(jobs)
     finally:
         if not resource_published:
-            # Fence any metadata copy or partial launch before making this slot
-            # reusable, then preserve the original fail-closed exception.
-            _mark_tiled_resource_complete(slot, stream=stream)
+            # Partial GPU work remains ordered before reuse on this same stream;
+            # metadata staging independently fenced its pinned source event.
+            _release_tiled_resource_slot(
+                slot,
+                stream=stream,
+                reservation_id=reservation_id,
+            )
 
 
 def run_capture_postprocess_job_if_needed(
     job: Any,
     *,
     meta_cache_owner: Optional[object],
+    prepared_tiled_resource_snapshot: Optional[
+        _PreparedTiledResourceSnapshot
+    ] = None,
     completion_wait_targets: Optional[
         dict[int, tuple[str, int, int]]
     ] = None,
@@ -3275,6 +3758,7 @@ def run_capture_postprocess_job_if_needed(
         ),
         drain_lastn1_rows=bool(getattr(job, "drain_lastn1_rows", False)),
         meta_cache_owner=meta_cache_owner,
+        prepared_tiled_resource_snapshot=prepared_tiled_resource_snapshot,
         alpha=float(getattr(job, "alpha", 0.0) or 0.0),
         debug_epoch=int(getattr(job, "debug_epoch", -1)),
         debug_layer_index=int(getattr(job, "debug_layer_index", -1)),
@@ -3353,21 +3837,48 @@ def run_capture_postprocess_job_sequence(
         owner_by_key[key] = job
         unique_jobs.append(job)
 
-    plans = tuple(_build_tiled_job_plan(job) for job in unique_jobs)
+    prepared_resource_snapshots: dict[
+        torch.device, _PreparedTiledResourceSnapshot
+    ] = {}
+    plans = tuple(
+        _build_tiled_job_plan(
+            job,
+            meta_cache_owner=meta_cache_owner,
+            prepared_resource_snapshots=prepared_resource_snapshots,
+        )
+        for job in unique_jobs
+    )
     completion_wait_targets: dict[int, tuple[str, int, int]] = {}
     ran_count = 0
     index = 0
     while index < len(unique_jobs):
         plan = plans[index]
         if plan is None:
+            scratch = getattr(unique_jobs[index], "scratch_capture_scores", None)
+            prepared_resource_snapshot = (
+                prepared_resource_snapshots.get(scratch.device)
+                if isinstance(scratch, torch.Tensor)
+                else None
+            )
             if run_capture_postprocess_job_if_needed(
                 unique_jobs[index],
                 meta_cache_owner=meta_cache_owner,
+                prepared_tiled_resource_snapshot=prepared_resource_snapshot,
                 completion_wait_targets=completion_wait_targets,
             ):
                 ran_count += 1
             index += 1
             continue
+        prepared_resource_snapshot = prepared_resource_snapshots.get(
+            plan.scratch.device
+        )
+        if prepared_resource_snapshot is None:
+            _selector_log_f_contract_error(
+                "RESOURCE_AUTHORITY",
+                "tiled plan is missing its call-boundary resource snapshot",
+            )
+        total_rows = len(plan.meta_i32_rows)
+        logical_k_max = plan.logical_k_max
         end = index + 1
         while end < len(unique_jobs):
             candidate = plans[end]
@@ -3376,11 +3887,29 @@ def run_capture_postprocess_job_sequence(
                 or candidate.num_query_heads != plan.num_query_heads
             ):
                 break
+            proposed_rows = total_rows + len(candidate.meta_i32_rows)
+            proposed_logical_k_max = max(
+                logical_k_max, candidate.logical_k_max
+            )
+            if not _prepared_tiled_resource_available(
+                snapshot=prepared_resource_snapshot,
+                device=plan.scratch.device,
+                num_rows=proposed_rows,
+                num_query_heads=plan.num_query_heads,
+                logical_k_max=proposed_logical_k_max,
+            ):
+                # The general sequence owner forms maximal capacity-bounded
+                # prefixes.  The strict cohort API instead rejects an
+                # over-capacity group as one ownership-contract violation.
+                break
+            total_rows = proposed_rows
+            logical_k_max = proposed_logical_k_max
             end += 1
         ran_count += _run_tiled_capture_postprocess_job_cohort(
             unique_jobs[index:end],
             meta_cache_owner=meta_cache_owner,
             initial_plans=plans[index:end],
+            prepared_resource_snapshot=prepared_resource_snapshot,
         )
         index = end
     return int(ran_count)

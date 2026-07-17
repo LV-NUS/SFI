@@ -17,6 +17,7 @@ import torch
 
 from patches.buffer_allocator_backends import AllocatorBackend, resolve_allocator_backend
 from patches.buffer_lease_protocol import BufferLease, BufferLeaseRegistry, LeaseKind
+from patches.global_slot_allocator import stable_request_id_hash64
 from patches.page_kv_residency import CompactMetadataBuffers, CompactPageResidency
 from patches.sparse_cache import _get_cached_empty_tensor
 from patches.sparse_constants import _DYNAMIC_ENV
@@ -66,27 +67,6 @@ def _mix_u64(sig: int, value: int) -> int:
     return sig_u64 & _U64_MASK
 
 
-# rid→hash64 纯函数 memo：签名重算占 align slow-path 的 ~85%（逐字节 FNV），
-# rid 字符串不可变故结果恒同；容量上限防 serve 长跑无界增长（清空仅触发重算）。
-_STR_HASH64_MEMO: Dict[str, int] = {}
-_STR_HASH64_MEMO_CAP = 65536
-
-
-def _stable_str_hash64(value: str) -> int:
-    cached = _STR_HASH64_MEMO.get(value)
-    if cached is not None:
-        return cached
-    h = _FNV64_OFFSET_BASIS
-    for byte in value.encode("utf-8"):
-        h ^= int(byte)
-        h = (h * _FNV64_PRIME) & _U64_MASK
-    h &= _U64_MASK
-    if len(_STR_HASH64_MEMO) >= _STR_HASH64_MEMO_CAP:
-        _STR_HASH64_MEMO.clear()
-    _STR_HASH64_MEMO[value] = h
-    return h
-
-
 def _stable_slot_signature64(
     request_id_to_slot: Dict[str, int],
     active_request_ids: Optional[Tuple[str, ...]],
@@ -96,7 +76,7 @@ def _stable_slot_signature64(
     for idx, rid in enumerate(active_ids):
         slot = int(request_id_to_slot.get(rid, -1))
         sig = _mix_u64(sig, idx + 1)
-        sig = _mix_u64(sig, _stable_str_hash64(str(rid)))
+        sig = _mix_u64(sig, stable_request_id_hash64(str(rid)))
         sig = _mix_u64(sig, slot + 2)
     return sig & _U64_MASK
 
@@ -214,6 +194,12 @@ class LayerState:
         # slot->row 仅供 Python 控制逻辑读取；保持 CPU-only，避免 graph 热路径 GPU 标量写。
         self.slot_batch_rows: Optional[torch.Tensor] = None
         self.slot_batch_rows_cpu: Optional[List[int]] = None
+        # Rebuild writer 的 row 映射 staging 由真实 layer 生命周期持有。每层只
+        # 保留当前权威值；同值 layer 在 fused rebuild 内共享同一 CUDA tensor。
+        # 这只是 stable writer buffer 的 H2D 源，不参与 CUDA graph key，因而
+        # 值换代不会触发 graph rebind/capture。
+        self._rebuild_row_tensor_cache_key: Optional[Tuple[int, ...]] = None
+        self._rebuild_row_tensor_cache: Optional[torch.Tensor] = None
         # slot->row 映射缓存（按 step_context_epoch 去重，避免每层重复清空/填充）
         self._slot_row_map_epoch: int = -1
         self._slot_row_map_key: Optional[Tuple[int, ...]] = None
@@ -865,6 +851,7 @@ class LayerState:
         *,
         active_request_ids: Optional[Tuple[str, ...]],
         epoch: Optional[int],
+        stable_slot_signature64: Optional[int] = None,
     ) -> None:
         epoch_i = int(epoch) if epoch is not None else -1
         if epoch_i >= 0:
@@ -872,9 +859,10 @@ class LayerState:
         else:
             self.slot_epoch = int(self.slot_epoch) + 1
         active_ids = tuple(active_request_ids or tuple())
-        self.slot_signature64 = _stable_slot_signature64(
-            self.request_id_to_slot,
-            active_ids,
+        self.slot_signature64 = (
+            int(stable_slot_signature64)
+            if stable_slot_signature64 is not None
+            else _stable_slot_signature64(self.request_id_to_slot, active_ids)
         )
 
     def get_compact_kv_views(
@@ -952,6 +940,7 @@ class LayerState:
         *,
         epoch: Optional[int] = None,
         slot_by_request: Optional[Dict[str, int]] = None,
+        stable_slot_signature64: Optional[int] = None,
     ) -> None:
         if epoch is not None:
             epoch_i = int(epoch)
@@ -1202,6 +1191,7 @@ class LayerState:
         self._refresh_slot_signature(
             active_request_ids=self.last_active_request_ids,
             epoch=epoch,
+            stable_slot_signature64=stable_slot_signature64,
         )
         if epoch is not None and int(epoch) >= 0:
             self._align_epoch_seen = int(epoch)

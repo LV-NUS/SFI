@@ -134,6 +134,22 @@ def ensure_step_recent_descriptors(
         eff_sink_page_slots = 0 if row_degrade else int(sink_page_slots)
         eff_recent_tokens = real_kv_len_i if row_degrade else int(step_meta.recent_cap)
 
+        # A non-refresh row may be wholly owned by the sink segment.  This is
+        # common for the one-safe-page padding row used by a mixed
+        # prefill/decode CUDA-graph batch.  Such a row has no disjoint recent
+        # segment; materializing page zero again would overlap the sink, while
+        # forcing a positive recent count rejects a valid full/inactive row.
+        # Keep the compact-row contract strict: consumers only admit compact
+        # rows with a positive recent count.  Full rows are expanded from real
+        # KV by the launch-plan builder.
+        if (
+            not row_degrade
+            and real_kv_len_i <= eff_sink_page_slots * int(page_size)
+        ):
+            first_pages.append(_ceil_div(real_kv_len_i, int(page_size)))
+            page_counts.append(0)
+            continue
+
         descriptor = build_materialized_recent_descriptor(
             real_kv_len=real_kv_len_i,
             page_size=int(page_size),

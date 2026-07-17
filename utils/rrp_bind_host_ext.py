@@ -1020,7 +1020,13 @@ def bind_host_derive_cpp(**kwargs) -> dict:
     try:
         _rrp_cpp_result = ext.bind_host_derive_cpp_v2(*args)
     except RuntimeError as _cpp_contract_exc:
-        raise ValueError(str(_cpp_contract_exc)) from _cpp_contract_exc
+        _message = str(_cpp_contract_exc)
+        # 仅失败分支补足跨来源几何取证。成功热路径不物化 tuple、不重算
+        # span，也不增加 extension ABI/编译世代；若 row-mode 与 launch-plan
+        # 来自不同快照，报错会直接给出 offending row 的实际/期望窗口。
+        if "compact offset plus page count exceeds slot compact span" in _message:
+            _message += "; " + _compact_span_error_context(kwargs)
+        raise ValueError(_message) from _cpp_contract_exc
     # Optional firing trace (default OFF, byte-neutral): when RRP_BIND_CPP_TRACE
     # is set, append one line per SUCCESSFUL C++ derive so a gate can prove the
     # fast path actually fired in the real CUDA-graph e2e (the ext loads
@@ -1032,6 +1038,84 @@ def bind_host_derive_cpp(**kwargs) -> dict:
         except Exception:
             pass
     return _rrp_cpp_result
+
+
+def _compact_span_error_context(kwargs: dict) -> str:
+    """Build exact compact-span diagnostics after the C++ contract rejected.
+
+    This helper is intentionally reachable only from the exception path above;
+    keeping it out of ``_build_buffers`` preserves the successful bind cost.
+    """
+
+    def _sequence(name: str) -> tuple:
+        value = kwargs.get(name, ())
+        try:
+            return tuple(value)
+        except TypeError:
+            return tuple()
+
+    batch_size = int(kwargs.get("batch_size", 0))
+    page_size = int(kwargs.get("page_size_i", 0))
+    capacity_pages = int(kwargs.get("compact_capacity_i", 0))
+    reserved_pages = int(kwargs.get("reserved_len", 0))
+    gen_count = int(kwargs.get("compact_gen_count", 0))
+    gen_stride_pages = reserved_pages // gen_count if gen_count > 0 else 0
+    ready = _sequence("compact_ready_by_batch")
+    slots = _sequence("slot_by_row")
+    valid_tokens = _sequence("compact_valid_tokens_by_row")
+    offsets = _sequence("compact_offset_tokens_by_row")
+    effective_k = _sequence("row_effective_k_by_row")
+    recent_first = _sequence("recent_first_page_by_row")
+    rows = []
+    for row in range(min(batch_size, len(ready))):
+        if not bool(ready[row]):
+            continue
+        slot = int(slots[row]) if row < len(slots) else None
+        valid = int(valid_tokens[row]) if row < len(valid_tokens) else None
+        offset = int(offsets[row]) if row < len(offsets) else None
+        offset_pages = (
+            offset // page_size
+            if offset is not None and page_size > 0
+            else None
+        )
+        offset_gen = (
+            int(gen_count > 1 and offset_pages >= gen_stride_pages)
+            if offset_pages is not None and gen_stride_pages > 0
+            else 0
+        )
+        expected_start = (
+            offset_gen * gen_stride_pages + slot * capacity_pages
+            if slot is not None
+            else None
+        )
+        rows.append(
+            {
+                "row": row,
+                "slot": slot,
+                "valid_tokens": valid,
+                "offset_tokens": offset,
+                "offset_pages": offset_pages,
+                "offset_gen": offset_gen,
+                "expected_start_page": expected_start,
+                "expected_end_page": (
+                    expected_start + capacity_pages
+                    if expected_start is not None
+                    else None
+                ),
+                "effective_k": (
+                    int(effective_k[row]) if row < len(effective_k) else None
+                ),
+                "recent_first_page": (
+                    int(recent_first[row]) if row < len(recent_first) else None
+                ),
+            }
+        )
+    return (
+        "rrp_compact_geometry="
+        f"{{'page_size': {page_size}, 'capacity_pages': {capacity_pages}, "
+        f"'reserved_pages': {reserved_pages}, 'gen_count': {gen_count}, "
+        f"'gen_stride_pages': {gen_stride_pages}, 'rows': {rows!r}}}"
+    )
 
 
 def trace_cpp_fallthrough(exc=None):

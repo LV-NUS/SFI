@@ -1092,31 +1092,47 @@ def patch_compact_page_block_pool_methods(block_pool_cls: type[Any]) -> dict[str
         getattr(self, "kv_event_queue").append(AllBlocksCleared())
 
     def _reset_sparse_completed_request_run() -> None:
-        try:
-            import sys
+        import sys
 
-            controller = getattr(
-                sys.modules.get("patches.vllm_sparse_patch"),
-                "_GLOBAL_CONTROLLER",
-                None,
-            )
-            reset_run = getattr(controller, "reset_for_completed_request_run", None)
-            if callable(reset_run):
-                reset_run()
-        except Exception:
+        controller = getattr(
+            sys.modules.get("patches.vllm_sparse_patch"),
+            "_GLOBAL_CONTROLLER",
+            None,
+        )
+        if controller is None:
             return
+        reset_run = getattr(controller, "reset_for_completed_request_run", None)
+        if not callable(reset_run):
+            raise RuntimeError(
+                "sparse controller is missing completed-request reset owner"
+            )
+        # reset_prefix_cache is a lifecycle boundary. Continuing after an
+        # async sparse-state drain failure can expose stale leases to the next
+        # request run, so interface drift and reset failure both fail closed.
+        reset_run()
 
     def _patched_reset_prefix_cache(self: Any) -> bool:
-        _reset_sparse_completed_request_run()
         reserved_ids = _reserved_ids(self)
-        if not reserved_ids:
-            return originals["reset_prefix_cache"](self)
-
         num_used_blocks = int(getattr(self, "num_gpu_blocks")) - int(
             self.get_num_free_blocks()
         )
+        # Native BlockPool reset is conditional. Check that read-only boundary
+        # before clearing request-local sparse state; otherwise a failed reset
+        # leaves live native ownership paired with an empty sparse controller.
         if num_used_blocks != 1 + len(reserved_ids):
             return False
+
+        _reset_sparse_completed_request_run()
+        if not reserved_ids:
+            # Keep the ordinary path owned by native vLLM after the shared
+            # eligibility preflight; do not duplicate its hash/map/metrics/event
+            # reset implementation here.
+            reset_result = originals["reset_prefix_cache"](self)
+            if reset_result is not True:
+                raise RuntimeError(
+                    "native reset_prefix_cache contradicted eligibility preflight"
+                )
+            return True
 
         cached_block_hash_to_block = getattr(self, "cached_block_hash_to_block", None)
         if cached_block_hash_to_block is not None:
@@ -1127,6 +1143,12 @@ def patch_compact_page_block_pool_methods(block_pool_cls: type[Any]) -> dict[str
         for block in getattr(self, "blocks"):
             if _block_id(block) not in reserved_ids:
                 block.reset_hash()
+        metrics_collector = getattr(self, "metrics_collector", None)
+        if metrics_collector:
+            # Parity with native BlockPool.reset_prefix_cache(): benchmark and
+            # RLHF reset boundaries must not retain prefix-cache metrics from
+            # the preceding request run.
+            metrics_collector.reset()
         _append_all_blocks_cleared_event(self)
         return True
 

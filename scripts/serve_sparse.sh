@@ -25,6 +25,36 @@ PYTHON="${PYTHON:?set PYTHON to the absolute vLLM environment interpreter}"
 PYTHON="$(realpath -e -- "${PYTHON}")"
 [[ "${PYTHON}" = /* && -x "${PYTHON}" ]] || die "PYTHON must be an absolute executable path"
 
+# Normalize the selector coefficient before any CUDA probe or artifact
+# creation.  Passing it as argv keeps arbitrary shell text out of the JSON
+# heredoc; the selected runtime interpreter is the single parser authority.
+GAMMA_RAW="${GAMMA-0}"
+GAMMA_NORMALIZED="$(
+  "${PYTHON}" -I - "${SFI_ROOT}" "${GAMMA_RAW}" <<'PY'
+import json
+import sys
+
+sys.path.insert(0, sys.argv[1])
+from hybrid_selectors.alpha_fair_selector import normalize_cuda_float32_gamma
+
+raw = sys.argv[2]
+try:
+    value = json.loads(raw)
+except (json.JSONDecodeError, ValueError) as exc:
+    raise SystemExit(
+        "GAMMA must be a finite non-negative JSON number representable as CUDA float32"
+    ) from exc
+try:
+    effective = normalize_cuda_float32_gamma(value)
+except (TypeError, ValueError) as exc:
+    raise SystemExit(
+        "GAMMA must be a finite non-negative JSON number representable as CUDA float32"
+    ) from exc
+print(json.dumps(effective, allow_nan=False))
+PY
+)" || die "invalid GAMMA=${GAMMA_RAW}"
+GAMMA="${GAMMA_NORMALIZED}"
+
 # Bind locally by default.  Hostnames other than localhost are rejected to
 # avoid DNS-dependent launch identities; a normalized IPv4 literal is stable
 # in the manifest and in the live-command proof.
@@ -104,7 +134,7 @@ case "${REQUESTED_CUDA_ARCH}" in
     die "SFI_CUDA_ARCH must be auto, sm80, sm90 or sm100: ${REQUESTED_CUDA_ARCH}"
     ;;
 esac
-CUDA_CAPABILITIES="$({
+CUDA_CAPABILITIES="$(
   CUDA_VISIBLE_DEVICES="${GPU_DEVICES}" "${PYTHON}" -I -c '
 import sys
 import torch
@@ -125,7 +155,7 @@ for logical_rank in range(expected):
     capabilities.append(f"{major}.{minor}")
 print(",".join(capabilities))
 ' "${#GPU_IDS[@]}"
-} 2>&1)" || die "CUDA capability detection failed: ${CUDA_CAPABILITIES}"
+)" || die "CUDA capability detection failed: ${CUDA_CAPABILITIES}"
 
 IFS=',' read -r -a CUDA_CAPABILITY_LIST <<< "${CUDA_CAPABILITIES}"
 (( ${#CUDA_CAPABILITY_LIST[@]} == ${#GPU_IDS[@]} )) || \
@@ -166,6 +196,27 @@ case "${CUDA_ARCH}" in
     FLASH_ATTN_VERSION=4
     ;;
 esac
+
+FA_ROOT="$(realpath -ms -- "${VLLM_SPARSE_FA3_UPSTREAM_ROOT:-${SFI_ROOT}/third_party_upstreams/vllm-project-flash-attention}")"
+CUDA_TOOLCHAIN_RESOLVER="${SFI_ROOT}/scripts/resolve_flash_attention_toolchain.py"
+BUILD_PROVENANCE_CHECKER="${SFI_ROOT}/scripts/check_flash_attention_build_provenance.py"
+[[ -f "${CUDA_TOOLCHAIN_RESOLVER}" ]] || \
+  die "CUDA toolchain resolver is missing: ${CUDA_TOOLCHAIN_RESOLVER}"
+[[ -f "${BUILD_PROVENANCE_CHECKER}" ]] || \
+  die "FlashAttention build-provenance checker is missing: ${BUILD_PROVENANCE_CHECKER}"
+if ! CUDA_TOOLCHAIN_EXPORTS="$(
+  "${PYTHON}" -I "${CUDA_TOOLCHAIN_RESOLVER}" \
+    --sfi-root "${SFI_ROOT}" \
+    --target "${FA_ROOT}" \
+    --architecture "${CUDA_ARCH}" \
+    --checker "${BUILD_PROVENANCE_CHECKER}"
+)"; then
+  echo "FAIL: FlashAttention CUDA toolchain preflight failed" >&2
+  exit 78
+fi
+eval "${CUDA_TOOLCHAIN_EXPORTS}"
+unset CUDA_TOOLCHAIN_EXPORTS
+echo "==> CUDA toolchain: home=${CUDA_HOME} compiler=${CUDACXX} release=${SFI_RUNNER_CUDA_COMPILER_RELEASE}"
 
 K_HEAD="${K_HEAD:-4096}"
 SLOTS="${SLOTS:-8}"
@@ -227,7 +278,6 @@ ROUTE_COUNTER_MMAP="${ARTIFACT_DIR}/route_counter.bin"
 MANIFEST="${ARTIFACT_DIR}/serve_manifest.json"
 MANIFEST_POINTER="${RUN_ROOT}/port-${PORT}.manifest"
 
-FA_ROOT="$(realpath -ms -- "${VLLM_SPARSE_FA3_UPSTREAM_ROOT:-${SFI_ROOT}/third_party_upstreams/vllm-project-flash-attention}")"
 FA3_INTERFACE="${FA_ROOT}/vllm_flash_attn/flash_attn_interface.py"
 [[ -f "${FA3_INTERFACE}" ]] || die "vendored FA3 interface is missing: ${FA3_INTERFACE}"
 if [[ "${ATTENTION_KERNEL}" == "fa3-native" ]]; then
@@ -309,6 +359,8 @@ else
 fi
 if [[ -n "${KVB:-}" ]]; then
   require_uint "KVB" "${KVB}"
+  KVB=$((10#${KVB}))
+  (( KVB > 0 )) || die "KVB must be positive"
   export VLLM_KV_CACHE_MEMORY_BYTES="${KVB}"
 fi
 
@@ -325,7 +377,7 @@ export VLLM_SPARSE_CONTROLLER_JSON="$(cat <<JSON
   "recent": ${RECENT},
   "refresh_interval": ${REFRESH_INTERVAL},
   "refresh_coalesce_window": 0,
-  "alpha_fair": {"k_head": ${K_HEAD}},
+  "alpha_fair": {"k_head": ${K_HEAD}, "gamma": ${GAMMA}},
   "prefill_last_n_query": 2,
   "one_shot_bootstrap_only": true,
   "continuous_producer_enabled": true,
@@ -339,19 +391,42 @@ export VLLM_SPARSE_CONTROLLER_JSON="$(cat <<JSON
 JSON
 )"
 
-# Validate the selected FlashAttention family and precompile the selectors once
-# in the exact interpreter/cache before spawning TP workers.
+# Validate the selected FlashAttention family and precompile the production
+# sparse extension closure once in the exact interpreter/cache before spawning
+# TP workers.  A ready server must not discover a required JIT build in its
+# first request.
 CUDA_VISIBLE_DEVICES="${GPU_DEVICES}" \
 EXPECTED_SELECTOR_SEMANTIC="${SELECTOR_SEMANTIC}" \
 EXPECTED_FLASH_ATTN_VERSION="${FLASH_ATTN_VERSION}" \
 EXPECTED_CUDA_ARCH="${CUDA_ARCH}" \
-EXPECTED_ATTENTION_KERNEL="${ATTENTION_KERNEL}" "${PYTHON}" - <<'PY'
+EXPECTED_ATTENTION_KERNEL="${ATTENTION_KERNEL}" "${PYTHON}" -I - "${SFI_ROOT}" <<'PY'
 import importlib.util
+import json
+import math
 import os
+import sys
+
+sys.path.insert(0, sys.argv[1])
+
+controller_config = json.loads(os.environ["VLLM_SPARSE_CONTROLLER_JSON"])
+alpha_fair = controller_config.get("alpha_fair")
+if not isinstance(alpha_fair, dict):
+    raise SystemExit("selector preflight requires alpha_fair config")
+effective_selector_gamma = alpha_fair.get("gamma")
+if type(effective_selector_gamma) not in (int, float):
+    raise SystemExit("selector preflight gamma must be a number")
+effective_selector_gamma = float(effective_selector_gamma)
+if not math.isfinite(effective_selector_gamma) or effective_selector_gamma < 0.0:
+    raise SystemExit("selector preflight gamma must be finite and non-negative")
 
 if importlib.util.find_spec("vllm.entrypoints.openai.api_server") is None:
     raise SystemExit("vLLM OpenAI server module is unavailable in selected PYTHON")
 from utils.bounds_kernel_ext import _require_ext as require_bounds
+from utils.bounds_prefill_kernel_ext import _require_ext as require_bounds_prefill
+from utils.fa_sparse_runtime_ext import _require_ext as require_fa_sparse
+from utils.req_meta_pack_ext import require_ext as require_req_meta_pack
+from utils.selector_batch_ext import _load_ext as load_selector_batch
+from utils.selector_log_s_ext import _require_ext as require_log_s
 from utils.selector_pipeline_ext import _require_ext as require_pipeline
 from patches.fa3_native.install import (
     load_vendored_flash_attn_bridge,
@@ -370,7 +445,18 @@ if resolved_fa != expected_fa:
     )
 
 require_bounds()
-pipeline = require_pipeline()
+require_bounds_prefill()
+require_fa_sparse(force=True)
+selector_batch = load_selector_batch()
+if selector_batch is None:
+    raise SystemExit("selector batch extension preflight failed")
+if effective_selector_gamma > 0.0:
+    from utils.selector_key_norms_ext import _require_ext as require_key_norms
+
+    require_key_norms(force=True)
+require_log_s(force=True)
+require_req_meta_pack()
+pipeline = require_pipeline(force=True)
 observed = int(pipeline.selector_pipeline_semantic_version())
 expected = int(os.environ["EXPECTED_SELECTOR_SEMANTIC"])
 if observed != expected:
@@ -422,7 +508,7 @@ PY
 "${PYTHON}" -I - \
   "${MANIFEST}" "${MANIFEST_POINTER}" "$$" "${HOST}" "${PORT}" \
   "${API_KEY_SOURCE}" "${MODEL}" "${SERVED_MODEL_ID}" "${MML}" "${RUN_NONCE}" \
-  "${RUN_SINCE}" "${PYTHON}" "${ARTIFACT_DIR}" "${SITE_LOG}" \
+  "${KVB:-}" "${RUN_SINCE}" "${PYTHON}" "${ARTIFACT_DIR}" "${SITE_LOG}" \
   "${REFRESH_PROFILE_LOG}" "${ROUTE_TRACE_LOG}" "${STEP_TRACE_LOG}" \
   "${ROUTE_COUNTER_MMAP}" \
   "${TP_SIZE}" "${SLOTS}" "${CAPTURE_SIZES_JSON}" "${SELECTOR_SEMANTIC}" \
@@ -445,6 +531,7 @@ import sys
     served_model_id,
     max_model_len,
     nonce,
+    kv_cache_memory_bytes,
     started_epoch,
     python,
     run_dir,
@@ -466,6 +553,8 @@ import sys
     flash_attn_version,
     flash_attn_root,
 ) = sys.argv[1:]
+controller_config = json.loads(os.environ["VLLM_SPARSE_CONTROLLER_JSON"])
+alpha_fair_config = controller_config["alpha_fair"]
 payload = {
     "schema": 4,
     "server_pid": int(server_pid),
@@ -475,6 +564,9 @@ payload = {
     "model_path": model_path,
     "served_model_id": served_model_id,
     "max_model_len": int(max_model_len),
+    "kv_cache_memory_bytes": (
+        int(kv_cache_memory_bytes) if kv_cache_memory_bytes else None
+    ),
     "run_nonce": nonce,
     "started_epoch": int(started_epoch),
     "python": os.path.realpath(python),
@@ -488,6 +580,8 @@ payload = {
     "slots": int(slots),
     "capture_sizes": json.loads(capture_sizes),
     "selector_semantic": int(selector_semantic),
+    "selector_k_head": int(alpha_fair_config["k_head"]),
+    "selector_gamma": float(alpha_fair_config["gamma"]),
     "torch_extensions_dir": extensions_dir,
     "gpu_devices": gpu_devices,
     "cuda_arch": cuda_arch,
@@ -537,6 +631,9 @@ SERVER_ARGS=(
 if [[ -n "${MAX_BATCHED_TOKENS:-}" ]]; then
   require_uint "MAX_BATCHED_TOKENS" "${MAX_BATCHED_TOKENS}"
   SERVER_ARGS+=(--max-num-batched-tokens "${MAX_BATCHED_TOKENS}")
+fi
+if [[ -n "${KVB:-}" ]]; then
+  SERVER_ARGS+=(--kv-cache-memory-bytes "${KVB}")
 fi
 
 # Keep an explicitly supplied secret out of the long-lived server environment;

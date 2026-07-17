@@ -587,7 +587,15 @@ def _cleanup_inactive_slots(state: LayerState, controller: Optional['VLLMSparseC
                 _gen_count = compact_gen_count()
                 _arena_pos = getattr(state, "compact_arena_pos", None)
                 _stride = int(getattr(state, "compact_stride_tokens", 0) or 0)
-                if _gen_count > 1 and _arena_pos is not None and _stride > 0:
+                _has_bound_page_residency = (
+                    getattr(state, "compact_page_residency", None) is not None
+                )
+                _arena_pos_ready = bool(
+                    isinstance(_arena_pos, torch.Tensor)
+                    and _arena_pos.dim() == 2
+                    and int(_arena_pos.numel()) > 0
+                )
+                if _gen_count > 1 and _arena_pos_ready and _stride > 0:
                     _gen_stride = int(_arena_pos.shape[1]) // int(_gen_count)
                     for _gen in range(int(_gen_count)):
                         _off = compact_slot_offset_tokens(
@@ -597,6 +605,11 @@ def _cleanup_inactive_slots(state: LayerState, controller: Optional['VLLMSparseC
                             gen_stride_tokens=_gen_stride,
                         )
                         _arena_pos.narrow(1, _off, _stride).fill_(-1)
+                elif _gen_count > 1 and _has_bound_page_residency:
+                    raise RuntimeError(
+                        "dual-gen compact page residency has no bound rank-2 "
+                        "compact_arena_pos during finished-slot cleanup"
+                    )
             # F10: 清零 compact 元数据，防止新请求复用 slot 时继承残留值
             if slot < len(state.compact_capacity):
                 state.compact_capacity[slot] = 0
@@ -1409,6 +1422,7 @@ class VLLMSparseController(
         self.request_states.clear()
         self._request_intent_tickets.clear()
         self._bootstrap_pending_request_ids.clear()
+        self._bootstrap_submission_boundary_pending_epoch_by_id.clear()
         # idle 周期边界：重置 global slot 相关状态，避免 slot 跨 idle 滞留。
         self._global_slot_allocator = GlobalSlotAllocator(
             capacity=self._global_slot_allocator_capacity()
@@ -1496,16 +1510,19 @@ class VLLMSparseController(
         self._lease_stats["pending"] = 0
 
         # [TOPK-GRAPH-IDLE-RESET 2026-07-11] idle 清环使 capture arena ptr
-        # 换代——selector topk graphs map 的旧键必死(key 编码 arena/槽容器
-        # data_ptr)。跨轮残留会顶满 population16 触发 clear-all 清库循环
-        # (旧 12 键+新 12 键>16;单轮判速 warmup 轮走 inline 臂 0 捕故未曾
-        # 显形,多轮 repeat/serve 空闲重入形态会)。整组重置=下轮从空 map
-        # 重捕。idle 边界必须排干当前流再丢 graphs+mempool 引用；同步失败
-        # 直接上抛，不能继续释放仍可能被 replay 使用的 graph 状态。
+        # 换代——selector topk graph 与 recurrence candidate 的旧 pointer key
+        # 均必死。整组重置=下轮从空 map 重建；idle 边界必须排干当前流再丢
+        # graphs+mempool 引用，同步失败直接上抛，不能释放仍可能在 replay 的
+        # graph 状态。
         _tkg_state = getattr(self, "_selector_topk_graph_state", None)
         if isinstance(_tkg_state, dict):
             torch.cuda.current_stream().synchronize()
             self._selector_topk_graph_state = None
+        _tkg_candidates = getattr(
+            self, "_selector_topk_graph_candidate_by_scope", None
+        )
+        if isinstance(_tkg_candidates, dict):
+            _tkg_candidates.clear()
 
         # 释放 controller 级缓冲
         self._selector_key_norms_all = None
@@ -1516,10 +1533,12 @@ class VLLMSparseController(
         self._selector_capture_scores_all = None
         self._selector_kv_lengths_all = None
         self._selector_log_f_denoms_all = None
-        self._selector_key_norms_delta_start_cpu = None
-        self._selector_key_norms_delta_end_cpu = None
-        self._selector_key_norms_delta_start_gpu = None
-        self._selector_key_norms_delta_end_gpu = None
+        _delta_carrier_pools = getattr(
+            self, "_selector_key_norms_delta_carrier_pools", None
+        )
+        if isinstance(_delta_carrier_pools, dict):
+            _delta_carrier_pools.clear()
+        self._selector_key_norms_delta_active_carrier = None
         self._selector_layer_index_cache_key = None
         self._selector_layer_index_cache_device = None
         self._selector_layer_index_cache_tensor = None
@@ -1912,6 +1931,36 @@ class VLLMSparseController(
         self,
         payload: SelectorBatchPayload,
     ) -> None:
+        # Prefill selector work may execute after the scheduler has rebound a
+        # physical slot.  Freeze the slot-to-request relation at submission;
+        # deferred consumers must never recover identity from mutable layer state.
+        slot_list = tuple(int(slot) for slot in payload.slot_list)
+        if payload.slot_req_ids is None:
+            batch_request_ids = getattr(payload.state, "batch_request_ids", None)
+            if batch_request_ids is None:
+                raise RuntimeError(
+                    "prefill capture enqueue requires state.batch_request_ids snapshot"
+                )
+            req_ids: List[str] = []
+            for slot in slot_list:
+                if slot < 0 or slot >= len(batch_request_ids):
+                    raise RuntimeError(
+                        "prefill capture enqueue slot index out of range: "
+                        f"slot={slot} batch={len(batch_request_ids)}"
+                    )
+                req_id = batch_request_ids[slot]
+                if req_id is None or _is_free_slot_id(req_id):
+                    raise RuntimeError(
+                        "prefill capture enqueue slot has no live submission request: "
+                        f"slot={slot}"
+                    )
+                req_ids.append(str(req_id))
+            payload.slot_req_ids = tuple(req_ids)
+        elif len(payload.slot_req_ids) != len(slot_list):
+            raise RuntimeError(
+                "prefill capture enqueue slot_req_ids/slot_list length mismatch: "
+                f"slot_req_ids={len(payload.slot_req_ids)} slot_list={len(slot_list)}"
+            )
         if self.step_prefill_epoch != self.step_context_epoch:
             self.step_prefill_epoch = self.step_context_epoch
             for buf_id, bucket in enumerate(self.step_prefill_chunk_payloads):
@@ -2240,6 +2289,10 @@ class VLLMSparseController(
             _invalidate_page_sparse_step_cache_truth(state)
             state._slot_row_map_key = None
         tracking.bootstrap_done = False
+        self._bootstrap_submission_boundary_pending_epoch_by_id.pop(
+            request_id,
+            None,
+        )
         # [A2-RESUME-TICKET-RESET 2026-07-11] resume=从头重算:抢占前的触发
         # 弹药(pending 票/sentence intent/lease 意图/post_bridge 追赶 due)
         # 描述的是被逐出的旧 decode 形态,对重算窗一律作废。重算窗内
@@ -2637,6 +2690,10 @@ class VLLMSparseController(
             self._pending_global_slot_releases.update(finished_set)
             for rid in finished_set:
                 self._bootstrap_pending_request_ids.discard(rid)
+                self._bootstrap_submission_boundary_pending_epoch_by_id.pop(
+                    rid,
+                    None,
+                )
                 self.request_states.pop(rid, None)
                 self._request_intent_tickets.pop(rid, None)
             self._active_step_snapshot = None
@@ -2765,6 +2822,7 @@ class VLLMSparseController(
         self.request_states.clear()
         self._request_intent_tickets.clear()
         self._bootstrap_pending_request_ids.clear()
+        self._bootstrap_submission_boundary_pending_epoch_by_id.clear()
         self._finished_req_ids_step = set()
         self._snapshot_finished_req_ids = set()
         self._finished_generation = 0
@@ -2811,6 +2869,22 @@ class VLLMSparseController(
         for idx in range(len(self._capture_ring_active_lease_by_buf)):
             self._capture_ring_active_lease_by_buf[idx] = None
         self._capture_ring_retired_events.clear()
+        # profile-time capture 发布物与本 engine 的 refresh stream 绑定。跨
+        # engine/KV-cache 边界不能只重建 stream 而保留 tape/plan/seal，否则
+        # 下一次 profile 会复用旧 stream identity 或跳过 prebuild。这里仅
+        # 失效发布状态；已分配的通用 scratch/arena 仍由 profile 按新几何复用。
+        self._capture_cohort_tape_state = None
+        self._capture_cohort_tape_report = None
+        self._capture_cohort_tape_lease_tracker = None
+        self._selector_log_f_r2_tiled_resources = {}
+        self._selector_log_f_r2_tiled_resource_seal = None
+        self._selector_log_f_r2_tiled_resource_prebuild_key = None
+        self._capture_kv_max_bucket = 0
+        self._capture_last_n_bucket = 0
+        self._capture_rows_bucket = 0
+        self._capture_tiled_postprocess_resource_report = None
+        self._capture_prebuilt = False
+        self._capture_ownership_plan = None
         self.refresh_stream = None
         self._refresh_stream_device = None
         self.chunk_ready_evt = []
@@ -2875,10 +2949,12 @@ class VLLMSparseController(
         self._selector_key_norms_shape = None
         self._selector_capture_scores_all = None
         self._selector_kv_lengths_all = None
-        self._selector_key_norms_delta_start_cpu = None
-        self._selector_key_norms_delta_end_cpu = None
-        self._selector_key_norms_delta_start_gpu = None
-        self._selector_key_norms_delta_end_gpu = None
+        _delta_carrier_pools = getattr(
+            self, "_selector_key_norms_delta_carrier_pools", None
+        )
+        if isinstance(_delta_carrier_pools, dict):
+            _delta_carrier_pools.clear()
+        self._selector_key_norms_delta_active_carrier = None
         self._selector_layer_index_cache_key = None
         self._selector_layer_index_cache_device = None
         self._selector_layer_index_cache_tensor = None
@@ -3175,6 +3251,10 @@ class VLLMSparseController(
         self._step_global_slot_map = {}
         for rid in pending_new:
             self._bootstrap_pending_request_ids.discard(rid)
+            self._bootstrap_submission_boundary_pending_epoch_by_id.pop(
+                rid,
+                None,
+            )
             if rid in self.request_states:
                 del self.request_states[rid]
             if rid in self._request_intent_tickets:
