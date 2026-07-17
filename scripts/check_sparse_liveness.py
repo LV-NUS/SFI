@@ -219,6 +219,14 @@ def main() -> int:
         action="store_true",
         help="已知长请求中所有非 refresh 的 mature decode 行都必须 compact",
     )
+    ap.add_argument(
+        "--require-mixed-prefill-decode",
+        action="store_true",
+        help=(
+            "要求至少一个 TP 完整一致的 step 同时包含 prefill/decode，"
+            "且 row policy 同时包含 compact/native"
+        ),
+    )
     ap.add_argument("--phase", default="run", help="输出中使用的评测相位标签")
     args = ap.parse_args()
 
@@ -294,7 +302,9 @@ def main() -> int:
     )
     mmap_ok = _r0_check(args.route_counter_mmap, "route counter mmap", False)
     require_step_trace = bool(
-        args.reject_request_fallback or args.require_mature_decode_compact
+        args.reject_request_fallback
+        or args.require_mature_decode_compact
+        or args.require_mixed_prefill_decode
     )
     step_trace_ok = _r0_check(
         args.step_trace,
@@ -532,6 +542,10 @@ def main() -> int:
         tp_parity_mismatch_count = 0
         tp_duplicate_event_count = 0
         tp_missing_field_count = 0
+        mixed_phase_step_tokens: set[int] = set()
+        mixed_compact_step_tokens: set[int] = set()
+        mixed_contract_malformed_count = 0
+        mixed_contract_malformed_samples: list[str] = []
         vector_fields = (
             "req_ids",
             "is_prefill_by_row",
@@ -593,6 +607,46 @@ def main() -> int:
                     "R4: fa3_step_state 必须完整覆盖 batch_size 且行向量等长"
                 )
                 continue
+            if args.require_mixed_prefill_decode:
+                prefill_flags = vectors["is_prefill_by_row"]
+                compact_flags = vectors["use_compact_by_row"]
+                raw_prefill_count = event.get("prefill_row_count")
+                raw_decode_count = event.get("decode_row_count")
+                identity_token = event.get("step_identity_token")
+                malformed_reason = ""
+                if (
+                    any(type(value) is not bool for value in prefill_flags)
+                    or any(type(value) is not bool for value in compact_flags)
+                ):
+                    malformed_reason = "phase/compact vector contains non-bool"
+                elif (
+                    type(raw_prefill_count) is not int
+                    or type(raw_decode_count) is not int
+                ):
+                    malformed_reason = "prefill/decode row counts are missing or non-int"
+                elif type(identity_token) is not int:
+                    malformed_reason = "step_identity_token is missing or non-int"
+                else:
+                    derived_prefill_count = sum(prefill_flags)
+                    derived_decode_count = rows - derived_prefill_count
+                    if (
+                        raw_prefill_count != derived_prefill_count
+                        or raw_decode_count != derived_decode_count
+                    ):
+                        malformed_reason = (
+                            "prefill/decode row counts disagree with row vectors"
+                        )
+                    elif derived_prefill_count > 0 and derived_decode_count > 0:
+                        mixed_phase_step_tokens.add(identity_token)
+                        if any(compact_flags) and not all(compact_flags):
+                            mixed_compact_step_tokens.add(identity_token)
+                if malformed_reason:
+                    mixed_contract_malformed_count += 1
+                    if len(mixed_contract_malformed_samples) < 8:
+                        mixed_contract_malformed_samples.append(
+                            f"pid={pid} reason={malformed_reason}"
+                        )
+                    continue
             tp_step_pids.add(pid)
             missing_parity = tuple(
                 field for field in tp_parity_fields if field not in event
@@ -830,8 +884,46 @@ def main() -> int:
                 "R5 TP step 语义一致性: single-rank run, "
                 f"observed_pids={sorted(tp_step_pids)}"
             )
+        if args.require_mixed_prefill_decode:
+            if expected_tp_ranks > 1:
+                complete_mixed_phase_tokens = {
+                    token
+                    for token in mixed_phase_step_tokens
+                    if token in tp_step_groups
+                    and len(tp_step_groups[token][2]) == expected_tp_ranks
+                }
+                complete_mixed_compact_tokens = {
+                    token
+                    for token in mixed_compact_step_tokens
+                    if token in tp_step_groups
+                    and len(tp_step_groups[token][2]) == expected_tp_ranks
+                }
+            else:
+                complete_mixed_phase_tokens = set(mixed_phase_step_tokens)
+                complete_mixed_compact_tokens = set(mixed_compact_step_tokens)
+            print(
+                "R6 mixed prefill/decode: "
+                f"phase_groups={len(complete_mixed_phase_tokens)} "
+                f"compact_native_groups={len(complete_mixed_compact_tokens)} "
+                f"malformed={mixed_contract_malformed_count}"
+            )
+            if mixed_contract_malformed_count:
+                fails.append(
+                    "R6: mixed step 合同字段损坏: "
+                    f"count={mixed_contract_malformed_count} "
+                    f"sample={mixed_contract_malformed_samples}"
+                )
+            if not complete_mixed_phase_tokens:
+                fails.append(
+                    "R6: 没有 TP 完整一致的 prefill+decode mixed step"
+                )
+            if not complete_mixed_compact_tokens:
+                fails.append(
+                    "R6: 没有 TP 完整一致且同时包含 compact/native row policy "
+                    "的 prefill+decode mixed step"
+                )
     elif require_step_trace:
-        fails.append("R4: 请求了 fallback 判定但 request-level step trace 不可用")
+        fails.append("R4: 请求了 request-level 判定但 step trace 不可用")
 
     warns.append(
         "配置组合(slots≥max_num_seqs / dual-gen×residency / FORCE_*)由启动期"

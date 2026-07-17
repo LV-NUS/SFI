@@ -293,7 +293,14 @@ else
 fi
 
 SELECTOR_CACHE_ABI_KEY="$(
-  env -u PYTHONPATH "${PYTHON}" -I "${SFI_ROOT}/utils/selector_cache_identity.py"
+  env -u PYTHONPATH "${PYTHON}" -I - "${SFI_ROOT}" <<'PY'
+import sys
+
+sys.path.insert(0, sys.argv[1])
+from utils.selector_cache_identity import current_selector_cache_abi_key
+
+print(current_selector_cache_abi_key())
+PY
 )"
 [[ "${SELECTOR_CACHE_ABI_KEY}" =~ ^[0-9a-f]{16}$ ]] || \
   die "invalid selector cache ABI identity: ${SELECTOR_CACHE_ABI_KEY}"
@@ -333,6 +340,14 @@ export VLLM_TENSOR_PARALLEL_SIZE="${TP_SIZE}"
 export VLLM_WORKER_MULTIPROC_METHOD="spawn"
 export VLLM_SPARSE_ASYNC_REFRESH=1
 export VLLM_SPARSE_ONE_SHOT_ASYNC_BOOTSTRAP=1
+# Chunked prefill capture stamps one cohort across all TP ranks.  Its final
+# chunk has exactly one producer owner: the deferred request-local consumer.
+# Keep this production contract fixed in the launcher so a missing caller env
+# cannot split TP ranks between the immediate and deferred ownership paths.
+export VLLM_SPARSE_DEFER_BOOTSTRAP_PRODUCER=1
+export VLLM_SPARSE_BOOTSTRAP_BRIDGE_MAX_TOKENS=3
+export VLLM_SPARSE_BOOTSTRAP_BRIDGE_GRAPH_POLICY="evict_recapture_once"
+export VLLM_SPARSE_DEFERRED_PRODUCER_GROUPS_PER_STEP=-1
 export VLLM_SPARSE_FULL_CUDAGRAPH_REPLAY_REFRESH_BATCHED_FLUSH=1
 export VLLM_SPARSE_FULL_CUDAGRAPH_REPLAY_REFRESH_DEFER_TO_DEADLINE=1
 export VLLM_SPARSE_REFRESH_ENQUEUE_STAGGER=1

@@ -38,7 +38,7 @@
 # IMPORTANT: throughput numbers are only meaningful on an EXCLUSIVE, idle GPU.
 #
 # Success criteria (printed at the end):
-#   decode_tps reported; all requests decode to MAX_NEW tokens; zero dense
+#   all_decode_tps reported; every request reaches its declared output cap; zero dense
 #   fallbacks; every producer, semantic, and dense-reference gate is green.
 #   Any non-zero harness return code fails closed.
 # =============================================================================
@@ -140,6 +140,76 @@ for workload_integer in BS CTX KVB MML MAX_NEW REFRESH_INTERVAL BLOCKS K_HEAD; d
   fi
   printf -v "${workload_integer}" '%d' "$((10#${workload_value}))"
 done
+
+normalize_request_vector() {
+  local label="$1"
+  local raw="$2"
+  local expected_count="$3"
+  local default_value="$4"
+  local index value normalized="" maximum=0
+  if [[ -z "${raw}" ]]; then
+    for ((index = 0; index < expected_count; index += 1)); do
+      raw+="${raw:+,}${default_value}"
+    done
+  fi
+  if [[ ! "${raw}" =~ ^[1-9][0-9]*(,[1-9][0-9]*)*$ ]]; then
+    echo "FAIL: ${label} must be a comma-separated list of positive integers: ${raw}" >&2
+    exit 64
+  fi
+  IFS=',' read -r -a REQUEST_VECTOR_VALUES <<< "${raw}"
+  if (( ${#REQUEST_VECTOR_VALUES[@]} != expected_count )); then
+    echo "FAIL: ${label} must contain exactly BS=${expected_count} values, got ${#REQUEST_VECTOR_VALUES[@]}" >&2
+    exit 64
+  fi
+  for value in "${REQUEST_VECTOR_VALUES[@]}"; do
+    if (( 10#${value} <= 0 )); then
+      echo "FAIL: every ${label} value must be > 0: ${raw}" >&2
+      exit 64
+    fi
+    value=$((10#${value}))
+    normalized+="${normalized:+,}${value}"
+    if (( value > maximum )); then
+      maximum=${value}
+    fi
+  done
+  IFS=',' read -r -a REQUEST_VECTOR_VALUES <<< "${normalized}"
+  REQUEST_VECTOR_NORMALIZED="${normalized}"
+  REQUEST_VECTOR_MAXIMUM="${maximum}"
+}
+
+normalize_request_vector \
+  "REQUEST_CONTEXT_TOKENS" "${REQUEST_CONTEXT_TOKENS:-}" "${BS}" "${CTX}"
+REQUEST_CONTEXT_TOKENS="${REQUEST_VECTOR_NORMALIZED}"
+REQUEST_CONTEXT_TOKEN_VALUES=("${REQUEST_VECTOR_VALUES[@]}")
+REQUEST_CONTEXT_MAXIMUM="${REQUEST_VECTOR_MAXIMUM}"
+normalize_request_vector \
+  "REQUEST_MAX_NEW_TOKENS" "${REQUEST_MAX_NEW_TOKENS:-}" "${BS}" "${MAX_NEW}"
+REQUEST_MAX_NEW_TOKENS="${REQUEST_VECTOR_NORMALIZED}"
+REQUEST_MAX_NEW_TOKEN_VALUES=("${REQUEST_VECTOR_VALUES[@]}")
+REQUEST_MAX_NEW_MAXIMUM="${REQUEST_VECTOR_MAXIMUM}"
+if (( REQUEST_CONTEXT_MAXIMUM != CTX )); then
+  echo "FAIL: max(REQUEST_CONTEXT_TOKENS)=${REQUEST_CONTEXT_MAXIMUM} must equal CTX=${CTX}" >&2
+  exit 64
+fi
+if (( REQUEST_MAX_NEW_MAXIMUM != MAX_NEW )); then
+  echo "FAIL: max(REQUEST_MAX_NEW_TOKENS)=${REQUEST_MAX_NEW_MAXIMUM} must equal MAX_NEW=${MAX_NEW}" >&2
+  exit 64
+fi
+MAX_REQUEST_SEQUENCE_TOKENS=0
+for ((request_index = 0; request_index < BS; request_index += 1)); do
+  request_sequence_tokens=$((
+    REQUEST_CONTEXT_TOKEN_VALUES[request_index]
+    + REQUEST_MAX_NEW_TOKEN_VALUES[request_index]
+    + CHAT_TEMPLATE_RESERVE_TOKENS
+  ))
+  if (( request_sequence_tokens > MAX_REQUEST_SEQUENCE_TOKENS )); then
+    MAX_REQUEST_SEQUENCE_TOKENS=${request_sequence_tokens}
+  fi
+done
+export REQUEST_CONTEXT_TOKENS
+export REQUEST_MAX_NEW_TOKENS
+export SFI_RUNNER_REQUEST_CONTEXT_TOKENS="${REQUEST_CONTEXT_TOKENS}"
+export SFI_RUNNER_REQUEST_MAX_NEW_TOKENS="${REQUEST_MAX_NEW_TOKENS}"
 # Throughput arms own one explicit engine scheduling policy.  This is not an
 # experimental env override: dense and sparse receive the same EngineArgs
 # value, and their instantiated scheduler configs are proved in artifacts.
@@ -158,9 +228,9 @@ done
 MAX_NUM_SEQS=$((10#${MAX_NUM_SEQS}))
 MAX_NUM_BATCHED_TOKENS=$((10#${MAX_NUM_BATCHED_TOKENS}))
 MAX_SEQ_LEN_TO_CAPTURE=$((10#${MAX_SEQ_LEN_TO_CAPTURE}))
-NEEDED_SEQUENCE_TOKENS=$((CTX + MAX_NEW + CHAT_TEMPLATE_RESERVE_TOKENS))
+NEEDED_SEQUENCE_TOKENS="${MAX_REQUEST_SEQUENCE_TOKENS}"
 if (( MAX_SEQ_LEN_TO_CAPTURE < NEEDED_SEQUENCE_TOKENS || MAX_SEQ_LEN_TO_CAPTURE > MML )); then
-  echo "FAIL: MAX_SEQ_LEN_TO_CAPTURE=${MAX_SEQ_LEN_TO_CAPTURE} must cover CTX+MAX_NEW+chat_reserve=${NEEDED_SEQUENCE_TOKENS} without exceeding MML=${MML}" >&2
+  echo "FAIL: MAX_SEQ_LEN_TO_CAPTURE=${MAX_SEQ_LEN_TO_CAPTURE} must cover max per-request context+output+chat_reserve=${NEEDED_SEQUENCE_TOKENS} without exceeding MML=${MML}" >&2
   exit 64
 fi
 if (( MAX_NUM_SEQS < BS )); then
@@ -218,6 +288,20 @@ if [[ "${TIER}" == "tp8x64k" ]]; then
       exit 64
     fi
   done
+  TP8_CONTEXT_VECTOR=""
+  TP8_MAX_NEW_VECTOR=""
+  for ((request_index = 0; request_index < BS; request_index += 1)); do
+    TP8_CONTEXT_VECTOR+="${TP8_CONTEXT_VECTOR:+,}64000"
+    TP8_MAX_NEW_VECTOR+="${TP8_MAX_NEW_VECTOR:+,}2048"
+  done
+  if [[ "${REQUEST_CONTEXT_TOKENS}" != "${TP8_CONTEXT_VECTOR}" ]]; then
+    echo "FAIL: tier=tp8x64k requires every REQUEST_CONTEXT_TOKENS value to equal 64000" >&2
+    exit 64
+  fi
+  if [[ "${REQUEST_MAX_NEW_TOKENS}" != "${TP8_MAX_NEW_VECTOR}" ]]; then
+    echo "FAIL: tier=tp8x64k requires every REQUEST_MAX_NEW_TOKENS value to equal 2048" >&2
+    exit 64
+  fi
   if [[ "${MODE}" == "sparse" && "${VLLM_SPARSE_COMPACT_DUAL_GEN:-1}" != "1" ]]; then
     echo "FAIL: sparse tier=tp8x64k requires VLLM_SPARSE_COMPACT_DUAL_GEN=1" >&2
     exit 64
@@ -386,53 +470,60 @@ export SFI_RUNNER_KV_TOKEN_BYTES_PER_RANK_REQUESTED="${MODEL_KV_PER_RANK_BYTES_P
 export SFI_RUNNER_KV_TOKEN_BYTES_PER_RANK_EFFECTIVE="${KV_TOKEN_BYTES}"
 export SFI_RUNNER_KV_TOKEN_BYTES_OVERRIDE_PRESENT="${KV_TOKEN_BYTES_OVERRIDE_PRESENT}"
 
-# --- Sparse KV-budget preflight (fail-closed; explicit override nonexact only) ---
+# --- Sparse KV-budget preflight (single fail-closed admission path) ---
 SFI_RUNNER_KV_PREFLIGHT_STATUS="not_applicable"
+SFI_RUNNER_KV_REQUIRED_TOKEN_BLOCKS=0
+SFI_RUNNER_KV_REQUIRED_TOKENS_PADDED=0
+SFI_RUNNER_KV_REQUIRED_BYTES=0
+SFI_RUNNER_KV_COMPACT_LEASE_BYTES=0
 if [[ "${MODE}" == "sparse" ]]; then
-  if [[ "${SFI_ALLOW_UNDERSIZED_KV:-0}" != "0" && "${SFI_ALLOW_UNDERSIZED_KV:-0}" != "1" ]]; then
-    echo "FAIL: SFI_ALLOW_UNDERSIZED_KV must be 0 or 1" >&2
-    exit 64
-  fi
-  if [[ "${TIER}" == "tp8x64k" && "${SFI_ALLOW_UNDERSIZED_KV:-0}" == "1" ]]; then
-    echo "FAIL: tier=tp8x64k forbids SFI_ALLOW_UNDERSIZED_KV=1" >&2
-    exit 64
-  fi
   GEN_COUNT=2
   if [[ "${VLLM_SPARSE_COMPACT_DUAL_GEN:-1}" == "0" ]]; then
     GEN_COUNT=1
   fi
   LEASE_BYTES=$((BS * BLOCKS * 16 * KV_TOKEN_BYTES * GEN_COUNT))
-  CAP_TOKENS_PER_REQ=$(((KVB - LEASE_BYTES) / (KV_TOKEN_BYTES * BS)))
-  NEED_TOKENS_PER_REQ=$((CTX + MAX_NEW + CHAT_TEMPLATE_RESERVE_TOKENS))
+  FULL_KV_REQUIRED_BLOCKS=0
+  for ((request_index = 0; request_index < BS; request_index += 1)); do
+    request_required_tokens=$((
+      REQUEST_CONTEXT_TOKEN_VALUES[request_index]
+      + REQUEST_MAX_NEW_TOKEN_VALUES[request_index]
+      + CHAT_TEMPLATE_RESERVE_TOKENS
+    ))
+    request_required_blocks=$(((request_required_tokens + 15) / 16))
+    FULL_KV_REQUIRED_BLOCKS=$((FULL_KV_REQUIRED_BLOCKS + request_required_blocks))
+  done
+  FULL_KV_REQUIRED_TOKENS_PADDED=$((FULL_KV_REQUIRED_BLOCKS * 16))
+  FULL_KV_REQUIRED_BYTES=$((FULL_KV_REQUIRED_TOKENS_PADDED * KV_TOKEN_BYTES))
+  TOTAL_KV_REQUIRED_BYTES=$((FULL_KV_REQUIRED_BYTES + LEASE_BYTES))
+  SFI_RUNNER_KV_REQUIRED_TOKEN_BLOCKS="${FULL_KV_REQUIRED_BLOCKS}"
+  SFI_RUNNER_KV_REQUIRED_TOKENS_PADDED="${FULL_KV_REQUIRED_TOKENS_PADDED}"
+  SFI_RUNNER_KV_REQUIRED_BYTES="${TOTAL_KV_REQUIRED_BYTES}"
+  SFI_RUNNER_KV_COMPACT_LEASE_BYTES="${LEASE_BYTES}"
   SFI_RUNNER_KV_PREFLIGHT_STATUS="passed"
-  if ((CAP_TOKENS_PER_REQ < NEED_TOKENS_PER_REQ)); then
-    KVB_SUGGEST_GIB=$(((NEED_TOKENS_PER_REQ * KV_TOKEN_BYTES * BS + LEASE_BYTES) / 1073741824 + 2))
-    if [[ "${SFI_ALLOW_UNDERSIZED_KV:-0}" == "1" ]]; then
-      SFI_RUNNER_KV_PREFLIGHT_STATUS="undersized_override"
-      KV_PREFLIGHT_VERDICT="WARNING: sparse KV pool is undersized; explicit SFI_ALLOW_UNDERSIZED_KV=1 override accepted."
-      KV_PREFLIGHT_ACTION="Continuing due to explicit override."
-    else
-      SFI_RUNNER_KV_PREFLIGHT_STATUS="failed"
-      KV_PREFLIGHT_VERDICT="FAIL: sparse KV pool too small for this shape."
-      KV_PREFLIGHT_ACTION="Refusing to launch; lower shape pressure or raise KVB."
-    fi
+  if ((KVB < TOTAL_KV_REQUIRED_BYTES)); then
+    KVB_SUGGEST_GIB=$(((TOTAL_KV_REQUIRED_BYTES + 1073741824 - 1) / 1073741824))
+    SFI_RUNNER_KV_PREFLIGHT_STATUS="failed"
     cat >&2 <<EOW
 ==============================================================================
-${KV_PREFLIGHT_VERDICT}
+FAIL: sparse KV pool too small for this shape.
 The pool must hold full KV + compact lease without scheduler serialization:
   compact lease      = ${BS} slots x ${BLOCKS} blocks x 16 x ${KV_TOKEN_BYTES} B x ${GEN_COUNT} gen = ${LEASE_BYTES} B
-  cap_tokens_per_req = (KVB - lease) / (${KV_TOKEN_BYTES} x ${BS}) = ${CAP_TOKENS_PER_REQ}
-  needed per request = CTX + MAX_NEW + ${CHAT_TEMPLATE_RESERVE_TOKENS} chat-template reserve = ${NEED_TOKENS_PER_REQ}
+  full KV blocks     = sum_i ceil((ctx_i + max_new_i + ${CHAT_TEMPLATE_RESERVE_TOKENS}) / 16) = ${FULL_KV_REQUIRED_BLOCKS}
+  full KV bytes      = ${FULL_KV_REQUIRED_BLOCKS} blocks x 16 x ${KV_TOKEN_BYTES} B = ${FULL_KV_REQUIRED_BYTES} B
+  total required     = full KV + compact lease = ${TOTAL_KV_REQUIRED_BYTES} B
 Fix: KVB >= ~${KVB_SUGGEST_GIB} GiB (KVB=$((KVB_SUGGEST_GIB * 1073741824))),
-or lower CTX/MAX_NEW/BS/BLOCKS. ${KV_PREFLIGHT_ACTION}
+or lower CTX/MAX_NEW/BS/BLOCKS. Refusing to launch.
 ==============================================================================
 EOW
-    if [[ "${SFI_ALLOW_UNDERSIZED_KV:-0}" != "1" ]]; then
-      exit 78
-    fi
+    exit 78
   fi
 fi
 export SFI_RUNNER_KV_PREFLIGHT_STATUS
+export SFI_RUNNER_KV_REQUIRED_TOKEN_BLOCKS
+export SFI_RUNNER_KV_REQUIRED_TOKENS_PADDED
+export SFI_RUNNER_KV_REQUIRED_BYTES
+export SFI_RUNNER_KV_COMPACT_LEASE_BYTES
+export SFI_RUNNER_MAX_REQUEST_SEQUENCE_TOKENS="${MAX_REQUEST_SEQUENCE_TOKENS}"
 
 EXPECTED_GIT_COMMIT="${SFI_EXPECTED_GIT_COMMIT:-}"
 if [[ -n "${EXPECTED_GIT_COMMIT}" && ! "${EXPECTED_GIT_COMMIT}" =~ ^[0-9a-f]{40}$ ]]; then
@@ -850,11 +941,12 @@ if [[ "${ATTENTION_KERNEL}" == "fa4-cute" ]]; then
 fi
 
 if [[ -n "${CORPUS:-}" ]]; then
-  echo "FAIL: explicit CORPUS is retired; release runs require the content-addressed v5 corpus cache" >&2
+  echo "FAIL: explicit CORPUS is retired; release runs require the content-addressed v6 vector corpus cache" >&2
   exit 64
 fi
 CORPUS_RESULT="$("${PY}" "${SFI_ROOT}/scripts/make_context_corpus.py" \
-  --model "${MODEL}" --segments "${BS}" --tokens-per-segment "${CTX}" \
+  --model "${MODEL}" --segments "${BS}" \
+  --tokens-per-segment-by-request "${REQUEST_CONTEXT_TOKENS}" \
   --cache-dir "${OUT}/context_corpus_cache")"
 CORPUS="$(printf '%s\n' "${CORPUS_RESULT}" | sed -n 's/^context_corpus_path=//p' | tail -1)"
 if [[ -z "${CORPUS}" || ! -f "${CORPUS}" ]]; then
@@ -868,7 +960,7 @@ CHAT_TEMPLATE_TSV="$({
     --model "${MODEL}" \
     --corpus "${CORPUS}" \
     --batch-size "${BS}" \
-    --context-tokens "${CTX}" \
+    --context-tokens-by-request "${REQUEST_CONTEXT_TOKENS}" \
     --reserve-tokens "${CHAT_TEMPLATE_RESERVE_TOKENS}" \
     --format tsv
 })" || {
@@ -895,7 +987,8 @@ PY
 })"
 CORPUS_MANIFEST_TSV="$({
   "${PY}" -I "${SFI_ROOT}/scripts/make_context_corpus.py" \
-    --model "${MODEL}" --segments "${BS}" --tokens-per-segment "${CTX}" \
+    --model "${MODEL}" --segments "${BS}" \
+    --tokens-per-segment-by-request "${REQUEST_CONTEXT_TOKENS}" \
     --validate "${CORPUS}" --format manifest-tsv
 })" || {
   echo "FAIL: cached corpus manifest is not release-semantic grade" >&2
@@ -923,9 +1016,11 @@ export SFI_RUNNER_TIER="${TIER}"
 export SFI_RUNNER_MODE="${MODE}"
 export SFI_RUNNER_BATCH_SIZE="${BS}"
 export SFI_RUNNER_CONTEXT_TOKENS="${CTX}"
+export SFI_RUNNER_REQUEST_CONTEXT_TOKENS="${REQUEST_CONTEXT_TOKENS}"
 export SFI_RUNNER_KV_CACHE_MEMORY_BYTES="${KVB}"
 export SFI_RUNNER_MAX_MODEL_LEN="${MML}"
 export SFI_RUNNER_MAX_NEW_TOKENS="${MAX_NEW}"
+export SFI_RUNNER_REQUEST_MAX_NEW_TOKENS="${REQUEST_MAX_NEW_TOKENS}"
 export SFI_RUNNER_MAX_NUM_SEQS="${MAX_NUM_SEQS}"
 export SFI_RUNNER_MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS}"
 export SFI_RUNNER_CHUNKED_PREFILL="${CHUNKED_PREFILL}"
@@ -951,7 +1046,7 @@ export SFI_RUNNER_CUSTOM_AR_DISABLED="${VLLM_SPARSE_FORCE_DISABLE_CUSTOM_AR:-0}"
 export VLLM_KV_CACHE_MEMORY_BYTES="${KVB}"   # pin the KV pool: SFI runtime state
                                              # lives OUTSIDE vLLM's util budget
 
-echo "==> ${MODE} ${TIER}: bs=${BS} ctx=${CTX} kv_pool=$((KVB/1024/1024/1024))GiB mml=${MML} max_new=${MAX_NEW}"
+echo "==> ${MODE} ${TIER}: bs=${BS} ctx_max=${CTX} request_ctx=${REQUEST_CONTEXT_TOKENS} kv_pool=$((KVB/1024/1024/1024))GiB mml=${MML} max_new=${MAX_NEW} request_max_new=${REQUEST_MAX_NEW_TOKENS}"
 echo "==> attention: arch=${CUDA_ARCH} capabilities=${CUDA_CAPABILITIES} kernel=${ATTENTION_KERNEL} backend=${ATTENTION_BACKEND} version=${FLASH_ATTN_VERSION} preflight=${ATTENTION_PREFLIGHT_DETAIL}"
 if [[ "${CUDA_ARCH}" != "sm80" ]]; then
   echo "==> note: ${TIER} defaults are A100-derived compatibility shapes, not tuned ${CUDA_ARCH} settings"
@@ -978,6 +1073,8 @@ PYTHONPATH="${FA_ROOT}:${SFI_ROOT}${PYTHONPATH:+:${PYTHONPATH}}" \
   --backend "${ATTENTION_BACKEND}" --full-cuda-graph --warmup 1 \
   --prompt "${CORPUS}" --split-context-prompts \
   --batch-size "${BS}" --max-new-tokens "${MAX_NEW}" --max-model-len "${MML}" \
+  --request-context-tokens "${REQUEST_CONTEXT_TOKENS}" \
+  --request-max-new-tokens "${REQUEST_MAX_NEW_TOKENS}" \
   --max-num-seqs "${MAX_NUM_SEQS}" \
   --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}" \
   --kv-cache-memory-bytes "${KVB}" \

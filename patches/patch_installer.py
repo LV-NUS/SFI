@@ -275,9 +275,9 @@ _FULL_CUDAGRAPH_REPLAY_CUDA_EVENT_ROWS: List[dict] = []
 _FULL_CUDAGRAPH_REPLAY_CUDA_EVENT_PATH = ""
 _FULL_CUDAGRAPH_REPLAY_CUDA_EVENT_REGISTERED = False
 _FA3_ROUTE_TRACE_LOG_CACHED = os.environ.get("VLLM_SPARSE_FA3_ROUTE_TRACE_LOG", "")
-# [TPX-D5] 裸名 VLLM_FA3_ROUTE_TRACE_LOG（prepare 步长取证）也是进程内不变开关。
+# [TPX-D5] prepare 步长取证与 FA3 trace writer 共享唯一规范开关；进程内不变。
 _FA3_ROUTE_TRACE_LOG_RAW_CACHED = bool(
-    str(os.environ.get("VLLM_FA3_ROUTE_TRACE_LOG", "")).strip()
+    str(os.environ.get("VLLM_SPARSE_FA3_ROUTE_TRACE_LOG", "")).strip()
 )
 _BOOTSTRAP_BRIDGE_GRAPH_POLICY_CACHED = os.environ.get(
     "VLLM_SPARSE_BOOTSTRAP_BRIDGE_GRAPH_POLICY",
@@ -3630,7 +3630,14 @@ def _patch_prepare_inputs() -> None:
                 # [TPX-D5] 取证开关进程内不变：生产走 import-time 缓存，
                 # pytest/显式动态档 live 读。
                 route_trace_enabled = (
-                    bool(str(os.environ.get("VLLM_FA3_ROUTE_TRACE_LOG", "")).strip())
+                    bool(
+                        str(
+                            os.environ.get(
+                                "VLLM_SPARSE_FA3_ROUTE_TRACE_LOG",
+                                "",
+                            )
+                        ).strip()
+                    )
                     if _DYNAMIC_ENV
                     else _FA3_ROUTE_TRACE_LOG_RAW_CACHED
                 )

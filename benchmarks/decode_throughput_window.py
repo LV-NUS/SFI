@@ -25,6 +25,41 @@ CUSTOM_ALL_REDUCE_RUNTIME_WORKER_EXTENSION = (
 )
 
 
+def collect_single_token_decode_step_proof(engine: object) -> dict[str, object]:
+    """Prove the aggregate all-decode boundary is one-token-per-request.
+
+    This is evaluated once after engine construction.  It keeps speculative
+    decoding or buffered multi-step output from invalidating the zero-overhead
+    ``new_tokens == batch_size`` measurement boundary.
+    """
+    llm_engine = getattr(engine, "llm_engine", None)
+    vllm_config = getattr(llm_engine, "vllm_config", None)
+    if vllm_config is None:
+        raise RuntimeError(
+            "E_DECODE_STEP_CONTRACT_UNAVAILABLE: vllm_config missing"
+        )
+    speculative_config = getattr(vllm_config, "speculative_config", None)
+    scheduler_config = getattr(vllm_config, "scheduler_config", None)
+    stream_interval = getattr(scheduler_config, "stream_interval", None)
+    if speculative_config is not None:
+        raise RuntimeError(
+            "E_DECODE_STEP_CONTRACT_SPECULATIVE: speculative decoding is "
+            "incompatible with the aggregate all-decode boundary"
+        )
+    if type(stream_interval) is not int or stream_interval != 1:
+        raise RuntimeError(
+            "E_DECODE_STEP_CONTRACT_STREAM_INTERVAL: expected 1, got "
+            f"{stream_interval!r}"
+        )
+    return {
+        "decode_step_contract_schema": "sfi.single_token_decode_step.v1",
+        "decode_step_contract_proof_passed": True,
+        "decode_step_speculative_config_present": False,
+        "decode_step_stream_interval": 1,
+        "decode_step_max_tokens_per_request": 1,
+    }
+
+
 @dataclass(frozen=True)
 class CustomAllReduceDecision:
     """The effective vLLM custom-all-reduce policy for one benchmark arm."""
@@ -426,7 +461,7 @@ def benchmark_child_identity(args: object) -> dict[str, object]:
 def _worker_engine_runtime_contract_state(
     worker: object,
     required_batch_size: int,
-    required_tokens_per_request: int,
+    required_tokens_by_request: list[int] | tuple[int, ...],
     compact_blocks_per_slot: int,
     compact_generation_count: int,
     expected_kv_bytes_per_token: int,
@@ -442,7 +477,6 @@ def _worker_engine_runtime_contract_state(
 
     integers = {
         "required_batch_size": required_batch_size,
-        "required_tokens_per_request": required_tokens_per_request,
         "compact_blocks_per_slot": compact_blocks_per_slot,
         "compact_generation_count": compact_generation_count,
         "expected_kv_bytes_per_token": expected_kv_bytes_per_token,
@@ -453,6 +487,19 @@ def _worker_engine_runtime_contract_state(
     if required_batch_size <= 0:
         raise RuntimeError(
             "E_ENGINE_RUNTIME_CONTRACT_INPUT: required_batch_size must be > 0"
+        )
+    if not isinstance(required_tokens_by_request, (list, tuple)):
+        raise RuntimeError(
+            "E_ENGINE_RUNTIME_CONTRACT_INPUT: "
+            "required_tokens_by_request must be a sequence"
+        )
+    required_tokens = tuple(required_tokens_by_request)
+    if len(required_tokens) != required_batch_size or any(
+        type(value) is not int or value <= 0 for value in required_tokens
+    ):
+        raise RuntimeError(
+            "E_ENGINE_RUNTIME_CONTRACT_INPUT: required_tokens_by_request="
+            f"{required_tokens!r}:required_batch_size={required_batch_size}"
         )
 
     tp_group = get_tp_group()
@@ -613,13 +660,14 @@ def _worker_engine_runtime_contract_state(
         and allocated_bytes % allocated_token_slots == 0
         else 0
     )
-    required_workload_tokens = required_batch_size * required_tokens_per_request
-    required_blocks_per_request = (
-        (required_tokens_per_request + block_size - 1) // block_size
+    required_workload_tokens = sum(required_tokens)
+    required_blocks_by_request = tuple(
+        (value + block_size - 1) // block_size
         if block_size > 0
         else 0
+        for value in required_tokens
     )
-    required_workload_blocks = required_batch_size * required_blocks_per_request
+    required_workload_blocks = sum(required_blocks_by_request)
     compact_lease_blocks = (
         required_batch_size
         * compact_blocks_per_slot
@@ -705,9 +753,9 @@ def _worker_engine_runtime_contract_state(
         "ordinary_blocks": ordinary_blocks,
         "schedulable_tokens": schedulable_tokens,
         "required_batch_size": required_batch_size,
-        "required_tokens_per_request": required_tokens_per_request,
+        "required_tokens_by_request": list(required_tokens),
         "required_workload_tokens": required_workload_tokens,
-        "required_blocks_per_request": required_blocks_per_request,
+        "required_blocks_by_request": list(required_blocks_by_request),
         "required_workload_blocks": required_workload_blocks,
         "required_total_blocks": required_total_blocks,
         "required_total_tokens": required_total_tokens,
@@ -777,9 +825,11 @@ def _worker_engine_runtime_contract_state(
         "kv_cache_null_block_count": null_block_count,
         "kv_cache_ordinary_blocks": ordinary_blocks,
         "kv_cache_required_batch_size": required_batch_size,
-        "kv_cache_required_tokens_per_request": required_tokens_per_request,
+        "kv_cache_required_tokens_by_request": list(required_tokens),
         "kv_cache_required_workload_tokens": required_workload_tokens,
-        "kv_cache_required_blocks_per_request": required_blocks_per_request,
+        "kv_cache_required_blocks_by_request": list(
+            required_blocks_by_request
+        ),
         "kv_cache_required_workload_blocks": required_workload_blocks,
         "kv_cache_compact_blocks_per_slot": compact_blocks_per_slot,
         "kv_cache_compact_generation_count": compact_generation_count,
@@ -809,7 +859,7 @@ class CustomAllReduceRuntimeWorkerExtension:
     def sfi_engine_runtime_contract_state(
         self,
         required_batch_size: int,
-        required_tokens_per_request: int,
+        required_tokens_by_request: list[int],
         compact_blocks_per_slot: int,
         compact_generation_count: int,
         expected_kv_bytes_per_token: int,
@@ -817,7 +867,7 @@ class CustomAllReduceRuntimeWorkerExtension:
         return _worker_engine_runtime_contract_state(
             self,
             required_batch_size,
-            required_tokens_per_request,
+            required_tokens_by_request,
             compact_blocks_per_slot,
             compact_generation_count,
             expected_kv_bytes_per_token,
@@ -1247,7 +1297,7 @@ def collect_engine_runtime_contract_proof(
     *,
     tensor_parallel_size: int,
     required_batch_size: int,
-    required_tokens_per_request: int,
+    required_tokens_by_request: list[int] | tuple[int, ...],
     compact_blocks_per_slot: int,
     compact_generation_count: int,
     expected_kv_bytes_per_token: int,
@@ -1266,6 +1316,14 @@ def collect_engine_runtime_contract_proof(
             "E_ENGINE_RUNTIME_CONTRACT_TP_SIZE: "
             f"tensor_parallel_size={tp_size}"
         )
+    required_tokens = tuple(required_tokens_by_request)
+    if len(required_tokens) != int(required_batch_size) or any(
+        type(value) is not int or value <= 0 for value in required_tokens
+    ):
+        raise RuntimeError(
+            "E_ENGINE_RUNTIME_CONTRACT_INPUT: required_tokens_by_request="
+            f"{required_tokens!r}:required_batch_size={required_batch_size}"
+        )
     collective_rpc = getattr(engine, "collective_rpc", None)
     if not callable(collective_rpc):
         raise RuntimeError(
@@ -1278,7 +1336,7 @@ def collect_engine_runtime_contract_proof(
             timeout=60.0,
             args=(
                 int(required_batch_size),
-                int(required_tokens_per_request),
+                list(required_tokens),
                 int(compact_blocks_per_slot),
                 int(compact_generation_count),
                 int(expected_kv_bytes_per_token),
@@ -1350,7 +1408,6 @@ def collect_engine_runtime_contract_proof(
 
         numeric_expectations = {
             "kv_cache_required_batch_size": required_batch_size,
-            "kv_cache_required_tokens_per_request": required_tokens_per_request,
             "kv_cache_compact_blocks_per_slot": compact_blocks_per_slot,
             "kv_cache_compact_generation_count": compact_generation_count,
             "kv_cache_expected_bytes_per_token": expected_kv_bytes_per_token,
@@ -1360,6 +1417,14 @@ def collect_engine_runtime_contract_proof(
                 errors.append(
                     f"{rank_prefix}.{key}={record.get(key)!r}:expected={expected}"
                 )
+        if record.get("kv_cache_required_tokens_by_request") != list(
+            required_tokens
+        ):
+            errors.append(
+                f"{rank_prefix}.kv_cache_required_tokens_by_request="
+                f"{record.get('kv_cache_required_tokens_by_request')!r}:"
+                f"expected={list(required_tokens)!r}"
+            )
         if record.get("kv_cache_config_present") is not True:
             errors.append(f"{rank_prefix}.kv_cache_config_missing")
         if record.get("kv_cache_group_count") != 1:
@@ -1379,13 +1444,27 @@ def collect_engine_runtime_contract_proof(
             "kv_cache_schedulable_tokens",
             "kv_cache_tensor_count",
             "kv_cache_runner_tensor_count",
-            "kv_cache_required_blocks_per_request",
             "kv_cache_required_workload_blocks",
             "kv_cache_required_total_blocks",
         ):
             value = record.get(key)
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 errors.append(f"{rank_prefix}.{key}={value!r}")
+        required_blocks_by_request = record.get(
+            "kv_cache_required_blocks_by_request"
+        )
+        if (
+            not isinstance(required_blocks_by_request, list)
+            or len(required_blocks_by_request) != int(required_batch_size)
+            or any(
+                type(value) is not int or value <= 0
+                for value in required_blocks_by_request
+            )
+        ):
+            errors.append(
+                f"{rank_prefix}.kv_cache_required_blocks_by_request="
+                f"{required_blocks_by_request!r}"
+            )
         actual_bytes_per_token = record.get("kv_cache_actual_bytes_per_token")
         if actual_bytes_per_token != expected_kv_bytes_per_token:
             errors.append(
@@ -1581,8 +1660,8 @@ def collect_engine_runtime_contract_proof(
         "engine_runtime_kv_ordinary_blocks": reference.get(
             "kv_cache_ordinary_blocks"
         ),
-        "engine_runtime_kv_required_blocks_per_request": reference.get(
-            "kv_cache_required_blocks_per_request"
+        "engine_runtime_kv_required_blocks_by_request": reference.get(
+            "kv_cache_required_blocks_by_request"
         ),
         "engine_runtime_kv_required_workload_blocks": reference.get(
             "kv_cache_required_workload_blocks"
@@ -1846,7 +1925,7 @@ class DecodeWindowMeter:
     """Measure decode throughput in the window [first_emit_ts, last_emit_ts].
 
     When *batch_size* is provided, an additional **all-decode window** is
-    tracked: it starts from the first step where ``new_tokens >= batch_size``
+    tracked: it starts from the first step where ``new_tokens == batch_size``
     (i.e. all requests have entered decode) and ends at the last emit.  This
     avoids counting the slow prefill-interleaved steps that occur when
     different-length prompts finish chunked prefill at different times.
@@ -1929,17 +2008,25 @@ class DecodeWindowMeter:
     def finalize_all_decode(self) -> Tuple[float, int, float, int]:
         """Return (elapsed_s, tokens, tok_per_s, steps) for the all-decode window.
 
-        Falls back to the full window if batch_size was not set or all-decode
-        was never entered.
+        The all-decode window is a strict measurement contract.  Returning the
+        ordinary first-emit window here would silently mix chunked prefill into
+        the reported throughput, so a run that never reaches the boundary is
+        invalid instead of having a fallback value.
         """
-        if self._ad_start_ts is not None and self.last_emit_ts is not None:
-            ad_elapsed = float(self.last_emit_ts - self._ad_start_ts)
-            ad_tokens = max(0, int(self.total_tokens) - int(self._ad_start_tokens))
-            ad_tps = float(ad_tokens) / float(ad_elapsed) if ad_elapsed > 0 else float("nan")
-            return ad_elapsed, ad_tokens, ad_tps, int(self._ad_steps)
-        # fallback: use the full first-emit window
-        elapsed, tokens, tps, _ = self.finalize()
-        return elapsed, tokens, tps, len(self.decode_step_durations_s)
+        if self._ad_start_ts is None or self.last_emit_ts is None:
+            raise RuntimeError(
+                "E_ALL_DECODE_WINDOW_NOT_ENTERED: no full-batch decode step "
+                "was observed"
+            )
+        ad_elapsed = float(self.last_emit_ts - self._ad_start_ts)
+        ad_tokens = max(0, int(self.total_tokens) - int(self._ad_start_tokens))
+        if ad_elapsed <= 0.0 or ad_tokens <= 0:
+            raise RuntimeError(
+                "E_ALL_DECODE_WINDOW_EMPTY: the full-batch boundary was "
+                "observed without a measurable later decode interval"
+            )
+        ad_tps = float(ad_tokens) / float(ad_elapsed)
+        return ad_elapsed, ad_tokens, ad_tps, int(self._ad_steps)
 
     def all_decode_contract(self) -> dict[str, object]:
         """Return strict full-batch measurement-window evidence."""
@@ -1949,7 +2036,6 @@ class DecodeWindowMeter:
             "all_decode_full_batch_steps": int(self._ad_full_batch_steps),
             "all_decode_partial_batch_steps": int(self._ad_partial_batch_steps),
             "all_decode_zero_token_steps": int(self._ad_zero_token_steps),
-            "all_decode_fallback_used": not entered,
         }
 
     @property

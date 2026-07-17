@@ -25,6 +25,7 @@ try:
         collect_custom_all_reduce_runtime_proof,
         collect_engine_core_block_pool_reservation_proof,
         collect_engine_runtime_contract_proof,
+        collect_single_token_decode_step_proof,
         benchmark_child_identity,
         count_new_tokens,
         pull_step_outputs_with_timing,
@@ -34,10 +35,14 @@ try:
         summarize_cudagraph_runtime_observer,
     )
     from benchmarks.prompt_batch_io import (
+        build_request_sampling_params,
         decoded_output_payload,
         load_prompt_batch,
         maybe_apply_chat_template,
         output_payload_from_generation,
+        parse_optional_exact_positive_int,
+        resolve_exact_positive_int_vector,
+        resolve_exact_request_context_tokens,
         resolved_generation_stop_token_ids,
     )
     from benchmarks.scheduler_contract import (
@@ -67,6 +72,7 @@ except ModuleNotFoundError:
         collect_custom_all_reduce_runtime_proof,
         collect_engine_core_block_pool_reservation_proof,
         collect_engine_runtime_contract_proof,
+        collect_single_token_decode_step_proof,
         benchmark_child_identity,
         count_new_tokens,
         pull_step_outputs_with_timing,
@@ -76,10 +82,14 @@ except ModuleNotFoundError:
         summarize_cudagraph_runtime_observer,
     )
     from prompt_batch_io import (  # type: ignore[no-redef]
+        build_request_sampling_params,
         decoded_output_payload,
         load_prompt_batch,
         maybe_apply_chat_template,
         output_payload_from_generation,
+        parse_optional_exact_positive_int,
+        resolve_exact_positive_int_vector,
+        resolve_exact_request_context_tokens,
         resolved_generation_stop_token_ids,
     )
     from scheduler_contract import (  # type: ignore[no-redef]
@@ -179,10 +189,46 @@ def _decode_run_config(
     prompt_count: int,
     custom_all_reduce_decision: CustomAllReduceDecision,
     custom_all_reduce_runtime_proof: dict[str, object],
+    decode_step_contract_proof: dict[str, object],
     engine_runtime_contract_proof: dict[str, object] | None = None,
     engine_scheduling_proof: dict[str, object] | None = None,
     child_identity: dict[str, object] | None = None,
 ) -> dict[str, object]:
+    request_max_new_tokens = getattr(
+        args, "request_max_new_tokens_resolved", None
+    )
+    if not isinstance(request_max_new_tokens, tuple):
+        raise RuntimeError(
+            "E_REQUEST_MAX_NEW_TOKENS_VECTOR: normalized vector missing"
+        )
+    request_max_new_tokens = tuple(
+        int(value) for value in request_max_new_tokens
+    )
+    if len(request_max_new_tokens) != int(prompt_count) or any(
+        value <= 0 for value in request_max_new_tokens
+    ):
+        raise RuntimeError(
+            "E_REQUEST_MAX_NEW_TOKENS_VECTOR: "
+            f"expected={prompt_count}:actual={request_max_new_tokens!r}"
+        )
+    request_context_tokens_raw = getattr(
+        args, "request_context_tokens_resolved", None
+    )
+    if not isinstance(request_context_tokens_raw, tuple):
+        raise RuntimeError(
+            "E_REQUEST_CONTEXT_TOKENS_VECTOR: normalized vector missing"
+        )
+    request_context_tokens = tuple(
+        int(value) for value in request_context_tokens_raw
+    )
+    if (
+        len(request_context_tokens) != int(prompt_count)
+        or any(value <= 0 for value in request_context_tokens)
+    ):
+        raise RuntimeError(
+            "E_REQUEST_CONTEXT_TOKENS_VECTOR: "
+            f"expected={prompt_count}:actual={request_context_tokens!r}"
+        )
     return {
         "runner": "run_dense_only.py",
         "model": str(args.model),
@@ -194,6 +240,8 @@ def _decode_run_config(
         "chat_template": bool(args.chat_template),
         "enable_thinking": bool(args.enable_thinking),
         "max_new_tokens": int(args.max_new_tokens),
+        "request_context_tokens": list(request_context_tokens),
+        "request_max_new_tokens": list(request_max_new_tokens),
         "respect_eos": bool(args.respect_eos),
         "ignore_eos": not bool(args.respect_eos),
         "measure_decode_latency": bool(args.measure_decode_latency),
@@ -215,6 +263,7 @@ def _decode_run_config(
         **(engine_scheduling_proof or {}),
         **custom_all_reduce_decision.as_dict(),
         **custom_all_reduce_runtime_proof,
+        **decode_step_contract_proof,
         **(engine_runtime_contract_proof or {}),
     }
 
@@ -449,7 +498,27 @@ def main() -> None:
         action="store_true",
         help="Treat each Context: segment as one request instead of repeating the full file.",
     )
+    parser.add_argument(
+        "--request-context-tokens",
+        type=str,
+        default=None,
+        help=(
+            "Optional comma-separated exact pre-chat-template token counts, "
+            "one positive integer per request. Values are proved against the "
+            "rows loaded from --prompt."
+        ),
+    )
     parser.add_argument("--max-new-tokens", type=int, default=64)
+    parser.add_argument(
+        "--request-max-new-tokens",
+        type=str,
+        default=None,
+        help=(
+            "Optional comma-separated output caps, one positive integer per "
+            "request. When omitted, --max-new-tokens is expanded once to the "
+            "whole batch."
+        ),
+    )
     parser.add_argument(
         "--respect-eos",
         action="store_true",
@@ -580,6 +649,30 @@ def main() -> None:
     if int(args.batch_size) <= 0:
         parser.error("--batch-size must be > 0")
     try:
+        context_scalar = parse_optional_exact_positive_int(
+            os.environ.get("SFI_RUNNER_CONTEXT_TOKENS"),
+            option_name="SFI_RUNNER_CONTEXT_TOKENS",
+        )
+        args.request_max_new_tokens_resolved = (
+            resolve_exact_positive_int_vector(
+                args.request_max_new_tokens,
+                request_count=int(args.batch_size),
+                option_name="--request-max-new-tokens",
+                homogeneous_value=int(args.max_new_tokens),
+            )
+        )
+        args.request_context_tokens_declared = (
+            resolve_exact_positive_int_vector(
+                args.request_context_tokens,
+                request_count=int(args.batch_size),
+                option_name="--request-context-tokens",
+                homogeneous_value=context_scalar,
+            )
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+    assert args.request_max_new_tokens_resolved is not None
+    try:
         validate_scheduler_graph_args(args)
     except ValueError as exc:
         parser.error(str(exc))
@@ -651,6 +744,7 @@ def main() -> None:
         engine_kwargs["profiler_config"] = profiler_config
     engine = LLM(**engine_kwargs)
     engine_shutdown = EngineShutdownGuard(engine)
+    decode_step_contract_proof = collect_single_token_decode_step_proof(engine)
     engine_scheduling_proof = _engine_scheduling_runtime_proof(
         engine,
         requested_mode=engine_scheduling_mode,
@@ -668,8 +762,37 @@ def main() -> None:
         decision=custom_all_reduce_decision,
         required_num_tokens=int(args.batch_size),
     )
+    prompt_path = Path(args.prompt)
+    if not prompt_path.is_absolute():
+        prompt_path = repo_root / prompt_path
+    raw_prompts = load_prompt_batch(
+        prompt_path,
+        batch_size=int(args.batch_size),
+        split_context_prompts=bool(args.split_context_prompts),
+    )
+    request_context_tokens = resolve_exact_request_context_tokens(
+        engine.get_tokenizer(),
+        raw_prompts,
+        declared=args.request_context_tokens_declared,
+    )
+    request_max_new_tokens = tuple(
+        int(value) for value in args.request_max_new_tokens_resolved
+    )
+    if len(request_max_new_tokens) != len(raw_prompts):
+        raise RuntimeError(
+            "E_REQUEST_MAX_NEW_TOKENS_COUNT: "
+            f"expected={len(raw_prompts)}:actual={len(request_max_new_tokens)}"
+        )
+    args.request_context_tokens_resolved = request_context_tokens
+    child_identity["request_context_tokens"] = list(request_context_tokens)
+    child_identity["request_max_new_tokens"] = list(request_max_new_tokens)
+    prompts = maybe_apply_chat_template(
+        engine,
+        raw_prompts,
+        use_chat_template=bool(args.chat_template),
+        enable_thinking=bool(args.enable_thinking),
+    )
     exact_runtime_required = os.environ.get("SFI_RUNNER_TIER", "") == "tp8x64k"
-    context_tokens = int(os.environ.get("SFI_RUNNER_CONTEXT_TOKENS", "0") or 0)
     chat_template_reserve_tokens = int(
         os.environ.get("SFI_RUNNER_CHAT_TEMPLATE_RESERVE_TOKENS", "0") or 0
     )
@@ -680,8 +803,7 @@ def main() -> None:
         or 0
     )
     if exact_runtime_required and (
-        context_tokens <= 0
-        or chat_template_reserve_tokens != 512
+        chat_template_reserve_tokens != 512
         or expected_kv_bytes_per_token <= 0
     ):
         raise RuntimeError(
@@ -691,12 +813,16 @@ def main() -> None:
         engine,
         tensor_parallel_size=int(engine_kwargs["tensor_parallel_size"]),
         required_batch_size=int(args.batch_size),
-        required_tokens_per_request=(
-            context_tokens
-            + int(args.max_new_tokens)
-            + chat_template_reserve_tokens
+        required_tokens_by_request=(
+            [
+                context_cap + output_cap + chat_template_reserve_tokens
+                for context_cap, output_cap in zip(
+                    request_context_tokens,
+                    request_max_new_tokens,
+                )
+            ]
             if exact_runtime_required
-            else 0
+            else []
         ),
         compact_blocks_per_slot=0,
         compact_generation_count=0,
@@ -722,29 +848,14 @@ def main() -> None:
         f"{custom_all_reduce_runtime_proof['custom_all_reduce_runtime_required_payload_bytes']}",
         flush=True,
     )
-    sp = SamplingParams(
-        temperature=0.0,
-        top_p=1.0,
-        max_tokens=int(args.max_new_tokens),
-        ignore_eos=not bool(args.respect_eos),
+    request_sampling_params = build_request_sampling_params(
+        SamplingParams,
+        request_max_new_tokens,
+        respect_eos=bool(args.respect_eos),
         # [C4-DETOKENIZE 2026-07-06] speed 路径只消费 token_ids（text 结束后
         # 统一重解码），关闭前端每步增量 detokenize；非测速分支直读
         # output.text，保持默认——分支限定（与 sparse runner 同款，配对公平）。
         detokenize=not bool(args.measure_decode_latency),
-    )
-    prompt_path = Path(args.prompt)
-    if not prompt_path.is_absolute():
-        prompt_path = repo_root / prompt_path
-    prompts = load_prompt_batch(
-        prompt_path,
-        batch_size=int(args.batch_size),
-        split_context_prompts=bool(args.split_context_prompts),
-    )
-    prompts = maybe_apply_chat_template(
-        engine,
-        prompts,
-        use_chat_template=bool(args.chat_template),
-        enable_thinking=bool(args.enable_thinking),
     )
     final_outputs: dict[str, object] = {}
 
@@ -767,8 +878,16 @@ def main() -> None:
         # Use cumulative outputs, track per-request token deltas.
         request_ids = [f"bench-{i}-{time.time_ns()}" for i in range(len(prompts))]
         t_add0 = time.perf_counter()
-        for rid, p in zip(request_ids, prompts):
-            engine.llm_engine.add_request(rid, p, sp)  # type: ignore[attr-defined]
+        for rid, prompt, sampling_params in zip(
+            request_ids,
+            prompts,
+            request_sampling_params,
+        ):
+            engine.llm_engine.add_request(  # type: ignore[attr-defined]
+                rid,
+                prompt,
+                sampling_params,
+            )
         t_add1 = time.perf_counter()
 
         prev_len: dict[str, int] = {}
@@ -877,6 +996,7 @@ def main() -> None:
                 )
         decode_elapsed, decode_tokens, _decode_tps, decode_step_durations_s = decode_meter.finalize()
         ad_elapsed_s, ad_tokens, ad_tps, ad_steps = decode_meter.finalize_all_decode()
+        all_decode_contract = decode_meter.all_decode_contract()
         first_emit_delay_s, post_decode_tail_s = decode_meter.boundary_delays(
             t_total0,
             t_total1,
@@ -886,7 +1006,7 @@ def main() -> None:
             "all_decode_tokens": int(ad_tokens),
             "all_decode_tok_per_s": float(ad_tps),
             "all_decode_steps": int(ad_steps),
-            **decode_meter.all_decode_contract(),
+            **all_decode_contract,
             "_all_decode_start_step_index": (
                 decode_meter.all_decode_start_step_index
             ),
@@ -938,7 +1058,7 @@ def main() -> None:
         for _ in range(max(0, int(args.warmup_runs))):
             _generate_with_engine_step()
     else:
-        engine.generate(prompts, sp)
+        engine.generate(prompts, request_sampling_params)
     final_outputs.clear()
     if bool(args.reset_prefix_cache):
         _reset_prefix_cache()
@@ -1007,6 +1127,7 @@ def main() -> None:
                 custom_all_reduce_runtime_proof=(
                     custom_all_reduce_runtime_proof
                 ),
+                decode_step_contract_proof=decode_step_contract_proof,
                 engine_runtime_contract_proof=engine_runtime_contract_proof,
                 child_identity=child_identity,
             )
@@ -1016,10 +1137,17 @@ def main() -> None:
                 "runner": run_config["runner"],
                 "batch_size": run_config["batch_size"],
                 "max_new_tokens": run_config["max_new_tokens"],
+                "request_context_tokens": run_config[
+                    "request_context_tokens"
+                ],
+                "request_max_new_tokens": run_config[
+                    "request_max_new_tokens"
+                ],
                 "split_context_prompts": run_config["split_context_prompts"],
                 "respect_eos": run_config["respect_eos"],
                 **custom_all_reduce_decision.as_dict(),
                 **custom_all_reduce_runtime_proof,
+                **decode_step_contract_proof,
                 **engine_runtime_contract_proof,
                 "run_config": run_config,
                 "out_tokens": int(out_tokens),
@@ -1063,7 +1191,7 @@ def main() -> None:
         profiling = maybe_start_vllm_torch_profile(engine)
         t0 = time.perf_counter()
         try:
-            out = engine.generate(prompts, sp)
+            out = engine.generate(prompts, request_sampling_params)
             t1 = time.perf_counter()
         finally:
             maybe_stop_vllm_torch_profile(engine, profiling)

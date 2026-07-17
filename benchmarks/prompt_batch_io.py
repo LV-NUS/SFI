@@ -1,7 +1,162 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
+
+
+_POSITIVE_DECIMAL = re.compile(r"[1-9][0-9]*")
+
+
+def parse_optional_exact_positive_int(
+    raw: str | None,
+    *,
+    option_name: str,
+) -> int | None:
+    """Parse one optional canonical positive scalar without silent coercion."""
+    if raw is None or raw == "":
+        return None
+    if not isinstance(raw, str) or _POSITIVE_DECIMAL.fullmatch(raw) is None:
+        raise ValueError(f"{option_name} must be a canonical positive integer")
+    return int(raw)
+
+
+def parse_exact_positive_int_vector(
+    raw: str,
+    *,
+    option_name: str,
+) -> tuple[int, ...]:
+    """Parse one canonical comma-separated positive-integer vector.
+
+    Empty elements, signs, zero, and non-canonical decimal spellings are
+    rejected instead of being silently normalized.  This keeps command-line
+    workload identity stable across the sparse and dense children.
+    """
+
+    if not isinstance(raw, str) or not raw:
+        raise ValueError(f"{option_name} must be a comma-separated positive vector")
+    values: list[int] = []
+    for index, part in enumerate(raw.split(",")):
+        if _POSITIVE_DECIMAL.fullmatch(part) is None:
+            raise ValueError(
+                f"{option_name}[{index}] must be a canonical positive integer: "
+                f"{part!r}"
+            )
+        values.append(int(part))
+    return tuple(values)
+
+
+def resolve_exact_positive_int_vector(
+    raw: str | None,
+    *,
+    request_count: int,
+    option_name: str,
+    homogeneous_value: int | None = None,
+) -> tuple[int, ...] | None:
+    """Resolve an exact per-request vector once, outside generation loops.
+
+    An explicit vector must have exactly one value per request.  The scalar is
+    the maximum envelope when a vector is present, or the homogeneous value
+    expanded once when the vector is omitted.  ``None`` is returned only when
+    neither representation was supplied; callers such as the context-token
+    proof may then derive the vector from the loaded rows.
+    """
+
+    count = int(request_count)
+    if count <= 0:
+        raise ValueError("request_count must be positive")
+    if raw is None:
+        if homogeneous_value is None:
+            return None
+        if (
+            isinstance(homogeneous_value, bool)
+            or not isinstance(homogeneous_value, int)
+            or homogeneous_value <= 0
+        ):
+            raise ValueError(
+                f"{option_name} homogeneous value must be a positive integer"
+            )
+        return (int(homogeneous_value),) * count
+    values = parse_exact_positive_int_vector(raw, option_name=option_name)
+    if len(values) != count:
+        raise ValueError(
+            f"{option_name} must contain exactly {count} values, got {len(values)}"
+        )
+    if homogeneous_value is not None:
+        if (
+            isinstance(homogeneous_value, bool)
+            or not isinstance(homogeneous_value, int)
+            or homogeneous_value <= 0
+        ):
+            raise ValueError(
+                f"{option_name} homogeneous value must be a positive integer"
+            )
+        if max(values) != int(homogeneous_value):
+            raise ValueError(
+                f"max({option_name}) must equal the scalar envelope "
+                f"{int(homogeneous_value)}, got {max(values)}"
+            )
+    return values
+
+
+def exact_prompt_token_lengths(
+    tokenizer: Any,
+    prompts: Iterable[str],
+) -> tuple[int, ...]:
+    """Return the exact pre-chat-template token count for every prompt row."""
+
+    encode = getattr(tokenizer, "encode", None)
+    if not callable(encode):
+        raise RuntimeError("E_REQUEST_CONTEXT_TOKENS: tokenizer.encode unavailable")
+    lengths = tuple(
+        len(encode(str(prompt), add_special_tokens=False)) for prompt in prompts
+    )
+    if not lengths or any(length <= 0 for length in lengths):
+        raise RuntimeError(
+            f"E_REQUEST_CONTEXT_TOKENS: non-positive prompt lengths {lengths!r}"
+        )
+    return lengths
+
+
+def resolve_exact_request_context_tokens(
+    tokenizer: Any,
+    prompts: Iterable[str],
+    *,
+    declared: tuple[int, ...] | None,
+) -> tuple[int, ...]:
+    """Prove an optional declared context vector against loaded prompt rows."""
+
+    actual = exact_prompt_token_lengths(tokenizer, prompts)
+    if declared is not None and tuple(declared) != actual:
+        raise RuntimeError(
+            "E_REQUEST_CONTEXT_TOKENS_MISMATCH: "
+            f"declared={tuple(declared)!r}:actual={actual!r}"
+        )
+    return actual
+
+
+def build_request_sampling_params(
+    sampling_params_factory: Callable[..., Any],
+    request_max_new_tokens: Iterable[int],
+    *,
+    respect_eos: bool,
+    detokenize: bool,
+) -> tuple[Any, ...]:
+    """Build one immutable request-parameter object per row before timing."""
+
+    caps = tuple(int(value) for value in request_max_new_tokens)
+    if not caps or any(value <= 0 for value in caps):
+        raise ValueError("request_max_new_tokens must be a non-empty positive vector")
+    return tuple(
+        sampling_params_factory(
+            temperature=0.0,
+            top_p=1.0,
+            max_tokens=cap,
+            ignore_eos=not bool(respect_eos),
+            detokenize=bool(detokenize),
+        )
+        for cap in caps
+    )
 
 
 def load_prompt_batch(

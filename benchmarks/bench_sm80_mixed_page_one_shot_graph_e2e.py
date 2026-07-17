@@ -383,12 +383,29 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "If omitted, legacy --iters is used as the output length."
         ),
     )
+    parser.add_argument(
+        "--request-max-new-tokens",
+        default="",
+        help=(
+            "Comma-separated per-request output caps. The vector must contain "
+            "exactly --batch-size positive integers; its maximum is the scalar "
+            "--max-new-tokens engine cap."
+        ),
+    )
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
     parser.add_argument("--python", default=DEFAULT_PYTHON)
     parser.add_argument("--fa3-upstream-root", default=DEFAULT_FA3_UPSTREAM_ROOT)
     parser.add_argument("--cuda-visible-devices", default="0")
     parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument(
+        "--request-context-tokens",
+        default="",
+        help=(
+            "Comma-separated exact pre-chat-template context lengths, one "
+            "positive integer per request."
+        ),
+    )
     parser.add_argument(
         "--max-num-seqs",
         type=int,
@@ -674,6 +691,76 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args.repeat_semantics = "legacy_alias_for_max_new_tokens"
     if args.batch_size <= 0:
         parser.error("--batch-size must be > 0")
+    request_context_raw = str(args.request_context_tokens or "").strip()
+    if not request_context_raw:
+        request_context_raw = str(
+            os.environ.get("REQUEST_CONTEXT_TOKENS", "")
+            or os.environ.get("SFI_RUNNER_REQUEST_CONTEXT_TOKENS", "")
+        ).strip()
+    if not request_context_raw:
+        scalar_context_raw = str(
+            os.environ.get("SFI_RUNNER_CONTEXT_TOKENS", "") or ""
+        ).strip()
+        if scalar_context_raw:
+            request_context_raw = ",".join(
+                [scalar_context_raw] * int(args.batch_size)
+            )
+    request_max_new_raw = str(args.request_max_new_tokens or "").strip()
+    if not request_max_new_raw:
+        request_max_new_raw = str(
+            os.environ.get("REQUEST_MAX_NEW_TOKENS", "")
+            or os.environ.get("SFI_RUNNER_REQUEST_MAX_NEW_TOKENS", "")
+        ).strip()
+    request_context_tokens = (
+        _parse_positive_request_vector(
+            parser,
+            request_context_raw,
+            option="--request-context-tokens",
+            expected_count=int(args.batch_size),
+        )
+        if request_context_raw
+        else []
+    )
+    request_max_new_tokens = (
+        _parse_positive_request_vector(
+            parser,
+            request_max_new_raw,
+            option="--request-max-new-tokens",
+            expected_count=int(args.batch_size),
+        )
+        if request_max_new_raw
+        else [effective_max_new_tokens] * int(args.batch_size)
+    )
+    request_maximum = max(request_max_new_tokens)
+    if request_maximum != effective_max_new_tokens:
+        if max_new_tokens_was_explicit or iters_was_explicit:
+            parser.error(
+                "max(--request-max-new-tokens) must equal the effective "
+                f"--max-new-tokens ({effective_max_new_tokens}), got "
+                f"{request_maximum}"
+            )
+        effective_max_new_tokens = request_maximum
+        args.iters = request_maximum
+        args.output_len = request_maximum
+        args.max_new_tokens = request_maximum
+        args.max_new_tokens_effective = request_maximum
+    scalar_context_raw = str(
+        os.environ.get("SFI_RUNNER_CONTEXT_TOKENS", "") or ""
+    ).strip()
+    if request_context_tokens and scalar_context_raw:
+        try:
+            scalar_context = int(scalar_context_raw)
+        except ValueError:
+            parser.error("SFI_RUNNER_CONTEXT_TOKENS must be a positive integer")
+        if scalar_context <= 0 or max(request_context_tokens) != scalar_context:
+            parser.error(
+                "max(--request-context-tokens) must equal "
+                "SFI_RUNNER_CONTEXT_TOKENS"
+            )
+    args.request_context_tokens_vector = request_context_tokens
+    args.request_max_new_tokens_vector = request_max_new_tokens
+    args.request_context_tokens = _request_vector_csv(request_context_tokens)
+    args.request_max_new_tokens = _request_vector_csv(request_max_new_tokens)
     try:
         validate_scheduler_graph_args(args)
     except ValueError as exc:
@@ -838,6 +925,45 @@ def _argv_has_option(argv: list[str], option: str) -> bool:
     return any(arg == option or arg.startswith(f"{option}=") for arg in argv)
 
 
+def _parse_positive_request_vector(
+    parser: argparse.ArgumentParser,
+    raw: str,
+    *,
+    option: str,
+    expected_count: int,
+) -> list[int]:
+    """Parse one exact request vector; reject ambiguous CSV spellings."""
+    if not re.fullmatch(r"[1-9][0-9]*(?:,[1-9][0-9]*)*", raw):
+        parser.error(
+            f"{option} must be a comma-separated list of positive integers"
+        )
+    values = [int(value) for value in raw.split(",")]
+    if len(values) != int(expected_count):
+        parser.error(
+            f"{option} must contain exactly --batch-size={expected_count} "
+            f"values, got {len(values)}"
+        )
+    return values
+
+
+def _request_vector_csv(values: list[int]) -> str:
+    return ",".join(str(int(value)) for value in values)
+
+
+def _request_context_tokens(args: argparse.Namespace) -> list[int]:
+    values = getattr(args, "request_context_tokens_vector", None)
+    if isinstance(values, list):
+        return [int(value) for value in values]
+    return []
+
+
+def _request_max_new_tokens(args: argparse.Namespace) -> list[int]:
+    values = getattr(args, "request_max_new_tokens_vector", None)
+    if isinstance(values, list) and values:
+        return [int(value) for value in values]
+    return [_effective_max_new_tokens(args)] * int(args.batch_size)
+
+
 def _effective_max_new_tokens(args: argparse.Namespace) -> int:
     value = getattr(args, "max_new_tokens_effective", None)
     if value is None:
@@ -998,6 +1124,8 @@ def _phase2_controller_payload(args: argparse.Namespace) -> dict[str, object]:
 def _workload_plan_config_from_args(args: argparse.Namespace) -> dict[str, object]:
     return {
         "batch_size": int(args.batch_size),
+        "request_context_tokens": _request_context_tokens(args),
+        "request_max_new_tokens": _request_max_new_tokens(args),
         "max_new_tokens": int(_effective_max_new_tokens(args)),
         "prefill_last_n_query": int(args.prefill_last_n),
         "refresh_interval": int(args.refresh_interval),
@@ -1441,6 +1569,7 @@ def _build_phase2_command(
         outputs_path=outputs_path,
     )
     _append_scheduler_graph_child_args(command, args)
+    _append_request_vector_child_args(command, args)
     command.extend(["--scheduling-mode", str(args.scheduling_mode)])
     command.append("--collect-cudagraph-runtime-proof")
     _append_deferred_bridge_child_args(command, args)
@@ -1476,6 +1605,23 @@ def _append_scheduler_graph_child_args(
             str(contract["chunked_prefill"]),
             "--max-seq-len-to-capture",
             str(contract["max_seq_len_to_capture"]),
+        ]
+    )
+
+
+def _append_request_vector_child_args(
+    command: list[str],
+    args: argparse.Namespace,
+) -> None:
+    context_tokens = _request_context_tokens(args)
+    if context_tokens:
+        command.extend(
+            ["--request-context-tokens", _request_vector_csv(context_tokens)]
+        )
+    command.extend(
+        [
+            "--request-max-new-tokens",
+            _request_vector_csv(_request_max_new_tokens(args)),
         ]
     )
 
@@ -1517,6 +1663,7 @@ def _build_sparse_speed_command(
         outputs_path=outputs_path,
     )
     _append_scheduler_graph_child_args(command, args)
+    _append_request_vector_child_args(command, args)
     command.extend(["--scheduling-mode", str(args.scheduling_mode)])
     _append_deferred_bridge_child_args(command, args)
     return command
@@ -1554,6 +1701,8 @@ def _build_no_eos_diagnostic_command(args: argparse.Namespace) -> list[str]:
         str(args.cuda_visible_devices),
         "--batch-size",
         str(args.batch_size),
+        "--request-max-new-tokens",
+        _request_vector_csv(_request_max_new_tokens(args)),
         "--max-num-seqs",
         str(_effective_max_num_seqs(args)),
         "--max-num-batched-tokens",
@@ -1575,6 +1724,11 @@ def _build_no_eos_diagnostic_command(args: argparse.Namespace) -> list[str]:
         "--summary-output",
         "logs/no_eos_diagnostic_summary.json",
     ]
+    context_tokens = _request_context_tokens(args)
+    if context_tokens:
+        command.extend(
+            ["--request-context-tokens", _request_vector_csv(context_tokens)]
+        )
     if bool(args.split_context_prompts):
         command.append("--split-context-prompts")
     if bool(args.outputs_include_text):
@@ -2105,6 +2259,8 @@ def _run_provenance_payload(
         ),
         "mode": str(args.mode),
         "batch_size": int(args.batch_size),
+        "request_context_tokens": _request_context_tokens(args),
+        "request_max_new_tokens": _request_max_new_tokens(args),
         "tensor_parallel_size": int(
             getattr(args, "tensor_parallel_size", 1) or 1
         ),
@@ -2204,6 +2360,21 @@ def _run_provenance_payload(
         "cuda_visible_devices_env": str(env.get("CUDA_VISIBLE_DEVICES", "") or ""),
         "runner_kv_preflight_status": str(
             env.get("SFI_RUNNER_KV_PREFLIGHT_STATUS", "") or ""
+        ),
+        "runner_kv_required_token_blocks": _env_int(
+            "SFI_RUNNER_KV_REQUIRED_TOKEN_BLOCKS"
+        ),
+        "runner_kv_required_tokens_padded": _env_int(
+            "SFI_RUNNER_KV_REQUIRED_TOKENS_PADDED"
+        ),
+        "runner_kv_required_bytes": _env_int(
+            "SFI_RUNNER_KV_REQUIRED_BYTES"
+        ),
+        "runner_kv_compact_lease_bytes": _env_int(
+            "SFI_RUNNER_KV_COMPACT_LEASE_BYTES"
+        ),
+        "runner_max_request_sequence_tokens": _env_int(
+            "SFI_RUNNER_MAX_REQUEST_SEQUENCE_TOKENS"
         ),
         "runner_gpu_lock_mode": str(
             env.get("SFI_RUNNER_GPU_LOCK_MODE", "") or ""
@@ -2333,6 +2504,11 @@ def _run_provenance_payload(
         "runner_context_tokens": str(
             env.get("SFI_RUNNER_CONTEXT_TOKENS", "") or ""
         ),
+        "runner_request_context_tokens": str(
+            env.get("SFI_RUNNER_REQUEST_CONTEXT_TOKENS", "")
+            or env.get("REQUEST_CONTEXT_TOKENS", "")
+            or ""
+        ),
         "runner_kv_cache_memory_bytes": str(
             env.get("SFI_RUNNER_KV_CACHE_MEMORY_BYTES", "") or ""
         ),
@@ -2341,6 +2517,11 @@ def _run_provenance_payload(
         ),
         "runner_max_new_tokens": str(
             env.get("SFI_RUNNER_MAX_NEW_TOKENS", "") or ""
+        ),
+        "runner_request_max_new_tokens": str(
+            env.get("SFI_RUNNER_REQUEST_MAX_NEW_TOKENS", "")
+            or env.get("REQUEST_MAX_NEW_TOKENS", "")
+            or ""
         ),
         "runner_max_num_seqs": str(
             env.get("SFI_RUNNER_MAX_NUM_SEQS", "") or ""
@@ -2417,6 +2598,7 @@ def _build_gate_d_dense_command(
         str(float(args.gpu_mem_util)),
     ]
     _append_scheduler_graph_child_args(command, args)
+    _append_request_vector_child_args(command, args)
     if int(getattr(args, "max_model_len", 0) or 0) > 0:
         command.extend(["--max-model-len", str(int(args.max_model_len))])
     if int(getattr(args, "tensor_parallel_size", 1) or 1) > 1:
@@ -2968,6 +3150,8 @@ def _gate_d_config(
         "legacy_iters": int(getattr(args, "legacy_iters", args.iters)),
         "iters_semantics": "legacy_alias_for_max_new_tokens",
         "batch_size": int(args.batch_size),
+        "request_context_tokens": _request_context_tokens(args),
+        "request_max_new_tokens": _request_max_new_tokens(args),
         "max_num_seqs": _effective_max_num_seqs(args),
         "scheduler_graph_contract_requested": requested_scheduler_graph_contract(
             args
@@ -2996,6 +3180,12 @@ def _gate_d_config(
             "VLLM_SPARSE_ONE_SHOT_READY_CHUNK": env.get(
                 "VLLM_SPARSE_ONE_SHOT_READY_CHUNK",
                 "",
+            ),
+            "SFI_RUNNER_REQUEST_CONTEXT_TOKENS": env.get(
+                "SFI_RUNNER_REQUEST_CONTEXT_TOKENS", ""
+            ),
+            "SFI_RUNNER_REQUEST_MAX_NEW_TOKENS": env.get(
+                "SFI_RUNNER_REQUEST_MAX_NEW_TOKENS", ""
             ),
             **{
                 key: str(env.get(key, "") or "")
@@ -3095,8 +3285,9 @@ def _expected_interval_trigger_intents(
     refresh_interval = int(getattr(args, "refresh_interval", 0) or 0)
     if refresh_interval <= 0:
         return 0
-    return int(args.batch_size) * (
-        max(0, int(_effective_max_new_tokens(args))) // int(refresh_interval)
+    return sum(
+        max(0, int(max_new_tokens)) // int(refresh_interval)
+        for max_new_tokens in _request_max_new_tokens(args)
     )
 
 
@@ -3158,34 +3349,107 @@ def _boundary_diagnostics_payload(metrics: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _request_ordered_output_records(path: Path) -> list[dict[str, Any]]:
+    """Return outputs only when request keys prove one contiguous row binding."""
+    payload = _read_json(path)
+    if not isinstance(payload, dict):
+        return []
+    indexed_keys: list[tuple[int, str]] = []
+    for key in payload:
+        match = re.fullmatch(r"bench-([0-9]+)-.+", str(key))
+        if match is None:
+            return []
+        indexed_keys.append((int(match.group(1)), str(key)))
+    indices = [index for index, _ in indexed_keys]
+    if sorted(indices) != list(range(len(indexed_keys))):
+        return []
+    rows: list[dict[str, Any]] = []
+    for request_index, key in sorted(indexed_keys):
+        value = payload[key]
+        if isinstance(value, list):
+            rows.append(
+                {
+                    "request_index": request_index,
+                    "token_ids": [int(token_id) for token_id in value],
+                }
+            )
+            continue
+        if not isinstance(value, dict) or not isinstance(
+            value.get("token_ids"), list
+        ):
+            continue
+        row: dict[str, Any] = {
+            "request_index": request_index,
+            "token_ids": [int(token_id) for token_id in value["token_ids"]],
+            "text": str(value.get("text", "")),
+        }
+        for field_name in (
+            "semantic_text",
+            "semantic_stop_seen",
+            "semantic_first_stop_token_index",
+            "semantic_stop_token_id",
+            "semantic_stop_token_ids",
+            "semantic_token_count",
+        ):
+            if field_name in value:
+                row[field_name] = value[field_name]
+        rows.append(row)
+    return rows
+
+
 def _output_completion_gate(
     records: list[dict[str, Any]],
     *,
     expected_request_count: int,
-    expected_output_tokens: int,
-    require_exact_length: bool,
+    expected_output_tokens: int | None = None,
+    expected_output_tokens_by_request: list[int] | None = None,
+    require_exact_length: bool = True,
 ) -> dict[str, Any]:
     """Validate request cardinality and fixed-length decode completion."""
+    expected_vector = (
+        [int(value) for value in expected_output_tokens_by_request]
+        if expected_output_tokens_by_request is not None
+        else [int(expected_output_tokens or 0)] * int(expected_request_count)
+    )
+    expected_maximum = max(expected_vector, default=int(expected_output_tokens or 0))
     token_lengths = [
         len(record.get("token_ids", []))
         if isinstance(record.get("token_ids"), list)
         else -1
         for record in records
     ]
+    request_indices = [record.get("request_index") for record in records]
     reasons: list[str] = []
     if len(records) != int(expected_request_count):
         reasons.append(
             "output_record_count_mismatch:"
             f"actual={len(records)}:expected={int(expected_request_count)}"
         )
-    if require_exact_length and any(
-        length != int(expected_output_tokens) for length in token_lengths
-    ):
+    expected_indices = list(range(int(expected_request_count)))
+    if request_indices != expected_indices:
+        reasons.append(
+            "output_request_index_binding_mismatch:"
+            f"actual={request_indices!r}:expected={expected_indices!r}"
+        )
+    if len(expected_vector) != int(expected_request_count):
+        reasons.append(
+            "expected_output_vector_count_mismatch:"
+            f"actual={len(expected_vector)}:expected={int(expected_request_count)}"
+        )
+    if require_exact_length and token_lengths != expected_vector:
+        mismatched_indices = [
+            index
+            for index, (actual, expected) in enumerate(
+                zip(token_lengths, expected_vector)
+            )
+            if actual != expected
+        ]
         reasons.append(
             "output_token_count_mismatch:"
             f"min={min(token_lengths, default=-1)}:"
             f"max={max(token_lengths, default=-1)}:"
-            f"expected={int(expected_output_tokens)}"
+            f"expected_by_request={_request_vector_csv(expected_vector)}:"
+            f"mismatched_indices={mismatched_indices}"
         )
     return {
         "required": True,
@@ -3194,10 +3458,161 @@ def _output_completion_gate(
         "reasons": reasons,
         "actual_request_count": len(records),
         "expected_request_count": int(expected_request_count),
+        "request_indices": request_indices,
         "token_lengths": token_lengths,
+        "expected_output_tokens_by_request": expected_vector,
         "min_output_tokens": min(token_lengths, default=-1),
         "max_output_tokens": max(token_lengths, default=-1),
-        "expected_output_tokens": int(expected_output_tokens),
+        "expected_output_tokens": int(expected_maximum),
+    }
+
+
+def _mixed_chunk_postflight_gate(
+    args: argparse.Namespace,
+    trace_events: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Prove mixed chunk-prefill/decode only from the cold route artifact."""
+    batch_size = int(args.batch_size)
+    context_tokens = _request_context_tokens(args)
+    max_new_tokens = _request_max_new_tokens(args)
+    context_heterogeneous = bool(
+        len(context_tokens) == batch_size and len(set(context_tokens)) > 1
+    )
+    max_new_heterogeneous = len(set(max_new_tokens)) > 1
+    if batch_size == 1:
+        return {
+            "schema": "sfi.mixed_chunk_postflight.v1",
+            "required": False,
+            "status": "not_applicable",
+            "passed": True,
+            "reasons": [],
+            "batch_size": batch_size,
+            "request_context_tokens": context_tokens,
+            "request_max_new_tokens": max_new_tokens,
+            "context_heterogeneous": False,
+            "max_new_tokens_heterogeneous": False,
+            "prepare_step_lengths_count": 0,
+            "malformed_prepare_step_lengths_count": 0,
+            "mixed_chunk_event_count": 0,
+            "mixed_chunk_event_sample": {},
+        }
+    if not context_heterogeneous:
+        return {
+            "schema": "sfi.mixed_chunk_postflight.v1",
+            "required": False,
+            "status": "not_required",
+            "passed": True,
+            "reasons": [],
+            "batch_size": batch_size,
+            "request_context_tokens": context_tokens,
+            "request_max_new_tokens": max_new_tokens,
+            "context_heterogeneous": False,
+            "max_new_tokens_heterogeneous": max_new_heterogeneous,
+            "prepare_step_lengths_count": 0,
+            "malformed_prepare_step_lengths_count": 0,
+            "mixed_chunk_event_count": 0,
+            "mixed_chunk_event_sample": {},
+        }
+
+    prepare_count = 0
+    malformed_count = 0
+    mixed_samples: list[dict[str, Any]] = []
+    for event in trace_events:
+        if event.get("event") != "prepare_step_lengths":
+            continue
+        prepare_count += 1
+        req_ids = event.get("req_ids")
+        prompt_lengths = event.get("prompt_lengths")
+        computed_tokens = event.get("num_computed_tokens")
+        scheduled_tokens = event.get("num_scheduled_tokens")
+        if not all(
+            isinstance(values, list)
+            for values in (
+                req_ids,
+                prompt_lengths,
+                computed_tokens,
+                scheduled_tokens,
+            )
+        ):
+            malformed_count += 1
+            continue
+        row_count = len(req_ids)
+        if row_count == 0 or any(
+            len(values) != row_count
+            for values in (
+                prompt_lengths,
+                computed_tokens,
+                scheduled_tokens,
+            )
+        ):
+            malformed_count += 1
+            continue
+        if (
+            any(type(value) is not str or not value for value in req_ids)
+            or any(
+                type(value) is not int or value < 0
+                for values in (
+                    prompt_lengths,
+                    computed_tokens,
+                    scheduled_tokens,
+                )
+                for value in values
+            )
+            or any(value <= 0 for value in prompt_lengths)
+        ):
+            malformed_count += 1
+            continue
+        # A heterogeneous scheduler legitimately has one active request before
+        # another row is admitted, and again after a short row finishes.  Such
+        # a record is well formed but cannot prove a simultaneous mixed step.
+        if row_count < 2:
+            continue
+        prefill_indices = [
+            index
+            for index, (prompt, computed, scheduled) in enumerate(
+                zip(prompt_lengths, computed_tokens, scheduled_tokens)
+            )
+            if computed < prompt and scheduled > 1
+        ]
+        decode_indices = [
+            index
+            for index, (prompt, computed, scheduled) in enumerate(
+                zip(prompt_lengths, computed_tokens, scheduled_tokens)
+            )
+            if computed >= prompt and scheduled == 1
+        ]
+        if prefill_indices and decode_indices:
+            mixed_samples.append(
+                {
+                    "epoch": _as_int(event.get("epoch"), -1),
+                    "req_ids": list(req_ids),
+                    "prompt_lengths": list(prompt_lengths),
+                    "num_computed_tokens": list(computed_tokens),
+                    "num_scheduled_tokens": list(scheduled_tokens),
+                    "prefill_indices": prefill_indices,
+                    "decode_indices": decode_indices,
+                }
+            )
+    reasons: list[str] = []
+    if malformed_count:
+        reasons.append("mixed_chunk_route_evidence_malformed")
+    if not mixed_samples:
+        reasons.append("mixed_chunk_route_evidence_missing")
+    return {
+        "schema": "sfi.mixed_chunk_postflight.v1",
+        "required": True,
+        "status": "passed" if not reasons else "failed",
+        "passed": not reasons,
+        "reasons": reasons,
+        "batch_size": batch_size,
+        "request_context_tokens": context_tokens,
+        "request_max_new_tokens": max_new_tokens,
+        "context_heterogeneous": True,
+        "max_new_tokens_heterogeneous": max_new_heterogeneous,
+        "prepare_step_lengths_count": prepare_count,
+        "malformed_prepare_step_lengths_count": malformed_count,
+        "mixed_chunk_event_count": len(mixed_samples),
+        "mixed_chunk_event_sample": mixed_samples[0] if mixed_samples else {},
     }
 
 
@@ -3994,6 +4409,56 @@ def _apply_scheduler_graph_contract_payload(
     ):
         reasons.append("scheduler_graph_child_contracts_diverged")
 
+    expected_request_vectors = {
+        "request_context_tokens": _request_context_tokens(args),
+        "request_max_new_tokens": _request_max_new_tokens(args),
+    }
+    observed_request_vectors: dict[str, dict[str, object]] = {}
+    request_vector_reasons: list[str] = []
+    for child, metrics in runtime_metrics.items():
+        run_config_raw = metrics.get("run_config")
+        run_config = run_config_raw if isinstance(run_config_raw, dict) else {}
+        observed = {
+            field: run_config.get(field)
+            for field in expected_request_vectors
+        }
+        observed_request_vectors[child] = observed
+        for field, expected_value in expected_request_vectors.items():
+            if observed.get(field) != expected_value:
+                request_vector_reasons.append(
+                    f"{child}_{field}_mismatch"
+                )
+    payload["request_vector_contract_expected"] = expected_request_vectors
+    payload["request_vector_contract_observed"] = observed_request_vectors
+    payload["request_vector_contract_match"] = not request_vector_reasons
+    payload["request_vector_contract_reasons"] = request_vector_reasons
+    reasons.extend(request_vector_reasons)
+
+    expected_decode_step_contract = {
+        "decode_step_contract_schema": "sfi.single_token_decode_step.v1",
+        "decode_step_contract_proof_passed": True,
+        "decode_step_speculative_config_present": False,
+        "decode_step_stream_interval": 1,
+        "decode_step_max_tokens_per_request": 1,
+    }
+    decode_step_contract_reasons: list[str] = []
+    for child, metrics in runtime_metrics.items():
+        run_config_raw = metrics.get("run_config")
+        run_config = run_config_raw if isinstance(run_config_raw, dict) else {}
+        proof = {
+            field: run_config.get(field, metrics.get(field))
+            for field in expected_decode_step_contract
+        }
+        payload[f"{child}_decode_step_contract_proof"] = proof
+        if proof != expected_decode_step_contract:
+            decode_step_contract_reasons.append(
+                f"{child}_decode_step_contract_mismatch"
+            )
+    payload["decode_step_contract_expected"] = expected_decode_step_contract
+    payload["decode_step_contract_match"] = not decode_step_contract_reasons
+    payload["decode_step_contract_reasons"] = decode_step_contract_reasons
+    reasons.extend(decode_step_contract_reasons)
+
     exact_runtime_required = (
         os.environ.get("SFI_RUNNER_TIER", "") == "tp8x64k"
     )
@@ -4091,6 +4556,12 @@ def _apply_sparse_dense_pair_speedup_payload(
     exact_required = contract_kind == "exact_speedup_verdict"
     local_comparison_required = contract_kind == "explicit_local_comparison"
     pair_required = exact_required or local_comparison_required
+    request_context_vector = _request_context_tokens(args)
+    request_max_new_vector = _request_max_new_tokens(args)
+    all_decode_window_alignment_required = bool(
+        len(set(request_context_vector)) <= 1
+        and len(set(request_max_new_vector)) <= 1
+    )
     reasons: list[str] = []
     provenance_raw = payload.get("run_provenance")
     provenance = provenance_raw if isinstance(provenance_raw, dict) else {}
@@ -4167,7 +4638,9 @@ def _apply_sparse_dense_pair_speedup_payload(
         "cuda_capabilities": provenance.get("runner_cuda_capabilities"),
         "batch_size": int(args.batch_size),
         "context_tokens": provenance.get("runner_context_tokens"),
+        "request_context_tokens": provenance.get("request_context_tokens"),
         "max_new_tokens": _effective_max_new_tokens(args),
+        "request_max_new_tokens": provenance.get("request_max_new_tokens"),
         "max_model_len": int(args.max_model_len),
         "attention_backend_artifact": provenance.get("backend_artifact"),
         "attention_build_identity": provenance.get(
@@ -4184,7 +4657,9 @@ def _apply_sparse_dense_pair_speedup_payload(
         "cuda_capabilities",
         "batch_size",
         "context_tokens",
+        "request_context_tokens",
         "max_new_tokens",
+        "request_max_new_tokens",
         "max_model_len",
         "attention_backend_artifact",
         "attention_build_identity",
@@ -4213,7 +4688,9 @@ def _apply_sparse_dense_pair_speedup_payload(
         "cuda_capabilities": provenance.get("runner_cuda_capabilities"),
         "batch_size": int(args.batch_size),
         "context_tokens": int(provenance.get("runner_context_tokens") or 0),
+        "request_context_tokens": _request_context_tokens(args),
         "max_new_tokens": _effective_max_new_tokens(args),
+        "request_max_new_tokens": _request_max_new_tokens(args),
         "max_model_len": int(args.max_model_len),
         "runner_tier": provenance.get("runner_tier"),
         "expected_git_commit": provenance.get("runner_expected_git_commit"),
@@ -4242,7 +4719,9 @@ def _apply_sparse_dense_pair_speedup_payload(
         "cuda_capabilities",
         "batch_size",
         "context_tokens",
+        "request_context_tokens",
         "max_new_tokens",
+        "request_max_new_tokens",
         "max_model_len",
         "runner_tier",
         "expected_git_commit",
@@ -4418,10 +4897,6 @@ def _apply_sparse_dense_pair_speedup_payload(
                 reasons.append(
                     f"sparse_dense_pair_{arm}_all_decode_zero_token_steps_mismatch"
                 )
-            if boundary.get("all_decode_fallback_used") is not False:
-                reasons.append(
-                    f"sparse_dense_pair_{arm}_all_decode_fallback_used_mismatch"
-                )
             full_steps = boundary.get("all_decode_full_batch_steps")
             if type(full_steps) is not int or full_steps <= 0:
                 reasons.append(
@@ -4448,14 +4923,17 @@ def _apply_sparse_dense_pair_speedup_payload(
                     f"sparse_dense_pair_{arm}_all_decode_step_accounting_mismatch"
                 )
 
-    if pair_required and set(pair_boundaries) == {"sparse", "dense"}:
+    if (
+        pair_required
+        and all_decode_window_alignment_required
+        and set(pair_boundaries) == {"sparse", "dense"}
+    ):
         for field in (
             "all_decode_entered",
             "all_decode_steps",
             "all_decode_full_batch_steps",
             "all_decode_partial_batch_steps",
             "all_decode_zero_token_steps",
-            "all_decode_fallback_used",
         ):
             if pair_boundaries["sparse"].get(field) != pair_boundaries[
                 "dense"
@@ -4492,32 +4970,39 @@ def _apply_sparse_dense_pair_speedup_payload(
         "decode_speedup": decode_speedup,
         "all_decode_speedup": all_decode_speedup,
     }
-    for name, ratio in ratios.items():
-        if local_comparison_required and (
-            ratio is None or not math.isfinite(ratio) or ratio <= 0.0
-        ):
-            reasons.append(f"{name}_not_finite_positive")
-        elif exact_required and (
-            ratio is None or not math.isfinite(ratio) or ratio <= 1.0
-        ):
-            reasons.append(f"{name}_not_above_one")
+    if local_comparison_required and (
+        all_decode_speedup is None
+        or not math.isfinite(all_decode_speedup)
+        or all_decode_speedup <= 0.0
+    ):
+        reasons.append("all_decode_speedup_not_finite_positive")
+    elif exact_required and (
+        all_decode_speedup is None
+        or not math.isfinite(all_decode_speedup)
+        or all_decode_speedup <= 1.0
+    ):
+        reasons.append("all_decode_speedup_not_above_one")
 
-    for field in ("out_tokens", "decode_tokens", "all_decode_tokens"):
+    compared_token_fields = ["out_tokens", "decode_tokens"]
+    if all_decode_window_alignment_required:
+        compared_token_fields.append("all_decode_tokens")
+    for field in compared_token_fields:
         if pair_required and sparse_metrics.get(field) != dense_metrics.get(field):
             reasons.append(f"sparse_dense_{field}_mismatch")
 
     speedup_observed = bool(
-        ratios
-        and all(
-            ratio is not None and math.isfinite(ratio) and ratio > 1.0
-            for ratio in ratios.values()
-        )
+        all_decode_speedup is not None
+        and math.isfinite(all_decode_speedup)
+        and all_decode_speedup > 1.0
     )
 
     payload.update(
         {
             "sparse_dense_pair_contract_kind": contract_kind,
             "sparse_dense_pair_required": pair_required,
+            "sparse_dense_pair_all_decode_window_alignment_required": (
+                all_decode_window_alignment_required
+            ),
             "sparse_dense_pair_dense_metrics_readable": dense_metrics_readable,
             "sparse_dense_pair_execution_order": (
                 "sparse_speed,dense_reference,sparse_diagnostic"
@@ -4558,6 +5043,12 @@ def _apply_sparse_dense_pair_speedup_payload(
             "sparse_dense_pair_dense_decode_tps": dense_decode_tps,
             "sparse_dense_pair_sparse_all_decode_tps": sparse_all_decode_tps,
             "sparse_dense_pair_dense_all_decode_tps": dense_all_decode_tps,
+            "sparse_dense_pair_verdict_metric": "all_decode_speedup",
+            "sparse_dense_pair_diagnostic_metrics": [
+                "total_wall_speedup",
+                "total_token_speedup",
+                "decode_speedup",
+            ],
             **ratios,
             # Local comparison validity and an exact speedup verdict are
             # deliberately separate contracts.  A finite, slower local pair
@@ -4595,7 +5086,7 @@ def _apply_sparse_dense_pair_speedup_payload(
                 },
             },
             "sparse_dense_pair_claim": (
-                "sparse_engine_loop_e2e_and_decode_speedup"
+                "sparse_all_decode_steady_speedup"
                 if exact_required and not reasons
                 else (
                     "paired_engine_loop_comparison"
@@ -4732,11 +5223,12 @@ def _gate_d_payload(
         )
     )
     if output_records is None:
-        output_records = _canonical_output_records(outputs_path)
+        output_records = _request_ordered_output_records(outputs_path)
     output_length_gate = _output_completion_gate(
         output_records,
         expected_request_count=int(getattr(args, "batch_size", 1) or 1),
         expected_output_tokens=_effective_max_new_tokens(args),
+        expected_output_tokens_by_request=_request_max_new_tokens(args),
         require_exact_length=not bool(getattr(args, "respect_eos", False)),
     )
     refresh_profile = refresh_profile or []
@@ -5134,6 +5626,14 @@ def _gate_d_payload(
             if isinstance(metrics.get("boundary_diagnostics"), dict)
             else False
         ),
+        "all_decode_steps": _as_int(
+            (metrics.get("boundary_diagnostics") or {}).get(
+                "all_decode_steps", -1
+            )
+            if isinstance(metrics.get("boundary_diagnostics"), dict)
+            else -1,
+            -1,
+        ),
         "all_decode_full_batch_steps": _as_int(
             (metrics.get("boundary_diagnostics") or {}).get(
                 "all_decode_full_batch_steps", -1
@@ -5157,13 +5657,6 @@ def _gate_d_payload(
             if isinstance(metrics.get("boundary_diagnostics"), dict)
             else -1,
             -1,
-        ),
-        "all_decode_fallback_used": bool(
-            (metrics.get("boundary_diagnostics") or {}).get(
-                "all_decode_fallback_used", True
-            )
-            if isinstance(metrics.get("boundary_diagnostics"), dict)
-            else True
         ),
         "vllm_reported_tps": _decode_metric(metrics, "tok_per_s"),
         "elapsed_s": _decode_metric(metrics, "elapsed_s"),
@@ -5883,7 +6376,7 @@ def _run_gate_d_mode(args: argparse.Namespace) -> int:
     sparse_reference_outputs_path: Path | None = None
     dense_reference_env: dict[str, str] | None = None
     dense_arm_green = tp8_lifecycle_state is None
-    sparse_output_records = _canonical_output_records(outputs_path)
+    sparse_output_records = _request_ordered_output_records(outputs_path)
     if (
         bool(args.outputs_include_text)
         and not bool(args.skip_dense_reference)
@@ -6024,8 +6517,12 @@ def _run_gate_d_mode(args: argparse.Namespace) -> int:
             speed_outputs_path=outputs_path,
             diagnostic_outputs_path=diag_outputs_path,
         )
-        sparse_output_records = _canonical_output_records(sparse_reference_outputs_path)
-        dense_output_records = _canonical_output_records(dense_reference_outputs_path)
+        sparse_output_records = _request_ordered_output_records(
+            sparse_reference_outputs_path
+        )
+        dense_output_records = _request_ordered_output_records(
+            dense_reference_outputs_path
+        )
         reference_semantic_diffs = _semantic_output_diffs(
             sparse_output_records,
             dense_output_records,
@@ -6129,7 +6626,7 @@ def _run_gate_d_mode(args: argparse.Namespace) -> int:
         hook_profile_summary=measurement_hook_summary,
         selector_pipeline_cpu_profile_path=selector_pipeline_cpu_profile_path,
         selector_pipeline_cpu_profile=selector_pipeline_cpu_profile,
-        output_records=_canonical_output_records(outputs_path),
+        output_records=_request_ordered_output_records(outputs_path),
         fa3_so_sha256=fa3_so_sha256,
         run_provenance=_run_provenance_payload(
             args,
@@ -6150,6 +6647,17 @@ def _run_gate_d_mode(args: argparse.Namespace) -> int:
         if args.verdict_only
         else "diagnostic_child_route_trace"
     )
+    mixed_chunk_postflight_gate = _mixed_chunk_postflight_gate(
+        args,
+        measurement_trace_events,
+    )
+    payload["mixed_chunk_postflight_gate"] = mixed_chunk_postflight_gate
+    payload["mixed_chunk_postflight_gate_passed"] = bool(
+        mixed_chunk_postflight_gate.get("passed", False)
+    )
+    if not payload["mixed_chunk_postflight_gate_passed"]:
+        payload["gate_passed"] = False
+        payload["production_gate_passed"] = False
     payload.update(
         _workload_plan_payload(
             args,
@@ -11801,8 +12309,12 @@ def main(argv: list[str] | None = None) -> int:
                 timeout_s=int(args.timeout_s),
             )
             if reference_result.returncode == 0 and not reference_result.timed_out:
-                sparse_records = _canonical_output_records(sparse_outputs_path)
-                dense_records = _canonical_output_records(dense_outputs_path)
+                sparse_records = _request_ordered_output_records(
+                    sparse_outputs_path
+                )
+                dense_records = _request_ordered_output_records(
+                    dense_outputs_path
+                )
                 sparse_outputs = [
                     list(record["token_ids"]) for record in sparse_records
                 ]

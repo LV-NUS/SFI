@@ -110,6 +110,68 @@ def _is_finite_positive_number(value: object) -> bool:
     )
 
 
+def _exact_positive_int_vector(
+    value: object,
+    *,
+    expected_count: int,
+) -> list[int] | None:
+    if not isinstance(value, list) or len(value) != int(expected_count):
+        return None
+    if any(type(item) is not int or item <= 0 for item in value):
+        return None
+    return [int(item) for item in value]
+
+
+def _request_vector_csv(values: list[int]) -> str:
+    return ",".join(str(value) for value in values)
+
+
+def _mixed_chunk_sample_reasons(sample: object) -> list[str]:
+    """Independently validate the cold mixed prefill/decode evidence row."""
+    if not isinstance(sample, dict) or not sample:
+        return ["mixed_chunk_event_sample_missing"]
+    req_ids = sample.get("req_ids")
+    prompt_lengths = sample.get("prompt_lengths")
+    computed_tokens = sample.get("num_computed_tokens")
+    scheduled_tokens = sample.get("num_scheduled_tokens")
+    vectors = (req_ids, prompt_lengths, computed_tokens, scheduled_tokens)
+    if not all(isinstance(values, list) for values in vectors):
+        return ["mixed_chunk_event_sample_vectors_invalid"]
+    row_count = len(req_ids)
+    if row_count < 2 or any(len(values) != row_count for values in vectors[1:]):
+        return ["mixed_chunk_event_sample_vector_lengths_invalid"]
+    if any(type(value) is not str or not value for value in req_ids):
+        return ["mixed_chunk_event_sample_req_ids_invalid"]
+    if any(
+        type(value) is not int or value < 0
+        for values in (prompt_lengths, computed_tokens, scheduled_tokens)
+        for value in values
+    ) or any(value <= 0 for value in prompt_lengths):
+        return ["mixed_chunk_event_sample_token_values_invalid"]
+    expected_prefill = [
+        index
+        for index, (prompt, computed, scheduled) in enumerate(
+            zip(prompt_lengths, computed_tokens, scheduled_tokens)
+        )
+        if computed < prompt and scheduled > 1
+    ]
+    expected_decode = [
+        index
+        for index, (prompt, computed, scheduled) in enumerate(
+            zip(prompt_lengths, computed_tokens, scheduled_tokens)
+        )
+        if computed >= prompt and scheduled == 1
+    ]
+    reasons: list[str] = []
+    if not expected_prefill or not expected_decode:
+        reasons.append("mixed_chunk_event_sample_not_mixed")
+    if sample.get("prefill_indices") != expected_prefill:
+        reasons.append("mixed_chunk_event_sample_prefill_indices_mismatch")
+    if sample.get("decode_indices") != expected_decode:
+        reasons.append("mixed_chunk_event_sample_decode_indices_mismatch")
+    return reasons
+
+
 def _reject_nonstandard_json_constant(value: str) -> None:
     raise ValueError(f"non-standard JSON numeric constant: {value}")
 
@@ -184,13 +246,16 @@ def _corpus_manifest_reasons(provenance: dict[str, Any]) -> list[str]:
     try:
         model_path = Path(str(provenance.get("model", "") or ""))
         source_snapshot = CONTEXT_CORPUS_SOURCE.read_bytes()
+        request_context_tokens = _exact_positive_int_vector(
+            provenance.get("request_context_tokens"),
+            expected_count=int(provenance.get("batch_size", 0)),
+        )
+        if request_context_tokens is None:
+            raise ValueError("request_context_tokens missing or invalid")
         expected_identity = context_corpus_cache_identity(
             source_path=CONTEXT_CORPUS_SOURCE,
             model_path=model_path,
-            segments=int(provenance.get("batch_size", 0)),
-            tokens_per_segment=int(
-                provenance.get("runner_context_tokens", 0)
-            ),
+            tokens_per_segment_by_request=request_context_tokens,
         )
         validated_path, validated_sha256, manifest = (
             validate_context_corpus_manifest(
@@ -688,8 +753,6 @@ def _model_kv_contract_reasons(
             kv_pool_bytes = int(provenance.get("runner_kv_cache_memory_bytes", 0))
             batch_size = int(provenance.get("batch_size", 0))
             compact_blocks = int(provenance.get("compact_blocks_per_slot", 0))
-            context_tokens = int(provenance.get("runner_context_tokens", 0))
-            max_new_tokens = int(provenance.get("max_new_tokens_effective", 0))
             chat_template_reserve = int(
                 provenance.get("runner_chat_template_reserve_tokens", 0)
             )
@@ -705,21 +768,57 @@ def _model_kv_contract_reasons(
             lease_bytes = (
                 batch_size * compact_blocks * 16 * per_rank * generation_count
             )
-            denominator = per_rank * batch_size
-            capacity = (
-                (kv_pool_bytes - lease_bytes) // denominator
-                if denominator > 0
-                else -1
+            request_context_tokens = _exact_positive_int_vector(
+                provenance.get("request_context_tokens"),
+                expected_count=batch_size,
             )
-            needed = context_tokens + max_new_tokens + chat_template_reserve
+            request_max_new_tokens = _exact_positive_int_vector(
+                provenance.get("request_max_new_tokens"),
+                expected_count=batch_size,
+            )
+            if request_context_tokens is None or request_max_new_tokens is None:
+                reasons.append("runner_model_kv_request_vectors_invalid")
+                return reasons
+            required_blocks = sum(
+                (
+                    context_tokens
+                    + max_new_tokens
+                    + chat_template_reserve
+                    + 15
+                )
+                // 16
+                for context_tokens, max_new_tokens in zip(
+                    request_context_tokens,
+                    request_max_new_tokens,
+                )
+            )
+            required_tokens_padded = required_blocks * 16
+            full_kv_bytes = required_tokens_padded * per_rank
+            total_required_bytes = full_kv_bytes + lease_bytes
             preflight_status = provenance.get("runner_kv_preflight_status")
-            if capacity < needed and preflight_status == "passed":
+            if kv_pool_bytes < total_required_bytes and preflight_status == "passed":
                 reasons.append(
                     "runner_model_kv_capacity_insufficient:"
-                    f"capacity={capacity}:needed={needed}"
+                    f"pool={kv_pool_bytes}:needed={total_required_bytes}"
                 )
-            elif capacity >= needed and preflight_status == "undersized_override":
-                reasons.append("runner_model_kv_undersized_override_not_needed")
+            recorded_capacity = {
+                "runner_kv_required_token_blocks": required_blocks,
+                "runner_kv_required_tokens_padded": required_tokens_padded,
+                "runner_kv_required_bytes": total_required_bytes,
+                "runner_kv_compact_lease_bytes": lease_bytes,
+                "runner_max_request_sequence_tokens": max(
+                    context_tokens + max_new_tokens + chat_template_reserve
+                    for context_tokens, max_new_tokens in zip(
+                        request_context_tokens,
+                        request_max_new_tokens,
+                    )
+                ),
+            }
+            for field, expected in recorded_capacity.items():
+                if provenance.get(field) != expected:
+                    reasons.append(
+                        f"runner_model_kv_capacity_provenance_mismatch:{field}"
+                    )
     return reasons
 
 
@@ -771,6 +870,40 @@ def _runner_config_identity_reasons(
                 f"runner_config_identity_mismatch:{field}:"
                 f"actual={provenance.get(field)!r}:expected={expected!r}"
             )
+    batch_size_raw = provenance.get("batch_size")
+    batch_size = batch_size_raw if type(batch_size_raw) is int else 0
+    request_context_tokens = _exact_positive_int_vector(
+        provenance.get("request_context_tokens"),
+        expected_count=batch_size,
+    )
+    request_max_new_tokens = _exact_positive_int_vector(
+        provenance.get("request_max_new_tokens"),
+        expected_count=batch_size,
+    )
+    if request_context_tokens is None:
+        reasons.append("runner_request_context_tokens_invalid")
+    else:
+        if provenance.get("runner_request_context_tokens") != _request_vector_csv(
+            request_context_tokens
+        ):
+            reasons.append("runner_request_context_tokens_identity_mismatch")
+        try:
+            scalar_context_tokens = int(provenance.get("runner_context_tokens", 0))
+        except (TypeError, ValueError):
+            scalar_context_tokens = 0
+        if max(request_context_tokens) != scalar_context_tokens:
+            reasons.append("runner_request_context_tokens_maximum_mismatch")
+    if request_max_new_tokens is None:
+        reasons.append("runner_request_max_new_tokens_invalid")
+    else:
+        if provenance.get("runner_request_max_new_tokens") != _request_vector_csv(
+            request_max_new_tokens
+        ):
+            reasons.append("runner_request_max_new_tokens_identity_mismatch")
+        if max(request_max_new_tokens) != provenance.get(
+            "max_new_tokens_effective"
+        ):
+            reasons.append("runner_request_max_new_tokens_maximum_mismatch")
     for field in ("runner_context_tokens", "runner_kv_cache_memory_bytes"):
         raw = str(provenance.get(field, "") or "")
         if not raw.isdigit() or int(raw) <= 0:
@@ -895,9 +1028,13 @@ def _runner_config_identity_reasons(
             "runner_tensor_parallel_size": "8",
             "runner_batch_size": "32",
             "runner_context_tokens": "64000",
+            "request_context_tokens": [64_000] * 32,
+            "runner_request_context_tokens": ",".join(["64000"] * 32),
             "runner_kv_cache_memory_bytes": "42949672960",
             "runner_max_model_len": "66560",
             "runner_max_new_tokens": "2048",
+            "request_max_new_tokens": [2_048] * 32,
+            "runner_request_max_new_tokens": ",".join(["2048"] * 32),
             "runner_max_num_seqs": "32",
             "runner_max_num_batched_tokens": "8192",
             "runner_chunked_prefill": "enabled",
@@ -1316,7 +1453,7 @@ def _exact_runtime_proof_reasons(
         ),
         "engine_runtime_kv_page_size_identity_passed": True,
         "engine_runtime_kv_null_block_count": 1,
-        "engine_runtime_kv_required_blocks_per_request": 4_160,
+        "engine_runtime_kv_required_blocks_by_request": [4_160] * 32,
         "engine_runtime_kv_required_workload_blocks": 133_120,
         "engine_runtime_kv_capacity_covers_required_total": True,
     }
@@ -1552,9 +1689,9 @@ def _exact_runtime_proof_reasons(
             "compact_generation_count": compact_generation_count,
             "compact_lease_blocks": compact_lease_blocks,
             "required_batch_size": 32,
-            "required_tokens_per_request": 66_560,
+            "required_tokens_by_request": [66_560] * 32,
             "required_workload_tokens": 2_129_920,
-            "required_blocks_per_request": 4_160,
+            "required_blocks_by_request": [4_160] * 32,
             "required_workload_blocks": 133_120,
             "expected_bytes_per_token": expected_kv_bytes_per_token,
             "capacity_covers_required_total": True,
@@ -1632,6 +1769,12 @@ def _pair_summary_integrity_reasons(
             for arm, runner in _PAIR_RUNNER_CONTRACT.items()
         },
         "sparse_dense_pair_geometry_match": True,
+        "sparse_dense_pair_verdict_metric": "all_decode_speedup",
+        "sparse_dense_pair_diagnostic_metrics": [
+            "total_wall_speedup",
+            "total_token_speedup",
+            "decode_speedup",
+        ],
     }
     for field, expected in expected_fields.items():
         if summary.get(field) != expected:
@@ -1659,6 +1802,46 @@ def _pair_summary_integrity_reasons(
     if recorded_digests.get("sparse") != recorded_digests.get("dense"):
         reasons.append(f"{prefix}_geometry_digest_mismatch")
 
+    provenance = summary.get("run_provenance")
+    if isinstance(provenance, dict):
+        expected_vectors = {
+            "request_context_tokens": provenance.get(
+                "request_context_tokens"
+            ),
+            "request_max_new_tokens": provenance.get(
+                "request_max_new_tokens"
+            ),
+        }
+        context_vector = expected_vectors["request_context_tokens"]
+        max_new_vector = expected_vectors["request_max_new_tokens"]
+        expected_alignment_required = bool(
+            isinstance(context_vector, list)
+            and isinstance(max_new_vector, list)
+            and len(set(context_vector)) <= 1
+            and len(set(max_new_vector)) <= 1
+        )
+        if summary.get(
+            "sparse_dense_pair_all_decode_window_alignment_required"
+        ) is not expected_alignment_required:
+            reasons.append(
+                f"{prefix}_all_decode_window_alignment_contract_mismatch"
+            )
+        for arm, geometry in geometries.items():
+            for field, expected in expected_vectors.items():
+                if geometry.get(field) != expected:
+                    reasons.append(
+                        f"{prefix}_{arm}_geometry_vector_mismatch:{field}"
+                    )
+            child_identity = geometry.get("child_identity")
+            if not isinstance(child_identity, dict):
+                reasons.append(f"{prefix}_{arm}_geometry_child_identity_invalid")
+                continue
+            for field, expected in expected_vectors.items():
+                if child_identity.get(field) != expected:
+                    reasons.append(
+                        f"{prefix}_{arm}_child_vector_mismatch:{field}"
+                    )
+
     for arm, expected_backend in _PAIR_BACKEND_CONTRACT.items():
         identity = summary.get(f"sparse_dense_pair_{arm}_child_identity")
         if not isinstance(identity, dict):
@@ -1683,23 +1866,11 @@ def _explicit_local_pair_reasons(summary: dict[str, Any]) -> list[str]:
     for field, expected in expected_fields.items():
         if summary.get(field) != expected:
             reasons.append(f"local_pair_field_mismatch:{field}")
-    for field in (
-        "total_wall_speedup",
-        "total_token_speedup",
-        "decode_speedup",
-        "all_decode_speedup",
-    ):
-        if not _is_finite_positive_number(summary.get(field)):
-            reasons.append(f"local_pair_ratio_invalid:{field}")
-    expected_speedup_observed = all(
-        _is_finite_positive_number(summary.get(field))
-        and float(summary[field]) > 1.0
-        for field in (
-            "total_wall_speedup",
-            "total_token_speedup",
-            "decode_speedup",
-            "all_decode_speedup",
-        )
+    if not _is_finite_positive_number(summary.get("all_decode_speedup")):
+        reasons.append("local_pair_ratio_invalid:all_decode_speedup")
+    expected_speedup_observed = bool(
+        _is_finite_positive_number(summary.get("all_decode_speedup"))
+        and float(summary["all_decode_speedup"]) > 1.0
     )
     if summary.get("sparse_dense_pair_speedup_observed") is not (
         expected_speedup_observed
@@ -1797,21 +1968,20 @@ def _exact_engine_runtime_and_pair_reasons(
         "sparse_dense_pair_speedup_gate_passed": True,
         "sparse_dense_pair_speedup_gate_reasons": [],
         "sparse_dense_pair_claim": (
-            "sparse_engine_loop_e2e_and_decode_speedup"
+            "sparse_all_decode_steady_speedup"
         ),
     }
     for field, expected in exact_pair_fields.items():
         if summary.get(field) != expected:
             reasons.append(f"tp8_exact_pair_field_mismatch:{field}")
-    for field in (
-        "total_wall_speedup",
-        "total_token_speedup",
-        "decode_speedup",
-        "all_decode_speedup",
+    all_decode_speedup = summary.get("all_decode_speedup")
+    if (
+        not _is_finite_positive_number(all_decode_speedup)
+        or float(all_decode_speedup) <= 1.0
     ):
-        value = summary.get(field)
-        if not _is_finite_positive_number(value) or float(value) <= 1.0:
-            reasons.append(f"tp8_exact_pair_ratio_not_above_one:{field}")
+        reasons.append(
+            "tp8_exact_pair_ratio_not_above_one:all_decode_speedup"
+        )
     if summary.get("reference_returncode") != 0:
         reasons.append("tp8_exact_pair_dense_returncode_nonzero")
     if summary.get("reference_timed_out") is not False:
@@ -1855,18 +2025,6 @@ def _exact_engine_runtime_and_pair_reasons(
     ) is True:
         reasons.append("tp8_exact_pair_sparse_timed_observer_present")
     raw_ratio_inputs = {
-        "total_wall_speedup": (
-            dense_metrics.get("elapsed_s"),
-            sparse_metrics.get("elapsed_s"),
-        ),
-        "total_token_speedup": (
-            sparse_metrics.get("tok_per_s"),
-            dense_metrics.get("tok_per_s"),
-        ),
-        "decode_speedup": (
-            sparse_metrics.get("decode_tok_per_s"),
-            dense_metrics.get("decode_tok_per_s"),
-        ),
         "all_decode_speedup": (
             sparse_metrics.get("all_decode_tok_per_s"),
             dense_metrics.get("all_decode_tok_per_s"),
@@ -1898,9 +2056,7 @@ def _exact_engine_runtime_and_pair_reasons(
     else:
         exact_boundary = {
             "all_decode_entered": True,
-            "all_decode_partial_batch_steps": 0,
             "all_decode_zero_token_steps": 0,
-            "all_decode_fallback_used": False,
         }
         for field, expected in exact_boundary.items():
             if boundary.get(field) != expected:
@@ -1909,6 +2065,20 @@ def _exact_engine_runtime_and_pair_reasons(
             "all_decode_full_batch_steps"
         ) <= 0:
             reasons.append("tp8_exact_pair_dense_full_decode_steps_missing")
+        partial_steps = boundary.get("all_decode_partial_batch_steps")
+        if type(partial_steps) is not int or partial_steps < 0:
+            reasons.append("tp8_exact_pair_dense_partial_decode_steps_invalid")
+        all_decode_steps = boundary.get("all_decode_steps")
+        if (
+            type(all_decode_steps) is not int
+            or type(boundary.get("all_decode_full_batch_steps")) is not int
+            or type(partial_steps) is not int
+            or all_decode_steps
+            != boundary["all_decode_full_batch_steps"]
+            + partial_steps
+            + boundary.get("all_decode_zero_token_steps", -1)
+        ):
+            reasons.append("tp8_exact_pair_dense_decode_step_accounting_mismatch")
         if boundary.get("cudagraph_runtime_observer_enabled") is True:
             reasons.append("tp8_exact_pair_dense_timed_observer_present")
 
@@ -1929,7 +2099,9 @@ def _exact_engine_runtime_and_pair_reasons(
         "cuda_capabilities",
         "batch_size",
         "context_tokens",
+        "request_context_tokens",
         "max_new_tokens",
+        "request_max_new_tokens",
         "max_model_len",
         "runner_tier",
         "expected_git_commit",
@@ -1955,7 +2127,9 @@ def _exact_engine_runtime_and_pair_reasons(
         "cuda_capabilities": provenance.get("runner_cuda_capabilities"),
         "batch_size": 32,
         "context_tokens": 64_000,
+        "request_context_tokens": [64_000] * 32,
         "max_new_tokens": 2_048,
+        "request_max_new_tokens": [2_048] * 32,
         "max_model_len": 66_560,
         "runner_tier": "tp8x64k",
         "expected_git_commit": provenance.get("runner_expected_git_commit"),
@@ -2753,6 +2927,12 @@ def _harness_condition_reasons(
         if isinstance(provenance, dict):
             expected_requests = provenance.get("batch_size")
             expected_tokens = provenance.get("max_new_tokens_effective")
+            expected_vector = _exact_positive_int_vector(
+                provenance.get("request_max_new_tokens"),
+                expected_count=(
+                    expected_requests if type(expected_requests) is int else 0
+                ),
+            )
             if (
                 not _is_exact_positive_int(
                     output_length_gate.get("expected_request_count"),
@@ -2764,31 +2944,157 @@ def _harness_condition_reasons(
                 )
             ):
                 reasons.append("output_length_request_count_mismatch")
+            if output_length_gate.get("request_indices") != list(
+                range(expected_requests if type(expected_requests) is int else 0)
+            ):
+                reasons.append("output_length_request_index_binding_mismatch")
             if (
-                not _is_exact_positive_int(
+                expected_vector is None
+                or output_length_gate.get(
+                    "expected_output_tokens_by_request"
+                )
+                != expected_vector
+                or not _is_exact_positive_int(
                     output_length_gate.get("expected_output_tokens"),
                     expected_tokens,
                 )
-                or not _is_exact_positive_int(
-                    output_length_gate.get("min_output_tokens"),
-                    expected_tokens,
-                )
-                or not _is_exact_positive_int(
-                    output_length_gate.get("max_output_tokens"),
-                    expected_tokens,
-                )
+                or output_length_gate.get("min_output_tokens")
+                != min(expected_vector or [-1])
+                or output_length_gate.get("max_output_tokens")
+                != max(expected_vector or [-1])
             ):
                 reasons.append("output_length_token_count_mismatch")
             token_lengths = output_length_gate.get("token_lengths")
             if (
                 not isinstance(token_lengths, list)
-                or len(token_lengths) != expected_requests
-                or any(
-                    not _is_exact_positive_int(length, expected_tokens)
-                    for length in token_lengths
-                )
+                or any(type(value) is not int or value <= 0 for value in token_lengths)
+                or token_lengths != expected_vector
             ):
                 reasons.append("output_length_token_lengths_mismatch")
+    if mode == "sparse":
+        mixed_gate = summary.get("mixed_chunk_postflight_gate")
+        if not isinstance(mixed_gate, dict):
+            reasons.append("mixed_chunk_postflight_gate_missing_or_invalid")
+        elif isinstance(provenance, dict):
+            batch_size_raw = provenance.get("batch_size")
+            batch_size = batch_size_raw if type(batch_size_raw) is int else 0
+            context_vector = _exact_positive_int_vector(
+                provenance.get("request_context_tokens"),
+                expected_count=batch_size,
+            )
+            max_new_vector = _exact_positive_int_vector(
+                provenance.get("request_max_new_tokens"),
+                expected_count=batch_size,
+            )
+            if context_vector is None or max_new_vector is None:
+                reasons.append("mixed_chunk_postflight_request_vectors_invalid")
+            else:
+                expected_required = bool(
+                    batch_size > 1 and len(set(context_vector)) > 1
+                )
+                expected_status = (
+                    "not_applicable"
+                    if batch_size == 1
+                    else ("passed" if expected_required else "not_required")
+                )
+                expected_fields = {
+                    "schema": "sfi.mixed_chunk_postflight.v1",
+                    "required": expected_required,
+                    "status": expected_status,
+                    "passed": True,
+                    "reasons": [],
+                    "batch_size": batch_size,
+                    "request_context_tokens": context_vector,
+                    "request_max_new_tokens": max_new_vector,
+                    "context_heterogeneous": expected_required,
+                    "max_new_tokens_heterogeneous": (
+                        len(set(max_new_vector)) > 1
+                    ),
+                }
+                for field, expected in expected_fields.items():
+                    if mixed_gate.get(field) != expected:
+                        reasons.append(
+                            f"mixed_chunk_postflight_field_mismatch:{field}"
+                        )
+                if expected_required:
+                    if (
+                        type(mixed_gate.get("prepare_step_lengths_count"))
+                        is not int
+                        or mixed_gate.get("prepare_step_lengths_count") <= 0
+                    ):
+                        reasons.append(
+                            "mixed_chunk_prepare_step_lengths_evidence_missing"
+                        )
+                    if mixed_gate.get(
+                        "malformed_prepare_step_lengths_count"
+                    ) != 0:
+                        reasons.append("mixed_chunk_malformed_evidence_present")
+                    if (
+                        type(mixed_gate.get("mixed_chunk_event_count")) is not int
+                        or mixed_gate.get("mixed_chunk_event_count") <= 0
+                    ):
+                        reasons.append("mixed_chunk_event_evidence_missing")
+                    reasons.extend(
+                        _mixed_chunk_sample_reasons(
+                            mixed_gate.get("mixed_chunk_event_sample")
+                        )
+                    )
+        if summary.get("mixed_chunk_postflight_gate_passed") is not True:
+            reasons.append("mixed_chunk_postflight_gate_not_green")
+    if isinstance(provenance, dict):
+        expected_request_vectors = {
+            "request_context_tokens": provenance.get(
+                "request_context_tokens"
+            ),
+            "request_max_new_tokens": provenance.get(
+                "request_max_new_tokens"
+            ),
+        }
+        if summary.get("request_vector_contract_expected") != (
+            expected_request_vectors
+        ):
+            reasons.append("request_vector_contract_expected_mismatch")
+        if summary.get("request_vector_contract_match") is not True:
+            reasons.append("request_vector_contract_not_green")
+        if summary.get("request_vector_contract_reasons") != []:
+            reasons.append("request_vector_contract_reasons_nonempty")
+        observed_vectors = summary.get("request_vector_contract_observed")
+        if not isinstance(observed_vectors, dict):
+            reasons.append("request_vector_contract_observed_invalid")
+        else:
+            expected_children = ["speed_child"]
+            if str(summary.get("diagnostic_decode_metrics_path", "") or ""):
+                expected_children.append("diagnostic_child")
+            if str(summary.get("reference_dense_metrics_path", "") or ""):
+                expected_children.append("dense_reference_child")
+            for child in expected_children:
+                if observed_vectors.get(child) != expected_request_vectors:
+                    reasons.append(
+                        f"request_vector_contract_{child}_mismatch"
+                    )
+        expected_decode_step_contract = {
+            "decode_step_contract_schema": "sfi.single_token_decode_step.v1",
+            "decode_step_contract_proof_passed": True,
+            "decode_step_speculative_config_present": False,
+            "decode_step_stream_interval": 1,
+            "decode_step_max_tokens_per_request": 1,
+        }
+        if summary.get("decode_step_contract_expected") != (
+            expected_decode_step_contract
+        ):
+            reasons.append("decode_step_contract_expected_mismatch")
+        if summary.get("decode_step_contract_match") is not True:
+            reasons.append("decode_step_contract_not_green")
+        if summary.get("decode_step_contract_reasons") != []:
+            reasons.append("decode_step_contract_reasons_nonempty")
+        if isinstance(observed_vectors, dict):
+            for child in expected_children:
+                if summary.get(
+                    f"{child}_decode_step_contract_proof"
+                ) != expected_decode_step_contract:
+                    reasons.append(
+                        f"decode_step_contract_{child}_mismatch"
+                    )
     if not _is_zero_int(summary.get("returncode")):
         reasons.append(f"speed_child_returncode_nonzero:{summary.get('returncode')}")
     if summary.get("timed_out") is not False:
@@ -2849,9 +3155,7 @@ def _harness_condition_reasons(
     if exact_tier:
         exact_decode_window = {
             "all_decode_entered": True,
-            "all_decode_partial_batch_steps": 0,
             "all_decode_zero_token_steps": 0,
-            "all_decode_fallback_used": False,
         }
         for field, expected in exact_decode_window.items():
             actual = summary.get(field)
@@ -2863,6 +3167,20 @@ def _harness_condition_reasons(
         full_batch_steps = summary.get("all_decode_full_batch_steps")
         if type(full_batch_steps) is not int or full_batch_steps <= 0:
             reasons.append("tp8_exact_full_batch_decode_steps_missing")
+        partial_steps = summary.get("all_decode_partial_batch_steps")
+        if type(partial_steps) is not int or partial_steps < 0:
+            reasons.append("tp8_exact_partial_decode_steps_invalid")
+        all_decode_steps = summary.get("all_decode_steps")
+        if (
+            type(all_decode_steps) is not int
+            or type(full_batch_steps) is not int
+            or type(partial_steps) is not int
+            or all_decode_steps
+            != full_batch_steps
+            + partial_steps
+            + summary.get("all_decode_zero_token_steps", -1)
+        ):
+            reasons.append("tp8_exact_decode_step_accounting_mismatch")
 
     route_proof = summary.get("route_proof")
     if not isinstance(route_proof, dict) or route_proof.get("passed") is not True:
@@ -3031,15 +3349,9 @@ def check_run_speed_summary(
         messages.append("FAIL: summary root must be a JSON object")
         return _failure_returncode(harness_returncode), messages
 
-    tps = summary.get("decode_tps")
-    messages.append(f"decode_tps={tps}")
-    tps_valid = _is_finite_positive_number(tps)
-    if not tps_valid:
-        messages.append("  decode_tps must be a finite positive JSON number")
     all_decode_tps = summary.get("all_decode_tps")
     all_decode_tps_valid = _is_finite_positive_number(all_decode_tps)
-    if all_decode_tps is not None:
-        messages.append(f"all_decode_tps={all_decode_tps}")
+    messages.append(f"all_decode_tps={all_decode_tps}")
     if not all_decode_tps_valid:
         messages.append("  all_decode_tps must be a finite positive JSON number")
     for key in sorted(summary):
@@ -3130,8 +3442,7 @@ def check_run_speed_summary(
         )
 
     summary_ok = bool(
-        tps_valid
-        and all_decode_tps_valid
+        all_decode_tps_valid
         and not fallbacks
         and not unexpected_gate_reasons
         and not route_proof_reasons
@@ -3154,9 +3465,15 @@ def check_run_speed_summary(
         messages.append("SPEED RUN CHECK FAILED")
         return 1, messages
     if exact_tier and mode == "sparse":
-        messages.append("SPARSE/DENSE PAIRED ENGINE-LOOP SPEEDUP OK")
+        messages.append(
+            "SPARSE/DENSE ALL-DECODE SPEEDUP OK: "
+            f"{summary.get('all_decode_speedup')}x"
+        )
     elif expect_local_paired_comparison and mode == "sparse":
-        messages.append("SPARSE/DENSE LOCAL PAIRED COMPARISON OK")
+        messages.append(
+            "SPARSE/DENSE LOCAL ALL-DECODE COMPARISON OK: "
+            f"{summary.get('all_decode_speedup')}x"
+        )
     else:
         messages.append("SPEED ARM HEALTHY (single arm; no speedup claim)")
     return 0, messages

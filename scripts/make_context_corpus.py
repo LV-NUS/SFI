@@ -8,16 +8,17 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import stat
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 
 CONTEXT_DELIMITER = "Context:"
 ESCAPED_CONTEXT_DELIMITER = "Context："
-CACHE_SCHEMA = "sfi.context_corpus_cache.v5"
+CACHE_SCHEMA = "sfi.context_corpus_cache.v6"
 SOURCE_STREAM_MODE = "cyclic_layout_body_token_stream_v1"
 SOURCE_PHASE_SOLVER = "minimal_exact_cyclic_phase_v1"
 WIRE_VALIDATION_CONTRACT = "load_prompt_batch_exact_v1"
@@ -104,20 +105,50 @@ def _source_layout_template_sha256(fixed_prefix: str, fixed_suffix: str) -> str:
     return digest.hexdigest()
 
 
+def normalize_tokens_per_segment_by_request(
+    values: Sequence[int],
+) -> tuple[int, ...]:
+    """Return the sole canonical per-request corpus length contract."""
+
+    if isinstance(values, (str, bytes)):
+        raise ValueError("tokens_per_segment_by_request must be an integer sequence")
+    normalized = tuple(values)
+    if not normalized:
+        raise ValueError("tokens_per_segment_by_request must not be empty")
+    if any(type(value) is not int or value <= 0 for value in normalized):
+        raise ValueError(
+            "tokens_per_segment_by_request values must be positive integers"
+        )
+    return normalized
+
+
+def parse_tokens_per_segment_by_request(
+    raw: str,
+    *,
+    option_name: str = "--tokens-per-segment-by-request",
+) -> tuple[int, ...]:
+    """Parse the CLI CSV form without creating a second shape contract."""
+
+    value = str(raw)
+    if re.fullmatch(r"[1-9][0-9]*(?:,[1-9][0-9]*)*", value) is None:
+        raise ValueError(
+            f"{option_name} must be a canonical positive-integer CSV"
+        )
+    parsed = tuple(int(field, 10) for field in value.split(","))
+    return normalize_tokens_per_segment_by_request(parsed)
+
+
 def _build_context_corpus_with_report(
     source_text: str,
     tokenizer: Any,
     *,
-    segments: int,
-    tokens_per_segment: int,
+    tokens_per_segment_by_request: Sequence[int],
 ) -> tuple[str, dict[str, object]]:
     """Token-slice ``source_text`` into the prompt loader's exact wire format."""
-    segment_count = int(segments)
-    segment_tokens = int(tokens_per_segment)
-    if segment_count <= 0:
-        raise ValueError("segments must be positive")
-    if segment_tokens <= 0:
-        raise ValueError("tokens_per_segment must be positive")
+    token_targets = normalize_tokens_per_segment_by_request(
+        tokens_per_segment_by_request
+    )
+    segment_count = len(token_targets)
     # ``Context:`` is the on-wire record delimiter consumed by
     # load_prompt_batch.  Long sources can legitimately contain the same text
     # far beyond the short-context smoke range.  Classify one explicit source
@@ -141,13 +172,14 @@ def _build_context_corpus_with_report(
             add_special_tokens=False,
         )
     )
-    if segment_tokens <= fixed_wire_tokens:
-        raise ValueError(
-            "tokens_per_segment cannot hold the source layout envelope and "
-            "a non-empty body: "
-            f"tokens_per_segment={segment_tokens}, "
-            f"fixed_wire_tokens={fixed_wire_tokens}, layout={source_layout}"
-        )
+    for segment_index, segment_tokens in enumerate(token_targets):
+        if segment_tokens <= fixed_wire_tokens:
+            raise ValueError(
+                "tokens_per_segment_by_request cannot hold the source layout "
+                "envelope and a non-empty body: "
+                f"segment={segment_index}, tokens={segment_tokens}, "
+                f"fixed_wire_tokens={fixed_wire_tokens}, layout={source_layout}"
+            )
 
     # The source is benchmark content, not a capacity limit.  Treat its tokens
     # as one deterministic cyclic stream so every requested batch row can be
@@ -172,6 +204,7 @@ def _build_context_corpus_with_report(
     def _try_render_exact_prompt(
         start: int,
         segment_index: int,
+        segment_tokens: int,
     ) -> tuple[tuple[str, int] | None, tuple[int, int]]:
         candidate = max(1, segment_tokens - fixed_wire_tokens)
         max_candidate = max(4096, segment_tokens * 4)
@@ -254,15 +287,16 @@ def _build_context_corpus_with_report(
     # cyclic phase repeats a start already considered here.  Do not impose an
     # arbitrary retry cap that could reject an existing canonical exact window.
     phase_count = len(source_body_token_ids)
-    best_failure: tuple[int, int, int, int] | None = None
+    best_failure: tuple[int, int, int, int, int] | None = None
     for source_phase in range(phase_count):
         rendered_segments: list[str] = []
         consumed_by_segment: list[int] = []
         source_cursor = int(source_phase)
-        for segment_index in range(segment_count):
+        for segment_index, segment_tokens in enumerate(token_targets):
             rendered, closest = _try_render_exact_prompt(
                 source_cursor,
                 segment_index,
+                segment_tokens,
             )
             if rendered is None:
                 closest_count, closest_actual = closest
@@ -271,6 +305,7 @@ def _build_context_corpus_with_report(
                     int(source_phase),
                     int(segment_index),
                     int(closest_count),
+                    int(segment_tokens),
                 )
                 if best_failure is None or failure < best_failure:
                     best_failure = failure
@@ -287,7 +322,8 @@ def _build_context_corpus_with_report(
                 "source_body_tokens_consumed_by_segment": consumed_by_segment,
             }
 
-    _, closest_phase, closest_segment, closest_count = best_failure or (
+    _, closest_phase, closest_segment, closest_count, closest_target = best_failure or (
+        -1,
         -1,
         -1,
         -1,
@@ -296,7 +332,7 @@ def _build_context_corpus_with_report(
     raise ValueError(
         "unable to render exact wire prompt token length with canonical "
         "cyclic source phase: "
-        f"segment={closest_segment}, expected={segment_tokens}, "
+        f"segment={closest_segment}, expected={closest_target}, "
         f"closest_source_phase={closest_phase}, "
         f"closest_source_tokens_used={closest_count}, "
         f"phases_considered={phase_count}"
@@ -307,15 +343,13 @@ def build_context_corpus(
     source_text: str,
     tokenizer: Any,
     *,
-    segments: int,
-    tokens_per_segment: int,
+    tokens_per_segment_by_request: Sequence[int],
 ) -> str:
     """Build the exact wire corpus from one canonical cyclic source stream."""
     corpus, _ = _build_context_corpus_with_report(
         source_text,
         tokenizer,
-        segments=segments,
-        tokens_per_segment=tokens_per_segment,
+        tokens_per_segment_by_request=tokens_per_segment_by_request,
     )
     return corpus
 
@@ -392,8 +426,7 @@ def context_corpus_cache_identity(
     *,
     source_path: Path,
     model_path: Path,
-    segments: int,
-    tokens_per_segment: int,
+    tokens_per_segment_by_request: Sequence[int],
 ) -> dict[str, object]:
     source = Path(source_path).expanduser().resolve()
     model = Path(model_path).expanduser().resolve()
@@ -403,8 +436,7 @@ def context_corpus_cache_identity(
     return _context_corpus_cache_identity_from_snapshot(
         source_snapshot=source_snapshot,
         model_path=model,
-        segments=segments,
-        tokens_per_segment=tokens_per_segment,
+        tokens_per_segment_by_request=tokens_per_segment_by_request,
     )
 
 
@@ -412,14 +444,12 @@ def _context_corpus_cache_identity_from_snapshot(
     *,
     source_snapshot: bytes,
     model_path: Path,
-    segments: int,
-    tokens_per_segment: int,
+    tokens_per_segment_by_request: Sequence[int],
 ) -> dict[str, object]:
     model = Path(model_path).expanduser().resolve()
-    if int(segments) <= 0:
-        raise ValueError("segments must be positive")
-    if int(tokens_per_segment) <= 0:
-        raise ValueError("tokens_per_segment must be positive")
+    token_targets = normalize_tokens_per_segment_by_request(
+        tokens_per_segment_by_request
+    )
     source_text = bytes(source_snapshot).decode("utf-8")
     source_layout, fixed_prefix, _, fixed_suffix = _escaped_source_layout(
         source_text
@@ -436,8 +466,8 @@ def _context_corpus_cache_identity_from_snapshot(
         ),
         "source_stream_mode": SOURCE_STREAM_MODE,
         "source_phase_solver": SOURCE_PHASE_SOLVER,
-        "segments": int(segments),
-        "tokens_per_segment": int(tokens_per_segment),
+        "segments": len(token_targets),
+        "tokens_per_segment_by_request": list(token_targets),
     }
 
 
@@ -468,7 +498,7 @@ def validate_context_corpus_manifest(
     source_snapshot: bytes,
     tokenizer: Any,
 ) -> tuple[Path, str, dict[str, object]]:
-    """Validate one v5 corpus/manifest pair against its complete identity.
+    """Validate one v6 corpus/manifest pair against its complete identity.
 
     This is the sole manifest contract shared by cache admission, run
     preflight, and postflight.  It deliberately validates immutable snapshots
@@ -491,8 +521,14 @@ def validate_context_corpus_manifest(
     if manifest.get("identity") != expected_identity:
         raise ValueError("corpus manifest identity mismatch")
 
-    expected_segments = int(expected_identity["segments"])
-    expected_tokens = int(expected_identity["tokens_per_segment"])
+    if expected_identity.get("schema") != CACHE_SCHEMA:
+        raise ValueError("corpus manifest schema mismatch")
+    expected_tokens = normalize_tokens_per_segment_by_request(
+        expected_identity.get("tokens_per_segment_by_request", ())  # type: ignore[arg-type]
+    )
+    expected_segments = len(expected_tokens)
+    if expected_identity.get("segments") != expected_segments:
+        raise ValueError("corpus manifest segment count mismatch")
     wire_token_lengths = manifest.get("wire_token_lengths")
     body_tokens_consumed = manifest.get("source_body_tokens_consumed_by_segment")
     layout_verified = manifest.get("source_layout_verified_by_segment")
@@ -519,21 +555,18 @@ def validate_context_corpus_manifest(
     expected_corpus, expected_build_report = _build_context_corpus_with_report(
         source_text,
         tokenizer,
-        segments=expected_segments,
-        tokens_per_segment=expected_tokens,
+        tokens_per_segment_by_request=expected_tokens,
     )
     if corpus_bytes != expected_corpus.encode("utf-8"):
-        raise ValueError("corpus content does not match canonical v5 rendering")
+        raise ValueError("corpus content does not match canonical v6 rendering")
     for field, expected in expected_build_report.items():
         if manifest.get(field) != expected:
             raise ValueError(f"corpus manifest build proof mismatch: {field}")
     if (
         not isinstance(wire_token_lengths, list)
         or len(wire_token_lengths) != expected_segments
-        or any(
-            type(length) is not int or length != expected_tokens
-            for length in wire_token_lengths
-        )
+        or any(type(length) is not int for length in wire_token_lengths)
+        or tuple(wire_token_lengths) != expected_tokens
     ):
         raise ValueError("corpus manifest wire-token proof mismatch")
     if (
@@ -637,8 +670,7 @@ def ensure_context_corpus_cached(
     cache_dir: Path,
     source_path: Path,
     model_path: Path,
-    segments: int,
-    tokens_per_segment: int,
+    tokens_per_segment_by_request: Sequence[int],
     tokenizer_loader: Callable[[Path], Any] = _load_local_tokenizer,
 ) -> tuple[Path, bool]:
     """Return a verified content-addressed corpus, building it once per identity."""
@@ -647,17 +679,24 @@ def ensure_context_corpus_cached(
     if not source.is_file():
         raise ValueError(f"source prompt not found: {source}")
     source_snapshot = source.read_bytes()
+    token_targets = normalize_tokens_per_segment_by_request(
+        tokens_per_segment_by_request
+    )
     identity = _context_corpus_cache_identity_from_snapshot(
         source_snapshot=source_snapshot,
         model_path=model,
-        segments=segments,
-        tokens_per_segment=tokens_per_segment,
+        tokens_per_segment_by_request=token_targets,
     )
     identity_json = json.dumps(identity, sort_keys=True, separators=(",", ":"))
     cache_key = hashlib.sha256(identity_json.encode("utf-8")).hexdigest()
     cache_root = Path(cache_dir).expanduser().resolve()
     cache_root.mkdir(parents=True, exist_ok=True)
-    corpus_path = cache_root / f"ctx_{int(segments)}x{int(tokens_per_segment)}_{cache_key}.txt"
+    length_tag = (
+        str(token_targets[0])
+        if len(set(token_targets)) == 1
+        else f"mixed{min(token_targets)}-{max(token_targets)}"
+    )
+    corpus_path = cache_root / f"ctx_{len(token_targets)}x{length_tag}_{cache_key}.txt"
     manifest_path = corpus_path.with_suffix(".manifest.json")
     lock_path = corpus_path.with_suffix(".lock")
 
@@ -686,12 +725,13 @@ def validate_context_corpus(
     prompt_path: Path,
     tokenizer: Any,
     *,
-    segments: int,
-    tokens_per_segment: int,
+    tokens_per_segment_by_request: Sequence[int],
 ) -> tuple[int, ...]:
     """Validate the exact prompts consumed by ``load_prompt_batch``."""
-    expected_segments = int(segments)
-    expected_tokens = int(tokens_per_segment)
+    expected_tokens = normalize_tokens_per_segment_by_request(
+        tokens_per_segment_by_request
+    )
+    expected_segments = len(expected_tokens)
     prompts = _load_context_prompts(
         Path(prompt_path),
         segments=expected_segments,
@@ -702,12 +742,11 @@ def validate_context_corpus(
     )
     if (
         len(token_lengths) != expected_segments
-        or any(length != expected_tokens for length in token_lengths)
+        or token_lengths != expected_tokens
     ):
         raise ValueError(
             "context corpus wire prompt token length mismatch: "
-            f"actual={token_lengths}, expected_segments={expected_segments}, "
-            f"expected_tokens={expected_tokens}"
+            f"actual={token_lengths}, expected={expected_tokens}"
         )
     return token_lengths
 
@@ -719,25 +758,30 @@ def write_context_corpus_artifacts(
     identity: dict[str, object],
     tokenizer: Any,
 ) -> tuple[Path, Path]:
-    """Atomically publish a corpus and its mandatory sibling v5 manifest."""
+    """Atomically publish a corpus and its mandatory sibling v6 manifest."""
 
     output = Path(output_path)
     source_text = bytes(source_snapshot).decode("utf-8")
     source_layout, fixed_prefix, _, fixed_suffix = _escaped_source_layout(
         source_text
     )
+    token_targets = normalize_tokens_per_segment_by_request(
+        identity.get("tokens_per_segment_by_request", ())  # type: ignore[arg-type]
+    )
+    if identity.get("schema") != CACHE_SCHEMA or identity.get("segments") != len(
+        token_targets
+    ):
+        raise ValueError("corpus identity does not satisfy the v6 vector contract")
     corpus, build_report = _build_context_corpus_with_report(
         source_text,
         tokenizer,
-        segments=int(identity["segments"]),
-        tokens_per_segment=int(identity["tokens_per_segment"]),
+        tokens_per_segment_by_request=token_targets,
     )
     write_text_atomic(output, corpus)
     wire_token_lengths = validate_context_corpus(
         output,
         tokenizer,
-        segments=int(identity["segments"]),
-        tokens_per_segment=int(identity["tokens_per_segment"]),
+        tokens_per_segment_by_request=token_targets,
     )
     layout_verified = validate_context_corpus_source_layout(
         output,
@@ -777,8 +821,10 @@ def write_context_corpus_artifacts(
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True, help="Local tokenizer model path")
-    parser.add_argument("--segments", type=int, required=True)
-    parser.add_argument("--tokens-per-segment", type=int, required=True)
+    parser.add_argument("--segments", type=int)
+    shape_group = parser.add_mutually_exclusive_group(required=True)
+    shape_group.add_argument("--tokens-per-segment", type=int)
+    shape_group.add_argument("--tokens-per-segment-by-request")
     parser.add_argument("--source", type=Path, default=DEFAULT_SOURCE)
     output_group = parser.add_mutually_exclusive_group(required=True)
     output_group.add_argument("--output", type=Path)
@@ -792,12 +838,47 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _resolve_cli_tokens_per_segment_by_request(
+    args: argparse.Namespace,
+) -> tuple[int, ...]:
+    vector_raw = getattr(args, "tokens_per_segment_by_request", None)
+    scalar_raw = getattr(args, "tokens_per_segment", None)
+    segments_raw = getattr(args, "segments", None)
+    if vector_raw is not None and scalar_raw is not None:
+        raise ValueError(
+            "--tokens-per-segment and --tokens-per-segment-by-request "
+            "are mutually exclusive"
+        )
+    if vector_raw is not None:
+        token_targets = (
+            parse_tokens_per_segment_by_request(vector_raw)
+            if isinstance(vector_raw, str)
+            else normalize_tokens_per_segment_by_request(vector_raw)
+        )
+        if segments_raw is not None and int(segments_raw) != len(token_targets):
+            raise ValueError(
+                "--segments must equal the number of "
+                "--tokens-per-segment-by-request values"
+            )
+        return token_targets
+    if scalar_raw is None:
+        raise ValueError(
+            "one of --tokens-per-segment or "
+            "--tokens-per-segment-by-request is required"
+        )
+    if segments_raw is None or int(segments_raw) <= 0:
+        raise ValueError("--segments must be positive with --tokens-per-segment")
+    if type(scalar_raw) is not int or scalar_raw <= 0:
+        raise ValueError("--tokens-per-segment must be positive")
+    return (scalar_raw,) * int(segments_raw)
+
+
 def main() -> int:
     args = _parse_args()
-    if int(args.segments) <= 0:
-        raise SystemExit("--segments must be positive")
-    if int(args.tokens_per_segment) <= 0:
-        raise SystemExit("--tokens-per-segment must be positive")
+    try:
+        token_targets = _resolve_cli_tokens_per_segment_by_request(args)
+    except (TypeError, ValueError) as exc:
+        raise SystemExit(str(exc)) from exc
 
     model_path = Path(args.model).expanduser().resolve()
     if not model_path.is_dir():
@@ -817,8 +898,7 @@ def main() -> int:
         identity = _context_corpus_cache_identity_from_snapshot(
             source_snapshot=source_snapshot,
             model_path=model_path,
-            segments=int(args.segments),
-            tokens_per_segment=int(args.tokens_per_segment),
+            tokens_per_segment_by_request=token_targets,
         )
         tokenizer = _load_local_tokenizer(model_path)
         manifest_path, manifest_sha256, manifest = (
@@ -852,7 +932,8 @@ def main() -> int:
             print(
                 "context corpus validated: "
                 f"segments={len(token_lengths)} "
-                f"tokens_per_segment={token_lengths[0]} "
+                "tokens_per_segment_by_request="
+                f"{','.join(str(value) for value in token_lengths)} "
                 f"source_layout={source_layout} "
                 f"layout_verified={all(layout_verified)} "
                 f"path={validate_path}"
@@ -864,8 +945,7 @@ def main() -> int:
             cache_dir=args.cache_dir,
             source_path=source_path,
             model_path=model_path,
-            segments=int(args.segments),
-            tokens_per_segment=int(args.tokens_per_segment),
+            tokens_per_segment_by_request=token_targets,
         )
         print(
             f"context corpus cache {'hit' if cache_hit else 'miss'}: {output_path}",
@@ -878,8 +958,7 @@ def main() -> int:
     identity = _context_corpus_cache_identity_from_snapshot(
         source_snapshot=source_snapshot,
         model_path=model_path,
-        segments=int(args.segments),
-        tokens_per_segment=int(args.tokens_per_segment),
+        tokens_per_segment_by_request=token_targets,
     )
     # Do not call Path.resolve() here: it follows an existing final symlink and
     # turns an otherwise atomic replacement into an overwrite of its victim.
@@ -896,8 +975,9 @@ def main() -> int:
     )
     print(
         "context corpus ready: "
-        f"segments={int(args.segments)} "
-        f"tokens_per_segment={int(args.tokens_per_segment)} "
+        f"segments={len(token_targets)} "
+        "tokens_per_segment_by_request="
+        f"{','.join(str(value) for value in token_targets)} "
         f"source={source_path} output={output_path}"
     )
     return 0
