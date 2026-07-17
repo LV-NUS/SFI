@@ -3920,7 +3920,15 @@ def run_capture_postprocess_job_sequence_for_cohort(
     *,
     meta_cache_owner: Optional[object],
 ) -> tuple[int, Any]:
-    """Run one strict cohort and return its dominating terminal event."""
+    """Run one ordered cohort and return its dominating terminal event.
+
+    Cohort ownership is a stream/lifecycle contract, not a kernel-route
+    contract.  A real mixed chunk may legitimately contain tiled, resident,
+    generic, direct-prefill, and last-n=1 jobs.  The general sequence owner
+    already preserves their order on the current stream while coalescing only
+    compatible tiled runs; keep that single route implementation authoritative
+    and validate the stricter cohort boundary around it.
+    """
 
     _reject_retired_selector_log_f_tp8_exact_env()
     jobs = tuple(jobs or tuple())
@@ -3936,6 +3944,31 @@ def run_capture_postprocess_job_sequence_for_cohort(
             "COHORT_SEQUENCE",
             "strict capture cohort jobs must have distinct owners",
         )
+    if any(
+        bool(getattr(job, "completed", False))
+        or bool(getattr(job, "launched", False))
+        or bool(getattr(job, "ran_postprocess", False))
+        or getattr(job, "completion_event", None) is not None
+        for job in jobs
+    ):
+        _selector_log_f_contract_error(
+            "COHORT_SEQUENCE",
+            "strict capture cohort requires fresh unlaunched jobs",
+        )
+    if any(
+        getattr(job, "ready_event", None) is None
+        or not callable(
+            getattr(getattr(job, "lifecycle_lock", None), "acquire", None)
+        )
+        or not callable(
+            getattr(getattr(job, "lifecycle_lock", None), "release", None)
+        )
+        for job in jobs
+    ):
+        _selector_log_f_contract_error(
+            "COHORT_SEQUENCE",
+            "strict capture cohort jobs require ready events and lifecycle locks",
+        )
     first_scratch = getattr(jobs[0], "scratch_capture_scores", None)
     if not isinstance(first_scratch, torch.Tensor) or any(
         not isinstance(getattr(job, "scratch_capture_scores", None), torch.Tensor)
@@ -3949,82 +3982,32 @@ def run_capture_postprocess_job_sequence_for_cohort(
     owner_stream_id = int(
         torch.cuda.current_stream(device=first_scratch.device).cuda_stream
     )
-    prepared_resource_snapshots: dict[
-        torch.device, _PreparedTiledResourceSnapshot
-    ] = {}
-    raw_plans = tuple(
-        _build_tiled_job_plan(
-            job,
-            meta_cache_owner=meta_cache_owner,
-            prepared_resource_snapshots=prepared_resource_snapshots,
-        )
-        for job in jobs
+    ran_count = run_capture_postprocess_job_sequence(
+        jobs,
+        meta_cache_owner=meta_cache_owner,
     )
-    if any(plan is None for plan in raw_plans):
+    terminal_stream_id = int(
+        torch.cuda.current_stream(device=first_scratch.device).cuda_stream
+    )
+    if terminal_stream_id != owner_stream_id:
         _selector_log_f_contract_error(
             "COHORT_SEQUENCE",
-            "strict capture cohort requires only live tiled jobs",
+            "strict capture cohort changed its current stream owner",
         )
-    plans = tuple(plan for plan in raw_plans if plan is not None)
-    if any(
-        plan.job is not job
-        or plan.scratch.device != first_scratch.device
-        or int(plan.num_query_heads) != int(plans[0].num_query_heads)
-        for plan, job in zip(plans, jobs, strict=True)
-    ):
-        _selector_log_f_contract_error(
-            "COHORT_SEQUENCE",
-            "strict capture cohort plan owner or geometry drifted",
-        )
-    prepared_snapshot = prepared_resource_snapshots.get(first_scratch.device)
-    prepared_stream = getattr(prepared_snapshot, "stream", None)
-    if (
-        prepared_snapshot is None
-        or len(prepared_resource_snapshots) != 1
-        or prepared_stream is None
-        or int(getattr(prepared_stream, "cuda_stream", -1)) != owner_stream_id
-    ):
-        _selector_log_f_contract_error(
-            "COHORT_SEQUENCE",
-            "strict capture cohort requires one prepared stream owner",
-        )
-
-    ran_count = 0
-    index = 0
-    while index < len(jobs):
-        plan = plans[index]
-        total_rows = len(plan.meta_i32_rows)
-        logical_k_max = int(plan.logical_k_max)
-        end = index + 1
-        while end < len(jobs):
-            candidate = plans[end]
-            proposed_rows = total_rows + len(candidate.meta_i32_rows)
-            proposed_logical_k_max = max(
-                logical_k_max,
-                int(candidate.logical_k_max),
-            )
-            if not _prepared_tiled_resource_available(
-                snapshot=prepared_snapshot,
-                device=plan.scratch.device,
-                num_rows=proposed_rows,
-                num_query_heads=int(plan.num_query_heads),
-                logical_k_max=proposed_logical_k_max,
-            ):
-                break
-            total_rows = proposed_rows
-            logical_k_max = proposed_logical_k_max
-            end += 1
-        ran_count += _run_tiled_capture_postprocess_job_cohort(
-            jobs[index:end],
-            meta_cache_owner=meta_cache_owner,
-            initial_plans=plans[index:end],
-            prepared_resource_snapshot=prepared_snapshot,
-        )
-        index = end
     if ran_count != len(jobs):
         _selector_log_f_contract_error(
             "COHORT_SEQUENCE",
             "strict capture cohort did not launch every job",
+        )
+    if any(
+        not bool(getattr(job, "completed", False))
+        or not bool(getattr(job, "ran_postprocess", False))
+        or getattr(job, "completion_event", None) is None
+        for job in jobs
+    ):
+        _selector_log_f_contract_error(
+            "COHORT_SEQUENCE",
+            "strict capture cohort did not complete every ordered job",
         )
     terminal_event = getattr(jobs[-1], "completion_event", None)
     if terminal_event is None:
@@ -4032,11 +4015,11 @@ def run_capture_postprocess_job_sequence_for_cohort(
             "COHORT_SEQUENCE",
             "strict capture cohort is missing its terminal event",
         )
-    # This strict sequence preserves job order and every capacity-bounded
-    # subrun is submitted to the one prepared stream proved above.  The final
-    # job's immutable event therefore dominates all earlier capacity-bounded
-    # subruns.  Keep every job's own event immutable and return that terminal
-    # ownership token; this adds no CUDA event, sync, kernel, or lock protocol.
+    # The authoritative sequence owner preserves job order and submits every
+    # route on the current stream (tiled plans freeze that same stream in their
+    # prepared snapshot).  The final job's immutable event therefore dominates
+    # every earlier mixed-route subrun.  Returning that existing token adds no
+    # CUDA event, sync, kernel, or lock protocol.
     return int(ran_count), terminal_event
 
 

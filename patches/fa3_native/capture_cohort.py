@@ -210,7 +210,7 @@ def validate_capture_cohort_completion(
         or ran_count != len(cohort.entries)
     ):
         raise RuntimeError(
-            "E_SFI_CAPTURE_COHORT_LAUNCH: strict tiled owner did not consume "
+            "E_SFI_CAPTURE_COHORT_LAUNCH: strict ordered owner did not consume "
             "every job"
         )
     if any(
