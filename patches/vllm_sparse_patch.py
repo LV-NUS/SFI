@@ -736,7 +736,26 @@ def _load_step_context_impl():
         _bind_runtime_worker_deps()
         from patches.decode_runtime.step_context_worker import prepare_step_context_impl
 
-        _STEP_CONTEXT_IMPL = prepare_step_context_impl
+        route_counter_enabled = (
+            os.environ.get("VLLM_SPARSE_FA3_ROUTE_COUNTER_ENABLED", "0") == "1"
+        )
+        step_trace_enabled = bool(
+            os.environ.get("VLLM_SPARSE_FA3_STEP_TRACE_LOG", "")
+        )
+        if route_counter_enabled or step_trace_enabled:
+            from patches.decode_runtime.step_context_observer import (
+                build_observed_prepare_step_context_impl,
+            )
+
+            _STEP_CONTEXT_IMPL = build_observed_prepare_step_context_impl(
+                prepare_step_context_impl,
+                route_counter_enabled=route_counter_enabled,
+                step_trace_enabled=step_trace_enabled,
+            )
+        else:
+            # Production specialization: exact core function identity, with no
+            # trace/proof wrapper, branch, env lookup, or no-op callback.
+            _STEP_CONTEXT_IMPL = prepare_step_context_impl
     return _STEP_CONTEXT_IMPL
 
 

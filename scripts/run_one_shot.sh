@@ -74,6 +74,26 @@ fi
 PY="$(realpath -e -- "${PY}")"
 PYTHON="${PY}"
 export PYTHON
+GPU_MEM_UTIL_NORMALIZED=""
+if [[ -n "${GPU_MEM_UTIL:-}" ]]; then
+  if ! GPU_MEM_UTIL_NORMALIZED="$(
+    "${PY}" - "${GPU_MEM_UTIL}" <<'PY'
+import math
+import sys
+
+try:
+    value = float(sys.argv[1])
+except (TypeError, ValueError):
+    raise SystemExit(1)
+if not math.isfinite(value) or not 0.0 < value <= 1.0:
+    raise SystemExit(1)
+print(format(value, ".17g"))
+PY
+  )"; then
+    echo "FAIL: GPU_MEM_UTIL must be finite and in (0, 1]: ${GPU_MEM_UTIL}" >&2
+    exit 64
+  fi
+fi
 MODEL="$(realpath -e -- "${MODEL}")"
 if [[ ! -d "${MODEL}" ]]; then
   echo "FAIL: MODEL_PATH must be a readable local directory: ${MODEL}" >&2
@@ -215,6 +235,9 @@ esac
 if [[ -n "${MML:-}" ]]; then
   EXTRA_ARGS+=(--max-model-len "${MML}")
 fi
+if [[ -n "${GPU_MEM_UTIL_NORMALIZED}" ]]; then
+  EXTRA_ARGS+=(--gpu-mem-util "${GPU_MEM_UTIL_NORMALIZED}")
+fi
 
 echo "==> one-shot tag=${RUN_TAG}"
 echo "    arch=${ARCH} capability=${CAPABILITY} backend=${EXPECTED_BACKEND}"
@@ -314,7 +337,7 @@ gate = summary.get("gate_passed") is True
 production = summary.get("production_gate_passed") is True
 producer = summary.get("producer_gate_passed") is True
 route = summary.get("route_proof_passed") is True
-speed_route = summary.get("speed_child_route_proof_passed") is True
+diagnostic_route = summary.get("diagnostic_child_route_proof_passed") is True
 output_length = summary.get("output_length_gate_passed") is True
 decode_tps = summary.get("decode_tps")
 producer_reasons = summary.get("producer_gate_reasons") or []
@@ -323,7 +346,7 @@ semantic_reasons = summary.get("semantic_gate_reasons") or []
 reference_reasons = summary.get("reference_gate_reasons") or []
 explicit_production_equivalent = bool(
     route
-    and speed_route
+    and diagnostic_route
     and producer
     and output_length
     and not producer_reasons
@@ -334,7 +357,8 @@ explicit_production_equivalent = bool(
 print(
     f"child_returncode={child_rc} gate_passed={gate} "
     f"production_gate_passed={production} producer_gate_passed={producer} "
-    f"route_proof_passed={route} speed_child_route_proof_passed={speed_route} "
+    f"route_proof_passed={route} "
+    f"diagnostic_child_route_proof_passed={diagnostic_route} "
     f"decode_tps={decode_tps}"
 )
 

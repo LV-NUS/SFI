@@ -6,10 +6,8 @@ from dataclasses import dataclass
 import importlib
 from importlib import util as importlib_util
 import json
-import mmap
 import os
 from pathlib import Path
-import struct
 from types import ModuleType
 from typing import Any, Callable
 import sys
@@ -96,42 +94,21 @@ _SPARSE_FA3_ROUTE_COUNTERS: dict[str, Any] = {
     "resolved_row_ptr_fwd_mixed_page_count": 0,
     "has_resolved_row_ptr_count": 0,
     "page_resolver_kind_counts": {},
+    "compact_row_steps": 0,
+    "compact_rows": 0,
 }
-# [JUDGE-REPLAY-AWARE 2026-07-09] 8q→10q:追加 [8]=compact_row_steps_total
-# (当步存在 ≥1 compact 读行的 step 数,step build 侧 bump=graph 无关)与
-# [9]=compact_rows_total。动机=FULL-graph serve 下 python 侧路由计数/trace 只在
-# capture/eager/prefill 步发射,replay 步不可见——判官 R3b "row_is_compact 恒
-# False" 在健康引擎上给出 FAIL(eager 定谳轮实测 18576/18684 步 compact 健康,
-# 三次 FAIL 全为盲区伪影)。2026-07-13 起每个 TP rank 独占一个 80B 槽；
-# 旧 64B/共享 RMW 文件 fail closed，避免 reset 截断 live mmap 与跨 rank 丢计数。
-_ROUTE_COUNTER_MMAP_BYTES = 10 * 8
-_ROUTE_COUNTER_SLOT_BYTES = _ROUTE_COUNTER_MMAP_BYTES
+# [ROUTE-COUNTER-LOCAL 2026-07-19] The ten counters are worker-owned runtime
+# state.  A blocking worker RPC is the only reset/snapshot boundary; binary
+# files are serialized by the caller after that boundary and are never a live
+# transport.  This removes mmap read-modify-write from both route and step hot
+# paths while preserving the established 10-field artifact layout.
 _ROUTE_COUNTER_SLOTS_ENV = "VLLM_SPARSE_FA3_ROUTE_COUNTER_SLOTS"
-_ROUTE_COUNTER_MMAP = None
-_ROUTE_COUNTER_MMAP_PATH = ""
-_ROUTE_COUNTER_MMAP_PID: int | None = None
-_ROUTE_COUNTER_MMAP_SLOTS = 0
-_ROUTE_COUNTER_MMAP_RANK = -1
-_ROUTE_COUNTER_RANK_OVERRIDE: int | None = None
+_ROUTE_COUNTER_ENABLED_ENV = "VLLM_SPARSE_FA3_ROUTE_COUNTER_ENABLED"
 
 
-def _close_route_counter_mmap() -> None:
-    global _ROUTE_COUNTER_MMAP
-    global _ROUTE_COUNTER_MMAP_PATH
-    global _ROUTE_COUNTER_MMAP_PID
-    global _ROUTE_COUNTER_MMAP_SLOTS
-    global _ROUTE_COUNTER_MMAP_RANK
-    mapping = _ROUTE_COUNTER_MMAP
-    _ROUTE_COUNTER_MMAP = None
-    _ROUTE_COUNTER_MMAP_PATH = ""
-    _ROUTE_COUNTER_MMAP_PID = None
-    _ROUTE_COUNTER_MMAP_SLOTS = 0
-    _ROUTE_COUNTER_MMAP_RANK = -1
-    if mapping is not None:
-        mapping.close()
-
-
-atexit.register(_close_route_counter_mmap)
+def sparse_fa3_route_counter_enabled() -> bool:
+    """Resolve the process-lifetime proof specialization before hot calls."""
+    return os.environ.get(_ROUTE_COUNTER_ENABLED_ENV, "0") == "1"
 
 
 def reset_sparse_fa3_route_counters() -> None:
@@ -139,98 +116,68 @@ def reset_sparse_fa3_route_counters() -> None:
     _SPARSE_FA3_ROUTE_COUNTERS["resolved_row_ptr_fwd_mixed_page_count"] = 0
     _SPARSE_FA3_ROUTE_COUNTERS["has_resolved_row_ptr_count"] = 0
     _SPARSE_FA3_ROUTE_COUNTERS["page_resolver_kind_counts"] = {}
+    _SPARSE_FA3_ROUTE_COUNTERS["compact_row_steps"] = 0
+    _SPARSE_FA3_ROUTE_COUNTERS["compact_rows"] = 0
 
 
-def _rank_local_route_counter_slot() -> tuple[mmap.mmap, int]:
-    counter = _route_counter_mmap()
-    if counter is None:
-        raise RuntimeError(
-            "E_TP_ROUTE_COUNTER_MMAP_UNAVAILABLE: rank-local route counter "
-            "mmap is required for measurement"
-        )
-    return counter
-
-
-def _rank_local_route_counter_record(
-    mapping: mmap.mmap,
-    values: tuple[int, ...],
-) -> dict[str, Any]:
-    return {
-        "rank": int(_ROUTE_COUNTER_MMAP_RANK),
-        "slot_count": int(_ROUTE_COUNTER_MMAP_SLOTS),
-        "field_count": 10,
-        "values": [int(value) for value in values],
-        "mmap_size_bytes": int(mapping.size()),
-        "pid": int(os.getpid()),
-    }
-
-
-def reset_rank_local_route_counter_slot_for_measurement() -> dict[str, Any]:
-    """Reset this worker's slot after all pre-measurement work is drained.
-
-    The caller invokes this through a synchronous named worker RPC.  Each TP
-    rank therefore remains the sole writer of its 10-counter slot; the client
-    never races async worker tail work by zeroing the shared file globally.
-    """
-    reset_sparse_fa3_route_counters()
-    mapping, slot_offset = _rank_local_route_counter_slot()
-    zero_values = (0,) * 10
-    try:
-        struct.pack_into("10q", mapping, slot_offset, *zero_values)
-        observed = tuple(
-            int(value) for value in struct.unpack_from("10q", mapping, slot_offset)
-        )
-    except (BufferError, TypeError, ValueError, struct.error) as exc:
-        raise RuntimeError(
-            "E_TP_ROUTE_COUNTER_RESET_WRITE: failed to reset rank-local route slot"
-        ) from exc
-    if observed != zero_values:
-        raise RuntimeError(
-            "E_TP_ROUTE_COUNTER_RESET_VERIFY: rank-local route slot remained nonzero"
-        )
-    return _rank_local_route_counter_record(mapping, observed)
-
-
-def snapshot_rank_local_route_counter_slot_after_measurement() -> dict[str, Any]:
-    """Snapshot this worker's slot after its queued model work is drained."""
-    mapping, slot_offset = _rank_local_route_counter_slot()
-    try:
-        observed = tuple(
-            int(value) for value in struct.unpack_from("10q", mapping, slot_offset)
-        )
-    except (BufferError, TypeError, ValueError, struct.error) as exc:
-        raise RuntimeError(
-            "E_TP_ROUTE_COUNTER_SNAPSHOT_READ: failed to read rank-local route slot"
-        ) from exc
-    if any(value < 0 for value in observed):
-        raise RuntimeError(
-            "E_TP_ROUTE_COUNTER_SNAPSHOT_NEGATIVE: rank-local route counters "
-            "must be non-negative"
-        )
-    return _rank_local_route_counter_record(mapping, observed)
-
-
-def get_sparse_fa3_route_counters(*, reset: bool = False) -> dict[str, Any]:
-    counters = {
-        "actual_fwd_mixed_page_count": int(
-            _SPARSE_FA3_ROUTE_COUNTERS.get("actual_fwd_mixed_page_count", 0) or 0
-        ),
-        "resolved_row_ptr_fwd_mixed_page_count": int(
+def _rank_local_route_counter_values() -> tuple[int, ...]:
+    kind_counts = dict(
+        _SPARSE_FA3_ROUTE_COUNTERS.get("page_resolver_kind_counts", {}) or {}
+    )
+    return (
+        int(_SPARSE_FA3_ROUTE_COUNTERS.get("actual_fwd_mixed_page_count", 0) or 0),
+        int(
             _SPARSE_FA3_ROUTE_COUNTERS.get(
                 "resolved_row_ptr_fwd_mixed_page_count", 0
             )
             or 0
         ),
-        "has_resolved_row_ptr_count": int(
-            _SPARSE_FA3_ROUTE_COUNTERS.get("has_resolved_row_ptr_count", 0) or 0
-        ),
-        "page_resolver_kind_counts": dict(
-            _SPARSE_FA3_ROUTE_COUNTERS.get("page_resolver_kind_counts", {}) or {}
-        ),
+        int(_SPARSE_FA3_ROUTE_COUNTERS.get("has_resolved_row_ptr_count", 0) or 0),
+        *(int(kind_counts.get(str(kind), 0) or 0) for kind in range(5)),
+        int(_SPARSE_FA3_ROUTE_COUNTERS.get("compact_row_steps", 0) or 0),
+        int(_SPARSE_FA3_ROUTE_COUNTERS.get("compact_rows", 0) or 0),
+    )
+
+
+def _rank_local_route_counter_record(
+    values: tuple[int, ...],
+) -> dict[str, Any]:
+    slots = _route_counter_slots()
+    return {
+        "rank": int(_resolve_route_counter_rank(slots)),
+        "slot_count": int(slots),
+        "field_count": 10,
+        "values": [int(value) for value in values],
+        "storage": "worker_local",
+        "pid": int(os.getpid()),
     }
-    if reset:
-        reset_sparse_fa3_route_counters()
-    return counters
+
+
+def reset_rank_local_route_counter_slot_for_measurement() -> dict[str, Any]:
+    """Reset this worker's counters after pre-measurement work is drained.
+
+    The caller invokes this through a synchronous named worker RPC.  The
+    worker-private state therefore has one owner and no shared live reader.
+    """
+    reset_sparse_fa3_route_counters()
+    observed = _rank_local_route_counter_values()
+    zero_values = (0,) * len(observed)
+    if observed != zero_values:
+        raise RuntimeError(
+            "E_TP_ROUTE_COUNTER_RESET_VERIFY: worker-local counters remained nonzero"
+        )
+    return _rank_local_route_counter_record(observed)
+
+
+def snapshot_rank_local_route_counter_slot_after_measurement() -> dict[str, Any]:
+    """Snapshot this worker's counters after queued model work is drained."""
+    observed = _rank_local_route_counter_values()
+    if any(value < 0 for value in observed):
+        raise RuntimeError(
+            "E_TP_ROUTE_COUNTER_SNAPSHOT_NEGATIVE: worker-local route counters "
+            "must be non-negative"
+        )
+    return _rank_local_route_counter_record(observed)
 
 
 def _record_sparse_fa3_mixed_page_route(
@@ -267,7 +214,6 @@ def _record_sparse_fa3_mixed_page_route(
     )
     key = str(kind)
     kind_counts[key] = int(kind_counts.get(key, 0) or 0) + 1
-    _bump_shared_route_counter(kind=kind, has_resolved_row_ptr=has_resolved_row_ptr)
 
 
 def _route_counter_slots() -> int:
@@ -287,9 +233,7 @@ def _route_counter_slots() -> int:
 
 
 def _resolve_route_counter_rank(slots: int) -> int:
-    if _ROUTE_COUNTER_RANK_OVERRIDE is not None:
-        rank = int(_ROUTE_COUNTER_RANK_OVERRIDE)
-    elif slots == 1:
+    if slots == 1:
         rank = 0
     else:
         try:
@@ -311,111 +255,21 @@ def _resolve_route_counter_rank(slots: int) -> int:
     return rank
 
 
-def _route_counter_mmap():
-    global _ROUTE_COUNTER_MMAP
-    global _ROUTE_COUNTER_MMAP_PATH
-    global _ROUTE_COUNTER_MMAP_PID
-    global _ROUTE_COUNTER_MMAP_SLOTS
-    global _ROUTE_COUNTER_MMAP_RANK
-    path = os.environ.get("VLLM_SPARSE_FA3_ROUTE_COUNTER_MMAP", "")
-    if not path:
-        return None
-    pid = os.getpid()
-    slots = _route_counter_slots()
-    if (
-        _ROUTE_COUNTER_MMAP is not None
-        and path == _ROUTE_COUNTER_MMAP_PATH
-        and pid == _ROUTE_COUNTER_MMAP_PID
-        and slots == _ROUTE_COUNTER_MMAP_SLOTS
-    ):
-        return _ROUTE_COUNTER_MMAP, _ROUTE_COUNTER_MMAP_RANK * _ROUTE_COUNTER_SLOT_BYTES
-    if _ROUTE_COUNTER_MMAP is not None:
-        _close_route_counter_mmap()
-    rank = _resolve_route_counter_rank(slots)
-    expected_bytes = slots * _ROUTE_COUNTER_SLOT_BYTES
-    try:
-        counter_path = Path(path)
-        counter_path.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(str(counter_path), os.O_RDWR | os.O_CREAT, 0o600)
-        try:
-            actual_bytes = int(os.fstat(fd).st_size)
-            if actual_bytes == 0:
-                os.ftruncate(fd, expected_bytes)
-            elif actual_bytes != expected_bytes:
-                raise RuntimeError(
-                    "E_TP_ROUTE_COUNTER_SIZE: route counter file does not match "
-                    f"declared slots: path={path} actual={actual_bytes} "
-                    f"expected={expected_bytes}"
-                )
-            _ROUTE_COUNTER_MMAP = mmap.mmap(fd, expected_bytes)
-            _ROUTE_COUNTER_MMAP_PATH = path
-            _ROUTE_COUNTER_MMAP_PID = pid
-            _ROUTE_COUNTER_MMAP_SLOTS = slots
-            _ROUTE_COUNTER_MMAP_RANK = rank
-            return _ROUTE_COUNTER_MMAP, rank * _ROUTE_COUNTER_SLOT_BYTES
-        finally:
-            os.close(fd)
-    except RuntimeError:
-        raise
-    except (OSError, ValueError) as exc:
-        raise RuntimeError(
-            f"E_TP_ROUTE_COUNTER_OPEN: cannot map route counter {path!r}"
-        ) from exc
-
-
-def _bump_shared_route_counter(
-    *,
-    kind: int,
-    has_resolved_row_ptr: bool,
-) -> None:
-    counter = _route_counter_mmap()
-    if counter is None:
-        return
-    mapping, slot_offset = counter
-    try:
-        values = list(struct.unpack_from("8q", mapping, slot_offset))
-        values[0] += 1
-        if int(kind) == 4:
-            values[1] += 1
-        if bool(has_resolved_row_ptr):
-            values[2] += 1
-        if 0 <= int(kind) <= 4:
-            values[3 + int(kind)] += 1
-        struct.pack_into("8q", mapping, slot_offset, *values)
-    except (BufferError, TypeError, ValueError, struct.error) as exc:
-        raise RuntimeError(
-            "E_TP_ROUTE_COUNTER_WRITE: failed to update the rank-local route slot"
-        ) from exc
-
-
 def bump_step_compact_row_liveness(compact_rows: int) -> None:
-    """[JUDGE-REPLAY-AWARE] step build 侧每步 compact 读行活性计数。
+    """Record replay-aware compact-row liveness in worker-owned state.
 
-    调用点=step_context_worker StepAuthority 构建后(全量/复用两臂汇合处),
-    每 engine step 恰一次;host 侧执行与 cudagraph replay 无关,是 FULL-graph
-    serve 下唯一 replay 覆盖的活性信号。mmap 未配置时零副作用。
+    The observer specialization calls this once per compact engine step.  It
+    performs two local integer updates and no mmap, file, lock, or env access.
     """
     rows = int(compact_rows)
     if rows <= 0:
         return
-    counter = _route_counter_mmap()
-    if counter is None:
-        return
-    mapping, slot_offset = counter
-    try:
-        liveness_offset = slot_offset + 8 * 8
-        steps_total, rows_total = struct.unpack_from("2q", mapping, liveness_offset)
-        struct.pack_into(
-            "2q",
-            mapping,
-            liveness_offset,
-            int(steps_total) + 1,
-            int(rows_total) + rows,
-        )
-    except (BufferError, TypeError, ValueError, struct.error) as exc:
-        raise RuntimeError(
-            "E_TP_ROUTE_COUNTER_WRITE: failed to update rank-local compact liveness"
-        ) from exc
+    _SPARSE_FA3_ROUTE_COUNTERS["compact_row_steps"] = (
+        int(_SPARSE_FA3_ROUTE_COUNTERS.get("compact_row_steps", 0) or 0) + 1
+    )
+    _SPARSE_FA3_ROUTE_COUNTERS["compact_rows"] = (
+        int(_SPARSE_FA3_ROUTE_COUNTERS.get("compact_rows", 0) or 0) + rows
+    )
 
 
 def wrap_mixed_page_route_counter(func: Callable[..., Any]) -> Callable[..., Any]:
@@ -663,9 +517,11 @@ def load_vendored_flash_attn_bridge(
     )
     # [COMPACT-RECENT-STAGE-B 2026-07-03] compact_recent_attn_varlen_func package
     # wiring deleted with the retired host op.
-    mixed_page_func = wrap_mixed_page_route_counter(
-        getattr(interface_module, "mixed_page_attn_varlen_func")
-    )
+    mixed_page_func = getattr(interface_module, "mixed_page_attn_varlen_func")
+    if sparse_fa3_route_counter_enabled():
+        mixed_page_func = wrap_mixed_page_route_counter(mixed_page_func)
+    elif bool(getattr(mixed_page_func, "_sfi_sparse_fa3_route_counter", False)):
+        mixed_page_func = getattr(mixed_page_func, "_sfi_route_counter_original")
     setattr(interface_module, "mixed_page_attn_varlen_func", mixed_page_func)
     setattr(package, "mixed_page_attn_varlen_func", mixed_page_func)
     setattr(package, "flash_attn_interface", interface_module)

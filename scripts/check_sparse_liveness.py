@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""[SPARSE-LIVENESS-JUDGE 2026-07-13 v4] serve/LongBench 场 sparse 活性判官。
+"""[SPARSE-LIVENESS-JUDGE 2026-07-19 v5] serve/LongBench 场 sparse 活性判官。
 
 bench 场有 producer gate 兜活性;serve 注入场(LongBench 等)此前裸奔——
 sparse 若静默退化成 dense(触发为零/patch 未装/路由回落),精度数字看着
@@ -10,12 +10,11 @@ sparse 若静默退化成 dense(触发为零/patch 未装/路由回落),精度�
   VLLM_SPARSE_REFRESH_PROFILE=1 \
   VLLM_SPARSE_REFRESH_PROFILE_LOG=/tmp/lb_refresh_profile.${RUN_TS}.log \
   VLLM_SPARSE_FA3_ROUTE_TRACE_LOG=/tmp/lb_route.${RUN_TS}.jsonl \
-  VLLM_SPARSE_FA3_ROUTE_COUNTER_MMAP=/tmp/lb_route_counter.${RUN_TS}.bin \
   <启动 serve;跑完 LongBench 后:>
   python scripts/check_sparse_liveness.py \
       --refresh-profile-log /tmp/lb_refresh_profile.${RUN_TS}.log \
       --route-trace /tmp/lb_route.${RUN_TS}.jsonl \
-      --route-counter-mmap /tmp/lb_route_counter.${RUN_TS}.bin \
+      --route-counter-snapshot /tmp/lb_route_counter.${RUN_TS}.bin \
       --run-since ${RUN_TS} [--min-world-publish 1]
 
 判定(全过=exit 0,任一红=exit 1 并逐条点名):
@@ -29,8 +28,9 @@ sparse 若静默退化成 dense(触发为零/patch 未装/路由回落),精度�
      时的同源提交证据，不能把健康 replay 误判为 decode 恒 dense。
   R2 触发活性: sentence 触发意图>0；interval-only 配置由 R1 的世代活性
      覆盖，replay-batched 路径也读取 route 事件中的 refresh_reason。
-  R3 路由活性(两源,mmap 优先):
-     a) --route-counter-mmap: 每个 TP rank 独占 10×int64 槽
+  R3 路由活性(两源,冻结 RPC 快照优先):
+     a) --route-counter-snapshot: blocking worker RPC 后按 TP rank 冻结的
+        10×int64 记录
         (total/kind4/has_rrp/kind0..4/compact_steps/compact_rows)，聚合前
         先要求各 rank 完全一致；kind4>0=前向真走 sparse resolver；
      b) --route-trace: 逐事件 JSON 解析 mode 分布+row_is_compact 聚合
@@ -98,8 +98,8 @@ def _iter_json_records(
                 )
 
 
-def _read_route_counter_mmap(path: str):
-    """Aggregate fixed 10×int64 single-writer slots without hiding rank drift."""
+def _read_route_counter_snapshot(path: str):
+    """Aggregate a frozen 10×int64-per-rank RPC artifact without hiding drift."""
     with open(path, "rb") as fh:
         raw = fh.read()
     slot_bytes = 10 * 8
@@ -170,7 +170,11 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--refresh-profile-log", required=True)
     ap.add_argument("--route-trace", default="")
-    ap.add_argument("--route-counter-mmap", default="")
+    ap.add_argument(
+        "--route-counter-snapshot",
+        default="",
+        help="blocking worker-RPC 后冻结的 10×int64-per-rank 二进制产物",
+    )
     ap.add_argument("--step-trace", default="")
     ap.add_argument("--min-world-publish", type=int, default=1)
     ap.add_argument(
@@ -196,6 +200,12 @@ def main() -> int:
         type=int,
         default=0,
         help="相对 R3c 基线所需的最小 compact 读步数增量",
+    )
+    ap.add_argument(
+        "--expected-route-counter-ranks",
+        type=int,
+        default=0,
+        help="非零时要求冻结快照恰好覆盖该数量的 TP ranks",
     )
     ap.add_argument(
         "--run-since",
@@ -243,6 +253,8 @@ def main() -> int:
         fails.append("R0: --step-trace-offset 必须非负")
     if args.min_compact_row_step_delta < 0:
         fails.append("R3c: --min-compact-row-step-delta 必须非负")
+    if args.expected_route_counter_ranks < 0:
+        fails.append("R0: --expected-route-counter-ranks 必须非负")
     if (
         args.min_compact_row_step_delta > 0
         and args.baseline_compact_row_steps < 0
@@ -300,7 +312,11 @@ def main() -> int:
         False,
         minimum_size=route_trace_offset,
     )
-    mmap_ok = _r0_check(args.route_counter_mmap, "route counter mmap", False)
+    snapshot_ok = _r0_check(
+        args.route_counter_snapshot,
+        "frozen route counter snapshot",
+        False,
+    )
     require_step_trace = bool(
         args.reject_request_fallback
         or args.require_mature_decode_compact
@@ -398,14 +414,15 @@ def main() -> int:
         else:
             print(f"R2 触发活性: sentence_intents={sentence_intents}")
 
-    # ---- R3a 路由活性(mmap 结构化计数,主判据) ----
+    # ---- R3a 路由活性(冻结 RPC 结构化计数,主判据) ----
     compact_row_steps = -1
     route_rank_slots = 0
-    if mmap_ok:
-        counters = _read_route_counter_mmap(args.route_counter_mmap)
+    if snapshot_ok:
+        counters = _read_route_counter_snapshot(args.route_counter_snapshot)
         if counters is None:
             fails.append(
-                "R3a: route counter mmap 不是非空的 80B-per-rank 完整槽"
+                "R3a: frozen route counter snapshot 不是非空的 "
+                "80B-per-rank 完整记录"
                 "(损坏/旧 64B 合同/未初始化)"
             )
         else:
@@ -415,7 +432,7 @@ def main() -> int:
             compact_row_steps = int(counters.get("compact_row_steps", -1))
             ratio = (kind4 / total) if total else 0.0
             print(
-                f"R3a 路由活性(mmap): total={total} kind4={kind4} "
+                f"R3a 路由活性(frozen RPC): total={total} kind4={kind4} "
                 f"({ratio:.1%}) has_rrp={counters['has_resolved_row_ptr']} "
                 f"by_kind={counters['by_kind']} rank_slots={counters['rank_slots']}"
             )
@@ -424,17 +441,26 @@ def main() -> int:
                     "R3a: TP rank-local route/liveness counters diverged; "
                     f"per_rank={counters['per_rank']}"
                 )
+            if (
+                args.expected_route_counter_ranks > 0
+                and route_rank_slots != args.expected_route_counter_ranks
+            ):
+                fails.append(
+                    "R3a: frozen route snapshot 的 rank 数不匹配: "
+                    f"observed={route_rank_slots} "
+                    f"expected={args.expected_route_counter_ranks}"
+                )
             if total > 0 and kind4 == 0:
                 fails.append(
-                    "R3a: mmap 计数 kind4=0 —— 前向从未走 sparse resolver"
+                    "R3a: frozen RPC 计数 kind4=0 —— 前向从未走 sparse resolver"
                 )
             # ---- R3c 读侧活性(step build 侧计数,replay-aware 主判据) ----
             # [JUDGE-REPLAY-AWARE 2026-07-09] FULL-graph serve 下 python 侧
             # 路由计数/trace 只在 capture/eager/prefill 步发射,replay 步不可
             # 见——旧 R3b 在健康引擎上恒 FAIL(eager 定谳:18576/18684 步
             # compact 健康,dense 事件全是 bootstrap/prefill 窗)。本判据由
-            # step_context_worker 每步 bump,graph 无关,是 replay 覆盖的读侧
-            # 真值。旧版 8q/单共享槽产物已在 R3a fail closed。
+            # proof specialization 每步 bump,graph 无关,是 replay 覆盖的读侧
+            # 真值。纯 runtime 不装 observer；旧版 8q/共享槽在 R3a fail closed。
             if compact_row_steps >= 0:
                 print(
                     f"R3c 读侧活性(step 计数): compact_row_steps="
@@ -461,10 +487,14 @@ def main() -> int:
                             f"{args.min_compact_row_step_delta}"
                         )
 
-    if args.baseline_compact_row_steps >= 0 and not mmap_ok:
-        fails.append("R3c: 已请求本轮增量判定，但 route counter mmap 不可用")
+    if args.baseline_compact_row_steps >= 0 and not snapshot_ok:
+        fails.append(
+            "R3c: 已请求本轮增量判定，但 frozen route counter snapshot 不可用"
+        )
     elif args.baseline_compact_row_steps >= 0 and compact_row_steps < 0:
-        fails.append("R3c: route counter mmap 不含 replay-aware compact 读计数")
+        fails.append(
+            "R3c: frozen route counter snapshot 不含 replay-aware compact 读计数"
+        )
 
     # ---- R3b 路由活性(trace 结构化解析;字符串 grep 已废:旧匹配串
     #      '"dense_native"' 全仓无源=恒 0 假安静) ----
@@ -516,8 +546,10 @@ def main() -> int:
                     "——所有可见行 dense(请求全短于阈值?FORCE_* env?"
                     "bootstrap 未完成即结束?)"
                 )
-    if not (mmap_ok or trace_ok):
-        warns.append("R3 未判(--route-trace / --route-counter-mmap 均不可用)")
+    if not (snapshot_ok or trace_ok):
+        warns.append(
+            "R3 未判(--route-trace / --route-counter-snapshot 均不可用)"
+        )
 
     # ---- R4 请求级 fallback：只把 mature decode 的不期望 dense 判死。 ----
     # prefill / bootstrap / refresh 是显式相位，不属于 fallback；短请求可以一直
@@ -854,7 +886,7 @@ def main() -> int:
             )
             if len(tp_step_pids) != expected_tp_ranks:
                 fails.append(
-                    "R5: step trace 的 TP PID 数与 route mmap 不一致: "
+                    "R5: step trace 的 TP PID 数与 frozen route snapshot 不一致: "
                     f"expected={expected_tp_ranks} observed={sorted(tp_step_pids)}"
                 )
             if tp_missing_field_count:

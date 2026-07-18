@@ -7,6 +7,7 @@ import os
 import statistics
 import struct
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -78,28 +79,12 @@ except ModuleNotFoundError:
 ACTIVE_SM80_GT1_RUNNER = "bench_sm80_mixed_page_one_shot_graph_e2e.py"
 FA3_ROUTE_COUNTER_FIELDS = 10
 FA3_ROUTE_COUNTER_SLOT_BYTES = FA3_ROUTE_COUNTER_FIELDS * 8
-FA3_ROUTE_COUNTER_MMAP_BYTES = FA3_ROUTE_COUNTER_SLOT_BYTES
 FA3_ROUTE_COUNTER_SLOTS_ENV = "VLLM_SPARSE_FA3_ROUTE_COUNTER_SLOTS"
-FA3_ROUTE_COUNTER_RPC_SNAPSHOT_SCHEMA = "sfi.fa3_route_counter.rpc_snapshot.v1"
+FA3_ROUTE_COUNTER_ENABLED_ENV = "VLLM_SPARSE_FA3_ROUTE_COUNTER_ENABLED"
+FA3_ROUTE_COUNTER_RETIRED_MMAP_ENV = "VLLM_SPARSE_FA3_ROUTE_COUNTER_MMAP"
+FA3_ROUTE_COUNTER_RPC_SNAPSHOT_SCHEMA = "sfi.fa3_route_counter.rpc_snapshot.v2"
 FA3_ROUTE_COUNTER_RPC_SNAPSHOT_SOURCE = "worker_collective_rpc"
-
-
-def _fa3_interface_module() -> object | None:
-    try:
-        from patches.fa3_native import install as fa3_install
-
-        if hasattr(fa3_install, "get_sparse_fa3_route_counters"):
-            return fa3_install
-    except Exception:
-        pass
-    for name in (
-        "vllm_flash_attn.flash_attn_interface",
-        "flash_attn.flash_attn_interface",
-    ):
-        module = sys.modules.get(name)
-        if module is not None:
-            return module
-    return None
+FA3_ROUTE_COUNTER_STORAGE = "worker_local"
 
 
 def _collect_fa3_route_counter_worker_records(
@@ -109,7 +94,7 @@ def _collect_fa3_route_counter_worker_records(
     phase: str,
     require_zero: bool,
 ) -> list[dict[str, object]]:
-    """Run a blocking worker barrier and validate every rank-local slot record."""
+    """Run a blocking worker barrier and validate every worker-local record."""
     slots = _route_counter_slots_from_env()
     phase_code = str(phase).strip().upper()
     collective_rpc = getattr(engine, "collective_rpc", None)
@@ -159,7 +144,7 @@ def _collect_fa3_route_counter_worker_records(
         slot_count = record.get("slot_count")
         field_count = record.get("field_count")
         values = record.get("values")
-        mmap_size_bytes = record.get("mmap_size_bytes")
+        storage = record.get("storage")
         pid = record.get("pid")
         if isinstance(rank, bool) or not isinstance(rank, int):
             errors.append(f"record[{index}].rank={rank!r}")
@@ -182,8 +167,8 @@ def _collect_fa3_route_counter_worker_records(
             errors.append(f"rank{rank}.values={values!r}")
         elif require_zero and values != [0] * FA3_ROUTE_COUNTER_FIELDS:
             errors.append(f"rank{rank}.values_nonzero={values!r}")
-        if mmap_size_bytes != slots * FA3_ROUTE_COUNTER_SLOT_BYTES:
-            errors.append(f"rank{rank}.mmap_size_bytes={mmap_size_bytes!r}")
+        if storage != FA3_ROUTE_COUNTER_STORAGE:
+            errors.append(f"rank{rank}.storage={storage!r}")
         if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
             errors.append(f"rank{rank}.pid={pid!r}")
         else:
@@ -255,11 +240,7 @@ def _collect_fa3_route_counter_worker_records(
 def _reset_fa3_route_counters_for_measurement(
     engine: object,
 ) -> list[dict[str, object]]:
-    """Drain warmup work, then let every TP worker reset only its own slot."""
-    module = _fa3_interface_module()
-    reset = getattr(module, "reset_sparse_fa3_route_counters", None)
-    if callable(reset):
-        reset()
+    """Drain warmup work, then reset every worker at one RPC boundary."""
     return _collect_fa3_route_counter_worker_records(
         engine,
         rpc_method=SPARSE_ROUTE_COUNTER_RESET_RPC_METHOD,
@@ -410,8 +391,8 @@ def _snapshot_fa3_route_counters_after_measurement(
                 )
     snapshot = _route_counter_snapshot_from_worker_records(records)
     # The blocking worker RPC return is the measurement linearization point.
-    # The mmap remains a live transport and can legitimately advance after it,
-    # so it must not be reread as a second acceptance source here.
+    # No live file transport exists; the caller serializes these frozen records
+    # once and must not introduce a second acceptance source.
     return records, snapshot
 
 
@@ -431,11 +412,12 @@ def _route_counter_slots_from_env() -> int:
     return slots
 
 
-def _prepare_fa3_route_counter_mmap(
+def _prepare_fa3_route_counter_snapshot_path(
     metrics_or_counter_path: str | Path,
     *,
     slots: int = 1,
 ) -> Path:
+    """Reserve a unique binary path for the post-RPC frozen snapshot."""
     if int(slots) <= 0:
         raise ValueError(f"route counter slots must be positive; got {slots}")
     path = Path(metrics_or_counter_path)
@@ -454,6 +436,48 @@ def _prepare_fa3_route_counter_mmap(
     return path
 
 
+def _write_fa3_route_counter_snapshot_artifact(
+    path: str | Path,
+    records: list[dict[str, object]],
+) -> None:
+    """Serialize validated worker records once, after the RPC boundary."""
+    counter_path = Path(path)
+    payload = bytearray()
+    for expected_rank, record in enumerate(records):
+        rank = record.get("rank")
+        values = record.get("values")
+        if rank != expected_rank or not isinstance(values, list):
+            raise RuntimeError(
+                "E_TP_ROUTE_COUNTER_ARTIFACT_SCHEMA: records are not rank ordered"
+            )
+        try:
+            payload.extend(struct.pack("10q", *(int(value) for value in values)))
+        except (TypeError, ValueError, struct.error) as exc:
+            raise RuntimeError(
+                "E_TP_ROUTE_COUNTER_ARTIFACT_SERIALIZE: "
+                f"rank={rank}: {type(exc).__name__}: {exc}"
+            ) from exc
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=counter_path.parent,
+            prefix=f".{counter_path.name}.tmp-",
+            delete=False,
+        ) as fh:
+            tmp_path = Path(fh.name)
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_path, counter_path)
+    finally:
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink()
+            except FileNotFoundError:
+                pass
+
+
 def _route_counter_slot_payload(values: tuple[int, ...], rank: int) -> dict[str, object]:
     return {
         "rank": int(rank),
@@ -465,48 +489,6 @@ def _route_counter_slot_payload(values: tuple[int, ...], rank: int) -> dict[str,
         },
         "compact_row_steps": int(values[8]),
         "compact_rows": int(values[9]),
-    }
-
-
-def _shared_fa3_route_counter_snapshot(path: str | Path) -> dict[str, object]:
-    counter_path = Path(path)
-    if not counter_path.exists():
-        return {}
-    data = counter_path.read_bytes()
-    if (
-        len(data) < FA3_ROUTE_COUNTER_SLOT_BYTES
-        or len(data) % FA3_ROUTE_COUNTER_SLOT_BYTES != 0
-    ):
-        return {}
-    slot_values = [
-        tuple(
-            int(value)
-            for value in struct.unpack_from(
-                "10q",
-                data,
-                rank * FA3_ROUTE_COUNTER_SLOT_BYTES,
-            )
-        )
-        for rank in range(len(data) // FA3_ROUTE_COUNTER_SLOT_BYTES)
-    ]
-    aggregate = tuple(sum(values[index] for values in slot_values) for index in range(10))
-    per_rank = [
-        _route_counter_slot_payload(values, rank)
-        for rank, values in enumerate(slot_values)
-    ]
-    rank_consistent = all(values == slot_values[0] for values in slot_values[1:])
-    return {
-        "actual_fwd_mixed_page_count": int(aggregate[0]),
-        "resolved_row_ptr_fwd_mixed_page_count": int(aggregate[1]),
-        "has_resolved_row_ptr_count": int(aggregate[2]),
-        "page_resolver_kind_counts": {
-            str(kind): int(aggregate[3 + kind]) for kind in range(5)
-        },
-        "compact_row_steps": int(aggregate[8]),
-        "compact_rows": int(aggregate[9]),
-        "route_counter_slots": len(slot_values),
-        "route_counter_rank_consistent": bool(rank_consistent),
-        "per_rank_route_counters": per_rank,
     }
 
 
@@ -526,25 +508,29 @@ def _fa3_route_counter_metrics(counters: dict[str, object]) -> dict[str, object]
     kind2 = _route_kind_count(counters, 2)
     kind3 = _route_kind_count(counters, 3)
     kind4 = _route_kind_count(counters, 4)
+    compact_row_steps = int(counters.get("compact_row_steps", 0) or 0)
+    compact_rows = int(counters.get("compact_rows", 0) or 0)
     available = bool(counters and actual > 0)
     payload: dict[str, object] = {
-        "speed_child_route_counter_scope": "measurement_window",
-        "speed_child_route_counter_available": available,
-        "speed_child_actual_fwd_mixed_page_count": actual,
-        "speed_child_resolved_row_ptr_fwd_mixed_page_count": resolved,
-        "speed_child_has_resolved_row_ptr_count": has_resolved,
-        "speed_child_page_resolver_kind0_count": kind0,
-        "speed_child_page_resolver_kind1_count": kind1,
-        "speed_child_page_resolver_kind2_count": kind2,
-        "speed_child_page_resolver_kind3_count": kind3,
-        "speed_child_page_resolver_kind4_count": kind4,
-        "speed_child_route_counter_rank_slots": int(
+        "route_counter_scope": "measurement_window",
+        "route_counter_available": available,
+        "route_counter_actual_fwd_mixed_page_count": actual,
+        "route_counter_resolved_row_ptr_fwd_mixed_page_count": resolved,
+        "route_counter_has_resolved_row_ptr_count": has_resolved,
+        "route_counter_page_resolver_kind0_count": kind0,
+        "route_counter_page_resolver_kind1_count": kind1,
+        "route_counter_page_resolver_kind2_count": kind2,
+        "route_counter_page_resolver_kind3_count": kind3,
+        "route_counter_page_resolver_kind4_count": kind4,
+        "route_counter_compact_row_steps": compact_row_steps,
+        "route_counter_compact_rows": compact_rows,
+        "route_counter_rank_slots": int(
             counters.get("route_counter_slots", 1) or 1
         ),
-        "speed_child_route_counter_rank_consistent": bool(
+        "route_counter_rank_consistent": bool(
             counters.get("route_counter_rank_consistent", True)
         ),
-        "speed_child_route_counter_per_rank": list(
+        "route_counter_per_rank": list(
             counters.get("per_rank_route_counters", []) or []
         ),
     }
@@ -1148,6 +1134,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--collect-route-counter-proof",
+        action="store_true",
+        help=(
+            "Diagnostic-only: install worker-local route observers and freeze "
+            "their measurement-window snapshot by blocking worker RPC. Timed "
+            "children must leave this disabled."
+        ),
+    )
+    parser.add_argument(
         "--outputs-json",
         type=str,
         default="",
@@ -1364,6 +1359,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if int(args.batch_size) <= 0:
         parser.error("--batch-size must be > 0")
+    if args.collect_route_counter_proof and not args.measure_decode_latency:
+        parser.error(
+            "--collect-route-counter-proof requires --measure-decode-latency"
+        )
+    if args.collect_route_counter_proof and not args.decode_metrics_json:
+        parser.error(
+            "--collect-route-counter-proof requires --decode-metrics-json"
+        )
     try:
         context_scalar = parse_optional_exact_positive_int(
             os.environ.get("SFI_RUNNER_CONTEXT_TOKENS"),
@@ -1414,14 +1417,24 @@ def main() -> None:
     args = parse_args()
     child_identity = benchmark_child_identity(args)
     apply_deferred_bridge_env(args, os.environ)
-    if args.decode_metrics_json:
+    counter_path: Path | None = None
+    if FA3_ROUTE_COUNTER_RETIRED_MMAP_ENV in os.environ:
+        raise RuntimeError(
+            "E_RETIRED_ROUTE_COUNTER_MMAP_ENV: unset "
+            f"{FA3_ROUTE_COUNTER_RETIRED_MMAP_ENV}; live file transport is removed"
+        )
+    collect_route_counter_proof = bool(args.collect_route_counter_proof)
+    if collect_route_counter_proof:
         route_counter_slots = max(1, int(args.tensor_parallel_size))
-        counter_path = _prepare_fa3_route_counter_mmap(
+        counter_path = _prepare_fa3_route_counter_snapshot_path(
             args.decode_metrics_json,
             slots=route_counter_slots,
         )
-        os.environ["VLLM_SPARSE_FA3_ROUTE_COUNTER_MMAP"] = str(counter_path)
+        os.environ[FA3_ROUTE_COUNTER_ENABLED_ENV] = "1"
         os.environ[FA3_ROUTE_COUNTER_SLOTS_ENV] = str(route_counter_slots)
+    else:
+        os.environ.pop(FA3_ROUTE_COUNTER_ENABLED_ENV, None)
+        os.environ.pop(FA3_ROUTE_COUNTER_SLOTS_ENV, None)
 
     def _read_env_sparse_json() -> dict[str, object] | None:
         raw = os.environ.get("VLLM_SPARSE_CONTROLLER_JSON", "")
@@ -2333,9 +2346,13 @@ def main() -> None:
     if bool(args.reset_prefix_cache) and not reset_after_warmup:
         _reset_prefix_cache()
     if bool(args.measure_decode_latency):
-        route_counter_reset_records = _reset_fa3_route_counters_for_measurement(
-            engine
-        )
+        route_counter_reset_records: list[dict[str, object]] = []
+        route_counter_snapshot_records: list[dict[str, object]] = []
+        route_counters: dict[str, object] = {}
+        if collect_route_counter_proof:
+            route_counter_reset_records = (
+                _reset_fa3_route_counters_for_measurement(engine)
+            )
         if bool(args.collect_cudagraph_runtime_proof):
             reset_cudagraph_runtime_observer(engine.llm_engine)
         profiling = maybe_start_vllm_torch_profile(engine)
@@ -2366,13 +2383,19 @@ def main() -> None:
                 ) = _generate_with_engine_step()
             finally:
                 maybe_stop_vllm_torch_profile(engine, profiling)
-            (
-                route_counter_snapshot_records,
-                route_counters,
-            ) = _snapshot_fa3_route_counters_after_measurement(
-                engine,
-                reset_records=route_counter_reset_records,
-            )
+            if collect_route_counter_proof:
+                (
+                    route_counter_snapshot_records,
+                    route_counters,
+                ) = _snapshot_fa3_route_counters_after_measurement(
+                    engine,
+                    reset_records=route_counter_reset_records,
+                )
+            if collect_route_counter_proof and counter_path is not None:
+                _write_fa3_route_counter_snapshot_artifact(
+                    counter_path,
+                    route_counter_snapshot_records,
+                )
         finally:
             warmup_measure_end_ts_ns = time.time_ns()
             _pipeline_profile_marker("measure_end", warmup_runs=warmup_runs)
@@ -2427,12 +2450,6 @@ def main() -> None:
         )
         print(format_decode_metrics_line(decode_metrics), flush=True)
         if args.decode_metrics_json:
-            route_counter_rpc_snapshot_artifact = (
-                _fa3_route_counter_rpc_snapshot_artifact(
-                    route_counter_snapshot_records,
-                    route_counters,
-                )
-            )
             run_config = _decode_run_config(
                 args,
                 prompt_count=len(prompts),
@@ -2485,21 +2502,26 @@ def main() -> None:
                     decode_step_durations_s
                 ),
                 "boundary_diagnostics": boundary_diagnostics,
+                "route_counter_proof_collected": collect_route_counter_proof,
             }
             metrics_payload.update(decode_metrics)
-            metrics_payload.update(_fa3_route_counter_metrics(route_counters))
-            metrics_payload["speed_child_route_counter_reset_records"] = (
-                route_counter_reset_records
-            )
-            metrics_payload["speed_child_route_counter_snapshot_records"] = (
-                route_counter_snapshot_records
-            )
-            metrics_payload["speed_child_route_counter_authority"] = (
-                FA3_ROUTE_COUNTER_RPC_SNAPSHOT_SOURCE
-            )
-            metrics_payload["speed_child_route_counter_rpc_snapshot_artifact"] = (
-                route_counter_rpc_snapshot_artifact
-            )
+            if collect_route_counter_proof:
+                metrics_payload.update(_fa3_route_counter_metrics(route_counters))
+                metrics_payload["route_counter_reset_records"] = (
+                    route_counter_reset_records
+                )
+                metrics_payload["route_counter_snapshot_records"] = (
+                    route_counter_snapshot_records
+                )
+                metrics_payload["route_counter_authority"] = (
+                    FA3_ROUTE_COUNTER_RPC_SNAPSHOT_SOURCE
+                )
+                metrics_payload["route_counter_rpc_snapshot_artifact"] = (
+                    _fa3_route_counter_rpc_snapshot_artifact(
+                        route_counter_snapshot_records,
+                        route_counters,
+                    )
+                )
             Path(args.decode_metrics_json).write_text(
                 json.dumps(metrics_payload, ensure_ascii=True, indent=2),
                 encoding="utf-8",

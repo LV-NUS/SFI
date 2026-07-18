@@ -76,6 +76,9 @@ SPEED_CHILD_OBSERVATION_ENV_EXACT_KEYS = frozenset(
         # also reasonable names for production policy and must not become a
         # catch-all speed-child deletion rule.
         "VLLM_SPARSE_EVT_BISECT",
+        "VLLM_SPARSE_FA3_ROUTE_COUNTER_ENABLED",
+        "VLLM_SPARSE_FA3_ROUTE_COUNTER_MMAP",
+        "VLLM_SPARSE_FA3_ROUTE_COUNTER_SLOTS",
         "VLLM_SPARSE_REFRESH_REBUILD_CHECK",
         "VLLM_SPARSE_VALIDATE_LAYER_SLOT_MAP",
         "VLLM_SPARSE_VALIDATE_LSR_CACHE_KEY",

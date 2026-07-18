@@ -37,11 +37,6 @@ from patches.sparse_types import (
     StepTicket,
 )
 from patches.step_authority import StepAuthority
-from patches.fa3_native.install import (
-    append_fa3_step_trace,
-    build_fa3_step_trace_event,
-    fa3_step_trace_enabled,
-)
 from patches.fa3_native.contracts import TargetSelectedScopeKey
 from patches.fa3_native.snapshot_binding import SelectedScopeKey
 from patches.fa3_native.scope_async import allocate_scope_wait_handle
@@ -1441,14 +1436,6 @@ def prepare_step_context_impl(
         refresh_non_last_n1_count = _c['refresh_non_last_n1_count']
         refresh_prefill_count = _c['refresh_prefill_count']
 
-    # [JUDGE-REPLAY-AWARE 2026-07-09] 每步 compact 读行活性计数(全量/复用两臂
-    # 汇合处恰一次;host 侧,graph replay 无关)。FULL-graph serve 下 python 路由
-    # 计数只见 capture/eager 步,本计数是判官对 replay 步的唯一活性判据(R3c)。
-    # mmap env 未配置时 bump 内部零副作用。
-    if _has_compact_row:
-        from patches.fa3_native.install import bump_step_compact_row_liveness
-
-        bump_step_compact_row_liveness(sum(1 for _uc in _use_compact if _uc))
     has_request_phase_mix_i32 = 1 if has_request_phase_mix else 0
     previous_step_authority = getattr(self, "step_authority", None)
     consume_selected_scope_key, consume_selected_scope_wait_handle = (
@@ -1577,15 +1564,6 @@ def prepare_step_context_impl(
     self._prepared_step_identity = step_identity
     self._prepared_num_actual_tokens = num_actual_tokens
     self._prepared_refresh_nonce = refresh_nonce
-    if fa3_step_trace_enabled():
-        append_fa3_step_trace(
-            build_fa3_step_trace_event(
-                step_authority=step_authority,
-                step_context=ctx,
-                source="prepare_step_context",
-            )
-        )
-
     # step profile：记录本步 refresh 规划信息（如果启用）。
     self._step_profile_begin(
         step_meta=self.step_meta,

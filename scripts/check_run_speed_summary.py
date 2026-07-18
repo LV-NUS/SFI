@@ -530,8 +530,8 @@ def _tp8_selector_log_s_runtime_reasons(
     expected_extension = SELECTOR_LOG_S_EXTENSION_NAME
     phase_proofs: dict[str, list[dict[str, Any]]] = {}
     for phase, field in (
-        ("reset", "speed_child_route_counter_reset_records"),
-        ("snapshot", "speed_child_route_counter_snapshot_records"),
+        ("reset", "route_counter_reset_records"),
+        ("snapshot", "route_counter_snapshot_records"),
     ):
         records = metrics.get(field)
         if not isinstance(records, list) or len(records) != tensor_parallel_size:
@@ -2480,13 +2480,14 @@ def _tp_sparse_rank_reasons(
         tensor_parallel_size = int(provenance.get("tensor_parallel_size", 0))
     except (TypeError, ValueError):
         tensor_parallel_size = 0
-    if tensor_parallel_size <= 1:
-        return []
+    if tensor_parallel_size <= 0:
+        return ["tp_sparse_tensor_parallel_size_invalid"]
     reasons: list[str] = []
-    # Timed proof is intentionally observer-free: rank-local RPC/mmap counters
-    # are the sole speed-child evidence. JSONL route tracing belongs only to the
-    # paired diagnostic child and must never perturb the measured arm.
-    metrics_path_text = str(summary.get("decode_metrics_path", "") or "")
+    # Route proof belongs to the diagnostic child. The timed sparse child never
+    # installs route/step observers and its metrics remain timing authority.
+    metrics_path_text = str(
+        summary.get("diagnostic_decode_metrics_path", "") or ""
+    )
     if not metrics_path_text:
         reasons.append("tp_sparse_route_counter_metrics_path_missing")
         return reasons
@@ -2495,7 +2496,8 @@ def _tp_sparse_rank_reasons(
         reasons.append("tp_sparse_summary_name_not_canonical")
     else:
         expected_metrics_path = summary_path.with_name(
-            summary_path.name.removesuffix("_summary.json") + "_decode_metrics.json"
+            summary_path.name.removesuffix("_summary.json")
+            + "_diag_decode_metrics.json"
         ).resolve(strict=False)
         if metrics_path.resolve(strict=False) != expected_metrics_path:
             reasons.append(
@@ -2508,18 +2510,58 @@ def _tp_sparse_rank_reasons(
         reasons.append(f"tp_sparse_route_counter_metrics_invalid:{exc}")
         return reasons
 
-    if metrics.get("speed_child_route_counter_scope") != "measurement_window":
+    if metrics.get("route_counter_proof_collected") is not True:
+        reasons.append("tp_sparse_route_counter_proof_not_collected")
+    if metrics.get("route_counter_scope") != "measurement_window":
         reasons.append("tp_sparse_route_counter_scope_mismatch")
-    if metrics.get("speed_child_route_counter_available") is not True:
+    if metrics.get("route_counter_available") is not True:
         reasons.append("tp_sparse_route_counter_unavailable")
-    slots = metrics.get("speed_child_route_counter_rank_slots")
+    slots = metrics.get("route_counter_rank_slots")
     if type(slots) is not int or slots != tensor_parallel_size:
         reasons.append(
             "tp_sparse_route_counter_slot_count_mismatch:"
             f"actual={slots!r}:expected={tensor_parallel_size}"
         )
-    if metrics.get("speed_child_route_counter_rank_consistent") is not True:
+    if metrics.get("route_counter_rank_consistent") is not True:
         reasons.append("tp_sparse_route_counter_rank_consistency_not_green")
+    if metrics.get("route_counter_authority") != "worker_collective_rpc":
+        reasons.append("tp_sparse_route_counter_authority_mismatch")
+
+    rpc_artifact = metrics.get("route_counter_rpc_snapshot_artifact")
+    if not isinstance(rpc_artifact, dict):
+        reasons.append("tp_sparse_route_counter_rpc_artifact_missing_or_invalid")
+    else:
+        if rpc_artifact.get("schema") != "sfi.fa3_route_counter.rpc_snapshot.v2":
+            reasons.append("tp_sparse_route_counter_rpc_artifact_schema_mismatch")
+        if rpc_artifact.get("source") != "worker_collective_rpc":
+            reasons.append("tp_sparse_route_counter_rpc_artifact_source_mismatch")
+        if rpc_artifact.get("measurement_boundary") != (
+            "blocking_collective_rpc_return"
+        ):
+            reasons.append("tp_sparse_route_counter_rpc_artifact_boundary_mismatch")
+        if rpc_artifact.get("records") != metrics.get(
+            "route_counter_snapshot_records"
+        ):
+            reasons.append("tp_sparse_route_counter_rpc_artifact_records_mismatch")
+        recorded_rpc_sha256 = rpc_artifact.get("sha256")
+        unsigned_rpc_artifact = dict(rpc_artifact)
+        unsigned_rpc_artifact.pop("sha256", None)
+        try:
+            canonical_rpc_artifact = json.dumps(
+                unsigned_rpc_artifact,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+        except (TypeError, ValueError):
+            reasons.append("tp_sparse_route_counter_rpc_artifact_not_canonical")
+        else:
+            expected_rpc_sha256 = hashlib.sha256(
+                canonical_rpc_artifact.encode("utf-8")
+            ).hexdigest()
+            if recorded_rpc_sha256 != expected_rpc_sha256:
+                reasons.append("tp_sparse_route_counter_rpc_artifact_sha256_mismatch")
 
     def _rpc_record_evidence(
         field: str,
@@ -2527,7 +2569,7 @@ def _tp_sparse_rank_reasons(
         require_zero: bool,
     ) -> tuple[list[tuple[int, ...]] | None, list[int] | None]:
         evidence_name = (
-            "reset" if field == "speed_child_route_counter_reset_records" else "snapshot"
+            "reset" if field == "route_counter_reset_records" else "snapshot"
         )
         raw_records = metrics.get(field)
         if (
@@ -2544,7 +2586,6 @@ def _tp_sparse_rank_reasons(
         values_by_rank: list[tuple[int, ...]] = []
         pids: list[int] = []
         valid = True
-        expected_mmap_size = tensor_parallel_size * 10 * 8
         for expected_rank, record in enumerate(raw_records):
             if not isinstance(record, dict):
                 reasons.append(
@@ -2557,7 +2598,7 @@ def _tp_sparse_rank_reasons(
             slot_count = record.get("slot_count")
             field_count = record.get("field_count")
             values = record.get("values")
-            mmap_size = record.get("mmap_size_bytes")
+            storage = record.get("storage")
             pid = record.get("pid")
             if type(rank) is not int or rank != expected_rank:
                 reasons.append(
@@ -2595,11 +2636,11 @@ def _tp_sparse_rank_reasons(
                     f"rank={expected_rank}:actual={values!r}"
                 )
                 valid = False
-            if type(mmap_size) is not int or mmap_size != expected_mmap_size:
+            if storage != "worker_local":
                 reasons.append(
-                    f"tp_sparse_route_counter_{evidence_name}_mmap_size_mismatch:"
-                    f"rank={expected_rank}:actual={mmap_size!r}:"
-                    f"expected={expected_mmap_size}"
+                    f"tp_sparse_route_counter_{evidence_name}_storage_mismatch:"
+                    f"rank={expected_rank}:actual={storage!r}:"
+                    "expected='worker_local'"
                 )
                 valid = False
             if type(pid) is not int or pid <= 0:
@@ -2624,11 +2665,11 @@ def _tp_sparse_rank_reasons(
         return values_by_rank, pids
 
     _reset_values, reset_pids = _rpc_record_evidence(
-        "speed_child_route_counter_reset_records",
+        "route_counter_reset_records",
         require_zero=True,
     )
     snapshot_values, snapshot_pids = _rpc_record_evidence(
-        "speed_child_route_counter_snapshot_records",
+        "route_counter_snapshot_records",
         require_zero=False,
     )
     if (
@@ -2652,7 +2693,7 @@ def _tp_sparse_rank_reasons(
                 )
             )
 
-    per_rank = metrics.get("speed_child_route_counter_per_rank")
+    per_rank = metrics.get("route_counter_per_rank")
     if not isinstance(per_rank, list) or len(per_rank) != tensor_parallel_size:
         reasons.append(
             "tp_sparse_route_counter_per_rank_shape_mismatch:"
@@ -2671,7 +2712,7 @@ def _tp_sparse_rank_reasons(
     signatures: list[tuple[int, ...]] = []
     expected_snapshot_values: list[tuple[int, ...]] = []
     valid_records = True
-    aggregate_values = {field: 0 for field in signature_fields[:3]}
+    aggregate_values = {field: 0 for field in signature_fields}
     aggregate_kinds = {kind: 0 for kind in range(5)}
     for expected_rank, record in enumerate(per_rank):
         rank_value = record.get("rank") if isinstance(record, dict) else None
@@ -2749,7 +2790,7 @@ def _tp_sparse_rank_reasons(
                 compact_rows,
             )
         )
-        for field, value in zip(signature_fields[:3], values[:3]):
+        for field, value in zip(signature_fields, values):
             aggregate_values[field] += int(value)
         for kind, value in enumerate(kinds):
             aggregate_kinds[kind] += int(value)
@@ -2769,17 +2810,21 @@ def _tp_sparse_rank_reasons(
         )
     if valid_records:
         aggregate_fields = {
-            "speed_child_actual_fwd_mixed_page_count": aggregate_values[
+            "route_counter_actual_fwd_mixed_page_count": aggregate_values[
                 "actual_fwd_mixed_page_count"
             ],
-            "speed_child_resolved_row_ptr_fwd_mixed_page_count": aggregate_values[
+            "route_counter_resolved_row_ptr_fwd_mixed_page_count": aggregate_values[
                 "resolved_row_ptr_fwd_mixed_page_count"
             ],
-            "speed_child_has_resolved_row_ptr_count": aggregate_values[
+            "route_counter_has_resolved_row_ptr_count": aggregate_values[
                 "has_resolved_row_ptr_count"
             ],
+            "route_counter_compact_row_steps": aggregate_values[
+                "compact_row_steps"
+            ],
+            "route_counter_compact_rows": aggregate_values["compact_rows"],
             **{
-                f"speed_child_page_resolver_kind{kind}_count": aggregate_kinds[kind]
+                f"route_counter_page_resolver_kind{kind}_count": aggregate_kinds[kind]
                 for kind in range(5)
             },
         }
@@ -3187,8 +3232,8 @@ def _harness_condition_reasons(
         reasons.append("route_proof_not_green")
     if summary.get("route_proof_passed") is not True:
         reasons.append("route_proof_passed_not_green")
-    if summary.get("speed_child_route_proof_passed") is not True:
-        reasons.append("speed_child_route_proof_not_green")
+    if summary.get("diagnostic_child_route_proof_passed") is not True:
+        reasons.append("diagnostic_child_route_proof_not_green")
     if (
         mode == "sparse"
         and summary.get("workload_plan_replay_counts_match") is not True
@@ -3369,7 +3414,9 @@ def check_run_speed_summary(
     route_proof_reasons = list(
         route_proof.get("reasons") or [] if isinstance(route_proof, dict) else []
     )
-    route_proof_reasons += list(summary.get("speed_child_route_proof_reasons") or [])
+    route_proof_reasons += list(
+        summary.get("diagnostic_child_route_proof_reasons") or []
+    )
     semantic_gate_reasons_raw = summary.get("semantic_gate_reasons")
     producer_gate_reasons_raw = summary.get("producer_gate_reasons")
     gate_reason_shape_reasons: list[str] = []

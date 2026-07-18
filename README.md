@@ -343,10 +343,14 @@ PYTHON="${PYTHON}" TORCH_EXTENSIONS_DIR="${PWD}/tmp/torch_extensions/${RUN_ID}" 
   bash scripts/run_one_shot.sh "${GPU}" "${MODEL}" "oneshot_${RUN_ID}"
 ```
 
+On memory-rich cards, `GPU_MEM_UTIL=0.75` may be supplied as a capacity-only
+override; the fixed one-shot workload is unchanged and the effective value is
+recorded in its artifacts.
+
 The one-shot run must end with:
 
 ```text
-child_returncode=0 gate_passed=True production_gate_passed=True producer_gate_passed=True route_proof_passed=True speed_child_route_proof_passed=True decode_tps=...
+child_returncode=0 gate_passed=True production_gate_passed=True producer_gate_passed=True route_proof_passed=True diagnostic_child_route_proof_passed=True decode_tps=...
 ONE-SHOT PASS
 ```
 
@@ -698,6 +702,20 @@ PYTHON="${PYTHON}" HOST=127.0.0.1 MML=131072 SLOTS=1 \
   bash scripts/serve_sparse.sh "0" "${MODEL}" 8000
 ```
 
+To run LongBench on the hot-path observer-free runtime:
+
+```bash
+PYTHON="${PYTHON}" HOST=127.0.0.1 MML=131072 SLOTS=1 \
+  SFI_TRACE=0 SFI_RUNTIME_PROOF=0 \
+  bash scripts/serve_sparse.sh "0" "${MODEL}" 8000
+```
+
+This mode installs no route/step/profile observer or worker proof extension;
+R0&ndash;R6 are reported as `NOT_RUN`, while output completeness and official
+scoring remain hard gates. Same-run liveness uses the default trace/proof mode
+above and is restricted to a loopback bind. `SFI_TRACE=0` rejects
+`SFI_RUNTIME_PROOF=1` so an observer cannot be hidden under a trace-off run.
+
 **5)&ensp;Run the gated official evaluation** &mdash; back in the original shell (it still holds the exports from steps 1&ndash;2):
 
 ```bash
@@ -711,7 +729,7 @@ PYTHON="${PYTHON}" LONGBENCH_ROOT="${LONGBENCH_ROOT}" \
   bash scripts/run_longbench_v2.sh "${MODEL_NAME}" 1 8000
 ```
 
-The run is accepted when it prints `PASS: official LongBench v2 sparse liveness, completeness and scoring` and the exact `score=.../result.txt` and `score_summary=.../score_summary.json` paths. Artifacts (external Git revision, config hashes, server identity, dataset identity, predictions, liveness logs, official score) land under `tmp/longbench_v2_runs/`.
+The proof mode prints `PASS: official LongBench v2 sparse liveness, completeness and scoring`; observer-free mode prints `PASS: official LongBench v2 observer-free completeness and scoring; R0-R6 NOT_RUN`. Both print the exact `score=.../result.txt` and `score_summary=.../score_summary.json` paths. Artifacts land under `tmp/longbench_v2_runs/`.
 
 <details>
 <summary>&ensp;<b>Acceptance checks &amp; reporting rules</b></summary>

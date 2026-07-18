@@ -121,7 +121,7 @@ fi
 
 # Bind the manifest to the live exec PID and its exact command/environment.
 mapfile -t SERVER_META < <(
-  "${PYTHON}" -I - "${MANIFEST}" "${PORT}" "${PYTHON}" <<'PY'
+  "${PYTHON}" -I - "${MANIFEST}" "${PORT}" "${PYTHON}" "${SFI_ROOT}" <<'PY'
 import json
 import ipaddress
 import os
@@ -131,6 +131,10 @@ import sys
 manifest_path = pathlib.Path(sys.argv[1]).resolve()
 requested_port = int(sys.argv[2])
 selected_python = os.path.realpath(sys.argv[3])
+repo_root = os.path.realpath(sys.argv[4])
+sys.path.insert(0, repo_root)
+from benchmarks.sm80_run_pair import classify_speed_child_env_key
+
 data = json.loads(manifest_path.read_text(encoding="utf-8"))
 required = {
     "schema",
@@ -149,7 +153,11 @@ required = {
     "refresh_profile_log",
     "route_trace_log",
     "step_trace_log",
-    "route_counter_mmap",
+    "route_counter_snapshot",
+    "trace_enabled",
+    "runtime_proof_enabled",
+    "route_counter_rpc_enabled",
+    "hot_path_observer_free",
     "tensor_parallel_size",
     "slots",
     "capture_sizes",
@@ -167,7 +175,7 @@ required = {
 missing = sorted(required.difference(data))
 if missing:
     raise SystemExit(f"server manifest is incomplete: {missing}")
-if data["schema"] != 4 or data["port"] != requested_port:
+if data["schema"] != 6 or data["port"] != requested_port:
     raise SystemExit("server manifest schema/port mismatch")
 try:
     bind_address = ipaddress.IPv4Address(data["host"])
@@ -175,12 +183,53 @@ except (ipaddress.AddressValueError, TypeError) as exc:
     raise SystemExit("server manifest host is not a normalized IPv4 literal") from exc
 if data["api_key_source"] not in {"default-loopback", "explicit"}:
     raise SystemExit("server manifest has invalid API-key provenance")
+for key in (
+    "trace_enabled",
+    "runtime_proof_enabled",
+    "route_counter_rpc_enabled",
+    "hot_path_observer_free",
+):
+    if type(data[key]) is not bool:
+        raise SystemExit(f"server manifest {key} must be a boolean")
+proof_mode = bool(
+    data["trace_enabled"]
+    and data["runtime_proof_enabled"]
+    and data["route_counter_rpc_enabled"]
+    and not data["hot_path_observer_free"]
+)
+observer_free_mode = bool(
+    not data["trace_enabled"]
+    and not data["runtime_proof_enabled"]
+    and not data["route_counter_rpc_enabled"]
+    and data["hot_path_observer_free"]
+)
+if not (proof_mode or observer_free_mode):
+    raise SystemExit(
+        "LongBench requires either diagnostic proof mode or the exact "
+        "observer-free runtime mode"
+    )
+if proof_mode and not bind_address.is_loopback:
+    raise SystemExit("LongBench runtime-proof RPC is restricted to loopback")
 if not isinstance(data["model_path"], str) or not os.path.isabs(data["model_path"]):
     raise SystemExit("server manifest model_path is not absolute")
 if not isinstance(data["served_model_id"], str) or not data["served_model_id"]:
     raise SystemExit("server manifest served_model_id is empty")
 if int(data["max_model_len"]) <= 0:
     raise SystemExit("server manifest max_model_len must be positive")
+if not isinstance(data["run_dir"], str):
+    raise SystemExit("server manifest run_dir must be a string")
+run_dir = pathlib.Path(data["run_dir"])
+if not run_dir.is_absolute() or not run_dir.is_dir():
+    raise SystemExit("server manifest run_dir is not an absolute directory")
+expected_snapshot = run_dir / "route_counter_snapshot.bin"
+if not isinstance(data["route_counter_snapshot"], str) or not os.path.isabs(
+    data["route_counter_snapshot"]
+):
+    raise SystemExit("server route-counter snapshot path is not absolute")
+if os.path.realpath(data["route_counter_snapshot"]) != os.path.realpath(
+    expected_snapshot
+):
+    raise SystemExit("server route-counter snapshot escaped its run directory")
 if data["attention_backend"] != "FLASH_ATTN_VLLM_V1":
     raise SystemExit("server manifest does not select FLASH_ATTN_VLLM_V1")
 supported_kernels = {
@@ -234,6 +283,7 @@ except OSError as exc:
 
 expected_env = {
     "SFI_RUN_NONCE": str(data["run_nonce"]),
+    "SFI_SERVE_RUN_DIR": str(data["run_dir"]),
     "SFI_SERVE_MANIFEST": str(manifest_path),
     "SFI_SERVE_HOST": str(data["host"]),
     "SFI_SERVE_API_KEY_SOURCE": str(data["api_key_source"]),
@@ -245,17 +295,45 @@ expected_env = {
     "SFI_ATTENTION_KERNEL": str(data["attention_kernel"]),
     "CUDA_VISIBLE_DEVICES": str(data["gpu_devices"]),
     "VLLM_TENSOR_PARALLEL_SIZE": str(data["tensor_parallel_size"]),
+    "VLLM_SPARSE_SITE_LOG": "1",
     "VLLM_SPARSE_SITE_LOG_PATH": str(data["site_log"]),
-    "VLLM_SPARSE_REFRESH_PROFILE_LOG": str(data["refresh_profile_log"]),
-    "VLLM_SPARSE_FA3_ROUTE_TRACE_LOG": str(data["route_trace_log"]),
-    "VLLM_SPARSE_FA3_STEP_TRACE_LOG": str(data["step_trace_log"]),
-    "VLLM_SPARSE_FA3_ROUTE_COUNTER_MMAP": str(data["route_counter_mmap"]),
 }
+if proof_mode:
+    expected_env.update(
+        {
+            "VLLM_SPARSE_REFRESH_PROFILE_LOG": str(data["refresh_profile_log"]),
+            "VLLM_SPARSE_FA3_ROUTE_TRACE_LOG": str(data["route_trace_log"]),
+            "VLLM_SPARSE_FA3_STEP_TRACE_LOG": str(data["step_trace_log"]),
+            "VLLM_SPARSE_FA3_ROUTE_COUNTER_ENABLED": "1",
+            "VLLM_SPARSE_FA3_ROUTE_COUNTER_SLOTS": str(
+                data["tensor_parallel_size"]
+            ),
+            "VLLM_SERVER_DEV_MODE": "1",
+        }
+    )
 for key, expected in expected_env.items():
     if environ.get(key) != expected:
         raise SystemExit(
             f"live server environment mismatch: {key}={environ.get(key)!r}, "
             f"expected={expected!r}"
+        )
+
+forbidden_env = {"VLLM_SPARSE_FA3_ROUTE_COUNTER_MMAP"}
+if observer_free_mode:
+    cold_startup_provenance = {
+        "VLLM_SPARSE_SITE_LOG",
+        "VLLM_SPARSE_SITE_LOG_PATH",
+    }
+    forbidden_env.update(
+        key
+        for key in environ
+        if classify_speed_child_env_key(key) == "observation"
+        and key not in cold_startup_provenance
+    )
+for forbidden_key in sorted(forbidden_env):
+    if forbidden_key in environ:
+        raise SystemExit(
+            f"live server retains forbidden hot-path environment: {forbidden_key}"
         )
 
 controller = json.loads(environ.get("VLLM_SPARSE_CONTROLLER_JSON", "null"))
@@ -286,6 +364,14 @@ if int(cli_value("--max-num-seqs")) != int(data["slots"]):
     raise SystemExit("live server max-num-seqs does not equal sparse slots")
 if int(cli_value("--tensor-parallel-size")) != int(data["tensor_parallel_size"]):
     raise SystemExit("live server TP size mismatch")
+if proof_mode:
+    if cli_value("--worker-extension-cls") != (
+        "patches.fa3_native.route_counter_worker_extension."
+        "SparseRouteCounterWorkerExtension"
+    ):
+        raise SystemExit("live server route-counter RPC worker extension mismatch")
+elif "--worker-extension-cls" in cmdline:
+    raise SystemExit("observer-free server retains a worker extension")
 
 default_api_key = "token-abc123"
 client_api_key = os.environ.get("API_KEY")
@@ -317,7 +403,7 @@ for key in (
     "refresh_profile_log",
     "route_trace_log",
     "step_trace_log",
-    "route_counter_mmap",
+    "route_counter_snapshot",
     "slots",
     "cuda_arch",
     "attention_kernel",
@@ -327,11 +413,15 @@ for key in (
     "model_path",
     "served_model_id",
     "max_model_len",
+    "trace_enabled",
+    "runtime_proof_enabled",
+    "hot_path_observer_free",
+    "tensor_parallel_size",
 ):
     print(data[key])
 PY
 )
-(( ${#SERVER_META[@]} == 17 )) || die "failed to parse live server manifest"
+(( ${#SERVER_META[@]} == 21 )) || die "failed to parse live server manifest"
 SERVER_PID="${SERVER_META[0]}"
 SERVER_NONCE="${SERVER_META[1]}"
 SERVER_STARTED_EPOCH="${SERVER_META[2]}"
@@ -339,7 +429,7 @@ SERVER_RUN_DIR="${SERVER_META[3]}"
 REFRESH_PROFILE_LOG="${SERVER_META[4]}"
 ROUTE_TRACE_LOG="${SERVER_META[5]}"
 STEP_TRACE_LOG="${SERVER_META[6]}"
-ROUTE_COUNTER_MMAP="${SERVER_META[7]}"
+ROUTE_COUNTER_SNAPSHOT="${SERVER_META[7]}"
 SLOTS="${SERVER_META[8]}"
 CUDA_ARCH="${SERVER_META[9]}"
 ATTENTION_KERNEL="${SERVER_META[10]}"
@@ -349,6 +439,19 @@ API_KEY_SOURCE="${SERVER_META[13]}"
 SERVER_MODEL_PATH="${SERVER_META[14]}"
 SERVED_MODEL_ID="${SERVER_META[15]}"
 SERVER_MAX_MODEL_LEN="${SERVER_META[16]}"
+TRACE_ENABLED="${SERVER_META[17]}"
+RUNTIME_PROOF_ENABLED="${SERVER_META[18]}"
+HOT_PATH_OBSERVER_FREE="${SERVER_META[19]}"
+TP_SIZE="${SERVER_META[20]}"
+if [[ "${RUNTIME_PROOF_ENABLED}" == "True" ]]; then
+  [[ "${TRACE_ENABLED}" == "True" && "${HOT_PATH_OBSERVER_FREE}" == "False" ]] || \
+    die "runtime-proof LongBench mode has an inconsistent observer contract"
+  LIVENESS_ENABLED=1
+else
+  [[ "${TRACE_ENABLED}" == "False" && "${HOT_PATH_OBSERVER_FREE}" == "True" ]] || \
+    die "observer-free LongBench mode has an inconsistent observer contract"
+  LIVENESS_ENABLED=0
+fi
 SERVER_CLIENT_HOST="${SERVER_BIND_HOST}"
 if [[ "${SERVER_CLIENT_HOST}" == "0.0.0.0" ]]; then
   SERVER_CLIENT_HOST="127.0.0.1"
@@ -631,6 +734,11 @@ payload = {
         "hf_datasets_offline": True,
         "hf_hub_offline": True,
         "scoring": "official result.py with isolated results symlink",
+        "runtime_liveness": (
+            "same_run_trace_and_frozen_rpc"
+            if manifest["runtime_proof_enabled"]
+            else "not_run_hot_path_observer_free"
+        ),
     },
     "live_server": {
         "manifest": str(pathlib.Path(manifest_arg).resolve()),
@@ -643,6 +751,9 @@ payload = {
         "attention_kernel": manifest["attention_kernel"],
         "flash_attn_version": manifest["flash_attn_version"],
         "api_key_source": manifest["api_key_source"],
+        "trace_enabled": manifest["trace_enabled"],
+        "runtime_proof_enabled": manifest["runtime_proof_enabled"],
+        "hot_path_observer_free": manifest["hot_path_observer_free"],
     },
 }
 path = pathlib.Path(provenance_arg)
@@ -691,17 +802,17 @@ done
 
 snapshot_evidence() {
   "${PYTHON}" -I - \
-    "${REFRESH_PROFILE_LOG}" "${ROUTE_COUNTER_MMAP}" "${STEP_TRACE_LOG}" \
+    "${REFRESH_PROFILE_LOG}" "${ROUTE_COUNTER_SNAPSHOT}" "${STEP_TRACE_LOG}" \
     "${ROUTE_TRACE_LOG}" <<'PY'
 import os
 import struct
 import sys
 
-profile, mmap_path, step_trace, route_trace = sys.argv[1:]
+profile, counter_snapshot, step_trace, route_trace = sys.argv[1:]
 print(os.path.getsize(profile) if os.path.isfile(profile) else 0)
 compact_steps = 0
-if os.path.isfile(mmap_path):
-    with open(mmap_path, "rb") as fh:
+if os.path.isfile(counter_snapshot):
+    with open(counter_snapshot, "rb") as fh:
         raw = fh.read()
     slot_bytes = 10 * 8
     if len(raw) >= slot_bytes and len(raw) % slot_bytes == 0:
@@ -715,6 +826,28 @@ print(os.path.getsize(route_trace) if os.path.isfile(route_trace) else 0)
 PY
 }
 
+route_counter_rpc() {
+  local phase="$1"
+  local json_output="$2"
+  local reset_json="${3:-}"
+  local -a rpc_args=(
+    --base-url "http://${SERVER_CLIENT_HOST}:${PORT}"
+    --api-key "${CLIENT_API_KEY}"
+    --tp-size "${TP_SIZE}"
+    --phase "${phase}"
+    --json-output "${json_output}"
+    --binary-output "${ROUTE_COUNTER_SNAPSHOT}"
+  )
+  if [[ "${phase}" == "snapshot" ]]; then
+    [[ -n "${reset_json}" ]] || die "snapshot RPC requires a reset artifact"
+    rpc_args+=(--reset-json "${reset_json}")
+  elif [[ "${phase}" != "reset" || -n "${reset_json}" ]]; then
+    die "invalid route-counter RPC arguments: phase=${phase}"
+  fi
+  "${PYTHON}" -I "${SFI_ROOT}/scripts/snapshot_sparse_route_counters.py" \
+    "${rpc_args[@]}"
+}
+
 run_liveness_delta() {
   local phase="$1"
   local profile_offset="$2"
@@ -724,31 +857,43 @@ run_liveness_delta() {
   local request_policy="$6"
   local -a liveness_args=(
     --refresh-profile-log "${REFRESH_PROFILE_LOG}" \
-    --route-trace "${ROUTE_TRACE_LOG}" \
-    --route-counter-mmap "${ROUTE_COUNTER_MMAP}" \
-    --step-trace "${STEP_TRACE_LOG}" \
+    --route-counter-snapshot "${ROUTE_COUNTER_SNAPSHOT}" \
     --run-since "${SERVER_STARTED_EPOCH}" \
     --min-world-publish 1 \
     --refresh-profile-offset "${profile_offset}" \
-    --route-trace-offset "${route_trace_offset}" \
     --baseline-compact-row-steps "${compact_baseline}" \
     --min-compact-row-step-delta 1 \
-    --step-trace-offset "${step_trace_offset}" \
-    --reject-request-fallback \
+    --expected-route-counter-ranks "${TP_SIZE}" \
     --phase "${phase}"
+  )
+  if [[ "${request_policy}" != "strict-long" && "${request_policy}" != "sticky" ]]; then
+    die "unknown liveness request policy: ${request_policy}"
+  fi
+  [[ "${TRACE_ENABLED}" == "True" ]] || \
+    die "same-run liveness requires the diagnostic trace/proof server mode"
+  liveness_args+=(
+    --route-trace "${ROUTE_TRACE_LOG}"
+    --route-trace-offset "${route_trace_offset}"
+    --step-trace "${STEP_TRACE_LOG}"
+    --step-trace-offset "${step_trace_offset}"
+    --reject-request-fallback
   )
   if [[ "${request_policy}" == "strict-long" ]]; then
     liveness_args+=(--require-mature-decode-compact)
-  elif [[ "${request_policy}" != "sticky" ]]; then
-    die "unknown liveness request policy: ${request_policy}"
   fi
   "${PYTHON}" -I "${SFI_ROOT}/scripts/check_sparse_liveness.py" \
     "${liveness_args[@]}" \
     2>&1 | tee "${EVAL_DIR}/${phase}_liveness.log"
 }
 
-mapfile -t SMOKE_BASELINE < <(snapshot_evidence)
-(( ${#SMOKE_BASELINE[@]} == 4 )) || die "cannot snapshot sparse evidence"
+SMOKE_RESET_JSON="${EVAL_DIR}/smoke_route_counter_reset.json"
+SMOKE_SNAPSHOT_JSON="${EVAL_DIR}/smoke_route_counter_snapshot.json"
+if (( LIVENESS_ENABLED == 1 )); then
+  route_counter_rpc "reset" "${SMOKE_RESET_JSON}"
+  mapfile -t SMOKE_BASELINE < <(snapshot_evidence)
+  (( ${#SMOKE_BASELINE[@]} == 4 )) || die "cannot snapshot sparse evidence"
+  (( SMOKE_BASELINE[1] == 0 )) || die "smoke route-counter reset is not zero"
+fi
 
 # One long request must create fresh producer and replay-aware read evidence.
 "${PYTHON}" -I - \
@@ -835,12 +980,23 @@ print(
     f"completion_tokens={completion_tokens}"
 )
 PY
-run_liveness_delta "smoke" \
-  "${SMOKE_BASELINE[0]}" "${SMOKE_BASELINE[1]}" \
-  "${SMOKE_BASELINE[2]}" "${SMOKE_BASELINE[3]}" "strict-long"
+if (( LIVENESS_ENABLED == 1 )); then
+  route_counter_rpc "snapshot" "${SMOKE_SNAPSHOT_JSON}" "${SMOKE_RESET_JSON}"
+  run_liveness_delta "smoke" \
+    "${SMOKE_BASELINE[0]}" "${SMOKE_BASELINE[1]}" \
+    "${SMOKE_BASELINE[2]}" "${SMOKE_BASELINE[3]}" "strict-long"
+else
+  echo "INFO: smoke R0-R6 NOT_RUN; server is the hot-path observer-free specialization"
+fi
 
-mapfile -t EVAL_BASELINE < <(snapshot_evidence)
-(( ${#EVAL_BASELINE[@]} == 4 )) || die "cannot snapshot pre-eval sparse evidence"
+EVAL_RESET_JSON="${EVAL_DIR}/eval_route_counter_reset.json"
+EVAL_SNAPSHOT_JSON="${EVAL_DIR}/eval_route_counter_snapshot.json"
+if (( LIVENESS_ENABLED == 1 )); then
+  route_counter_rpc "reset" "${EVAL_RESET_JSON}"
+  mapfile -t EVAL_BASELINE < <(snapshot_evidence)
+  (( ${#EVAL_BASELINE[@]} == 4 )) || die "cannot snapshot pre-eval sparse evidence"
+  (( EVAL_BASELINE[1] == 0 )) || die "eval route-counter reset is not zero"
+fi
 
 echo "==> LongBench v2: alias=${MODEL_NAME} served_model=${SERVED_MODEL_ID} n_proc=${N_PROC} server_pid=${SERVER_PID}"
 echo "    arch=${CUDA_ARCH} kernel=${ATTENTION_KERNEL} version=${FLASH_ATTN_VERSION}"
@@ -863,9 +1019,14 @@ set -e
 (( PRED_EXIT_CODE == 0 )) || \
   die "official LongBench pred.py failed with exit code ${PRED_EXIT_CODE}"
 
-run_liveness_delta "posteval" \
-  "${EVAL_BASELINE[0]}" "${EVAL_BASELINE[1]}" \
-  "${EVAL_BASELINE[2]}" "${EVAL_BASELINE[3]}" "sticky"
+if (( LIVENESS_ENABLED == 1 )); then
+  route_counter_rpc "snapshot" "${EVAL_SNAPSHOT_JSON}" "${EVAL_RESET_JSON}"
+  run_liveness_delta "posteval" \
+    "${EVAL_BASELINE[0]}" "${EVAL_BASELINE[1]}" \
+    "${EVAL_BASELINE[2]}" "${EVAL_BASELINE[3]}" "sticky"
+else
+  echo "INFO: posteval R0-R6 NOT_RUN; quality/scoring ran without hot-path observers"
+fi
 
 "${PYTHON}" -I - \
   "${PREDICTIONS_DIR}" "${EXPECTED_ROWS}" "${DATASET_IDENTITY}" \
@@ -958,7 +1119,11 @@ set -e
   die "official LongBench score validation failed"
 verify_official_checkout_unchanged
 
-echo "PASS: official LongBench v2 sparse liveness, completeness and scoring"
+if (( LIVENESS_ENABLED == 1 )); then
+  echo "PASS: official LongBench v2 sparse liveness, completeness and scoring"
+else
+  echo "PASS: official LongBench v2 observer-free completeness and scoring; R0-R6 NOT_RUN"
+fi
 echo "artifacts=${EVAL_DIR}"
 echo "score=${SCORING_DIR}/result.txt"
 echo "score_summary=${SCORE_SUMMARY}"

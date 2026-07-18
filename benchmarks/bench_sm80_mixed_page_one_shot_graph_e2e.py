@@ -492,7 +492,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Render prompts through the model chat template in sparse/dense runners.",
     )
     parser.add_argument("--enable-thinking", action="store_true")
-    parser.add_argument("--gpu-mem-util", type=float, default=0.9)
+    parser.add_argument(
+        "--gpu-mem-util",
+        type=float,
+        default=0.9,
+        help=(
+            "Engine GPU-memory utilization. Named presets supply their "
+            "validated default unless this capacity-only value is explicit."
+        ),
+    )
     parser.add_argument(
         "--max-model-len",
         type=int,
@@ -650,6 +658,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Write a fail-closed Phase 2 record without launching vLLM.",
     )
     args = parser.parse_args(argv_list)
+    if not math.isfinite(float(args.gpu_mem_util)) or not (
+        0.0 < float(args.gpu_mem_util) <= 1.0
+    ):
+        parser.error("--gpu-mem-util must be finite and in (0, 1]")
     if args.warmup < 0:
         parser.error("--warmup must be >= 0")
     if args.iters <= 0:
@@ -872,13 +884,6 @@ def _apply_named_preset(
     _reject_conflicting_preset_value(
         parser,
         argv_list,
-        "--gpu-mem-util",
-        float(args.gpu_mem_util),
-        expected_gpu_mem_util,
-    )
-    _reject_conflicting_preset_value(
-        parser,
-        argv_list,
         "--refresh-interval",
         int(args.refresh_interval),
         BS2_LONG_CAP128_REFRESH_INTERVAL,
@@ -900,7 +905,8 @@ def _apply_named_preset(
     args.batch_size = BS2_LONG_CAP128_BATCH_SIZE
     args.split_context_prompts = True
     args.max_new_tokens = BS2_LONG_CAP128_MAX_NEW_TOKENS
-    args.gpu_mem_util = expected_gpu_mem_util
+    if not _argv_has_option(argv_list, "--gpu-mem-util"):
+        args.gpu_mem_util = expected_gpu_mem_util
     args.refresh_interval = BS2_LONG_CAP128_REFRESH_INTERVAL
     args.full_cuda_graph = True
 
@@ -1572,6 +1578,7 @@ def _build_phase2_command(
     _append_request_vector_child_args(command, args)
     command.extend(["--scheduling-mode", str(args.scheduling_mode)])
     command.append("--collect-cudagraph-runtime-proof")
+    command.append("--collect-route-counter-proof")
     _append_deferred_bridge_child_args(command, args)
     command.extend(
         [
@@ -2706,7 +2713,7 @@ def _command_output_has_fatal_error(result: Phase1CommandResult | None) -> bool:
     return any(marker in combined for marker in _FATAL_CHILD_OUTPUT_MARKERS)
 
 
-def _speed_child_route_counter_proof(
+def _diagnostic_route_counter_proof(
     metrics: dict[str, Any],
     *,
     require_resolved_row_ptr: bool = False,
@@ -2716,19 +2723,19 @@ def _speed_child_route_counter_proof(
     reasons: list[str] = []
     route_summary = route_summary or {}
     producer_route_summary = producer_route_summary or {}
-    available = bool(metrics.get("speed_child_route_counter_available", False))
-    actual = _as_int(metrics.get("speed_child_actual_fwd_mixed_page_count"), -1)
+    available = bool(metrics.get("route_counter_available", False))
+    actual = _as_int(metrics.get("route_counter_actual_fwd_mixed_page_count"), -1)
     resolved = _as_int(
-        metrics.get("speed_child_resolved_row_ptr_fwd_mixed_page_count"),
+        metrics.get("route_counter_resolved_row_ptr_fwd_mixed_page_count"),
         -1,
     )
-    kind0 = _as_int(metrics.get("speed_child_page_resolver_kind0_count"), 0)
-    kind4 = _as_int(metrics.get("speed_child_page_resolver_kind4_count"), -1)
+    kind0 = _as_int(metrics.get("route_counter_page_resolver_kind0_count"), 0)
+    kind4 = _as_int(metrics.get("route_counter_page_resolver_kind4_count"), -1)
     route_family = "unknown"
     if not available:
-        reasons.append("speed_child_route_counters_missing")
+        reasons.append("diagnostic_route_counters_missing")
     if actual <= 0:
-        reasons.append("speed_child_actual_fwd_mixed_page_count_missing")
+        reasons.append("diagnostic_actual_fwd_mixed_page_count_missing")
     if available and actual > 0:
         dense_native = kind0 == actual and kind4 == 0 and resolved == 0
         resolved_row_ptr = kind0 == 0 and kind4 == actual and resolved == actual
@@ -2806,7 +2813,7 @@ def _speed_child_route_counter_proof(
                 if graph_replay_rrp:
                     route_family = "resolved_row_ptr_graph_replay_native_capture"
                 else:
-                    reasons.append("speed_child_dense_native_kind0_fallback")
+                    reasons.append("diagnostic_dense_native_kind0_fallback")
         elif resolved_row_ptr:
             route_family = "resolved_row_ptr_kind4"
         elif resolved_row_ptr_after_full_kv_bridge:
@@ -2816,21 +2823,21 @@ def _speed_child_route_counter_proof(
             ):
                 route_family = "resolved_row_ptr_kind4_with_full_kv_bridge"
             else:
-                reasons.append("speed_child_native_kind0_seen")
-                reasons.append("speed_child_rrp_count_mismatch")
+                reasons.append("diagnostic_native_kind0_seen")
+                reasons.append("diagnostic_rrp_count_mismatch")
         else:
             if resolved <= 0:
-                reasons.append("speed_child_resolved_row_ptr_count_missing")
+                reasons.append("diagnostic_resolved_row_ptr_count_missing")
             if kind4 <= 0:
-                reasons.append("speed_child_page_resolver_kind4_count_missing")
+                reasons.append("diagnostic_page_resolver_kind4_count_missing")
             if kind0 > 0:
-                reasons.append("speed_child_native_kind0_seen")
+                reasons.append("diagnostic_native_kind0_seen")
             if actual > 0 and resolved >= 0 and resolved != actual:
-                reasons.append("speed_child_rrp_count_mismatch")
+                reasons.append("diagnostic_rrp_count_mismatch")
     return {
         "passed": not reasons,
         "reasons": reasons,
-        "scope": "speed_child_measurement_window",
+        "scope": "diagnostic_child_measurement_window",
         "route_family": route_family,
         "actual_fwd_mixed_page_count": int(actual),
         "resolved_row_ptr_fwd_mixed_page_count": int(resolved),
@@ -5109,6 +5116,7 @@ def _gate_d_payload(
     metrics_path: Path,
     outputs_path: Path,
     metrics: dict[str, Any],
+    route_counter_metrics: dict[str, Any] | None = None,
     route_trace_path: Path | None,
     route_summary: dict[str, Any] | None = None,
     producer_route_summary: dict[str, Any] | None = None,
@@ -5188,28 +5196,28 @@ def _gate_d_payload(
     route_proof_passed = bool(
         (route_proof or {}).get("passed", bool(mode == "dense"))
     )
-    speed_child_route_counter_proof = (
+    diagnostic_child_route_counter_proof = (
         {"passed": True, "reasons": [], "scope": "not_required_for_dense"}
         if mode == "dense"
-        else _speed_child_route_counter_proof(
-            metrics,
+        else _diagnostic_route_counter_proof(
+            route_counter_metrics or {},
             require_resolved_row_ptr=_producer_mode_requires_refresh(producer_mode),
             route_summary=route_summary,
             producer_route_summary=producer_route_summary,
         )
     )
-    speed_child_route_proof_passed = bool(
-        speed_child_route_counter_proof.get("passed", False)
+    diagnostic_child_route_proof_passed = bool(
+        diagnostic_child_route_counter_proof.get("passed", False)
     )
-    dense_native_speed_fallback = bool(
+    dense_native_diagnostic_fallback = bool(
         mode != "dense"
-        and speed_child_route_counter_proof.get("passed", False)
-        and str(speed_child_route_counter_proof.get("route_family", ""))
+        and diagnostic_child_route_counter_proof.get("passed", False)
+        and str(diagnostic_child_route_counter_proof.get("route_family", ""))
         == "dense_native_kind0"
     )
     producer_gate_scope = (
         "dense_native_kind0_fallback"
-        if dense_native_speed_fallback
+        if dense_native_diagnostic_fallback
         else "producer_refresh"
     )
     speed_child_fatal_error = _command_output_has_fatal_error(result)
@@ -5339,7 +5347,7 @@ def _gate_d_payload(
     if mode != "dense":
         producer_requires_refresh = _producer_mode_requires_refresh(producer_mode)
         if producer_requires_refresh:
-            if not dense_native_speed_fallback:
+            if not dense_native_diagnostic_fallback:
                 if continuous_refresh_reqs <= 0:
                     producer_gate_reasons.append("continuous_refresh_reqs_missing")
                 if not interval_trigger_requirement_ok:
@@ -5419,7 +5427,7 @@ def _gate_d_payload(
         and not speed_child_fatal_error
         and diagnostic_ok
         and route_proof_passed
-        and speed_child_route_proof_passed
+        and diagnostic_child_route_proof_passed
         and producer_gate_passed
         and bool(output_length_gate["passed"])
         and not semantic_gate_reasons
@@ -5751,10 +5759,10 @@ def _gate_d_payload(
         ),
         "route_proof": route_proof or {"passed": mode == "dense", "reasons": []},
         "route_proof_passed": route_proof_passed,
-        "speed_child_route_counter_proof": speed_child_route_counter_proof,
-        "speed_child_route_proof_passed": speed_child_route_proof_passed,
-        "speed_child_route_proof_reasons": list(
-            speed_child_route_counter_proof.get("reasons", [])
+        "diagnostic_child_route_counter_proof": diagnostic_child_route_counter_proof,
+        "diagnostic_child_route_proof_passed": diagnostic_child_route_proof_passed,
+        "diagnostic_child_route_proof_reasons": list(
+            diagnostic_child_route_counter_proof.get("reasons", [])
         ),
         **speed_child_engine_scheduling,
         "speed_child_custom_all_reduce_requested": (
@@ -6134,9 +6142,10 @@ def _run_gate_d_mode(args: argparse.Namespace) -> int:
     if one_shot_timeline_path is not None:
         one_shot_timeline_path.parent.mkdir(parents=True, exist_ok=True)
         one_shot_timeline_path.write_text("", encoding="utf-8")
-    # Full-form throughput proof comes from the rank-local mmap/RPC counters.
-    # Only the explicitly directional verdict-only diagnostic keeps the legacy
-    # speed-child JSONL observer because it has no independent diagnostic child.
+    # Timed children are observer-free. Full-form route proof is collected only
+    # by the later diagnostic child. The legacy verdict-only mode keeps its
+    # JSONL trace for diagnostics but cannot satisfy the independent counter
+    # proof and therefore cannot produce a production-green speed verdict.
     speed_route_trace_path = (
         _default_gate_d_speed_route_path(output_path)
         if bool(args.verdict_only)
@@ -6591,6 +6600,9 @@ def _run_gate_d_mode(args: argparse.Namespace) -> int:
         else []
     )
     metrics = _read_json(metrics_path)
+    diagnostic_metrics = (
+        _read_json(diag_metrics_path) if diag_result is not None else None
+    )
     if bool(args.outputs_include_text):
         # Runtime health belongs to the sparse output itself.  A healthy sparse
         # answer may reasonably differ from the independently sampled dense arm.
@@ -6612,6 +6624,7 @@ def _run_gate_d_mode(args: argparse.Namespace) -> int:
         metrics_path=metrics_path,
         outputs_path=outputs_path,
         metrics=metrics,
+        route_counter_metrics=diagnostic_metrics,
         route_trace_path=route_trace_path,
         route_summary=route_summary,
         producer_route_summary=producer_route_summary,
@@ -6772,9 +6785,6 @@ def _run_gate_d_mode(args: argparse.Namespace) -> int:
         if reference_gate_reasons and not dense_reference_skipped:
             payload["gate_passed"] = False
             payload["production_gate_passed"] = False
-    diagnostic_metrics = (
-        _read_json(diag_metrics_path) if diag_result is not None else None
-    )
     dense_reference_metrics = (
         _read_json(dense_reference_metrics_path)
         if dense_reference_metrics_path is not None
@@ -6818,7 +6828,7 @@ def _run_gate_d_mode(args: argparse.Namespace) -> int:
             or (diag_result.returncode == 0 and not diag_result.timed_out)
         )
         and route_proof_result.passed
-        and bool(payload.get("speed_child_route_proof_passed", False))
+        and bool(payload.get("diagnostic_child_route_proof_passed", False))
         # [2026-07-01] producer_graph_roi retired from the exit gate: its counter
         # is now owned by the sanctioned task-#9 writer graph (see
         # _producer_graph_roi_proof). The retired producer-graph surface removal

@@ -94,6 +94,30 @@ fi
 if (( HOST_IS_LOOPBACK == 0 )) && [[ "${API_KEY_VALUE}" == "${DEFAULT_API_KEY}" ]]; then
   die "non-loopback HOST=${HOST} rejects the default API_KEY"
 fi
+SFI_TRACE="${SFI_TRACE:-1}"
+[[ "${SFI_TRACE}" == "0" || "${SFI_TRACE}" == "1" ]] || \
+  die "SFI_TRACE must be 0 or 1: ${SFI_TRACE}"
+# Worker proof uses vLLM's built-in development RPC route. Keep that route
+# loopback-only. Trace-off is the production specialization: proof observers
+# cannot be re-enabled under a trace-off label.
+if [[ -z "${SFI_RUNTIME_PROOF+x}" ]]; then
+  if [[ "${SFI_TRACE}" == "1" ]] && (( HOST_IS_LOOPBACK == 1 )); then
+    SFI_RUNTIME_PROOF=1
+  else
+    SFI_RUNTIME_PROOF=0
+  fi
+fi
+[[ "${SFI_RUNTIME_PROOF}" == "0" || "${SFI_RUNTIME_PROOF}" == "1" ]] || \
+  die "SFI_RUNTIME_PROOF must be 0 or 1: ${SFI_RUNTIME_PROOF}"
+if [[ "${SFI_RUNTIME_PROOF}" == "1" ]] && (( HOST_IS_LOOPBACK == 0 )); then
+  die "SFI_RUNTIME_PROOF=1 requires a loopback HOST; refusing to expose collective RPC"
+fi
+if [[ "${SFI_TRACE}" == "0" && "${SFI_RUNTIME_PROOF}" == "1" ]]; then
+  die "SFI_TRACE=0 requires SFI_RUNTIME_PROOF=0; proof observers need a separate diagnostic run"
+fi
+if [[ -n "${VLLM_SPARSE_FA3_ROUTE_COUNTER_MMAP+x}" ]]; then
+  die "VLLM_SPARSE_FA3_ROUTE_COUNTER_MMAP is retired; unset it"
+fi
 MODEL="$(realpath -e -- "${MODEL}")" || die "MODEL_PATH does not exist: ${MODEL}"
 SERVED_MODEL_ID="${SERVED_MODEL_ID-${MODEL}}"
 [[ -n "${SERVED_MODEL_ID}" && "${SERVED_MODEL_ID}" != *$'\n'* && "${SERVED_MODEL_ID}" != *$'\r'* ]] || \
@@ -274,7 +298,7 @@ SITE_LOG="${ARTIFACT_DIR}/site.log"
 REFRESH_PROFILE_LOG="${ARTIFACT_DIR}/refresh_profile.log"
 ROUTE_TRACE_LOG="${ARTIFACT_DIR}/route.jsonl"
 STEP_TRACE_LOG="${ARTIFACT_DIR}/step.jsonl"
-ROUTE_COUNTER_MMAP="${ARTIFACT_DIR}/route_counter.bin"
+ROUTE_COUNTER_SNAPSHOT="${ARTIFACT_DIR}/route_counter_snapshot.bin"
 MANIFEST="${ARTIFACT_DIR}/serve_manifest.json"
 MANIFEST_POINTER="${RUN_ROOT}/port-${PORT}.manifest"
 
@@ -351,14 +375,46 @@ export VLLM_SPARSE_DEFERRED_PRODUCER_GROUPS_PER_STEP=-1
 export VLLM_SPARSE_FULL_CUDAGRAPH_REPLAY_REFRESH_BATCHED_FLUSH=1
 export VLLM_SPARSE_FULL_CUDAGRAPH_REPLAY_REFRESH_DEFER_TO_DEADLINE=1
 export VLLM_SPARSE_REFRESH_ENQUEUE_STAGGER=1
+if [[ "${SFI_TRACE}" == "1" ]]; then
+  export VLLM_SPARSE_REFRESH_PROFILE=1
+  export VLLM_SPARSE_REFRESH_PROFILE_LOG="${REFRESH_PROFILE_LOG}"
+  export VLLM_SPARSE_FA3_ROUTE_TRACE_LOG="${ROUTE_TRACE_LOG}"
+  export VLLM_SPARSE_FA3_STEP_TRACE_LOG="${STEP_TRACE_LOG}"
+else
+  # Reuse the benchmark's single observation-env classifier. This prevents a
+  # caller shell from smuggling an unrelated profile/trace hook into the
+  # observer-free server while avoiding another drifting shell-side list.
+  mapfile -t TRACE_OFF_ENV_NAMES < <(
+    "${PYTHON}" -I - "${SFI_ROOT}" <<'PY'
+import os
+import sys
+
+sys.path.insert(0, sys.argv[1])
+from benchmarks.sm80_run_pair import classify_speed_child_env_key
+
+for name in sorted(os.environ):
+    if classify_speed_child_env_key(name) == "observation":
+        print(name)
+PY
+  )
+  for trace_off_env_name in "${TRACE_OFF_ENV_NAMES[@]}"; do
+    unset "${trace_off_env_name}"
+  done
+  unset TRACE_OFF_ENV_NAMES trace_off_env_name
+fi
+# The site log is written only while sitecustomize installs the patch. It is
+# retained as cold startup provenance and is never consulted by a request path.
 export VLLM_SPARSE_SITE_LOG=1
 export VLLM_SPARSE_SITE_LOG_PATH="${SITE_LOG}"
-export VLLM_SPARSE_REFRESH_PROFILE=1
-export VLLM_SPARSE_REFRESH_PROFILE_LOG="${REFRESH_PROFILE_LOG}"
-export VLLM_SPARSE_FA3_ROUTE_TRACE_LOG="${ROUTE_TRACE_LOG}"
-export VLLM_SPARSE_FA3_STEP_TRACE_LOG="${STEP_TRACE_LOG}"
-export VLLM_SPARSE_FA3_ROUTE_COUNTER_MMAP="${ROUTE_COUNTER_MMAP}"
-export VLLM_SPARSE_FA3_ROUTE_COUNTER_SLOTS="${TP_SIZE}"
+if [[ "${SFI_RUNTIME_PROOF}" == "1" ]]; then
+  export VLLM_SPARSE_FA3_ROUTE_COUNTER_ENABLED=1
+  export VLLM_SPARSE_FA3_ROUTE_COUNTER_SLOTS="${TP_SIZE}"
+  export VLLM_SERVER_DEV_MODE=1
+else
+  unset VLLM_SPARSE_FA3_ROUTE_COUNTER_ENABLED
+  unset VLLM_SPARSE_FA3_ROUTE_COUNTER_SLOTS
+  unset VLLM_SERVER_DEV_MODE
+fi
 export VLLM_NO_USAGE_REPORT=1
 export CPUINFO_NO_DMI=1
 export SFI_RUN_NONCE="${RUN_NONCE}"
@@ -525,7 +581,7 @@ PY
   "${API_KEY_SOURCE}" "${MODEL}" "${SERVED_MODEL_ID}" "${MML}" "${RUN_NONCE}" \
   "${KVB:-}" "${RUN_SINCE}" "${PYTHON}" "${ARTIFACT_DIR}" "${SITE_LOG}" \
   "${REFRESH_PROFILE_LOG}" "${ROUTE_TRACE_LOG}" "${STEP_TRACE_LOG}" \
-  "${ROUTE_COUNTER_MMAP}" \
+  "${ROUTE_COUNTER_SNAPSHOT}" "${SFI_TRACE}" "${SFI_RUNTIME_PROOF}" \
   "${TP_SIZE}" "${SLOTS}" "${CAPTURE_SIZES_JSON}" "${SELECTOR_SEMANTIC}" \
   "${TORCH_EXTENSIONS_DIR}" "${GPU_DEVICES}" "${CUDA_ARCH}" "${CUDA_CAPABILITIES}" \
   "${CUDA_ARCH_SOURCE}" "${ATTENTION_KERNEL}" "${FLASH_ATTN_VERSION}" \
@@ -554,7 +610,9 @@ import sys
     profile_log,
     route_trace,
     step_trace,
-    route_mmap,
+    route_counter_snapshot,
+    trace_enabled,
+    runtime_proof_enabled,
     tp_size,
     slots,
     capture_sizes,
@@ -571,7 +629,7 @@ import sys
 controller_config = json.loads(os.environ["VLLM_SPARSE_CONTROLLER_JSON"])
 alpha_fair_config = controller_config["alpha_fair"]
 payload = {
-    "schema": 4,
+    "schema": 6,
     "server_pid": int(server_pid),
     "host": host,
     "port": int(port),
@@ -590,7 +648,13 @@ payload = {
     "refresh_profile_log": profile_log,
     "route_trace_log": route_trace,
     "step_trace_log": step_trace,
-    "route_counter_mmap": route_mmap,
+    "route_counter_snapshot": route_counter_snapshot,
+    "trace_enabled": bool(int(trace_enabled)),
+    "runtime_proof_enabled": bool(int(runtime_proof_enabled)),
+    "route_counter_rpc_enabled": bool(int(runtime_proof_enabled)),
+    "hot_path_observer_free": not bool(
+        int(trace_enabled) or int(runtime_proof_enabled)
+    ),
     "tensor_parallel_size": int(tp_size),
     "slots": int(slots),
     "capture_sizes": json.loads(capture_sizes),
@@ -623,6 +687,7 @@ echo "    gpu=${GPU_DEVICES} tp=${TP_SIZE} slots=max_num_seqs=${SLOTS}"
 echo "    bind=${HOST}:${PORT} auth=${API_KEY_SOURCE} served_model=${SERVED_MODEL_ID}"
 echo "    arch=${CUDA_ARCH} source=${CUDA_ARCH_SOURCE} kernel=${ATTENTION_KERNEL} version=${FLASH_ATTN_VERSION}"
 echo "    capture_sizes=${CAPTURE_SIZES_JSON} selector_semantic=${SELECTOR_SEMANTIC}"
+echo "    trace=${SFI_TRACE} runtime_proof=${SFI_RUNTIME_PROOF}"
 echo "    artifacts=${ARTIFACT_DIR}"
 echo "    manifest=${MANIFEST}"
 
@@ -649,6 +714,12 @@ if [[ -n "${MAX_BATCHED_TOKENS:-}" ]]; then
 fi
 if [[ -n "${KVB:-}" ]]; then
   SERVER_ARGS+=(--kv-cache-memory-bytes "${KVB}")
+fi
+if [[ "${SFI_RUNTIME_PROOF}" == "1" ]]; then
+  SERVER_ARGS+=(
+    --worker-extension-cls
+    patches.fa3_native.route_counter_worker_extension.SparseRouteCounterWorkerExtension
+  )
 fi
 
 # Keep an explicitly supplied secret out of the long-lived server environment;

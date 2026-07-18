@@ -19,7 +19,7 @@ capture_chunk = int(
 )
 print(f"git_head={str(prov.get('git_head'))[:9]} capture_chunk_effective={capture_chunk} model={str(prov.get('model')).rsplit('/',1)[-1]} fa3_so={str(s.get('fa3_so_sha256'))[:12]}")
 print(f"all_decode_tps={s.get('all_decode_tps')} decode_tps={s.get('decode_tps')} p50_us={round(s.get('decode_p50_us') or -1,1)} p95_us={round(s.get('decode_p95_us') or -1,1)}")
-print(f"gate={s.get('gate_passed')} prod_gate={s.get('production_gate_passed')} fallback={s.get('dense_native_fallback_count')} route_proof={s.get('route_proof_passed')} speed_child_route_proof={s.get('speed_child_route_proof_passed')}")
+print(f"gate={s.get('gate_passed')} prod_gate={s.get('production_gate_passed')} fallback={s.get('dense_native_fallback_count')} route_proof={s.get('route_proof_passed')} diagnostic_child_route_proof={s.get('diagnostic_child_route_proof_passed')}")
 print(f"counts={s.get('refresh_reason_counts')} payloads={s.get('refresh_payloads')} intents={s.get('refresh_trigger_intents')}")
 print(f"arena_reserved={s.get('arena_reserved_bytes')} peak={s.get('arena_peak_bytes')} budget_exceeded={s.get('arena_budget_exceeded')} bind={s.get('arena_bind_status')}")
 
