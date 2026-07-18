@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import statistics
@@ -79,6 +80,8 @@ FA3_ROUTE_COUNTER_FIELDS = 10
 FA3_ROUTE_COUNTER_SLOT_BYTES = FA3_ROUTE_COUNTER_FIELDS * 8
 FA3_ROUTE_COUNTER_MMAP_BYTES = FA3_ROUTE_COUNTER_SLOT_BYTES
 FA3_ROUTE_COUNTER_SLOTS_ENV = "VLLM_SPARSE_FA3_ROUTE_COUNTER_SLOTS"
+FA3_ROUTE_COUNTER_RPC_SNAPSHOT_SCHEMA = "sfi.fa3_route_counter.rpc_snapshot.v1"
+FA3_ROUTE_COUNTER_RPC_SNAPSHOT_SOURCE = "worker_collective_rpc"
 
 
 def _fa3_interface_module() -> object | None:
@@ -296,6 +299,38 @@ def _route_counter_snapshot_from_worker_records(
     }
 
 
+def _fa3_route_counter_rpc_snapshot_artifact(
+    records: list[dict[str, object]],
+    snapshot: dict[str, object],
+) -> dict[str, object]:
+    """Freeze the synchronized worker-RPC result for decode-metrics output."""
+    payload = {
+        "schema": FA3_ROUTE_COUNTER_RPC_SNAPSHOT_SCHEMA,
+        "source": FA3_ROUTE_COUNTER_RPC_SNAPSHOT_SOURCE,
+        "measurement_boundary": "blocking_collective_rpc_return",
+        "records": records,
+        "snapshot": snapshot,
+    }
+    try:
+        canonical = json.dumps(
+            payload,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        artifact = json.loads(canonical)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "E_TP_ROUTE_COUNTER_RPC_SNAPSHOT_SERIALIZATION: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+    if not isinstance(artifact, dict):
+        raise RuntimeError("E_TP_ROUTE_COUNTER_RPC_SNAPSHOT_ARTIFACT_SCHEMA")
+    artifact["sha256"] = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return artifact
+
+
 def _snapshot_fa3_route_counters_after_measurement(
     engine: object,
     *,
@@ -374,13 +409,9 @@ def _snapshot_fa3_route_counters_after_measurement(
                     f"failures={tiled_failures}"
                 )
     snapshot = _route_counter_snapshot_from_worker_records(records)
-    shared_path = os.environ.get("VLLM_SPARSE_FA3_ROUTE_COUNTER_MMAP", "")
-    shared_snapshot = _shared_fa3_route_counter_snapshot(shared_path)
-    if shared_snapshot != snapshot:
-        raise RuntimeError(
-            "E_TP_ROUTE_COUNTER_SNAPSHOT_SHARED_MISMATCH: synchronized worker "
-            "records do not match the shared route-counter artifact"
-        )
+    # The blocking worker RPC return is the measurement linearization point.
+    # The mmap remains a live transport and can legitimately advance after it,
+    # so it must not be reread as a second acceptance source here.
     return records, snapshot
 
 
@@ -2396,6 +2427,12 @@ def main() -> None:
         )
         print(format_decode_metrics_line(decode_metrics), flush=True)
         if args.decode_metrics_json:
+            route_counter_rpc_snapshot_artifact = (
+                _fa3_route_counter_rpc_snapshot_artifact(
+                    route_counter_snapshot_records,
+                    route_counters,
+                )
+            )
             run_config = _decode_run_config(
                 args,
                 prompt_count=len(prompts),
@@ -2456,6 +2493,12 @@ def main() -> None:
             )
             metrics_payload["speed_child_route_counter_snapshot_records"] = (
                 route_counter_snapshot_records
+            )
+            metrics_payload["speed_child_route_counter_authority"] = (
+                FA3_ROUTE_COUNTER_RPC_SNAPSHOT_SOURCE
+            )
+            metrics_payload["speed_child_route_counter_rpc_snapshot_artifact"] = (
+                route_counter_rpc_snapshot_artifact
             )
             Path(args.decode_metrics_json).write_text(
                 json.dumps(metrics_payload, ensure_ascii=True, indent=2),
