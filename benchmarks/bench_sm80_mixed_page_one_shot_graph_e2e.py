@@ -963,6 +963,28 @@ def _request_context_tokens(args: argparse.Namespace) -> list[int]:
     return []
 
 
+def _bind_runtime_request_context_tokens(
+    args: argparse.Namespace,
+    speed_metrics: dict[str, Any],
+) -> bool:
+    """Bind an undeclared context vector from the completed speed artifact."""
+    if _request_context_tokens(args):
+        return False
+    run_config_raw = speed_metrics.get("run_config")
+    run_config = run_config_raw if isinstance(run_config_raw, dict) else {}
+    values_raw = run_config.get("request_context_tokens")
+    if not isinstance(values_raw, list):
+        return False
+    if len(values_raw) != int(args.batch_size) or any(
+        type(value) is not int or value <= 0 for value in values_raw
+    ):
+        return False
+    values = list(values_raw)
+    args.request_context_tokens_vector = values
+    args.request_context_tokens = _request_vector_csv(values)
+    return True
+
+
 def _request_max_new_tokens(args: argparse.Namespace) -> list[int]:
     values = getattr(args, "request_max_new_tokens_vector", None)
     if isinstance(values, list) and values:
@@ -6600,6 +6622,7 @@ def _run_gate_d_mode(args: argparse.Namespace) -> int:
         else []
     )
     metrics = _read_json(metrics_path)
+    _bind_runtime_request_context_tokens(args, metrics)
     diagnostic_metrics = (
         _read_json(diag_metrics_path) if diag_result is not None else None
     )
