@@ -394,6 +394,112 @@ def _runtime_mode_name(value: object) -> str:
     return str(value).rsplit(".", 1)[-1].strip().upper()
 
 
+def _required_decode_dispatch_state(
+    dispatcher: object,
+    required_batch_size: int,
+) -> dict[str, object]:
+    """Resolve one required decode shape through the dispatcher's owner API."""
+    raw_keys = getattr(dispatcher, "cudagraph_keys", None)
+    if not isinstance(raw_keys, dict):
+        raise RuntimeError(
+            "E_ENGINE_RUNTIME_CONTRACT_UNAVAILABLE: cudagraph_keys"
+        )
+    dispatch = getattr(dispatcher, "dispatch", None)
+    if not callable(dispatch):
+        raise RuntimeError(
+            "E_ENGINE_RUNTIME_CONTRACT_UNAVAILABLE: cudagraph dispatch"
+        )
+    try:
+        resolved_mode, resolved_descriptor = dispatch(
+            num_tokens=required_batch_size,
+            uniform_decode=True,
+            has_lora=False,
+            num_active_loras=0,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "E_ENGINE_RUNTIME_CONTRACT_DISPATCH_FAILED: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+    resolved_keys = raw_keys.get(resolved_mode)
+    return {
+        "num_tokens": required_batch_size,
+        "uniform_decode": True,
+        "has_lora": False,
+        "num_active_loras": 0,
+        "runtime_mode": _runtime_mode_name(resolved_mode),
+        "batch_descriptor": {
+            "num_tokens": int(getattr(resolved_descriptor, "num_tokens")),
+            "num_reqs": (
+                None
+                if getattr(resolved_descriptor, "num_reqs", None) is None
+                else int(getattr(resolved_descriptor, "num_reqs"))
+            ),
+            "uniform": bool(getattr(resolved_descriptor, "uniform", False)),
+            "has_lora": bool(getattr(resolved_descriptor, "has_lora", False)),
+            "num_active_loras": int(
+                getattr(resolved_descriptor, "num_active_loras", 0) or 0
+            ),
+        },
+        "key_registered": bool(
+            resolved_keys is not None and resolved_descriptor in resolved_keys
+        ),
+    }
+
+
+def _runner_kv_storage_geometry(
+    runner_kv_caches: list[object],
+) -> dict[str, object]:
+    """Describe active KV tensors and deduplicated physical storages."""
+    from collections import Counter
+
+    tensor_signatures: Counter[tuple[object, ...]] = Counter()
+    storages: dict[tuple[str, int], int] = {}
+    for tensor in runner_kv_caches:
+        element_size = int(getattr(tensor, "element_size")())
+        numel = int(getattr(tensor, "numel")())
+        tensor_signatures[
+            (
+                tuple(int(value) for value in getattr(tensor, "shape", ())),
+                str(getattr(tensor, "dtype", "")),
+                element_size,
+                numel,
+            )
+        ] += 1
+        storage = getattr(tensor, "untyped_storage")()
+        storage_key = (
+            str(getattr(storage, "device", "")),
+            int(getattr(storage, "data_ptr")()),
+        )
+        storage_nbytes = int(getattr(storage, "nbytes")())
+        previous_nbytes = storages.setdefault(storage_key, storage_nbytes)
+        if previous_nbytes != storage_nbytes:
+            raise RuntimeError(
+                "E_ENGINE_RUNTIME_CONTRACT_STORAGE_IDENTITY: "
+                f"{previous_nbytes}!={storage_nbytes}"
+            )
+    storage_signatures = Counter(storages.values())
+    return {
+        "runner_tensor_count": len(runner_kv_caches),
+        "runner_tensor_signatures": [
+            {
+                "shape": list(key[0]),
+                "dtype": key[1],
+                "element_size": key[2],
+                "numel": key[3],
+                "count": count,
+            }
+            for key, count in sorted(tensor_signatures.items(), key=repr)
+        ],
+        "runner_storage_count": len(storages),
+        "runner_storage_signatures": [
+            {"nbytes": nbytes, "count": count}
+            for nbytes, count in sorted(storage_signatures.items())
+        ],
+        "runner_storage_bytes": sum(storages.values()),
+    }
+
+
 def benchmark_child_identity(args: object) -> dict[str, object]:
     """Emit the identity observed inside each timed worker child.
 
@@ -578,41 +684,10 @@ def _worker_engine_runtime_contract_state(
         raise RuntimeError(
             "E_ENGINE_RUNTIME_CONTRACT_UNAVAILABLE: cudagraph_dispatcher"
         )
-    raw_keys = getattr(dispatcher, "cudagraph_keys", None)
-    if not isinstance(raw_keys, dict):
-        raise RuntimeError(
-            "E_ENGINE_RUNTIME_CONTRACT_UNAVAILABLE: cudagraph_keys"
-        )
-    graph_keys: dict[str, list[dict[str, object]]] = {}
-    for mode, descriptors in raw_keys.items():
-        mode_name = _runtime_mode_name(mode)
-        serialized: list[dict[str, object]] = []
-        for descriptor in descriptors:
-            serialized.append(
-                {
-                    "num_tokens": int(getattr(descriptor, "num_tokens")),
-                    "num_reqs": (
-                        None
-                        if getattr(descriptor, "num_reqs", None) is None
-                        else int(getattr(descriptor, "num_reqs"))
-                    ),
-                    "uniform": bool(getattr(descriptor, "uniform", False)),
-                    "has_lora": bool(getattr(descriptor, "has_lora", False)),
-                    "num_active_loras": int(
-                        getattr(descriptor, "num_active_loras", 0) or 0
-                    ),
-                }
-            )
-        graph_keys[mode_name] = sorted(
-            serialized,
-            key=lambda item: (
-                int(item["num_tokens"]),
-                int(item["num_reqs"] or -1),
-                bool(item["uniform"]),
-                bool(item["has_lora"]),
-                int(item["num_active_loras"]),
-            ),
-        )
+    required_decode_dispatch = _required_decode_dispatch_state(
+        dispatcher,
+        required_batch_size,
+    )
 
     kv_cache_config = getattr(model_runner, "kv_cache_config", None)
     if kv_cache_config is None:
@@ -697,15 +772,14 @@ def _worker_engine_runtime_contract_state(
         )
         for tensor in kv_cache_tensors
     )
-    allocated_bytes = sum(int(getattr(tensor, "size")) for tensor in kv_cache_tensors)
+    tensor_owner_count = sum(
+        len(getattr(tensor, "shared_by", [])) for tensor in kv_cache_tensors
+    )
+    configured_bytes = sum(
+        int(getattr(tensor, "size")) for tensor in kv_cache_tensors
+    )
     block_size = next(iter(group_block_sizes)) if len(group_block_sizes) == 1 else 0
     allocated_token_slots = num_blocks * block_size if block_size > 0 else 0
-    actual_kv_bytes_per_token = (
-        allocated_bytes // allocated_token_slots
-        if allocated_token_slots > 0
-        and allocated_bytes % allocated_token_slots == 0
-        else 0
-    )
     required_workload_tokens = sum(required_tokens)
     required_blocks_by_request = tuple(
         (value + block_size - 1) // block_size
@@ -735,16 +809,14 @@ def _worker_engine_runtime_contract_state(
     required_total_tokens = required_total_blocks * block_size
 
     runner_kv_caches = list(getattr(model_runner, "kv_caches", []))
-    runner_tensor_signatures = Counter()
-    for tensor in runner_kv_caches:
-        runner_tensor_signatures[
-            (
-                tuple(int(value) for value in getattr(tensor, "shape", ())),
-                str(getattr(tensor, "dtype", "")),
-                int(getattr(tensor, "element_size")()),
-                int(getattr(tensor, "numel")()),
-            )
-        ] += 1
+    runner_storage = _runner_kv_storage_geometry(runner_kv_caches)
+    runner_storage_bytes = int(runner_storage["runner_storage_bytes"])
+    actual_kv_bytes_per_token = (
+        runner_storage_bytes // allocated_token_slots
+        if allocated_token_slots > 0
+        and runner_storage_bytes % allocated_token_slots == 0
+        else 0
+    )
     cross_layers_tensor = getattr(model_runner, "cross_layers_kv_cache", None)
     cross_layers_record: dict[str, object] | None = None
     if cross_layers_tensor is not None:
@@ -770,23 +842,17 @@ def _worker_engine_runtime_contract_state(
         ),
         "uniform_block_size": block_size,
         "tensor_count": len(kv_cache_tensors),
+        "tensor_owner_count": tensor_owner_count,
         "tensor_signatures": [
             {"size": key[0], "shared_by_count": key[1], "count": count}
             for key, count in sorted(tensor_signatures.items())
         ],
-        "allocated_bytes": allocated_bytes,
+        "configured_bytes": configured_bytes,
         "allocated_token_slots": allocated_token_slots,
-        "runner_tensor_count": len(runner_kv_caches),
-        "runner_tensor_signatures": [
-            {
-                "shape": list(key[0]),
-                "dtype": key[1],
-                "element_size": key[2],
-                "numel": key[3],
-                "count": count,
-            }
-            for key, count in sorted(runner_tensor_signatures.items(), key=repr)
-        ],
+        **runner_storage,
+        "configured_allocation_matches_runner_storage": bool(
+            configured_bytes == runner_storage_bytes > 0
+        ),
         "cross_layers_tensor": cross_layers_record,
         "actual_bytes_per_token": actual_kv_bytes_per_token,
     }
@@ -831,7 +897,7 @@ def _worker_engine_runtime_contract_state(
         "dispatcher_keys_initialized": bool(
             getattr(dispatcher, "keys_initialized", False)
         ),
-        "dispatcher_graph_keys": graph_keys,
+        "dispatcher_required_decode_dispatch": required_decode_dispatch,
         "kv_cache_physical_geometry": kv_physical_geometry,
         "kv_cache_arm_capacity_admission": kv_capacity_admission,
         "kv_cache_config_present": True,
@@ -848,22 +914,28 @@ def _worker_engine_runtime_contract_state(
         ),
         "kv_cache_uniform_block_size": block_size,
         "kv_cache_tensor_count": len(kv_cache_tensors),
+        "kv_cache_tensor_owner_count": tensor_owner_count,
         "kv_cache_tensor_signatures": [
             {"size": key[0], "shared_by_count": key[1], "count": count}
             for key, count in sorted(tensor_signatures.items())
         ],
-        "kv_cache_allocated_bytes": allocated_bytes,
-        "kv_cache_runner_tensor_count": len(runner_kv_caches),
-        "kv_cache_runner_tensor_signatures": [
-            {
-                "shape": list(key[0]),
-                "dtype": key[1],
-                "element_size": key[2],
-                "numel": key[3],
-                "count": count,
-            }
-            for key, count in sorted(runner_tensor_signatures.items(), key=repr)
+        "kv_cache_configured_bytes": configured_bytes,
+        "kv_cache_runner_tensor_count": runner_storage[
+            "runner_tensor_count"
         ],
+        "kv_cache_runner_tensor_signatures": runner_storage[
+            "runner_tensor_signatures"
+        ],
+        "kv_cache_runner_storage_count": runner_storage[
+            "runner_storage_count"
+        ],
+        "kv_cache_runner_storage_signatures": runner_storage[
+            "runner_storage_signatures"
+        ],
+        "kv_cache_runner_storage_bytes": runner_storage_bytes,
+        "kv_cache_configured_allocation_matches_runner_storage": bool(
+            configured_bytes == runner_storage_bytes > 0
+        ),
         "kv_cache_cross_layers_tensor": cross_layers_record,
         "kv_cache_actual_bytes_per_token": actual_kv_bytes_per_token,
         "kv_cache_allocated_token_slots": allocated_token_slots,
@@ -1432,25 +1504,40 @@ def collect_engine_runtime_contract_proof(
                 f"{rank_prefix}.max_capture_size="
                 f"{record.get('compilation_max_cudagraph_capture_size')!r}"
             )
-        graph_keys = record.get("dispatcher_graph_keys")
-        if not isinstance(graph_keys, dict):
-            errors.append(f"{rank_prefix}.dispatcher_graph_keys_invalid")
+        decode_dispatch = record.get("dispatcher_required_decode_dispatch")
+        if not isinstance(decode_dispatch, dict):
+            errors.append(f"{rank_prefix}.required_decode_dispatch_invalid")
         else:
-            full_keys = graph_keys.get("FULL")
-            expected_key = {
+            expected_request = {
                 "num_tokens": int(required_batch_size),
-                "num_reqs": int(required_batch_size),
-                "uniform": True,
+                "uniform_decode": True,
                 "has_lora": False,
                 "num_active_loras": 0,
             }
-            if not isinstance(full_keys, list) or expected_key not in full_keys:
+            for key, expected in expected_request.items():
+                if decode_dispatch.get(key) != expected:
+                    errors.append(
+                        f"{rank_prefix}.required_decode_dispatch_{key}="
+                        f"{decode_dispatch.get(key)!r}:expected={expected!r}"
+                    )
+            if decode_dispatch.get("runtime_mode") != "FULL":
                 errors.append(
-                    f"{rank_prefix}.full_decode_key_missing:{expected_key!r}"
+                    f"{rank_prefix}.required_decode_runtime_mode="
+                    f"{decode_dispatch.get('runtime_mode')!r}"
                 )
-            piecewise_keys = graph_keys.get("PIECEWISE", [])
-            if piecewise_keys not in ([], None):
-                errors.append(f"{rank_prefix}.piecewise_keys_nonempty")
+            if decode_dispatch.get("key_registered") is not True:
+                errors.append(
+                    f"{rank_prefix}.required_decode_key_not_registered"
+                )
+            resolved_descriptor = decode_dispatch.get("batch_descriptor")
+            if (
+                not isinstance(resolved_descriptor, dict)
+                or resolved_descriptor.get("num_tokens") != required_batch_size
+            ):
+                errors.append(
+                    f"{rank_prefix}.required_decode_descriptor="
+                    f"{resolved_descriptor!r}"
+                )
 
         numeric_expectations = {
             "kv_cache_required_batch_size": required_batch_size,
@@ -1485,11 +1572,14 @@ def collect_engine_runtime_contract_proof(
             )
         for key in (
             "kv_cache_num_blocks",
-            "kv_cache_allocated_bytes",
+            "kv_cache_configured_bytes",
             "kv_cache_allocated_token_slots",
             "kv_cache_schedulable_tokens",
             "kv_cache_tensor_count",
+            "kv_cache_tensor_owner_count",
             "kv_cache_runner_tensor_count",
+            "kv_cache_runner_storage_count",
+            "kv_cache_runner_storage_bytes",
             "kv_cache_required_workload_blocks",
             "kv_cache_required_total_blocks",
         ):
@@ -1517,8 +1607,10 @@ def collect_engine_runtime_contract_proof(
                 f"{rank_prefix}.kv_cache_actual_bytes_per_token="
                 f"{actual_bytes_per_token!r}:expected={expected_kv_bytes_per_token}"
             )
-        allocated_bytes = record.get("kv_cache_allocated_bytes")
+        configured_bytes = record.get("kv_cache_configured_bytes")
+        runner_storage_bytes = record.get("kv_cache_runner_storage_bytes")
         num_blocks = record.get("kv_cache_num_blocks")
+        block_size = record.get("kv_cache_uniform_block_size")
         page_size = record.get("kv_cache_group_page_size_bytes_total")
         leaf_page_size = record.get(
             "kv_cache_group_leaf_page_size_bytes_total"
@@ -1532,16 +1624,37 @@ def collect_engine_runtime_contract_proof(
                 f"{rank_prefix}.kv_cache_page_size_identity="
                 f"composite={page_size!r}:leaf_sum={leaf_page_size!r}"
             )
-        if (
-            isinstance(allocated_bytes, int)
-            and isinstance(num_blocks, int)
-            and isinstance(page_size, int)
-            and allocated_bytes != num_blocks * page_size
-        ):
+        if record.get(
+            "kv_cache_configured_allocation_matches_runner_storage"
+        ) is not True:
             errors.append(
-                f"{rank_prefix}.kv_cache_allocation_identity="
-                f"{allocated_bytes}!={num_blocks}*{page_size}"
+                f"{rank_prefix}.kv_cache_configured_runner_storage_mismatch:"
+                f"configured={configured_bytes!r}:"
+                f"runner_storage={runner_storage_bytes!r}"
             )
+        if configured_bytes != runner_storage_bytes:
+            errors.append(
+                f"{rank_prefix}.kv_cache_storage_identity="
+                f"{configured_bytes!r}!={runner_storage_bytes!r}"
+            )
+        if all(
+            type(value) is int
+            for value in (
+                runner_storage_bytes,
+                num_blocks,
+                block_size,
+                expected_kv_bytes_per_token,
+            )
+        ):
+            expected_storage_bytes = (
+                num_blocks * block_size * expected_kv_bytes_per_token
+            )
+            if runner_storage_bytes != expected_storage_bytes:
+                errors.append(
+                    f"{rank_prefix}.kv_cache_model_geometry_identity="
+                    f"{runner_storage_bytes}!={num_blocks}*{block_size}*"
+                    f"{expected_kv_bytes_per_token}"
+                )
         null_blocks = record.get("kv_cache_null_block_count")
         compact_blocks = record.get("kv_cache_compact_lease_blocks")
         ordinary_blocks = record.get("kv_cache_ordinary_blocks")
@@ -1578,10 +1691,14 @@ def collect_engine_runtime_contract_proof(
                     f"{required_total_blocks}:expected={expected_total}"
                 )
         cross_layers = record.get("kv_cache_cross_layers_tensor")
-        if isinstance(cross_layers, dict) and cross_layers.get("nbytes") != allocated_bytes:
+        if (
+            isinstance(cross_layers, dict)
+            and cross_layers.get("nbytes") != runner_storage_bytes
+        ):
             errors.append(
                 f"{rank_prefix}.cross_layers_nbytes="
-                f"{cross_layers.get('nbytes')!r}:expected={allocated_bytes!r}"
+                f"{cross_layers.get('nbytes')!r}:"
+                f"expected={runner_storage_bytes!r}"
             )
         if record.get("kv_cache_capacity_covers_required_total") is not True:
             errors.append(
@@ -1641,7 +1758,9 @@ def collect_engine_runtime_contract_proof(
             "dispatcher_keys_initialized": record.get(
                 "dispatcher_keys_initialized"
             ),
-            "dispatcher_graph_keys": record.get("dispatcher_graph_keys"),
+            "dispatcher_required_decode_dispatch": record.get(
+                "dispatcher_required_decode_dispatch"
+            ),
             "kv_cache": record.get("kv_cache_physical_geometry"),
         }
         for record in records
@@ -1671,7 +1790,7 @@ def collect_engine_runtime_contract_proof(
         "engine_runtime_graph_capture_sizes": reference.get(
             "compilation_cudagraph_capture_sizes"
         ),
-        "engine_runtime_graph_full_decode_key_present": True,
+        "engine_runtime_graph_required_decode_dispatch_passed": True,
         "engine_runtime_physical_geometry": {
             "tensor_parallel_size": tp_size,
             "rank_records": physical_rank_records,
@@ -1684,9 +1803,16 @@ def collect_engine_runtime_contract_proof(
         "engine_runtime_kv_block_size": reference.get(
             "kv_cache_uniform_block_size"
         ),
-        "engine_runtime_kv_allocated_bytes": reference.get(
-            "kv_cache_allocated_bytes"
+        "engine_runtime_kv_tensor_owner_count": reference.get(
+            "kv_cache_tensor_owner_count"
         ),
+        "engine_runtime_kv_configured_bytes": reference.get(
+            "kv_cache_configured_bytes"
+        ),
+        "engine_runtime_kv_runner_storage_bytes": reference.get(
+            "kv_cache_runner_storage_bytes"
+        ),
+        "engine_runtime_kv_allocation_identity_passed": True,
         "engine_runtime_kv_composite_page_size_bytes": reference.get(
             "kv_cache_group_page_size_bytes_total"
         ),

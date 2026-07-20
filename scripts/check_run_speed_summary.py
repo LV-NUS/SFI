@@ -1442,11 +1442,13 @@ def _exact_runtime_proof_reasons(
         "engine_runtime_contract_rank_consistent": True,
         "engine_runtime_graph_mode": "FULL",
         "engine_runtime_graph_capture_sizes": [32],
-        "engine_runtime_graph_full_decode_key_present": True,
+        "engine_runtime_graph_required_decode_dispatch_passed": True,
         "engine_runtime_kv_block_size": 16,
+        "engine_runtime_kv_tensor_owner_count": expected_layer_count,
         "engine_runtime_kv_actual_bytes_per_token": (
             expected_kv_bytes_per_token
         ),
+        "engine_runtime_kv_allocation_identity_passed": True,
         "engine_runtime_kv_page_size_identity_passed": True,
         "engine_runtime_kv_null_block_count": 1,
         "engine_runtime_kv_required_blocks_by_request": [4_160] * 32,
@@ -1483,10 +1485,9 @@ def _exact_runtime_proof_reasons(
     if len(admission_records) != 8:
         reasons.append(f"{prefix}_admission_rank_count={len(admission_records)}")
 
-    expected_full_key = {
+    expected_decode_dispatch = {
         "num_tokens": 32,
-        "num_reqs": 32,
-        "uniform": True,
+        "uniform_decode": True,
         "has_lora": False,
         "num_active_loras": 0,
     }
@@ -1615,24 +1616,42 @@ def _exact_runtime_proof_reasons(
                 reasons.append(f"{prefix}_rank{rank}_cuda_memory_invalid")
             if not isinstance(device.get("uuid"), str):
                 reasons.append(f"{prefix}_rank{rank}_cuda_uuid_invalid")
-        graph_keys = physical_record.get("dispatcher_graph_keys")
-        if not isinstance(graph_keys, dict):
-            reasons.append(f"{prefix}_rank{rank}_graph_keys_invalid")
+        decode_dispatch = physical_record.get(
+            "dispatcher_required_decode_dispatch"
+        )
+        if not isinstance(decode_dispatch, dict):
+            reasons.append(f"{prefix}_rank{rank}_decode_dispatch_invalid")
         else:
-            full_keys = graph_keys.get("FULL")
-            if not isinstance(full_keys, list) or expected_full_key not in full_keys:
-                reasons.append(f"{prefix}_rank{rank}_full_key_missing")
-            if graph_keys.get("PIECEWISE", []) not in ([], None):
-                reasons.append(f"{prefix}_rank{rank}_piecewise_key_present")
+            for field, expected in expected_decode_dispatch.items():
+                if decode_dispatch.get(field) != expected:
+                    reasons.append(
+                        f"{prefix}_rank{rank}_decode_dispatch_mismatch:{field}"
+                    )
+            if decode_dispatch.get("runtime_mode") != "FULL":
+                reasons.append(f"{prefix}_rank{rank}_decode_dispatch_not_full")
+            if decode_dispatch.get("key_registered") is not True:
+                reasons.append(
+                    f"{prefix}_rank{rank}_decode_dispatch_key_unregistered"
+                )
+            descriptor = decode_dispatch.get("batch_descriptor")
+            if (
+                not isinstance(descriptor, dict)
+                or descriptor.get("num_tokens") != 32
+            ):
+                reasons.append(
+                    f"{prefix}_rank{rank}_decode_dispatch_descriptor_invalid"
+                )
 
         kv = physical_record.get("kv_cache")
         if not isinstance(kv, dict):
             reasons.append(f"{prefix}_rank{rank}_kv_geometry_invalid")
             continue
         num_blocks = kv.get("num_blocks")
+        block_size = kv.get("uniform_block_size")
         composite_page = kv.get("composite_page_size_bytes_total")
         leaf_page = kv.get("leaf_page_size_bytes_total")
-        allocated_bytes = kv.get("allocated_bytes")
+        configured_bytes = kv.get("configured_bytes")
+        runner_storage_bytes = kv.get("runner_storage_bytes")
         if type(num_blocks) is not int or num_blocks <= 0:
             reasons.append(f"{prefix}_rank{rank}_kv_num_blocks_invalid")
         if (
@@ -1642,20 +1661,43 @@ def _exact_runtime_proof_reasons(
             or kv.get("composite_page_sizes_match_leaf_sums") is not True
         ):
             reasons.append(f"{prefix}_rank{rank}_kv_composite_leaf_identity")
+        if kv.get(
+            "configured_allocation_matches_runner_storage"
+        ) is not True:
+            reasons.append(
+                f"{prefix}_rank{rank}_kv_configured_storage_mismatch"
+            )
         if (
-            type(num_blocks) is int
-            and type(composite_page) is int
-            and allocated_bytes != num_blocks * composite_page
+            type(configured_bytes) is not int
+            or configured_bytes <= 0
+            or configured_bytes != runner_storage_bytes
         ):
-            reasons.append(f"{prefix}_rank{rank}_kv_allocation_identity")
+            reasons.append(f"{prefix}_rank{rank}_kv_storage_identity")
+        if all(
+            type(value) is int
+            for value in (num_blocks, block_size, runner_storage_bytes)
+        ):
+            expected_storage_bytes = (
+                num_blocks * block_size * expected_kv_bytes_per_token
+            )
+            if runner_storage_bytes != expected_storage_bytes:
+                reasons.append(
+                    f"{prefix}_rank{rank}_kv_model_geometry_identity"
+                )
         if kv.get("actual_bytes_per_token") != expected_kv_bytes_per_token:
             reasons.append(f"{prefix}_rank{rank}_kv_bytes_per_token_mismatch")
-        if kv.get("uniform_block_size") != 16:
+        if block_size != 16:
             reasons.append(f"{prefix}_rank{rank}_kv_block_size_mismatch")
         if type(kv.get("runner_tensor_count")) is not int or kv.get(
             "runner_tensor_count"
         ) <= 0:
             reasons.append(f"{prefix}_rank{rank}_runner_kv_tensor_missing")
+        if type(kv.get("runner_storage_count")) is not int or kv.get(
+            "runner_storage_count"
+        ) <= 0:
+            reasons.append(f"{prefix}_rank{rank}_runner_kv_storage_missing")
+        if kv.get("tensor_owner_count") != expected_layer_count:
+            reasons.append(f"{prefix}_rank{rank}_kv_tensor_owner_mismatch")
         groups = kv.get("groups")
         if not isinstance(groups, list) or len(groups) != 1:
             reasons.append(f"{prefix}_rank{rank}_kv_group_shape_mismatch")
@@ -1664,20 +1706,8 @@ def _exact_runtime_proof_reasons(
             if not isinstance(group, dict):
                 reasons.append(f"{prefix}_rank{rank}_kv_group_invalid")
             else:
-                signatures = group.get("leaf_spec_signatures")
-                leaf_count = (
-                    sum(
-                        int(item.get("count", 0))
-                        for item in signatures
-                        if isinstance(item, dict)
-                    )
-                    if isinstance(signatures, list)
-                    else -1
-                )
                 if group.get("layer_count") != expected_layer_count:
                     reasons.append(f"{prefix}_rank{rank}_layer_count_mismatch")
-                if leaf_count != expected_layer_count:
-                    reasons.append(f"{prefix}_rank{rank}_leaf_count_mismatch")
 
         admission_expected = {
             "null_block_count": 1,

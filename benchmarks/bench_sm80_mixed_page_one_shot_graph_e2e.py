@@ -4475,8 +4475,12 @@ def _apply_scheduler_graph_contract_payload(
                 runtime_reasons.append(f"{child}_runtime_graph_not_full")
             if proof.get("engine_runtime_graph_capture_sizes") != [int(args.batch_size)]:
                 runtime_reasons.append(f"{child}_runtime_capture_sizes_mismatch")
-            if proof.get("engine_runtime_graph_full_decode_key_present") is not True:
-                runtime_reasons.append(f"{child}_runtime_full_decode_key_missing")
+            if proof.get(
+                "engine_runtime_graph_required_decode_dispatch_passed"
+            ) is not True:
+                runtime_reasons.append(
+                    f"{child}_runtime_required_decode_dispatch_failed"
+                )
             if proof.get("engine_runtime_kv_capacity_covers_required_total") is not True:
                 runtime_reasons.append(f"{child}_runtime_kv_capacity_not_green")
             if proof.get("engine_core_block_pool_proof_required") is not True:
