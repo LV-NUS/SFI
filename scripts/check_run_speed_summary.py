@@ -39,6 +39,9 @@ from benchmarks.scheduler_contract import (
     SCHEDULER_GRAPH_CONTRACT_SCHEMA,
     SCHEDULER_GRAPH_RUNTIME_FIELDS,
 )
+from benchmarks.decode_throughput_window import (
+    cudagraph_runtime_observer_proof_reasons,
+)
 from benchmarks.sm80_run_pair import (
     VERDICT_ONLY_SPEED_PROOF_ENV_BINDINGS,
     build_config_digest,
@@ -633,9 +636,10 @@ def _tp8_selector_log_s_runtime_reasons(
                     )
             tiled_cohorts = int(snapshot_proof["tiled_cohort_count"])
             tiled_jobs = int(snapshot_proof["tiled_job_count"])
-            tiled_direct = int(snapshot_proof["tiled_direct_count"])
-            tiled_kernels = int(snapshot_proof["tiled_kernel_launch_count"])
-            tiled_failures = int(snapshot_proof["tiled_admission_failure_count"])
+            # The shared proof validator above owns tiled launch accounting:
+            # kernels == (cohorts + direct) * 4, route == jobs + direct, and
+            # zero admission failures.  This exact-tier gate adds only the
+            # promotion requirement that cohort work was actually amortized.
             if tiled_cohorts <= 0:
                 reasons.append(
                     f"tp8_selector_log_s_tiled_cohort_missing:rank={rank}"
@@ -644,21 +648,6 @@ def _tp8_selector_log_s_runtime_reasons(
                 reasons.append(
                     "tp8_selector_log_s_tiled_not_amortized:"
                     f"rank={rank}:cohorts={tiled_cohorts}:jobs={tiled_jobs}"
-                )
-            if tiled_direct != 0:
-                reasons.append(
-                    "tp8_selector_log_s_direct_tiled_observed:"
-                    f"rank={rank}:count={tiled_direct}"
-                )
-            if tiled_kernels != tiled_cohorts * 4:
-                reasons.append(
-                    "tp8_selector_log_s_tiled_kernel_count_mismatch:"
-                    f"rank={rank}:cohorts={tiled_cohorts}:kernels={tiled_kernels}"
-                )
-            if tiled_failures != 0:
-                reasons.append(
-                    "tp8_selector_log_s_tiled_admission_failure:"
-                    f"rank={rank}:count={tiled_failures}"
                 )
         artifact_path = Path(str(snapshot_proofs[0]["module_path"]))
         try:
@@ -959,6 +948,7 @@ def _runner_config_identity_reasons(
         "speed_child_custom_all_reduce_runtime_all_ranks_active",
         "speed_child_custom_all_reduce_runtime_rank_consistent",
         "speed_child_custom_all_reduce_runtime_preemptor_flashinfer_enabled",
+        "speed_child_custom_all_reduce_runtime_preemptor_torch_symm_mem_enabled",
         "speed_child_custom_all_reduce_runtime_preemptor_nccl_symm_mem_enabled",
         "speed_child_custom_all_reduce_runtime_required_num_tokens",
         "speed_child_custom_all_reduce_runtime_model_hidden_size",
@@ -1112,6 +1102,7 @@ def _runner_config_identity_reasons(
             "speed_child_custom_all_reduce_runtime_all_ranks_active": True,
             "speed_child_custom_all_reduce_runtime_rank_consistent": True,
             "speed_child_custom_all_reduce_runtime_preemptor_flashinfer_enabled": False,
+            "speed_child_custom_all_reduce_runtime_preemptor_torch_symm_mem_enabled": False,
             "speed_child_custom_all_reduce_runtime_preemptor_nccl_symm_mem_enabled": False,
             "speed_child_custom_all_reduce_runtime_required_num_tokens": 32,
             "speed_child_custom_all_reduce_runtime_model_hidden_size": 2560,
@@ -1182,10 +1173,8 @@ def _runner_config_identity_reasons(
                     "parallel_config_disable_custom_all_reduce": False,
                     "device_communicator_use_custom_allreduce": True,
                     "device_communicator_use_flashinfer_allreduce": False,
-                    "fi_ar_comm_present": False,
                     "fi_ar_comm_active": False,
                     "device_communicator_use_torch_symm_mem": False,
-                    "symm_mem_comm_present": False,
                     "symm_mem_comm_active": False,
                     "vllm_allreduce_use_flashinfer": False,
                     "vllm_allreduce_use_symm_mem": False,
@@ -1946,35 +1935,13 @@ def _exact_engine_runtime_and_pair_reasons(
         reasons.append("tp8_exact_engine_runtime_contract_reasons_nonempty")
 
     observer = summary.get("diagnostic_child_cudagraph_runtime_proof")
-    if not isinstance(observer, dict):
-        reasons.append("tp8_exact_diagnostic_graph_observer_missing")
-    else:
-        all_steps = observer.get("cudagraph_runtime_observer_all_decode_step_count")
-        expected_observer = {
-            "cudagraph_runtime_observer_scope": (
-                "diagnostic_measurement_all_decode"
-            ),
-            "cudagraph_runtime_observer_enabled": True,
-            "cudagraph_runtime_observer_missing_step_count": 0,
-            "cudagraph_runtime_observer_all_decode_exact_full": True,
-        }
-        for field, expected in expected_observer.items():
-            if observer.get(field) != expected:
-                reasons.append(f"tp8_exact_diagnostic_graph_mismatch:{field}")
-        if type(all_steps) is not int or all_steps <= 0:
-            reasons.append("tp8_exact_diagnostic_graph_step_count_invalid")
-        if observer.get("cudagraph_runtime_observer_exact_full_step_count") != all_steps:
-            reasons.append("tp8_exact_diagnostic_graph_exact_step_count_mismatch")
-        distribution = observer.get("cudagraph_runtime_observer_distribution")
-        expected_distribution = {
-            "num_unpadded_tokens": 32,
-            "num_padded_tokens": 32,
-            "num_paddings": 0,
-            "runtime_mode": "FULL",
-            "count": all_steps,
-        }
-        if distribution != [expected_distribution]:
-            reasons.append("tp8_exact_diagnostic_graph_distribution_mismatch")
+    reasons.extend(
+        "tp8_exact_diagnostic_graph_invalid:" + reason
+        for reason in cudagraph_runtime_observer_proof_reasons(
+            observer,
+            expected_batch_size=32,
+        )
+    )
 
     if mode != "sparse":
         return reasons

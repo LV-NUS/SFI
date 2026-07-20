@@ -5,21 +5,23 @@ import json
 import logging
 import os
 import time
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    MutableSequence,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+)
 
 _log = logging.getLogger(__name__)
 
 # [T1-FORENSIC 2026-07-09] refresh 链 host 分相取证:目录非空时对每次 refresh
 # flush 的 host 段做 cProfile 采样并落 pstats(取证发专用;默认空=零判速税)。
 _REFRESH_CPROFILE_DIR = os.environ.get("VLLM_SPARSE_REFRESH_CPROFILE_DIR", "")
-
-
-def _bootstrap_full_kv_handoff_trace_fields() -> dict[str, bool]:
-    fields: dict[str, bool] = {"bootstrap_full_kv_handoff": True}
-    if os.environ.get("VLLM_SPARSE_DEFERRED_BRIDGE_DIAGNOSTIC", "0") == "1":
-        fields["deferred_bridge_diagnostic_only"] = True
-    return fields
-
-from typing import Any, Callable, Dict, List, MutableSequence, Optional, Sequence, Set, Tuple
 
 import torch
 from patches.sparse_constants import (
@@ -2017,7 +2019,7 @@ def flush_prefill_batches_impl(
                             "gt1_scalar_fallback_count": int(
                                 gt1_scalar_fallback_count
                             ),
-                            **_bootstrap_full_kv_handoff_trace_fields(),
+                            "bootstrap_full_kv_handoff": True,
                         },
                     )
                     # Real deferred path: the producer has not run yet. The step

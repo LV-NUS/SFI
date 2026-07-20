@@ -1097,6 +1097,12 @@ def main() -> None:
                 summarize_cudagraph_runtime_observer(
                     graph_records,
                     all_decode_start_step_index=all_decode_start_step_index,
+                    expected_full_batch_steps=int(
+                        boundary_diagnostics["all_decode_full_batch_steps"]
+                    ),
+                    expected_partial_batch_steps=int(
+                        boundary_diagnostics["all_decode_partial_batch_steps"]
+                    ),
                     expected_batch_size=int(args.batch_size),
                     expected_total_engine_steps=int(
                         boundary_diagnostics["total_engine_steps"]

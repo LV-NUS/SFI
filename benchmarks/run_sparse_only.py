@@ -661,14 +661,6 @@ def _enforce_sm80_gt1_runner_contract(
     active_runner = str(os.environ.get("VLLM_SPARSE_ACTIVE_BENCH_RUNNER", "") or "")
     if active_runner == ACTIVE_SM80_GT1_RUNNER:
         return
-    if os.environ.get("VLLM_SPARSE_ALLOW_DIRECT_GT1_WORKER", "0") == "1":
-        print(
-            "[warn] run_sparse_only.py is worker/debug only for SM80 GT1 "
-            f"full-cudagraph; final perf runner is {ACTIVE_SM80_GT1_RUNNER}.",
-            file=sys.stderr,
-            flush=True,
-        )
-        return
     print(
         "[error] stale runner boundary: run_sparse_only.py must not be used as "
         "the final SM80 GT1 full-cudagraph benchmark runner. Use "
@@ -998,8 +990,6 @@ def _configure_sparse_flash_attention(repo_root: Path) -> tuple[str, str]:
 
 DEFERRED_BRIDGE_ENV_KEYS = (
     "VLLM_SPARSE_DEFER_BOOTSTRAP_PRODUCER",
-    "VLLM_SPARSE_BOOTSTRAP_DENSE_BRIDGE",
-    "VLLM_SPARSE_DEFERRED_BRIDGE_DIAGNOSTIC",
     "VLLM_SPARSE_BOOTSTRAP_BRIDGE_MAX_TOKENS",
     "VLLM_SPARSE_BOOTSTRAP_BRIDGE_GRAPH_POLICY",
     "VLLM_SPARSE_DEFERRED_PRODUCER_GROUPS_PER_STEP",
@@ -2409,6 +2399,12 @@ def main() -> None:
                 summarize_cudagraph_runtime_observer(
                     graph_records,
                     all_decode_start_step_index=all_decode_start_step_index,
+                    expected_full_batch_steps=int(
+                        boundary_diagnostics["all_decode_full_batch_steps"]
+                    ),
+                    expected_partial_batch_steps=int(
+                        boundary_diagnostics["all_decode_partial_batch_steps"]
+                    ),
                     expected_batch_size=int(args.batch_size),
                     expected_total_engine_steps=int(
                         boundary_diagnostics["total_engine_steps"]

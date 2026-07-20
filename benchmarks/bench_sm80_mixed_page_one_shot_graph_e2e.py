@@ -61,12 +61,15 @@ from benchmarks.scheduler_contract import (
     scheduler_graph_runtime_contract_from_metrics,
     validate_scheduler_graph_args,
 )
+from benchmarks.decode_throughput_window import (
+    cudagraph_runtime_observer_proof_reasons,
+)
 from utils.selector_cache_identity import selector_cache_abi_key_for_python
 from utils.model_kv_contract import MODEL_KV_CONTRACT_SCHEMA
 from benchmarks.sm80_run_pair import (
     ALLOWED_TRACE_ENV_KEYS,
     FULL_CUDAGRAPH_HOOK_PROFILE_ENV_KEY,
-    LEGACY_MIDDLE_NATIVE_CANONICAL_KEY,
+    NATIVE_CANONICAL_PAGES_KEY,
     ROUTE_TRACE_ENV_KEY,
     RouteProofResult,
     SPEED_CHILD_PAIRING_IDENTITY_ENV_KEYS,
@@ -97,8 +100,6 @@ DEFAULT_COMPACT_BLOCKS_PER_SLOT = 128
 DEFAULT_MAX_LIVE_SPARSE_SLOTS = 8
 DEFERRED_BRIDGE_ENV_KEYS = (
     "VLLM_SPARSE_DEFER_BOOTSTRAP_PRODUCER",
-    "VLLM_SPARSE_BOOTSTRAP_DENSE_BRIDGE",
-    "VLLM_SPARSE_DEFERRED_BRIDGE_DIAGNOSTIC",
     "VLLM_SPARSE_BOOTSTRAP_BRIDGE_MAX_TOKENS",
     "VLLM_SPARSE_BOOTSTRAP_BRIDGE_GRAPH_POLICY",
     "VLLM_SPARSE_DEFERRED_PRODUCER_GROUPS_PER_STEP",
@@ -219,7 +220,6 @@ class Phase2OneShotGraphRecord:
     compact_middle_excludes_bridge_positions: bool | None = None
     eos_before_ready_seen: bool | None = None
     bootstrap_full_kv_handoff: bool = False
-    deferred_bridge_diagnostic_only: bool = False
     commit_publish_us: float = -1.0
     producer_overlap_us: float = -1.0
     producer_deadline_wait_us: float = -1.0
@@ -248,7 +248,6 @@ class Phase2OneShotGraphRecord:
     finish_reason: str = ""
     eos_seen: bool | None = None
     semantic_output_health: str = ""
-    speed_diagnostic_only: bool = False
     writer_launch_count: int = -1
     writer_pointer_rebuild_count: int = -1
     writer_pointer_lookup_count: int = -1
@@ -319,13 +318,9 @@ class Phase2OneShotGraphRecord:
     arena_largest_bucket_bytes: int = -1
     arena_expansion_bytes: int = -1
     arena_budget_exceeded: bool | None = None
-    hidden_contention_miss: bool | None = None
     arena_prepare_miss_count: int = -1
     arena_bind_status: str = ""
     arena_reservation_status: str = ""
-    bridge_fallback_count: int = -1
-    bridged_token_count: int = -1
-    arena_no_fallback_success: bool | None = None
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -2752,120 +2747,102 @@ def _diagnostic_route_counter_proof(
         metrics.get("route_counter_resolved_row_ptr_fwd_mixed_page_count"),
         -1,
     )
-    kind0 = _as_int(metrics.get("route_counter_page_resolver_kind0_count"), 0)
-    kind4 = _as_int(metrics.get("route_counter_page_resolver_kind4_count"), -1)
+    has_resolved = _as_int(
+        metrics.get("route_counter_has_resolved_row_ptr_count"),
+        -1,
+    )
+    kind_counts = tuple(
+        _as_int(metrics.get(f"route_counter_page_resolver_kind{kind}_count"), -1)
+        for kind in range(5)
+    )
+    kind0, kind1, kind2, kind3, kind4 = kind_counts
+    compact_steps = _as_int(metrics.get("route_counter_compact_row_steps"), -1)
+    compact_rows = _as_int(metrics.get("route_counter_compact_rows"), -1)
     route_family = "unknown"
+
+    def _resolved_graph_family(summary: dict[str, Any]) -> bool:
+        graph_route_family = summary.get("graph_route_family", {}) or {}
+        return bool(
+            isinstance(graph_route_family, dict)
+            and str(graph_route_family.get("captured_route_family", ""))
+            == "resolved_row_ptr"
+            and str(graph_route_family.get("current_route_family", ""))
+            == "resolved_row_ptr"
+            and not bool(graph_route_family.get("route_family_mismatch", True))
+        )
+
+    def _resolved_graph_replay(summary: dict[str, Any]) -> bool:
+        return bool(
+            summary.get("full_graph_replay_refresh_seen", False)
+            and _resolved_graph_family(summary)
+            and _as_int(
+                summary.get("resolved_row_ptr_fwd_mixed_page_count", 0),
+                0,
+            )
+            > 0
+            and _as_int(summary.get("page_resolver_kind4_count", 0), 0) > 0
+        )
+
     if not available:
         reasons.append("diagnostic_route_counters_missing")
     if actual <= 0:
         reasons.append("diagnostic_actual_fwd_mixed_page_count_missing")
     if available and actual > 0:
-        dense_native = kind0 == actual and kind4 == 0 and resolved == 0
-        resolved_row_ptr = kind0 == 0 and kind4 == actual and resolved == actual
-        resolved_row_ptr_after_full_kv_bridge = (
-            kind0 > 0
-            and kind4 > 0
-            and resolved == kind4
-            and kind0 + kind4 == actual
+        if any(count < 0 for count in kind_counts):
+            reasons.append("diagnostic_page_resolver_kind_partition_missing")
+        elif sum(kind_counts) != actual:
+            reasons.append("diagnostic_page_resolver_kind_partition_mismatch")
+        if resolved < 0 or kind4 < 0 or resolved != kind4:
+            reasons.append("diagnostic_resolved_kind4_count_mismatch")
+        if any(count > 0 for count in (kind1, kind2, kind3)):
+            reasons.append("diagnostic_page_resolver_route_polluted")
+        if not 0 <= resolved <= has_resolved <= actual:
+            reasons.append("diagnostic_resolved_row_ptr_bounds_invalid")
+        if compact_steps <= 0 or compact_rows < compact_steps:
+            reasons.append("diagnostic_compact_replay_liveness_missing")
+
+        graph_replay_rrp = any(
+            _resolved_graph_replay(summary)
+            for summary in (producer_route_summary, route_summary)
         )
-
-        def _resolved_graph_family(summary: dict[str, Any]) -> bool:
-            graph_route_family = summary.get("graph_route_family", {}) or {}
-            return bool(
-                isinstance(graph_route_family, dict)
-                and str(graph_route_family.get("captured_route_family", ""))
-                == "resolved_row_ptr"
-                and str(graph_route_family.get("current_route_family", ""))
-                == "resolved_row_ptr"
-                and not bool(graph_route_family.get("route_family_mismatch", True))
-            )
-
-        def _allows_full_kv_bridge(summary: dict[str, Any]) -> bool:
-            phases = summary.get("phase_summaries", {}) or {}
-            if not isinstance(phases, dict):
-                return False
-            bridge = phases.get("bridge_phase", {}) or {}
-            post_switch = phases.get("post_switch_phase", {}) or {}
-            if not isinstance(bridge, dict) or not isinstance(post_switch, dict):
-                return False
-            bridge_modes = bridge.get("row_mode_distribution", {}) or {}
-            post_modes = post_switch.get("row_mode_distribution", {}) or {}
-            if not isinstance(bridge_modes, dict) or not isinstance(post_modes, dict):
-                return False
-            return bool(
-                summary.get("bootstrap_full_kv_handoff", False)
-                and _resolved_graph_family(summary)
-                and _as_int(summary.get("page_resolver_kind4_count", 0), 0) > 0
-                and _as_int(bridge_modes.get("full_kv", 0), 0) > 0
-                and _as_int(post_modes.get("compact", 0), 0) > 0
-                and _as_int(post_modes.get("native", 0), 0) == 0
-            )
-
-        if dense_native:
-            route_family = "dense_native_kind0"
-            if bool(require_resolved_row_ptr):
-                graph_route_family = (
-                    producer_route_summary.get(
-                        "graph_route_family",
-                        route_summary.get("graph_route_family", {}),
-                    )
-                    or {}
-                )
-                graph_replay_rrp = bool(
-                    route_summary.get("full_graph_replay_refresh_seen", False)
-                    and isinstance(graph_route_family, dict)
-                    and str(graph_route_family.get("captured_route_family", ""))
-                    == "resolved_row_ptr"
-                    and str(graph_route_family.get("current_route_family", ""))
-                    == "resolved_row_ptr"
-                    and not bool(graph_route_family.get("route_family_mismatch", True))
-                    and _as_int(
-                        route_summary.get(
-                            "resolved_row_ptr_fwd_mixed_page_count",
-                            0,
-                        ),
-                        0,
-                    )
-                    > 0
-                    and _as_int(
-                        route_summary.get("page_resolver_kind4_count", 0),
-                        0,
-                    )
-                    > 0
-                )
-                if graph_replay_rrp:
-                    route_family = "resolved_row_ptr_graph_replay_native_capture"
-                else:
-                    reasons.append("diagnostic_dense_native_kind0_fallback")
-        elif resolved_row_ptr:
-            route_family = "resolved_row_ptr_kind4"
-        elif resolved_row_ptr_after_full_kv_bridge:
-            if any(
-                _allows_full_kv_bridge(summary)
-                for summary in (producer_route_summary, route_summary)
-            ):
-                route_family = "resolved_row_ptr_kind4_with_full_kv_bridge"
-            else:
-                reasons.append("diagnostic_native_kind0_seen")
-                reasons.append("diagnostic_rrp_count_mismatch")
-        else:
+        if require_resolved_row_ptr:
             if resolved <= 0:
                 reasons.append("diagnostic_resolved_row_ptr_count_missing")
             if kind4 <= 0:
                 reasons.append("diagnostic_page_resolver_kind4_count_missing")
-            if kind0 > 0:
-                reasons.append("diagnostic_native_kind0_seen")
-            if actual > 0 and resolved >= 0 and resolved != actual:
-                reasons.append("diagnostic_rrp_count_mismatch")
+            if not graph_replay_rrp:
+                reasons.append("diagnostic_resolved_graph_replay_missing")
+
+        if graph_replay_rrp:
+            # Python route counters observe eager/capture calls; CUDA graph
+            # replay does not re-enter the callable.  kind0 may therefore come
+            # from prefill or capture and is not itself a replay fallback.  The
+            # graph-family trace plus compact step liveness owns that verdict.
+            route_family = (
+                "resolved_row_ptr_graph_replay_with_native_python_calls"
+                if kind0 > 0
+                else "resolved_row_ptr_graph_replay"
+            )
+        elif resolved > 0 and kind4 > 0:
+            route_family = (
+                "resolved_row_ptr_kind4_with_native_python_calls"
+                if kind0 > 0
+                else "resolved_row_ptr_kind4"
+            )
+        elif kind0 == actual and resolved == 0 and kind4 == 0:
+            route_family = "dense_native_kind0"
     return {
         "passed": not reasons,
         "reasons": reasons,
-        "scope": "diagnostic_child_measurement_window",
+        "scope": "diagnostic_child_python_calls_and_step_liveness",
         "route_family": route_family,
         "actual_fwd_mixed_page_count": int(actual),
         "resolved_row_ptr_fwd_mixed_page_count": int(resolved),
+        "has_resolved_row_ptr_count": int(has_resolved),
         "page_resolver_kind0_count": int(kind0),
         "page_resolver_kind4_count": int(kind4),
+        "compact_row_steps": int(compact_steps),
+        "compact_rows": int(compact_rows),
     }
 
 
@@ -3639,6 +3616,7 @@ def _speed_child_custom_all_reduce_provenance(
         "custom_all_reduce_runtime_all_ranks_active",
         "custom_all_reduce_runtime_rank_consistent",
         "custom_all_reduce_runtime_preemptor_flashinfer_enabled",
+        "custom_all_reduce_runtime_preemptor_torch_symm_mem_enabled",
         "custom_all_reduce_runtime_preemptor_nccl_symm_mem_enabled",
         "custom_all_reduce_runtime_required_num_tokens",
         "custom_all_reduce_runtime_model_hidden_size",
@@ -3686,6 +3664,7 @@ def _speed_child_custom_all_reduce_provenance(
             "custom_all_reduce_runtime_all_ranks_active": False,
             "custom_all_reduce_runtime_rank_consistent": False,
             "custom_all_reduce_runtime_preemptor_flashinfer_enabled": False,
+            "custom_all_reduce_runtime_preemptor_torch_symm_mem_enabled": False,
             "custom_all_reduce_runtime_preemptor_nccl_symm_mem_enabled": False,
             "custom_all_reduce_runtime_required_num_tokens": -1,
             "custom_all_reduce_runtime_model_hidden_size": -1,
@@ -3771,6 +3750,9 @@ def _speed_child_custom_all_reduce_provenance(
     )
     runtime_flashinfer_preemptor = _strict_bool(
         "custom_all_reduce_runtime_preemptor_flashinfer_enabled"
+    )
+    runtime_torch_symm_mem_preemptor = _strict_bool(
+        "custom_all_reduce_runtime_preemptor_torch_symm_mem_enabled"
     )
     runtime_nccl_symm_mem_preemptor = _strict_bool(
         "custom_all_reduce_runtime_preemptor_nccl_symm_mem_enabled"
@@ -3909,6 +3891,7 @@ def _speed_child_custom_all_reduce_provenance(
     record_ranks: list[int] = []
     record_active_count = 0
     record_flashinfer_preemptor = False
+    record_torch_symm_mem_preemptor = False
     record_nccl_symm_mem_preemptor = False
     for index, record in enumerate(runtime_records):
         if not isinstance(record, dict):
@@ -3963,6 +3946,14 @@ def _speed_child_custom_all_reduce_provenance(
             "device_communicator_use_flashinfer_allreduce"
         )
         flashinfer_active = record.get("fi_ar_comm_active")
+        flashinfer_env_enabled = record.get("vllm_allreduce_use_flashinfer")
+        torch_symm_mem_configured = record.get(
+            "device_communicator_use_torch_symm_mem"
+        )
+        torch_symm_mem_active = record.get("symm_mem_comm_active")
+        torch_symm_mem_env_enabled = record.get(
+            "vllm_allreduce_use_symm_mem"
+        )
         nccl_symm_mem_enabled = record.get("vllm_use_nccl_symm_mem")
         if isinstance(rank, bool) or not isinstance(rank, int):
             runtime_errors.append(f"record[{index}].tp_rank={rank!r}")
@@ -3976,18 +3967,45 @@ def _speed_child_custom_all_reduce_provenance(
         if not isinstance(active, bool):
             runtime_errors.append(f"rank{rank}.ca_comm_active={active!r}")
             continue
-        if not isinstance(flashinfer_configured, bool) or not isinstance(
-            flashinfer_active, bool
+        if not all(
+            isinstance(value, bool)
+            for value in (
+                flashinfer_configured,
+                flashinfer_active,
+                flashinfer_env_enabled,
+            )
         ):
             runtime_errors.append(
                 f"rank{rank}.flashinfer_state="
-                f"{flashinfer_configured!r},{flashinfer_active!r}"
+                f"{flashinfer_configured!r},{flashinfer_active!r},"
+                f"{flashinfer_env_enabled!r}"
             )
         else:
             record_flashinfer_preemptor = bool(
                 record_flashinfer_preemptor
                 or flashinfer_configured
                 or flashinfer_active
+                or flashinfer_env_enabled
+            )
+        if not all(
+            isinstance(value, bool)
+            for value in (
+                torch_symm_mem_configured,
+                torch_symm_mem_active,
+                torch_symm_mem_env_enabled,
+            )
+        ):
+            runtime_errors.append(
+                f"rank{rank}.torch_symm_mem_state="
+                f"{torch_symm_mem_configured!r},{torch_symm_mem_active!r},"
+                f"{torch_symm_mem_env_enabled!r}"
+            )
+        else:
+            record_torch_symm_mem_preemptor = bool(
+                record_torch_symm_mem_preemptor
+                or torch_symm_mem_configured
+                or torch_symm_mem_active
+                or torch_symm_mem_env_enabled
             )
         if not isinstance(nccl_symm_mem_enabled, bool):
             runtime_errors.append(
@@ -4147,6 +4165,12 @@ def _speed_child_custom_all_reduce_provenance(
             f"records={record_flashinfer_preemptor!r}:"
             f"declared={runtime_flashinfer_preemptor!r}"
         )
+    if record_torch_symm_mem_preemptor is not runtime_torch_symm_mem_preemptor:
+        runtime_errors.append(
+            "torch_symm_mem_preemptor_mismatch:"
+            f"records={record_torch_symm_mem_preemptor!r}:"
+            f"declared={runtime_torch_symm_mem_preemptor!r}"
+        )
     if record_nccl_symm_mem_preemptor is not runtime_nccl_symm_mem_preemptor:
         runtime_errors.append(
             "nccl_symm_mem_preemptor_mismatch:"
@@ -4155,6 +4179,8 @@ def _speed_child_custom_all_reduce_provenance(
         )
     if effective == "enabled" and runtime_flashinfer_preemptor:
         runtime_errors.append("flashinfer_preempts_custom_all_reduce")
+    if effective == "enabled" and runtime_torch_symm_mem_preemptor:
+        runtime_errors.append("torch_symm_mem_preempts_custom_all_reduce")
     if effective == "enabled" and runtime_nccl_symm_mem_preemptor:
         runtime_errors.append("nccl_symm_mem_preempts_custom_all_reduce")
     if runtime_all_active is not (
@@ -4207,6 +4233,9 @@ def _speed_child_custom_all_reduce_provenance(
         ),
         "custom_all_reduce_runtime_preemptor_flashinfer_enabled": (
             runtime_flashinfer_preemptor
+        ),
+        "custom_all_reduce_runtime_preemptor_torch_symm_mem_enabled": (
+            runtime_torch_symm_mem_preemptor
         ),
         "custom_all_reduce_runtime_preemptor_nccl_symm_mem_enabled": (
             runtime_nccl_symm_mem_preemptor
@@ -4489,21 +4518,13 @@ def _apply_scheduler_graph_contract_payload(
                 runtime_reasons.append(f"{child}_block_pool_proof_not_green")
 
         if diagnostic_metrics is not None:
-            if (
-                diagnostic_graph_proof.get(
-                    "cudagraph_runtime_observer_all_decode_exact_full"
+            runtime_reasons.extend(
+                "diagnostic_cudagraph_runtime_proof_invalid:" + reason
+                for reason in cudagraph_runtime_observer_proof_reasons(
+                    diagnostic_graph_proof,
+                    expected_batch_size=int(args.batch_size),
                 )
-                is not True
-            ):
-                runtime_reasons.append(
-                    "diagnostic_runtime_graph_steps_not_exact_full"
-                )
-            if diagnostic_graph_proof.get(
-                "cudagraph_runtime_observer_missing_step_count"
-            ) != 0:
-                runtime_reasons.append(
-                    "diagnostic_runtime_graph_steps_missing"
-                )
+            )
 
         geometries = {
             child: _engine_runtime_pair_geometry(proof)
@@ -5220,17 +5241,6 @@ def _gate_d_payload(
     diagnostic_child_route_proof_passed = bool(
         diagnostic_child_route_counter_proof.get("passed", False)
     )
-    dense_native_diagnostic_fallback = bool(
-        mode != "dense"
-        and diagnostic_child_route_counter_proof.get("passed", False)
-        and str(diagnostic_child_route_counter_proof.get("route_family", ""))
-        == "dense_native_kind0"
-    )
-    producer_gate_scope = (
-        "dense_native_kind0_fallback"
-        if dense_native_diagnostic_fallback
-        else "producer_refresh"
-    )
     speed_child_fatal_error = _command_output_has_fatal_error(result)
     diagnostic_child_fatal_error = _command_output_has_fatal_error(diag_result)
     diagnostic_ok = bool(
@@ -5358,19 +5368,18 @@ def _gate_d_payload(
     if mode != "dense":
         producer_requires_refresh = _producer_mode_requires_refresh(producer_mode)
         if producer_requires_refresh:
-            if not dense_native_diagnostic_fallback:
-                if continuous_refresh_reqs <= 0:
-                    producer_gate_reasons.append("continuous_refresh_reqs_missing")
-                if not interval_trigger_requirement_ok:
-                    producer_gate_reasons.append(
-                        "interval_trigger_intents_below_expected"
-                    )
-                if (
-                    continuous_refresh_reqs > 0
-                    and async_refresh_enabled_for_gate
-                    and async_producer_writer_count_for_gate <= 0
-                ):
-                    producer_gate_reasons.append("async_producer_writer_missing")
+            if continuous_refresh_reqs <= 0:
+                producer_gate_reasons.append("continuous_refresh_reqs_missing")
+            if not interval_trigger_requirement_ok:
+                producer_gate_reasons.append(
+                    "interval_trigger_intents_below_expected"
+                )
+            if (
+                continuous_refresh_reqs > 0
+                and async_refresh_enabled_for_gate
+                and async_producer_writer_count_for_gate <= 0
+            ):
+                producer_gate_reasons.append("async_producer_writer_missing")
         elif continuous_refresh_reqs != 0:
             producer_gate_reasons.append("continuous_refresh_reqs_nonzero")
         if (
@@ -5463,20 +5472,6 @@ def _gate_d_payload(
         _metric_or_route("arena_prepare_miss_count", -1),
         -1,
     )
-    bridge_fallback_count = _as_int(
-        _metric_or_producer_route("bridge_fallback_count", -1),
-        -1,
-    )
-    bridged_token_count = _as_int(
-        _metric_or_producer_route(
-            "bridged_token_count",
-            producer_route_summary.get(
-                "bridge_token_count",
-                route_summary.get("bridge_token_count", -1),
-            ),
-        ),
-        -1,
-    )
     bridge_token_count = _as_int(
         producer_route_summary.get(
             "bridge_token_count",
@@ -5484,8 +5479,6 @@ def _gate_d_payload(
         ),
         -1,
     )
-    if bridge_token_count > 0:
-        bridged_token_count = max(int(bridged_token_count), int(bridge_token_count))
     producer_launch_step = _as_int(
         _metric_or_producer_route("producer_launch_step", -1),
         -1,
@@ -5513,30 +5506,10 @@ def _gate_d_payload(
     else:
         route_family_mismatch = None
     arena_budget_exceeded_raw = _metric_or_route("arena_budget_exceeded")
-    hidden_contention_miss_raw = _metric_or_route("hidden_contention_miss")
     arena_bind_status = str(_metric_or_route("arena_bind_status", "") or "")
     arena_reservation_status = str(
         _metric_or_route("arena_reservation_status", "") or ""
     )
-    arena_no_fallback_success: bool | None = None
-    if (
-        arena_prepare_miss_count >= 0
-        and bridge_fallback_count >= 0
-        and bridged_token_count >= 0
-        and arena_bind_status
-        and arena_reservation_status
-        and arena_budget_exceeded_raw is not None
-        and hidden_contention_miss_raw is not None
-    ):
-        arena_no_fallback_success = bool(
-            arena_prepare_miss_count == 0
-            and bridge_fallback_count == 0
-            and bridged_token_count == 0
-            and not bool(arena_budget_exceeded_raw)
-            and not bool(hidden_contention_miss_raw)
-            and arena_bind_status == "prepared_bind"
-            and arena_reservation_status == "ready"
-        )
 
     deadline_v2_attribution = _deadline_v2_attribution_summary(
         metrics=metrics,
@@ -5612,7 +5585,6 @@ def _gate_d_payload(
         ),
         "producer_gate_passed": bool(producer_gate_passed),
         "producer_gate_reasons": list(producer_gate_reasons),
-        "producer_gate_scope": producer_gate_scope,
         "semantic_gate_reasons": list(semantic_gate_reasons),
         "sparse_native_lifecycle_required": bool(
             sparse_native_lifecycle_required
@@ -5761,9 +5733,6 @@ def _gate_d_payload(
         "bootstrap_full_kv_handoff": bool(
             producer_route_summary.get("bootstrap_full_kv_handoff", False)
         ),
-        "deferred_bridge_diagnostic_only": bool(
-            producer_route_summary.get("deferred_bridge_diagnostic_only", False)
-        ),
         "route_proof": route_proof or {"passed": mode == "dense", "reasons": []},
         "route_proof_passed": route_proof_passed,
         "diagnostic_child_route_counter_proof": diagnostic_child_route_counter_proof,
@@ -5826,16 +5795,9 @@ def _gate_d_payload(
             if arena_budget_exceeded_raw is not None
             else None
         ),
-        "hidden_contention_miss": (
-            bool(hidden_contention_miss_raw)
-            if hidden_contention_miss_raw is not None
-            else None
-        ),
         "arena_prepare_miss_count": arena_prepare_miss_count,
         "arena_bind_status": arena_bind_status,
         "arena_reservation_status": arena_reservation_status,
-        "bridge_fallback_count": bridge_fallback_count,
-        "bridged_token_count": bridged_token_count,
         "capture_layout_hot_path_alloc_count": _as_int(
             _metric_or_route("capture_layout_hot_path_alloc_count", -1),
             -1,
@@ -5865,7 +5827,6 @@ def _gate_d_payload(
             _metric_or_route("arena_prepare_wait_us", -1.0),
             -1.0,
         ),
-        "arena_no_fallback_success": arena_no_fallback_success,
         "prefill_global_meta_build_us": _as_float(
             _metric_or_route("prefill_global_meta_build_us", -1.0),
             -1.0,
@@ -7942,28 +7903,6 @@ def _refresh_work_item_max(
     return max(values) if values else -1.0
 
 
-def _deadline_async_producer_gpu_avg_ms(
-    refresh_profile: list[dict[str, Any]],
-    stage: str,
-    *,
-    fallback_key: str = "",
-) -> float:
-    count = _max_int_from_records(
-        refresh_profile,
-        f"deadline_async_producer_{stage}_gpu_count",
-    )
-    total_ms = _max_us_from_records(
-        refresh_profile,
-        f"deadline_async_producer_{stage}_gpu_ms_total",
-    )
-    value = _avg_from_total_count(total_ms, count)
-    if value >= 0.0:
-        return value
-    if fallback_key:
-        return _refresh_work_item_avg(refresh_profile, fallback_key)
-    return -1.0
-
-
 def _deadline_async_producer_counter_avg(
     refresh_profile: list[dict[str, Any]],
     total_key: str,
@@ -8790,46 +8729,35 @@ def _deadline_v2_selector_compute_breakdown(
     def _avg_with_async_refresh(
         primary: str,
         async_field: str,
-        async_stage: str,
     ) -> float:
         value = _refresh_work_item_avg(refresh_profile, primary)
         if value >= 0.0:
             return value
-        return _deadline_async_producer_gpu_avg_ms(
-            refresh_profile,
-            async_stage,
-            fallback_key=async_field,
-        )
+        return _refresh_work_item_avg(refresh_profile, async_field)
 
     selector_gpu_ms = _avg_with_async_refresh(
         "refresh_selector_gpu_ms",
         "async_producer_selector_gpu_ms",
-        "selector",
     )
     key_norms_gpu_ms = _avg_with_async_refresh(
         "refresh_key_norms_gpu_ms",
         "async_producer_key_norms_gpu_ms",
-        "key_norms",
     )
     key_norms_preproc_gpu_ms = _avg_with_async_refresh(
         "refresh_key_norms_preproc_gpu_ms",
         "async_producer_key_norms_preproc_gpu_ms",
-        "key_norms_preproc",
     )
     key_norms_h2d_gpu_ms = _avg_with_async_refresh(
         "refresh_key_norms_h2d_gpu_ms",
         "async_producer_key_norms_h2d_gpu_ms",
-        "key_norms_h2d",
     )
     key_norms_delta_gpu_ms = _avg_with_async_refresh(
         "refresh_key_norms_delta_gpu_ms",
         "async_producer_key_norms_delta_gpu_ms",
-        "key_norms_delta",
     )
     key_norms_pack_gpu_ms = _avg_with_async_refresh(
         "refresh_key_norms_pack_gpu_ms",
         "async_producer_key_norms_pack_gpu_ms",
-        "key_norms_pack",
     )
     key_norms_delta_total_tokens_avg = _deadline_async_producer_counter_avg(
         refresh_profile,
@@ -9572,20 +9500,14 @@ def _deadline_v2_attribution_summary(
         refresh_profile,
         selector_pipeline_cpu_profile=selector_pipeline_cpu_profile,
     )
-    async_producer_body_gpu_ms = _deadline_async_producer_gpu_avg_ms(
-        refresh_profile,
-        "body",
-        fallback_key="async_producer_body_gpu_ms",
+    async_producer_body_gpu_ms = _refresh_work_item_avg(
+        refresh_profile, "async_producer_body_gpu_ms"
     )
-    async_producer_selector_gpu_ms = _deadline_async_producer_gpu_avg_ms(
-        refresh_profile,
-        "selector",
-        fallback_key="async_producer_selector_gpu_ms",
+    async_producer_selector_gpu_ms = _refresh_work_item_avg(
+        refresh_profile, "async_producer_selector_gpu_ms"
     )
-    async_producer_writer_gpu_ms = _deadline_async_producer_gpu_avg_ms(
-        refresh_profile,
-        "writer",
-        fallback_key="async_producer_writer_gpu_ms",
+    async_producer_writer_gpu_ms = _refresh_work_item_avg(
+        refresh_profile, "async_producer_writer_gpu_ms"
     )
     decode_p50_us = _decode_metric(metrics, "decode_p50_us")
     decode_p95_us = _decode_metric(metrics, "decode_p95_us")
@@ -10151,7 +10073,6 @@ def _timeline_budget_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
         "bridge_added_decode_cost_us": -1.0,
         "saved_visible_wait_us": -1.0,
     }
-    deferred_bridge_diagnostic_only = False
     bootstrap_full_kv_handoff = False
     timeline_seen = False
     for record in records:
@@ -10201,10 +10122,6 @@ def _timeline_budget_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
             graph_wait_event_used_from_summary = True
         if "producer_final_event_recorded" in record:
             producer_final_event_recorded = bool(record.get("producer_final_event_recorded"))
-        if "deferred_bridge_diagnostic_only" in record:
-            deferred_bridge_diagnostic_only = bool(
-                record.get("deferred_bridge_diagnostic_only")
-            )
         if "bootstrap_full_kv_handoff" in record:
             bootstrap_full_kv_handoff = bool(
                 record.get("bootstrap_full_kv_handoff")
@@ -10271,7 +10188,6 @@ def _timeline_budget_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
             capture_tap_visible_ms_or_unavailable_reason
         ),
         "bootstrap_full_kv_handoff": bootstrap_full_kv_handoff,
-        "deferred_bridge_diagnostic_only": deferred_bridge_diagnostic_only,
         "writer_cached_pointer_hit_rate": writer_cached_pointer_hit_rate,
         **int_max_fields,
         **{
@@ -10719,14 +10635,6 @@ def _row_source_counter(
         return _as_int(row_source_distribution.get(key), -1)
     if key == "inactive_rows":
         return 0
-    if (
-        key == "middle_native_canonical_pages"
-        and LEGACY_MIDDLE_NATIVE_CANONICAL_KEY in row_source_distribution
-    ):
-        return _as_int(
-            row_source_distribution.get(LEGACY_MIDDLE_NATIVE_CANONICAL_KEY),
-            -1,
-        )
     return -1
 
 
@@ -10811,9 +10719,9 @@ def _record_from_result(
         row_source_distribution,
         "middle_native_canonical_pages",
     )
-    legacy_native_canonical_pages = _row_source_counter(
+    native_canonical_pages = _row_source_counter(
         row_source_distribution,
-        LEGACY_MIDDLE_NATIVE_CANONICAL_KEY,
+        NATIVE_CANONICAL_PAGES_KEY,
     )
     inactive_rows = _row_source_counter(row_source_distribution, "inactive_rows")
     native_rows = _row_source_counter(row_source_distribution, "native_rows")
@@ -10834,7 +10742,7 @@ def _record_from_result(
     expected_rows = _as_int(route_summary.get("expected_rows"), -1)
     num_kv_heads = _as_int(route_summary.get("num_kv_heads"), -1)
     source_proof_ready = bool(
-        legacy_native_canonical_pages <= 0
+        native_canonical_pages == 0
         and _source_proof_ready(
             source_counter_schema_version=source_counter_schema_version,
             source_counter_missing_fields=source_counter_missing_fields,
@@ -11182,7 +11090,6 @@ def _record_from_result(
         )
         or ""
     )
-    speed_diagnostic_only = bool(metrics.get("speed_diagnostic_only", False))
     capture_tap_visible_ms_or_unavailable_reason = str(
         metrics.get(
             "capture_tap_visible_ms_or_unavailable_reason",
@@ -11454,31 +11361,6 @@ def _record_from_result(
     )
     sparse_front_ms = _front_ms_from_metrics(metrics)
     dense_front_ms = _as_float(metrics.get("dense_front_ms"), -1.0)
-    bridge_fallback_count_for_gate = _as_int(
-        _arena_field_from_sources(
-            metrics,
-            refresh_profile,
-            timeline_summary,
-            "bridge_fallback_count",
-            0,
-        ),
-        0,
-    )
-    bridged_token_count_for_gate = _as_int(
-        _arena_field_from_sources(
-            metrics,
-            refresh_profile,
-            timeline_summary,
-            "bridged_token_count",
-            bridge_token_count,
-        ),
-        0,
-    )
-    if bridge_token_count > 0:
-        bridged_token_count_for_gate = max(
-            int(bridged_token_count_for_gate),
-            int(bridge_token_count),
-        )
     arena_prepare_miss_count = _as_int(
         _arena_field_from_sources(
             metrics,
@@ -11497,22 +11379,6 @@ def _record_from_result(
             "arena_budget_exceeded",
             False,
         )
-    )
-    hidden_contention_miss = bool(
-        _arena_field_from_sources(
-            metrics,
-            refresh_profile,
-            timeline_summary,
-            "hidden_contention_miss",
-            False,
-        )
-    )
-    arena_no_fallback_success = bool(
-        arena_prepare_miss_count == 0
-        and bridge_fallback_count_for_gate == 0
-        and bridged_token_count_for_gate == 0
-        and not arena_budget_exceeded
-        and not hidden_contention_miss
     )
     event_gate_ready = bool(
         (producer_final_event_present is True or producer_final_event_present is None)
@@ -11678,10 +11544,6 @@ def _record_from_result(
             timeline_summary.get("bootstrap_full_kv_handoff", False)
             or bridge_summary_source.get("bootstrap_full_kv_handoff", False)
         ),
-        deferred_bridge_diagnostic_only=bool(
-            timeline_summary.get("deferred_bridge_diagnostic_only", False)
-            or bridge_summary_source.get("deferred_bridge_diagnostic_only", False)
-        ),
         commit_publish_us=commit_publish_us,
         producer_overlap_us=producer_overlap_us,
         producer_deadline_wait_us=producer_deadline_wait_us,
@@ -11712,7 +11574,6 @@ def _record_from_result(
         finish_reason=finish_reason,
         eos_seen=eos_seen,
         semantic_output_health=semantic_output_health,
-        speed_diagnostic_only=speed_diagnostic_only,
         writer_launch_count=writer_launch_count,
         writer_pointer_rebuild_count=writer_pointer_rebuild_count,
         writer_pointer_lookup_count=writer_pointer_lookup_count,
@@ -11821,7 +11682,6 @@ def _record_from_result(
             -1,
         ),
         arena_budget_exceeded=arena_budget_exceeded,
-        hidden_contention_miss=hidden_contention_miss,
         arena_prepare_miss_count=arena_prepare_miss_count,
         arena_bind_status=str(
             _arena_field_from_sources(
@@ -11837,9 +11697,6 @@ def _record_from_result(
                 "",
             )
         ),
-        bridge_fallback_count=bridge_fallback_count_for_gate,
-        bridged_token_count=bridged_token_count_for_gate,
-        arena_no_fallback_success=arena_no_fallback_success,
     )
 
 
@@ -11910,7 +11767,7 @@ def _classify_phase2_failure(
         return "recent_page_source_missing"
     if record.middle_native_canonical_pages != 0:
         return "middle_native_canonical_pages_nonzero"
-    if int(record.row_source_distribution.get(LEGACY_MIDDLE_NATIVE_CANONICAL_KEY, 0) or 0) != 0:
+    if int(record.row_source_distribution.get(NATIVE_CANONICAL_PAGES_KEY, 0) or 0) != 0:
         return "native_canonical_pages_nonzero"
     if int(record.row_source_distribution.get("native_rows", 0) or 0) != 0:
         return "native_rows_nonzero"
@@ -12197,7 +12054,7 @@ def _write_summary(
         )
     )
     payload["native_canonical_pages"] = int(
-        record.row_source_distribution.get("native_canonical_pages", 0) or 0
+        record.row_source_distribution.get(NATIVE_CANONICAL_PAGES_KEY, 0) or 0
     )
     if reference_result is not None:
         payload["reference_command"] = reference_result.command

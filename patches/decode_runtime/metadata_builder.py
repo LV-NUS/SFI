@@ -60,7 +60,6 @@ from patches.refresh_runtime.post_kernel_worker import (
 )
 from patches.sparse_constants import (
     _CAPTURE_CHUNK,
-    _ONE_SHOT_BLOCKED_DENSE_FALLBACK_CACHED,
     _CAPTURE_IN_FLIGHT,
     _CAPTURE_KV_BUCKET_CACHED,
     _DYNAMIC_ENV,
@@ -6335,27 +6334,11 @@ def maybe_build_step_decode_data_from_metadata_impl(
                             ),
                         }
                     )
-                if not _ONE_SHOT_BLOCKED_DENSE_FALLBACK_CACHED:
-                    raise RuntimeError(
-                        "one-shot bootstrap graph decode requires compact_ready before replay: "
-                        + ", ".join(blocked_not_ready)
-                        + f"; details={blocked_details!r}"
-                    )
-                # ROBUST MODE: a not-compact-ready row has full native paged-KV; only the
-                # sparse compact buffer is absent. resolve_decode_row_policy (row_policy.py:76)
-                # already routes bootstrap_done=False rows to _ROW_MODE_DENSE (full-KV) every
-                # step, unconditionally; this guard's raise is a pre-emptive tripwire firing
-                # BEFORE that correct dense path. Demote (do NOT crash) -> decode dense until
-                # compact_ready flips it to sparse. No bridge-accept (would pollute the bridge
-                # bookkeeping of a never-bridged request). Scoped to this guard; selector
-                # key_norms path + one_shot_bootstrap_only untouched.
-                if not getattr(self, "_one_shot_blocked_dense_warned", False):
-                    _log.warning(
-                        "one-shot decode: %d not-compact-ready row(s) demoted to dense "
-                        "full-KV (will switch to sparse when compact ready); details=%r",
-                        len(blocked_not_ready), blocked_details,
-                    )
-                    self._one_shot_blocked_dense_warned = True
+                raise RuntimeError(
+                    "one-shot bootstrap graph decode requires compact_ready before replay: "
+                    + ", ".join(blocked_not_ready)
+                    + f"; details={blocked_details!r}"
+                )
             if bridge_not_ready:
                 self._mark_bridge_decode_metadata_accepted(
                     req_ids=tuple(bridge_not_ready),

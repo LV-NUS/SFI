@@ -11,13 +11,6 @@ import torch
 SUPPORTED_BOOTSTRAP_BRIDGE_GRAPH_POLICIES = frozenset({"evict_recapture_once"})
 
 
-def _bootstrap_full_kv_handoff_trace_fields() -> dict[str, bool]:
-    fields: dict[str, bool] = {"bootstrap_full_kv_handoff": True}
-    if os.environ.get("VLLM_SPARSE_DEFERRED_BRIDGE_DIAGNOSTIC", "0") == "1":
-        fields["deferred_bridge_diagnostic_only"] = True
-    return fields
-
-
 @dataclass(slots=True)
 class DeferredProducerJob:
     request_id: str
@@ -480,7 +473,7 @@ def run_deferred_bootstrap_producer_job(
                     "producer_ready_chunk": int(ready_chunk),
                     "producer_group_complete": bool(ready_groups_complete),
                     "producer_ready_group_ids": list(ready_group_ids),
-                    **_bootstrap_full_kv_handoff_trace_fields(),
+                    "bootstrap_full_kv_handoff": True,
                 },
             )
             capture_postprocess_job_count = sum(
@@ -742,7 +735,7 @@ def run_deferred_bootstrap_producer_job(
                     "producer_ready_chunk": int(ready_chunk),
                     "producer_group_complete": bool(ready_groups_complete),
                     "producer_ready_group_ids": list(ready_group_ids),
-                    **_bootstrap_full_kv_handoff_trace_fields(),
+                    "bootstrap_full_kv_handoff": True,
                 },
             )
             if ready_groups_complete and os.environ.get("VLLM_SPARSE_ONE_SHOT_TIMELINE_LOG", ""):
@@ -801,7 +794,7 @@ def run_deferred_bootstrap_producer_job(
                                 "producer_group_layer_indices": list(
                                     ready_group_layers
                                 ),
-                                **_bootstrap_full_kv_handoff_trace_fields(),
+                                "bootstrap_full_kv_handoff": True,
                             },
                         )
                 except Exception:
@@ -878,7 +871,7 @@ def run_deferred_bootstrap_producer_job(
                     "expected_group_mask": int(ready_state.expected_group_mask),
                     "submitted_group_mask": int(ready_state.submitted_group_mask),
                     "producer_final_event_recorded": True,
-                    **_bootstrap_full_kv_handoff_trace_fields(),
+                    "bootstrap_full_kv_handoff": True,
                     **writer_telemetry,
                 },
             )

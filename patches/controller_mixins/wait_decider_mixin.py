@@ -53,17 +53,6 @@ _DEFER_BOOTSTRAP_PRODUCER_CACHED = (
     os.environ.get("VLLM_SPARSE_DEFER_BOOTSTRAP_PRODUCER", "0") == "1"
 )
 
-
-
-def _bootstrap_full_kv_handoff_trace_fields() -> Dict[str, bool]:
-    fields: Dict[str, bool] = {"bootstrap_full_kv_handoff": True}
-    if os.environ.get("VLLM_SPARSE_DEFERRED_BRIDGE_DIAGNOSTIC", "0") == "1":
-        fields["deferred_bridge_diagnostic_only"] = True
-    return fields
-
-
-
-
 # VLLM_SPARSE_REFRESH_CP_PROBE — passive critical-path wait probe (default OFF).
 _CP_PROBE_ENABLED: bool = os.environ.get("VLLM_SPARSE_REFRESH_CP_PROBE", "") == "1"
 _CP_PROBE_WAIT_COUNTS: Dict[str, Dict[str, int]] = {}
@@ -326,7 +315,7 @@ class WaitDeciderMixin:
                             "bridge_token_position": int(bridge_token_position),
                             "bridge_token_positions": list(bridge_positions_tuple),
                             "producer_launch_step": int(producer_launch_step),
-                            **_bootstrap_full_kv_handoff_trace_fields(),
+                            "bootstrap_full_kv_handoff": True,
                         },
                     )
                 except Exception:
@@ -346,7 +335,7 @@ class WaitDeciderMixin:
                             "bridge_token_positions": list(bridge_positions_tuple),
                             "producer_launch_step": int(producer_launch_step),
                             "accepted_count": 1,
-                            **_bootstrap_full_kv_handoff_trace_fields(),
+                            "bootstrap_full_kv_handoff": True,
                         }
                     )
                 except Exception:
@@ -532,7 +521,7 @@ class WaitDeciderMixin:
             extra["producer_launch_step"] = int(
                 getattr(tracking, "producer_launch_step", -1)
             )
-            extra.update(_bootstrap_full_kv_handoff_trace_fields())
+            extra["bootstrap_full_kv_handoff"] = True
             append_one_shot_timeline(
                 path=timeline_log_path(),
                 request_id=str(rid),
@@ -1073,7 +1062,7 @@ class WaitDeciderMixin:
                             "active_compact_epoch": int(
                                 getattr(tracking, "active_compact_epoch", -1)
                             ),
-                            **_bootstrap_full_kv_handoff_trace_fields(),
+                            "bootstrap_full_kv_handoff": True,
                         },
                     )
                 except Exception:
@@ -1094,7 +1083,7 @@ class WaitDeciderMixin:
                             "producer_launch_step": int(
                                 getattr(tracking, "producer_launch_step", -1)
                             ),
-                            **_bootstrap_full_kv_handoff_trace_fields(),
+                            "bootstrap_full_kv_handoff": True,
                         }
                     )
                 except Exception:

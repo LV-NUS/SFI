@@ -25,6 +25,9 @@ SPARSE_ROUTE_COUNTER_SNAPSHOT_RPC_METHOD = (
 CUSTOM_ALL_REDUCE_RUNTIME_WORKER_EXTENSION = (
     "benchmarks.decode_throughput_window.CustomAllReduceRuntimeWorkerExtension"
 )
+CUDAGRAPH_RUNTIME_OBSERVER_SCOPE = (
+    "diagnostic_measurement_all_decode_partitioned"
+)
 
 
 def collect_single_token_decode_step_proof(engine: object) -> dict[str, object]:
@@ -288,14 +291,10 @@ def _worker_custom_all_reduce_runtime_state(
         "device_communicator_use_flashinfer_allreduce": bool(
             getattr(device_communicator, "use_flashinfer_allreduce", False)
         ),
-        "fi_ar_comm_present": bool(fi_ar_comm is not None),
-        "fi_ar_comm_disabled": fi_ar_disabled,
         "fi_ar_comm_active": fi_ar_active,
         "device_communicator_use_torch_symm_mem": bool(
             getattr(device_communicator, "use_torch_symm_mem", False)
         ),
-        "symm_mem_comm_present": bool(symm_mem_comm is not None),
-        "symm_mem_comm_disabled": symm_mem_disabled,
         "symm_mem_comm_active": symm_mem_active,
         "vllm_allreduce_use_flashinfer": bool(
             getattr(vllm_envs, "VLLM_ALLREDUCE_USE_FLASHINFER", False)
@@ -1081,7 +1080,11 @@ def collect_custom_all_reduce_runtime_proof(
         "parallel_config_disable_custom_all_reduce",
         "device_communicator_use_custom_allreduce",
         "device_communicator_use_flashinfer_allreduce",
+        "device_communicator_use_torch_symm_mem",
         "fi_ar_comm_active",
+        "symm_mem_comm_active",
+        "vllm_allreduce_use_flashinfer",
+        "vllm_allreduce_use_symm_mem",
         "vllm_use_nccl_symm_mem",
         "ca_comm_present",
         "ca_comm_disabled",
@@ -1245,12 +1248,39 @@ def collect_custom_all_reduce_runtime_proof(
             communicator_enabled = record[
                 "device_communicator_use_custom_allreduce"
             ]
+            flashinfer_fields = (
+                record["device_communicator_use_flashinfer_allreduce"],
+                record["fi_ar_comm_active"],
+                record["vllm_allreduce_use_flashinfer"],
+            )
+            torch_symm_mem_fields = (
+                record["device_communicator_use_torch_symm_mem"],
+                record["symm_mem_comm_active"],
+                record["vllm_allreduce_use_symm_mem"],
+            )
+            nccl_symm_mem_raw = record["vllm_use_nccl_symm_mem"]
+            if not all(isinstance(value, bool) for value in flashinfer_fields):
+                errors.append(
+                    f"rank{rank}.flashinfer_state={flashinfer_fields!r}"
+                )
+            if not all(isinstance(value, bool) for value in torch_symm_mem_fields):
+                errors.append(
+                    f"rank{rank}.torch_symm_mem_state={torch_symm_mem_fields!r}"
+                )
+            if not isinstance(nccl_symm_mem_raw, bool):
+                errors.append(
+                    f"rank{rank}.vllm_use_nccl_symm_mem={nccl_symm_mem_raw!r}"
+                )
             flashinfer_enabled = bool(
-                record["device_communicator_use_flashinfer_allreduce"]
-                or record["fi_ar_comm_active"]
+                all(isinstance(value, bool) for value in flashinfer_fields)
+                and any(flashinfer_fields)
+            )
+            torch_symm_mem_enabled = bool(
+                all(isinstance(value, bool) for value in torch_symm_mem_fields)
+                and any(torch_symm_mem_fields)
             )
             nccl_symm_mem_enabled = bool(
-                record["vllm_use_nccl_symm_mem"]
+                isinstance(nccl_symm_mem_raw, bool) and nccl_symm_mem_raw
             )
             if active is not expected_active:
                 errors.append(
@@ -1339,6 +1369,10 @@ def collect_custom_all_reduce_runtime_proof(
                 errors.append(
                     f"rank{rank}.flashinfer_preempts_custom_all_reduce"
                 )
+            if expected_active and torch_symm_mem_enabled:
+                errors.append(
+                    f"rank{rank}.torch_symm_mem_preempts_custom_all_reduce"
+                )
             if expected_active and nccl_symm_mem_enabled:
                 errors.append(
                     f"rank{rank}.nccl_symm_mem_preempts_custom_all_reduce"
@@ -1358,6 +1392,15 @@ def collect_custom_all_reduce_runtime_proof(
         bool(
             record["device_communicator_use_flashinfer_allreduce"]
             or record["fi_ar_comm_active"]
+            or record["vllm_allreduce_use_flashinfer"]
+        )
+        for record in records
+    )
+    torch_symm_mem_preemptor_enabled = any(
+        bool(
+            record["device_communicator_use_torch_symm_mem"]
+            or record["symm_mem_comm_active"]
+            or record["vllm_allreduce_use_symm_mem"]
         )
         for record in records
     )
@@ -1383,6 +1426,9 @@ def collect_custom_all_reduce_runtime_proof(
         "custom_all_reduce_runtime_rank_consistent": True,
         "custom_all_reduce_runtime_preemptor_flashinfer_enabled": (
             flashinfer_preemptor_enabled
+        ),
+        "custom_all_reduce_runtime_preemptor_torch_symm_mem_enabled": (
+            torch_symm_mem_preemptor_enabled
         ),
         "custom_all_reduce_runtime_preemptor_nccl_symm_mem_enabled": (
             nccl_symm_mem_preemptor_enabled
@@ -2232,14 +2278,122 @@ def stop_cudagraph_runtime_observer(llm_engine: object) -> list[dict[str, object
     return list(records)
 
 
+def cudagraph_runtime_observer_proof_reasons(
+    proof: object,
+    *,
+    expected_batch_size: int,
+) -> list[str]:
+    """Validate the cold graph-observer artifact from one shared contract."""
+    if type(expected_batch_size) is not int or expected_batch_size <= 0:
+        raise ValueError(
+            f"expected_batch_size must be positive, got {expected_batch_size!r}"
+        )
+    if not isinstance(proof, dict):
+        return ["proof_missing_or_invalid"]
+
+    reasons: list[str] = []
+    exact: dict[str, object] = {
+        "cudagraph_runtime_observer_scope": CUDAGRAPH_RUNTIME_OBSERVER_SCOPE,
+        "cudagraph_runtime_observer_enabled": True,
+        "cudagraph_runtime_observer_full_batch_missing_step_count": 0,
+        "cudagraph_runtime_observer_partial_batch_missing_step_count": 0,
+        "cudagraph_runtime_observer_full_batch_decode_exact_full": True,
+        "cudagraph_runtime_observer_partial_batch_decode_valid_padded_full": True,
+        "cudagraph_runtime_observer_all_decode_full_mode": True,
+    }
+    reasons.extend(
+        f"field_mismatch:{field}"
+        for field, expected in exact.items()
+        if type(proof.get(field)) is not type(expected)
+        or proof.get(field) != expected
+    )
+
+    total_steps = proof.get("cudagraph_runtime_observer_total_step_count")
+    full_steps = proof.get(
+        "cudagraph_runtime_observer_full_batch_decode_step_count"
+    )
+    partial_steps = proof.get(
+        "cudagraph_runtime_observer_partial_batch_decode_step_count"
+    )
+    if type(total_steps) is not int or total_steps <= 0:
+        reasons.append("total_step_count_invalid")
+    if type(full_steps) is not int or full_steps <= 0:
+        reasons.append("full_batch_step_count_invalid")
+    if type(partial_steps) is not int or partial_steps < 0:
+        reasons.append("partial_batch_step_count_invalid")
+    if (
+        type(total_steps) is int
+        and type(full_steps) is int
+        and type(partial_steps) is int
+        and full_steps + partial_steps > total_steps
+    ):
+        reasons.append("all_decode_step_count_exceeds_total")
+    if proof.get("cudagraph_runtime_observer_exact_full_step_count") != full_steps:
+        reasons.append("exact_full_step_count_mismatch")
+
+    full_distribution = proof.get(
+        "cudagraph_runtime_observer_full_batch_distribution"
+    )
+    expected_full_distribution = [
+        {
+            "num_unpadded_tokens": expected_batch_size,
+            "num_padded_tokens": expected_batch_size,
+            "num_paddings": 0,
+            "runtime_mode": "FULL",
+            "count": full_steps,
+        }
+    ]
+    if full_distribution != expected_full_distribution:
+        reasons.append("full_batch_distribution_mismatch")
+
+    partial_distribution = proof.get(
+        "cudagraph_runtime_observer_partial_batch_distribution"
+    )
+    if not isinstance(partial_distribution, list):
+        reasons.append("partial_batch_distribution_invalid")
+    else:
+        observed_partial_steps = 0
+        partial_distribution_valid = True
+        for record in partial_distribution:
+            if not isinstance(record, dict):
+                partial_distribution_valid = False
+                continue
+            unpadded = record.get("num_unpadded_tokens")
+            padded = record.get("num_padded_tokens")
+            paddings = record.get("num_paddings")
+            count = record.get("count")
+            if (
+                type(unpadded) is not int
+                or not 0 < unpadded < expected_batch_size
+                or type(padded) is not int
+                or padded != expected_batch_size
+                or type(paddings) is not int
+                or paddings != expected_batch_size - unpadded
+                or record.get("runtime_mode") != "FULL"
+                or type(count) is not int
+                or count <= 0
+            ):
+                partial_distribution_valid = False
+                continue
+            observed_partial_steps += count
+        if (
+            not partial_distribution_valid
+            or observed_partial_steps != partial_steps
+        ):
+            reasons.append("partial_batch_distribution_mismatch")
+    return list(dict.fromkeys(reasons))
+
+
 def summarize_cudagraph_runtime_observer(
     records: list[dict[str, object] | None],
     *,
     all_decode_start_step_index: int,
+    expected_full_batch_steps: int,
+    expected_partial_batch_steps: int,
     expected_batch_size: int,
     expected_total_engine_steps: int,
 ) -> dict[str, object]:
-    """Aggregate actual graph dispatch only for the strict all-decode window."""
+    """Validate full-batch and partial-tail graph dispatch separately."""
     from collections import Counter
 
     if len(records) != int(expected_total_engine_steps):
@@ -2253,33 +2407,81 @@ def summarize_cudagraph_runtime_observer(
             "E_CUDAGRAPH_RUNTIME_OBSERVER_WINDOW: "
             f"all_decode_start_step_index={start} records={len(records)}"
         )
-    window = records[start:]
-    missing = sum(record is None for record in window)
-    distribution: Counter[tuple[object, ...]] = Counter()
-    for record in window:
-        if record is None:
-            continue
-        distribution[
-            (
-                record.get("num_unpadded_tokens"),
-                record.get("num_padded_tokens"),
-                record.get("num_paddings"),
-                record.get("runtime_mode"),
-            )
-        ] += 1
+    full_batch_steps = int(expected_full_batch_steps)
+    end = start + full_batch_steps
+    if full_batch_steps <= 0 or end > len(records):
+        raise RuntimeError(
+            "E_CUDAGRAPH_RUNTIME_OBSERVER_FULL_BATCH_WINDOW: "
+            f"start={start} full_batch_steps={full_batch_steps} "
+            f"records={len(records)}"
+        )
+    partial_batch_steps = int(expected_partial_batch_steps)
+    tail_end = end + partial_batch_steps
+    if partial_batch_steps < 0 or tail_end != len(records):
+        raise RuntimeError(
+            "E_CUDAGRAPH_RUNTIME_OBSERVER_PARTIAL_BATCH_WINDOW: "
+            f"start={start} full_batch_steps={full_batch_steps} "
+            f"partial_batch_steps={partial_batch_steps} records={len(records)}"
+        )
+    # Requests only leave this fixed offline batch after the all-decode
+    # boundary, so full-batch decode is a prefix.  The remaining records are a
+    # legal partial tail and do not belong to the exact BS-sized graph proof.
+    full_batch_window = records[start:end]
+    partial_batch_window = records[end:tail_end]
+
+    def _distribution(
+        window: list[dict[str, object] | None],
+    ) -> Counter[tuple[object, ...]]:
+        distribution: Counter[tuple[object, ...]] = Counter()
+        for record in window:
+            if record is None:
+                continue
+            distribution[
+                (
+                    record.get("num_unpadded_tokens"),
+                    record.get("num_padded_tokens"),
+                    record.get("num_paddings"),
+                    record.get("runtime_mode"),
+                )
+            ] += 1
+        return distribution
+
+    full_batch_missing = sum(record is None for record in full_batch_window)
+    partial_batch_missing = sum(record is None for record in partial_batch_window)
+    full_batch_distribution = _distribution(full_batch_window)
+    partial_batch_distribution = _distribution(partial_batch_window)
     expected_signature = (expected_batch_size, expected_batch_size, 0, "FULL")
-    exact_steps = int(distribution.get(expected_signature, 0))
-    return {
-        "cudagraph_runtime_observer_scope": "diagnostic_measurement_all_decode",
-        "cudagraph_runtime_observer_enabled": True,
-        "cudagraph_runtime_observer_total_step_count": len(records),
-        "cudagraph_runtime_observer_all_decode_step_count": len(window),
-        "cudagraph_runtime_observer_missing_step_count": missing,
-        "cudagraph_runtime_observer_exact_full_step_count": exact_steps,
-        "cudagraph_runtime_observer_all_decode_exact_full": bool(
-            missing == 0 and exact_steps == len(window) and len(window) > 0
-        ),
-        "cudagraph_runtime_observer_distribution": [
+    exact_steps = int(full_batch_distribution.get(expected_signature, 0))
+    full_batch_exact = bool(
+        full_batch_missing == 0
+        and exact_steps == len(full_batch_window)
+        and len(full_batch_window) > 0
+    )
+
+    def _valid_partial_signature(signature: tuple[object, ...]) -> bool:
+        unpadded, padded, paddings, runtime_mode = signature
+        return bool(
+            type(unpadded) is int
+            and 0 < unpadded < expected_batch_size
+            and type(padded) is int
+            and padded == expected_batch_size
+            and type(paddings) is int
+            and paddings == expected_batch_size - unpadded
+            and runtime_mode == "FULL"
+        )
+
+    partial_batch_valid = bool(
+        partial_batch_missing == 0
+        and all(
+            _valid_partial_signature(signature)
+            for signature in partial_batch_distribution
+        )
+    )
+
+    def _serialized_distribution(
+        distribution: Counter[tuple[object, ...]],
+    ) -> list[dict[str, object]]:
+        return [
             {
                 "num_unpadded_tokens": signature[0],
                 "num_padded_tokens": signature[1],
@@ -2288,7 +2490,40 @@ def summarize_cudagraph_runtime_observer(
                 "count": count,
             }
             for signature, count in sorted(distribution.items(), key=repr)
-        ],
+        ]
+
+    return {
+        "cudagraph_runtime_observer_scope": CUDAGRAPH_RUNTIME_OBSERVER_SCOPE,
+        "cudagraph_runtime_observer_enabled": True,
+        "cudagraph_runtime_observer_total_step_count": len(records),
+        "cudagraph_runtime_observer_full_batch_decode_step_count": len(
+            full_batch_window
+        ),
+        "cudagraph_runtime_observer_partial_batch_decode_step_count": len(
+            partial_batch_window
+        ),
+        "cudagraph_runtime_observer_full_batch_missing_step_count": (
+            full_batch_missing
+        ),
+        "cudagraph_runtime_observer_partial_batch_missing_step_count": (
+            partial_batch_missing
+        ),
+        "cudagraph_runtime_observer_exact_full_step_count": exact_steps,
+        "cudagraph_runtime_observer_full_batch_decode_exact_full": (
+            full_batch_exact
+        ),
+        "cudagraph_runtime_observer_partial_batch_decode_valid_padded_full": (
+            partial_batch_valid
+        ),
+        "cudagraph_runtime_observer_all_decode_full_mode": bool(
+            full_batch_exact and partial_batch_valid
+        ),
+        "cudagraph_runtime_observer_full_batch_distribution": (
+            _serialized_distribution(full_batch_distribution)
+        ),
+        "cudagraph_runtime_observer_partial_batch_distribution": (
+            _serialized_distribution(partial_batch_distribution)
+        ),
     }
 
 

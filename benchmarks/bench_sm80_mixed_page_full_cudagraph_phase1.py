@@ -221,13 +221,6 @@ def _legacy_phase1_runner_disabled_message() -> str:
 def _enforce_phase1_cli_runner_contract(args: argparse.Namespace) -> None:
     if bool(getattr(args, "dry_run", False)):
         return
-    if os.environ.get("VLLM_SPARSE_ALLOW_LEGACY_PHASE1_RUNNER", "0") == "1":
-        print(
-            "[warn] " + _legacy_phase1_runner_disabled_message(),
-            file=sys.stderr,
-            flush=True,
-        )
-        return
     print(
         "[error] " + _legacy_phase1_runner_disabled_message(),
         file=sys.stderr,
@@ -715,6 +708,24 @@ def _build_dense_reference_command(
     return command
 
 
+_CUSTOM_ALL_REDUCE_BACKEND_ENV = {
+    "VLLM_ALLREDUCE_USE_FLASHINFER": "0",
+    "VLLM_ALLREDUCE_USE_SYMM_MEM": "0",
+    "VLLM_USE_NCCL_SYMM_MEM": "0",
+}
+
+
+def _apply_custom_all_reduce_backend_env(env: dict[str, str]) -> None:
+    """Pin the backend selected by the runtime custom-all-reduce contract.
+
+    vLLM backend defaults have changed between releases.  The benchmark policy
+    selects vLLM's CustomAllreduce explicitly, so inherited defaults must not
+    silently replace it with FlashInfer or either symmetric-memory backend.
+    This is a child-process launch contract and adds no model hot-path work.
+    """
+    env.update(_CUSTOM_ALL_REDUCE_BACKEND_ENV)
+
+
 def _build_env(
     args: argparse.Namespace,
     *,
@@ -733,6 +744,7 @@ def _build_env(
     env["VLLM_SPARSE_FA3_UPSTREAM_ROOT"] = str(args.fa3_upstream_root)
     env["VLLM_SPARSE_ATTENTION_IN_CUDAGRAPH"] = "1"
     env["VLLM_SPARSE_ASYNC_REFRESH"] = "0"
+    _apply_custom_all_reduce_backend_env(env)
     env["VLLM_ATTENTION_BACKEND"] = "FLASH_ATTN"
     env["VLLM_FLASH_ATTN_VERSION"] = "3"
     env["VLLM_SPARSE_FA3_ROUTE_TRACE_LOG"] = str(route_trace_path)
@@ -756,6 +768,7 @@ def _build_dense_reference_env(args: argparse.Namespace) -> dict[str, str]:
     )
     env["CUDA_VISIBLE_DEVICES"] = str(args.cuda_visible_devices)
     env.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+    _apply_custom_all_reduce_backend_env(env)
     for name in (
         "VLLM_SPARSE_ATTENTION_IN_CUDAGRAPH",
         "VLLM_SPARSE_ASYNC_REFRESH",
@@ -1673,11 +1686,6 @@ def _deferred_bridge_summary(
         summary["phase_summaries"] = phase_summaries
     if bridge_events or ready_events:
         summary["bootstrap_full_kv_handoff"] = True
-    if any(
-        bool(event.get("deferred_bridge_diagnostic_only"))
-        for event in bridge_events + ready_events + launch_events
-    ):
-        summary["deferred_bridge_diagnostic_only"] = True
     return summary
 
 
@@ -1707,8 +1715,6 @@ def _arena_trace_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
         "hot_path_d2h_count",
         "hot_path_cuda_sync_count",
         "tail_path_item_cpu_count",
-        "bridge_fallback_count",
-        "bridged_token_count",
     )
     for key in int_fields:
         values = [_as_int(event.get(key), -1) for event in arena_events]
@@ -1718,7 +1724,6 @@ def _arena_trace_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
 
     bool_fields = (
         "arena_budget_exceeded",
-        "hidden_contention_miss",
         "arena_ready_before_tail",
     )
     for key in bool_fields:

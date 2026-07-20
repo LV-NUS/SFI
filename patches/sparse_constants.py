@@ -120,11 +120,6 @@ _DYNAMIC_ENV = (
 _FORCE_DENSE_CACHED = os.environ.get("VLLM_SPARSE_FORCE_DENSE", "0") == "1"
 _FORCE_COMPACT_OFF_CACHED = os.environ.get("VLLM_SPARSE_FORCE_COMPACT_OFF", "0") == "1"
 _RELEASE_ON_IDLE_CACHED = os.environ.get("VLLM_SPARSE_RELEASE_ON_IDLE", "1") == "1"
-# Robust mode: demote not-compact-ready one-shot decode rows to dense full-KV
-# instead of raising "compact_ready before replay". Default ON (1).
-_ONE_SHOT_BLOCKED_DENSE_FALLBACK_CACHED = (
-    os.environ.get("VLLM_SPARSE_ONE_SHOT_BLOCKED_DENSE_FALLBACK", "1") == "1"
-)
 
 # ---------------------------------------------------------------------------
 # Rebuild / gather hot-path knobs

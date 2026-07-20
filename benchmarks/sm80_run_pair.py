@@ -136,6 +136,9 @@ REMOTE_SELECTOR_ADAPTIVE_OVERRIDE_ENVS = (
 # identity.
 SPEED_CHILD_PAIRING_IDENTITY_ENV_KEYS = (
     "VLLM_SOURCE_ROOT",
+    "VLLM_ALLREDUCE_USE_FLASHINFER",
+    "VLLM_ALLREDUCE_USE_SYMM_MEM",
+    "VLLM_USE_NCCL_SYMM_MEM",
     "VLLM_SPARSE_FULL_CUDAGRAPH_REPLAY_REFRESH_BATCHED_FLUSH",
     "VLLM_SPARSE_FULL_CUDAGRAPH_REPLAY_REFRESH_DEFER_TO_DEADLINE",
     "VLLM_SPARSE_REFRESH_REBUILD_MAX_DELAY_STEPS",
@@ -161,6 +164,7 @@ STAGE_A_SOURCE_SUMMARY_KEYS = (
 STAGE_A_SOURCE_COUNTER_SCHEMA_VERSION = 1
 STAGE_A_ROW_SOURCE_KEYS = (
     "compact_rows",
+    "native_canonical_pages",
     "compact_rows_with_reserved_pages",
     "compact_rows_with_recent_pages",
     "compact_reserved_pages",
@@ -169,7 +173,7 @@ STAGE_A_ROW_SOURCE_KEYS = (
     "native_rows",
     "compact_full_native_fallback_rows",
 )
-LEGACY_MIDDLE_NATIVE_CANONICAL_KEY = "native_canonical_pages"
+NATIVE_CANONICAL_PAGES_KEY = "native_canonical_pages"
 
 
 @dataclass(frozen=True)
@@ -295,12 +299,9 @@ def validate_shared_route_proof(summary: Mapping[str, Any]) -> RouteProofResult:
         reasons.append("recent_canonical_pages_nonpositive")
     if _as_int(row_sources.get("compact_full_native_fallback_rows")) != 0:
         reasons.append("compact_full_native_fallback_rows_nonzero")
-    if (
-        LEGACY_MIDDLE_NATIVE_CANONICAL_KEY in row_sources
-        and _as_int(row_sources.get(LEGACY_MIDDLE_NATIVE_CANONICAL_KEY)) != 0
-    ):
+    if _as_int(row_sources.get(NATIVE_CANONICAL_PAGES_KEY)) != 0:
         reasons.append("native_canonical_pages_nonzero")
-    if _middle_native_canonical_pages(row_sources) != 0:
+    if _as_int(row_sources.get("middle_native_canonical_pages")) != 0:
         reasons.append("middle_native_canonical_pages_nonzero")
     for key in NATIVE_ROW_SOURCE_KEYS:
         if _as_int(row_sources.get(key)) != 0:
@@ -424,12 +425,6 @@ def _string_list(value: Any) -> tuple[str, ...]:
     if not isinstance(value, (list, tuple)):
         return ()
     return tuple(str(item) for item in value if str(item))
-
-
-def _middle_native_canonical_pages(row_sources: Mapping[str, Any]) -> int:
-    if "middle_native_canonical_pages" in row_sources:
-        return _as_int(row_sources.get("middle_native_canonical_pages"))
-    return _as_int(row_sources.get(LEGACY_MIDDLE_NATIVE_CANONICAL_KEY))
 
 
 def _as_int(value: Any) -> int:

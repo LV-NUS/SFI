@@ -75,19 +75,14 @@ class CaptureArenaIntent(str, Enum):
 
 class ArenaReservationStatus(str, Enum):
     MISSING = "missing"
-    PENDING = "pending"
     READY = "ready"
     FAILED = "failed"
-    STALE = "stale"
 
 
 class ArenaBindStatus(str, Enum):
     PREPARED_BIND = "prepared_bind"
     SYNC_EXPANSION_MISS = "sync_expansion_miss"
-    ASYNC_WAIT_MISS = "async_wait_miss"
-    BRIDGE_FUNCTIONAL_FALLBACK = "bridge_functional_fallback"
     DIAGNOSTIC_FAIL = "diagnostic_fail"
-    HIDDEN_CONTENTION_MISS = "hidden_contention_miss"
     ARENA_BUDGET_EXCEEDED = "arena_budget_exceeded"
 
 
@@ -166,9 +161,6 @@ class ArenaMetrics:
     hot_path_d2h_count: int = 0
     hot_path_cuda_sync_count: int = 0
     tail_path_item_cpu_count: int = 0
-    bridge_fallback_count: int = 0
-    bridged_token_count: int = 0
-    hidden_contention_miss: bool = False
     arena_ready_before_tail: bool = False
     arena_prepare_wait_us: float = 0.0
     arena_bind_status: str = ""
@@ -189,9 +181,6 @@ class ArenaMetrics:
             "hot_path_d2h_count": int(self.hot_path_d2h_count),
             "hot_path_cuda_sync_count": int(self.hot_path_cuda_sync_count),
             "tail_path_item_cpu_count": int(self.tail_path_item_cpu_count),
-            "bridge_fallback_count": int(self.bridge_fallback_count),
-            "bridged_token_count": int(self.bridged_token_count),
-            "hidden_contention_miss": bool(self.hidden_contention_miss),
             "arena_ready_before_tail": bool(self.arena_ready_before_tail),
             "arena_prepare_wait_us": float(self.arena_prepare_wait_us),
             "arena_bind_status": str(self.arena_bind_status),
