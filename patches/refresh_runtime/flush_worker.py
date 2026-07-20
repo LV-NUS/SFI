@@ -31,7 +31,10 @@ from patches.refresh_runtime.producer_workspace import (
     build_refresh_producer_work_item,
     get_refresh_producer_workspace,
 )
-from patches.sparse_types import SelectorBatchPayload
+from patches.sparse_types import (
+    ASYNC_PRODUCER_GPU_PROFILE_STAGES,
+    SelectorBatchPayload,
+)
 from patches.sparse_utils import _submission_slot_owner_snapshot
 
 
@@ -607,10 +610,8 @@ def flush_prefill_batches_impl(
             if not any(payloads_in for payloads_in in payload_groups):
                 return
             record_ptr_set: Set[int] = set()
-            record_tensors = 0
 
             def _record(t: Optional[torch.Tensor]) -> None:
-                nonlocal record_tensors
                 if not isinstance(t, torch.Tensor):
                     return
                 try:
@@ -630,7 +631,6 @@ def flush_prefill_batches_impl(
                     _log.warning("record_stream: t.record_stream() failed", exc_info=True)
                     raise
                 record_ptr_set.add(ptr)
-                record_tensors += 1
 
             for payloads_in in payload_groups:
                 for payload in payloads_in:
@@ -3155,48 +3155,12 @@ def flush_prefill_batches_impl(
                     refresh_selector_bounds_evt1=prof.refresh_selector_bounds_evt1,
                     refresh_selector_pipeline_evt0=prof.refresh_selector_pipeline_evt0,
                     refresh_selector_pipeline_evt1=prof.refresh_selector_pipeline_evt1,
-                    async_producer_body_evt_pairs=tuple(
-                        prof.async_producer_body_evt_pairs
-                    ),
-                    async_producer_selector_evt_pairs=tuple(
-                        prof.async_producer_selector_evt_pairs
-                    ),
-                    async_producer_writer_evt_pairs=tuple(
-                        prof.async_producer_writer_evt_pairs
-                    ),
-                    async_producer_seq_full_evt_pairs=tuple(
-                        prof.async_producer_seq_full_evt_pairs
-                    ),
-                    async_producer_pure_preproc_evt_pairs=tuple(
-                        prof.async_producer_pure_preproc_evt_pairs
-                    ),
-                    async_producer_selector_bounds_evt_pairs=tuple(
-                        prof.async_producer_selector_bounds_evt_pairs
-                    ),
-                    async_producer_selector_pipeline_evt_pairs=tuple(
-                        prof.async_producer_selector_pipeline_evt_pairs
-                    ),
-                    async_producer_key_norms_preproc_evt_pairs=tuple(
-                        prof.async_producer_key_norms_preproc_evt_pairs
-                    ),
-                    async_producer_key_norms_evt_pairs=tuple(
-                        prof.async_producer_key_norms_evt_pairs
-                    ),
-                    async_producer_key_norms_h2d_evt_pairs=tuple(
-                        prof.async_producer_key_norms_h2d_evt_pairs
-                    ),
-                    async_producer_key_norms_delta_evt_pairs=tuple(
-                        prof.async_producer_key_norms_delta_evt_pairs
-                    ),
-                    async_producer_key_norms_pack_evt_pairs=tuple(
-                        prof.async_producer_key_norms_pack_evt_pairs
-                    ),
-                    async_producer_log_s_evt_pairs=tuple(
-                        prof.async_producer_log_s_evt_pairs
-                    ),
-                    async_producer_topk_evt_pairs=tuple(
-                        prof.async_producer_topk_evt_pairs
-                    ),
+                    **{
+                        f"async_producer_{stage}_evt_pairs": tuple(
+                            getattr(prof, f"async_producer_{stage}_evt_pairs")
+                        )
+                        for stage in ASYNC_PRODUCER_GPU_PROFILE_STAGES
+                    },
                     rebuild_head_dim=int(prof.rebuild_head_dim),
                     rebuild_kv_dtype=str(prof.rebuild_kv_dtype),
                     rebuild_block_size=int(prof.rebuild_block_size),
@@ -3877,14 +3841,6 @@ def flush_prefill_batches_impl(
                             ] = float(done_since_start_ms)
                     return fields
 
-                drain_async_gpu_events = getattr(
-                    self,
-                    "_drain_deadline_async_producer_gpu_profile_events",
-                    None,
-                )
-                if callable(drain_async_gpu_events):
-                    drain_async_gpu_events()
-
                 record = {
                     "pid": int(os.getpid()),
                     "ctrl_step": int(getattr(self, "step", -1)),
@@ -4082,48 +4038,12 @@ def flush_prefill_batches_impl(
                         prof.refresh_selector_pipeline_evt0,
                         prof.refresh_selector_pipeline_evt1,
                     ),
-                    "async_producer_body_gpu_ms": _evt_pairs_ms(
-                        prof.async_producer_body_evt_pairs
-                    ),
-                    "async_producer_selector_gpu_ms": _evt_pairs_ms(
-                        prof.async_producer_selector_evt_pairs
-                    ),
-                    "async_producer_writer_gpu_ms": _evt_pairs_ms(
-                        prof.async_producer_writer_evt_pairs
-                    ),
-                    "async_producer_seq_full_gpu_ms": _evt_pairs_ms(
-                        prof.async_producer_seq_full_evt_pairs
-                    ),
-                    "async_producer_pure_preproc_gpu_ms": _evt_pairs_ms(
-                        prof.async_producer_pure_preproc_evt_pairs
-                    ),
-                    "async_producer_selector_bounds_gpu_ms": _evt_pairs_ms(
-                        prof.async_producer_selector_bounds_evt_pairs
-                    ),
-                    "async_producer_selector_pipeline_gpu_ms": _evt_pairs_ms(
-                        prof.async_producer_selector_pipeline_evt_pairs
-                    ),
-                    "async_producer_key_norms_preproc_gpu_ms": _evt_pairs_ms(
-                        prof.async_producer_key_norms_preproc_evt_pairs
-                    ),
-                    "async_producer_key_norms_gpu_ms": _evt_pairs_ms(
-                        prof.async_producer_key_norms_evt_pairs
-                    ),
-                    "async_producer_key_norms_h2d_gpu_ms": _evt_pairs_ms(
-                        prof.async_producer_key_norms_h2d_evt_pairs
-                    ),
-                    "async_producer_key_norms_delta_gpu_ms": _evt_pairs_ms(
-                        prof.async_producer_key_norms_delta_evt_pairs
-                    ),
-                    "async_producer_key_norms_pack_gpu_ms": _evt_pairs_ms(
-                        prof.async_producer_key_norms_pack_evt_pairs
-                    ),
-                    "async_producer_log_s_gpu_ms": _evt_pairs_ms(
-                        prof.async_producer_log_s_evt_pairs
-                    ),
-                    "async_producer_topk_gpu_ms": _evt_pairs_ms(
-                        prof.async_producer_topk_evt_pairs
-                    ),
+                    **{
+                        f"async_producer_{stage}_gpu_ms": _evt_pairs_ms(
+                            getattr(prof, f"async_producer_{stage}_evt_pairs")
+                        )
+                        for stage in ASYNC_PRODUCER_GPU_PROFILE_STAGES
+                    },
                     "rebuild_head_dim": int(prof.rebuild_head_dim),
                     "rebuild_kv_dtype": str(prof.rebuild_kv_dtype),
                     "rebuild_block_size": int(prof.rebuild_block_size),
@@ -4497,43 +4417,6 @@ def flush_prefill_batches_impl(
                     "refresh_overlap_old_k": prof.refresh_overlap_old_k,
                     "note": "sync_profile_debug_only",
                 }
-                for stage in (
-                    "body",
-                    "selector",
-                    "writer",
-                    "seq_full",
-                    "pure_preproc",
-                    "selector_bounds",
-                    "selector_pipeline",
-                    "key_norms_preproc",
-                    "key_norms",
-                    "key_norms_h2d",
-                    "key_norms_delta",
-                    "key_norms_pack",
-                    "log_s",
-                    "topk",
-                ):
-                    record[f"deadline_async_producer_{stage}_gpu_count"] = int(
-                        getattr(
-                            self,
-                            f"_deadline_async_producer_{stage}_gpu_count",
-                            0,
-                        )
-                    )
-                    record[f"deadline_async_producer_{stage}_gpu_ms_total"] = float(
-                        getattr(
-                            self,
-                            f"_deadline_async_producer_{stage}_gpu_ms_total",
-                            0.0,
-                        )
-                    )
-                    record[f"deadline_async_producer_{stage}_gpu_ms_max"] = float(
-                        getattr(
-                            self,
-                            f"_deadline_async_producer_{stage}_gpu_ms_max",
-                            0.0,
-                        )
-                    )
                 # [LITE-P0 J3 仪器 2026-07-11] SIG_RETURN 臂命中/降级计数快照
                 # ——J1 红案取证发现 DecodeRuntimeCounters 全族均无遥测通道
                 # ("计数恒 0"实为无此键假象)。record 为 dict,此处直塞与既有

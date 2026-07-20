@@ -41,7 +41,10 @@ from patches.sparse_constants import (
     _STEP_PROFILE_EVERY_CACHED,
     _STEP_PROFILE_LOG_CACHED,
 )
-from patches.sparse_types import _RefreshProfilePending
+from patches.sparse_types import (
+    ASYNC_PRODUCER_GPU_PROFILE_STAGES,
+    _RefreshProfilePending,
+)
 from patches.request_intent_ticket import pending_reason_code_to_text
 
 if TYPE_CHECKING:
@@ -77,8 +80,6 @@ class ProfileMixin:
         self._step_profile_refresh_noop_empty: int = 0
         self._step_profile_refresh_payload_none: int = 0
         self._step_profile_refresh_slot_empty: int = 0
-        self._step_profile_local_pack_mix: int = 0
-        self._step_profile_local_pack_refresh_dynamic: int = 0
         # detail trace（仅在 STEP_PROFILE_DETAIL=1 时写出）
         self._step_profile_req_ids: Tuple[str, ...] = tuple()
         self._step_profile_refresh_req_ids: Tuple[str, ...] = tuple()
@@ -201,8 +202,6 @@ class ProfileMixin:
         self._step_profile_refresh_noop_empty = 0
         self._step_profile_refresh_payload_none = 0
         self._step_profile_refresh_slot_empty = 0
-        self._step_profile_local_pack_mix = 0
-        self._step_profile_local_pack_refresh_dynamic = 0
         self._step_profile_req_ids = tuple()
         self._step_profile_refresh_req_ids = tuple()
         self._step_profile_refresh_rows = tuple()
@@ -332,14 +331,6 @@ class ProfileMixin:
         elif kind == "empty_slots":
             self._step_profile_refresh_slot_empty += 1
 
-    def _step_profile_record_local_pack(self, kind: str) -> None:
-        if not self._step_profile_enabled():
-            return
-        if kind == "mix":
-            self._step_profile_local_pack_mix += 1
-        elif kind == "refresh_dynamic":
-            self._step_profile_local_pack_refresh_dynamic += 1
-
     def _step_profile_end_if_needed(self, *, epoch: int) -> None:
         if not self._step_profile_enabled():
             return
@@ -377,10 +368,6 @@ class ProfileMixin:
             "refresh_noop_empty": int(self._step_profile_refresh_noop_empty),
             "refresh_payload_none": int(self._step_profile_refresh_payload_none),
             "refresh_slot_empty": int(self._step_profile_refresh_slot_empty),
-            "local_pack_mix": int(self._step_profile_local_pack_mix),
-            "local_pack_refresh_dynamic": int(
-                self._step_profile_local_pack_refresh_dynamic
-            ),
             "sentence_trigger_admission_coalesced_total": int(
                 getattr(self, "_sentence_trigger_admission_coalesced_total", 0)
             ),
@@ -612,14 +599,6 @@ class ProfileMixin:
                         done_since_start_ms
                     )
             return fields
-
-        drain_async_gpu_events = getattr(
-            self,
-            "_drain_deadline_async_producer_gpu_profile_events",
-            None,
-        )
-        if callable(drain_async_gpu_events):
-            drain_async_gpu_events()
 
         selector_log_f_route = self._selector_log_f_reduce_route_snapshot()
         record = {
@@ -875,48 +854,12 @@ class ProfileMixin:
                 pending.refresh_selector_pipeline_evt0,
                 pending.refresh_selector_pipeline_evt1,
             ),
-            "async_producer_body_gpu_ms": _evt_pairs_ms(
-                pending.async_producer_body_evt_pairs
-            ),
-            "async_producer_selector_gpu_ms": _evt_pairs_ms(
-                pending.async_producer_selector_evt_pairs
-            ),
-            "async_producer_writer_gpu_ms": _evt_pairs_ms(
-                pending.async_producer_writer_evt_pairs
-            ),
-            "async_producer_seq_full_gpu_ms": _evt_pairs_ms(
-                pending.async_producer_seq_full_evt_pairs
-            ),
-            "async_producer_pure_preproc_gpu_ms": _evt_pairs_ms(
-                pending.async_producer_pure_preproc_evt_pairs
-            ),
-            "async_producer_selector_bounds_gpu_ms": _evt_pairs_ms(
-                pending.async_producer_selector_bounds_evt_pairs
-            ),
-            "async_producer_selector_pipeline_gpu_ms": _evt_pairs_ms(
-                pending.async_producer_selector_pipeline_evt_pairs
-            ),
-            "async_producer_key_norms_preproc_gpu_ms": _evt_pairs_ms(
-                pending.async_producer_key_norms_preproc_evt_pairs
-            ),
-            "async_producer_key_norms_gpu_ms": _evt_pairs_ms(
-                pending.async_producer_key_norms_evt_pairs
-            ),
-            "async_producer_key_norms_h2d_gpu_ms": _evt_pairs_ms(
-                pending.async_producer_key_norms_h2d_evt_pairs
-            ),
-            "async_producer_key_norms_delta_gpu_ms": _evt_pairs_ms(
-                pending.async_producer_key_norms_delta_evt_pairs
-            ),
-            "async_producer_key_norms_pack_gpu_ms": _evt_pairs_ms(
-                pending.async_producer_key_norms_pack_evt_pairs
-            ),
-            "async_producer_log_s_gpu_ms": _evt_pairs_ms(
-                pending.async_producer_log_s_evt_pairs
-            ),
-            "async_producer_topk_gpu_ms": _evt_pairs_ms(
-                pending.async_producer_topk_evt_pairs
-            ),
+            **{
+                f"async_producer_{stage}_gpu_ms": _evt_pairs_ms(
+                    getattr(pending, f"async_producer_{stage}_evt_pairs")
+                )
+                for stage in ASYNC_PRODUCER_GPU_PROFILE_STAGES
+            },
             "rebuild_head_dim": int(pending.rebuild_head_dim or 0),
             "rebuild_kv_dtype": str(pending.rebuild_kv_dtype or ""),
             "rebuild_block_size": int(pending.rebuild_block_size or 0),
@@ -1274,31 +1217,6 @@ class ProfileMixin:
                 else None
             ),
         }
-        for stage in (
-            "body",
-            "selector",
-            "writer",
-            "seq_full",
-            "pure_preproc",
-            "selector_bounds",
-            "selector_pipeline",
-            "key_norms_preproc",
-            "key_norms",
-            "key_norms_h2d",
-            "key_norms_delta",
-            "key_norms_pack",
-            "log_s",
-            "topk",
-        ):
-            record[f"deadline_async_producer_{stage}_gpu_count"] = int(
-                getattr(self, f"_deadline_async_producer_{stage}_gpu_count", 0)
-            )
-            record[f"deadline_async_producer_{stage}_gpu_ms_total"] = float(
-                getattr(self, f"_deadline_async_producer_{stage}_gpu_ms_total", 0.0)
-            )
-            record[f"deadline_async_producer_{stage}_gpu_ms_max"] = float(
-                getattr(self, f"_deadline_async_producer_{stage}_gpu_ms_max", 0.0)
-            )
         # [SELECTED-OUT-RING v2] graph 接管判据仪器:selector topk graph 的
         # replay/capture 累计与环的 acquire/spill 计数(附加字段,消费端按
         # 键读不受影响)。

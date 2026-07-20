@@ -33,7 +33,6 @@ from benchmarks.bench_sm80_mixed_page_full_cudagraph_phase1 import (
     _build_env as _build_phase1_env,
     _build_smoke_command,
     _classify_failure,
-    _canonical_output_records,
     _default_decode_metrics_path,
     _default_dense_outputs_path,
     _default_route_trace_path,
@@ -66,6 +65,7 @@ from benchmarks.decode_throughput_window import (
 )
 from utils.selector_cache_identity import selector_cache_abi_key_for_python
 from utils.model_kv_contract import MODEL_KV_CONTRACT_SCHEMA
+from patches.sparse_types import ASYNC_PRODUCER_GPU_PROFILE_STAGES
 from benchmarks.sm80_run_pair import (
     ALLOWED_TRACE_ENV_KEYS,
     FULL_CUDAGRAPH_HOOK_PROFILE_ENV_KEY,
@@ -105,6 +105,12 @@ DEFERRED_BRIDGE_ENV_KEYS = (
     "VLLM_SPARSE_DEFERRED_PRODUCER_GROUPS_PER_STEP",
 )
 SELECTOR_PIPELINE_ARTIFACT_PREFIX = "SFI_SELECTOR_PIPELINE_ARTIFACT="
+
+SELECTOR_GPU_PROFILE_STAGES = tuple(
+    stage
+    for stage in ASYNC_PRODUCER_GPU_PROFILE_STAGES
+    if stage not in {"body", "writer"}
+)
 
 
 SELECTOR_PIPELINE_CPU_PROFILE_ENV_KEYS = (
@@ -1694,15 +1700,6 @@ def _build_sparse_speed_command(
     return command
 
 
-def _semantic_sparse_outputs_path(
-    args: argparse.Namespace,
-    *,
-    speed_outputs_path: Path,
-    diagnostic_outputs_path: Path | None,
-) -> Path:
-    return speed_outputs_path
-
-
 def _build_no_eos_diagnostic_command(args: argparse.Namespace) -> list[str]:
     command = [
         str(args.python),
@@ -2041,7 +2038,7 @@ def _copy_sparse_metadata_profile_env_for_diagnostic(env: dict[str, str]) -> Non
         # (deadline_deferred_selector_* 计数族;同上须回填,env 关=count 恒 0)。
         "VLLM_SPARSE_DEFERRED_SELECTOR_PROFILE_DETAIL",
         # [S7-FORENSIC 2026-07-10] off-loop body 内 GPU 事件段时长
-        # (deadline_async_producer_*@gpu 族;同上须回填)。
+        # (async_producer_*_gpu_ms direct event-pair schema;同上须回填)。
         "VLLM_SPARSE_ASYNC_PRODUCER_GPU_PROFILE",
     ):
         value = os.environ.get(key, "").strip()
@@ -2154,10 +2151,6 @@ def _gate_d_backend(args: argparse.Namespace) -> str:
 
 def _gate_d_flash_attn_version(args: argparse.Namespace) -> str:
     return "4" if _gate_d_backend(args) == BACKEND_FA4_SM100 else "3"
-
-
-def _gate_d_backend_label(args: argparse.Namespace) -> str:
-    return "fa4_sm100" if _gate_d_backend(args) == BACKEND_FA4_SM100 else "fa3"
 
 
 def _resolve_gate_d_backend_artifact(args: argparse.Namespace) -> Path | None:
@@ -3269,9 +3262,7 @@ def _expected_interval_trigger_intents(
 
 def _interval_trigger_requirement_satisfied(
     *,
-    producer_mode: str,
     expected_interval_trigger_intents: int,
-    interval_trigger_intents: int,
     refresh_trigger_intents: int,
 ) -> bool:
     # [INTERVAL-GATE-DYNAMIC 2026-07-07 口径变更] interval 是兜底节拍：任何
@@ -3284,7 +3275,6 @@ def _interval_trigger_requirement_satisfied(
     # sentence 重置语义下系统性误报红（4B 实测），故退休。
     if int(expected_interval_trigger_intents) <= 0:
         return True
-    del producer_mode, interval_trigger_intents  # 保留签名（观测字段照旧输出）
     return int(refresh_trigger_intents) >= int(expected_interval_trigger_intents)
 
 
@@ -5281,9 +5271,7 @@ def _gate_d_payload(
     )
     refresh_trigger_intents = sum(refresh_reason_counts.values())
     interval_trigger_requirement_ok = _interval_trigger_requirement_satisfied(
-        producer_mode=producer_mode,
         expected_interval_trigger_intents=expected_interval_trigger_intents,
-        interval_trigger_intents=interval_trigger_intents,
         refresh_trigger_intents=refresh_trigger_intents,
     )
     sentence_trigger_intents = _counter_int_from_all_sources(
@@ -6485,11 +6473,7 @@ def _run_gate_d_mode(args: argparse.Namespace) -> int:
     ):
         assert dense_reference_metrics_path is not None
         assert dense_reference_outputs_path is not None
-        sparse_reference_outputs_path = _semantic_sparse_outputs_path(
-            args,
-            speed_outputs_path=outputs_path,
-            diagnostic_outputs_path=diag_outputs_path,
-        )
+        sparse_reference_outputs_path = outputs_path
         sparse_output_records = _request_ordered_output_records(
             sparse_reference_outputs_path
         )
@@ -8704,7 +8688,6 @@ def _deadline_v2_resolve_selector_next_action(
     *,
     largest_component: str,
     largest_pure_preproc_component: str,
-    largest_key_norms_component: str,
     key_norms_next_action: str,
     largest_deferred_selector_cpu_component: str = "unmeasured",
     deferred_selector_cpu_next_action: str = "enable_deferred_selector_profile_detail",
@@ -8726,39 +8709,25 @@ def _deadline_v2_selector_compute_breakdown(
     refresh_profile: list[dict[str, Any]],
     selector_pipeline_cpu_profile: list[dict[str, Any]] | None = None,
 ) -> dict[str, object]:
-    def _avg_with_async_refresh(
-        primary: str,
-        async_field: str,
-    ) -> float:
-        value = _refresh_work_item_avg(refresh_profile, primary)
-        if value >= 0.0:
-            return value
-        return _refresh_work_item_avg(refresh_profile, async_field)
+    stage_gpu_ms: dict[str, float] = {}
+    for stage in SELECTOR_GPU_PROFILE_STAGES:
+        value = _refresh_work_item_avg(
+            refresh_profile,
+            f"refresh_{stage}_gpu_ms",
+        )
+        if value < 0.0:
+            value = _refresh_work_item_avg(
+                refresh_profile,
+                f"async_producer_{stage}_gpu_ms",
+            )
+        stage_gpu_ms[stage] = value
 
-    selector_gpu_ms = _avg_with_async_refresh(
-        "refresh_selector_gpu_ms",
-        "async_producer_selector_gpu_ms",
-    )
-    key_norms_gpu_ms = _avg_with_async_refresh(
-        "refresh_key_norms_gpu_ms",
-        "async_producer_key_norms_gpu_ms",
-    )
-    key_norms_preproc_gpu_ms = _avg_with_async_refresh(
-        "refresh_key_norms_preproc_gpu_ms",
-        "async_producer_key_norms_preproc_gpu_ms",
-    )
-    key_norms_h2d_gpu_ms = _avg_with_async_refresh(
-        "refresh_key_norms_h2d_gpu_ms",
-        "async_producer_key_norms_h2d_gpu_ms",
-    )
-    key_norms_delta_gpu_ms = _avg_with_async_refresh(
-        "refresh_key_norms_delta_gpu_ms",
-        "async_producer_key_norms_delta_gpu_ms",
-    )
-    key_norms_pack_gpu_ms = _avg_with_async_refresh(
-        "refresh_key_norms_pack_gpu_ms",
-        "async_producer_key_norms_pack_gpu_ms",
-    )
+    selector_gpu_ms = stage_gpu_ms["selector"]
+    key_norms_gpu_ms = stage_gpu_ms["key_norms"]
+    key_norms_preproc_gpu_ms = stage_gpu_ms["key_norms_preproc"]
+    key_norms_h2d_gpu_ms = stage_gpu_ms["key_norms_h2d"]
+    key_norms_delta_gpu_ms = stage_gpu_ms["key_norms_delta"]
+    key_norms_pack_gpu_ms = stage_gpu_ms["key_norms_pack"]
     key_norms_delta_total_tokens_avg = _deadline_async_producer_counter_avg(
         refresh_profile,
         "deadline_async_producer_key_norms_delta_total_tokens_total",
@@ -8852,36 +8821,12 @@ def _deadline_v2_selector_compute_breakdown(
         if key_norms_envelope_residual_ms >= 0.0 and key_norms_cpu_ms >= 0.0
         else -1.0
     )
-    pure_preproc_gpu_ms = _avg_with_async_refresh(
-        "refresh_pure_preproc_gpu_ms",
-        "async_producer_pure_preproc_gpu_ms",
-        "pure_preproc",
-    )
-    selector_bounds_gpu_ms = _avg_with_async_refresh(
-        "refresh_selector_bounds_gpu_ms",
-        "async_producer_selector_bounds_gpu_ms",
-        "selector_bounds",
-    )
-    selector_pipeline_gpu_ms = _avg_with_async_refresh(
-        "refresh_selector_pipeline_gpu_ms",
-        "async_producer_selector_pipeline_gpu_ms",
-        "selector_pipeline",
-    )
-    seq_full_gpu_ms = _avg_with_async_refresh(
-        "refresh_seq_full_gpu_ms",
-        "async_producer_seq_full_gpu_ms",
-        "seq_full",
-    )
-    log_s_gpu_ms = _avg_with_async_refresh(
-        "refresh_log_s_gpu_ms",
-        "async_producer_log_s_gpu_ms",
-        "log_s",
-    )
-    topk_gpu_ms = _avg_with_async_refresh(
-        "refresh_topk_gpu_ms",
-        "async_producer_topk_gpu_ms",
-        "topk",
-    )
+    pure_preproc_gpu_ms = stage_gpu_ms["pure_preproc"]
+    selector_bounds_gpu_ms = stage_gpu_ms["selector_bounds"]
+    selector_pipeline_gpu_ms = stage_gpu_ms["selector_pipeline"]
+    seq_full_gpu_ms = stage_gpu_ms["seq_full"]
+    log_s_gpu_ms = stage_gpu_ms["log_s"]
+    topk_gpu_ms = stage_gpu_ms["topk"]
     gather_gpu_ms = _refresh_work_item_avg(refresh_profile, "refresh_gather_gpu_ms")
     rebuild_gpu_ms = _refresh_work_item_avg(refresh_profile, "refresh_rebuild_gpu_ms")
     components = {
@@ -9106,7 +9051,6 @@ def _deadline_v2_selector_compute_breakdown(
         "next_action": _deadline_v2_resolve_selector_next_action(
             largest_component=largest_component,
             largest_pure_preproc_component=largest_pure_preproc_component,
-            largest_key_norms_component=largest_key_norms_component,
             key_norms_next_action=key_norms_next_action,
             largest_deferred_selector_cpu_component=(
                 largest_deferred_selector_cpu_component
@@ -9433,22 +9377,6 @@ def _deadline_v2_attribution_summary(
     async_producer_result_precomputed_count = _max_int_from_records(
         refresh_profile,
         "deadline_async_producer_result_precomputed_count",
-    )
-    async_producer_split_release_forced_count = _max_int_from_records(
-        refresh_profile,
-        "deadline_async_producer_split_release_forced_count",
-    )
-    async_producer_split_release_adaptive_count = _max_int_from_records(
-        refresh_profile,
-        "deadline_async_producer_split_release_adaptive_count",
-    )
-    async_producer_split_release_adaptive_gated_count = _max_int_from_records(
-        refresh_profile,
-        "deadline_async_producer_split_release_adaptive_gated_count",
-    )
-    async_producer_split_release_adaptive_layer_gated_count = _max_int_from_records(
-        refresh_profile,
-        "deadline_async_producer_split_release_adaptive_layer_gated_count",
     )
     async_producer_body_gap_total_us = -1.0
     async_producer_body_gap_avg_us = -1.0
@@ -9839,18 +9767,6 @@ def _deadline_v2_attribution_summary(
         "async_producer_writer_count": int(async_producer_writer_count),
         "async_producer_writer_avg_ms": _ms_from_us(async_producer_writer_avg_us),
         "async_producer_writer_max_ms": _ms_from_us(async_producer_writer_max_us),
-        "async_producer_split_release_forced_count": int(
-            async_producer_split_release_forced_count
-        ),
-        "async_producer_split_release_adaptive_count": int(
-            async_producer_split_release_adaptive_count
-        ),
-        "async_producer_split_release_adaptive_gated_count": int(
-            async_producer_split_release_adaptive_gated_count
-        ),
-        "async_producer_split_release_adaptive_layer_gated_count": int(
-            async_producer_split_release_adaptive_layer_gated_count
-        ),
         "async_producer_body_gpu_ms": float(async_producer_body_gpu_ms),
         "async_producer_selector_gpu_ms": float(async_producer_selector_gpu_ms),
         "async_producer_writer_gpu_ms": float(async_producer_writer_gpu_ms),
@@ -10479,29 +10395,6 @@ def _counter_int_from_sources(
         return _as_int(route_summary.get(key), -1)
     total = _sum_int(refresh_profile, key)
     return total if total > 0 else -1
-
-
-def _bitwise_or_int_from_sources(
-    metrics: dict[str, Any],
-    refresh_profile: list[dict[str, Any]],
-    route_summary: dict[str, object],
-    key: str,
-) -> int:
-    if key in metrics:
-        return _as_int(metrics.get(key), -1)
-    if key in route_summary:
-        return _as_int(route_summary.get(key), -1)
-    found = False
-    mask = 0
-    for record in refresh_profile:
-        if key not in record:
-            continue
-        value = _as_int(record.get(key), -1)
-        if value < 0:
-            continue
-        found = True
-        mask |= int(value)
-    return int(mask) if found else -1
 
 
 def _counter_int_from_all_sources(
@@ -11406,9 +11299,7 @@ def _record_from_result(
         else continuous_refresh_reqs == 0
     )
     interval_trigger_requirement_ok = _interval_trigger_requirement_satisfied(
-        producer_mode=producer_mode,
         expected_interval_trigger_intents=expected_interval_trigger_intents,
-        interval_trigger_intents=interval_trigger_intents,
         refresh_trigger_intents=refresh_trigger_intents,
     )
     sentence_requirement_ok = (

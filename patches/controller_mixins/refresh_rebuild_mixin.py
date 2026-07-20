@@ -44,10 +44,10 @@ from patches.request_intent_ticket import PendingPolicy, PendingReasonCode
 from patches.refresh_runtime.producer_workspace import (
     build_refresh_producer_work_item,
 )
+from patches.sparse_types import ASYNC_PRODUCER_GPU_PROFILE_STAGES
 from patches.selector_runtime.selected_out_ring import (
     SLOT_VALID_SET_ATTR,
     SelectedOutRing,
-    SelectedOutRingSlot,
     SlotStableOverrides,
 )
 from patches.sparse_constants import (
@@ -310,10 +310,6 @@ class RefreshRebuildMixin:
         self._writer_graph_capture_stream_obj: Optional[Any] = None
         self._writer_graph_capture_stream_device: Optional[torch.device] = None
         self._deadline_async_producer_result_precomputed_count: int = 0
-        self._deadline_async_producer_split_release_forced_count: int = 0
-        self._deadline_async_producer_split_release_adaptive_count: int = 0
-        self._deadline_async_producer_split_release_adaptive_gated_count: int = 0
-        self._deadline_async_producer_split_release_adaptive_layer_gated_count: int = 0
         self._pending_refresh_grouped_async_records: Optional[
             List[Dict[str, Any]]
         ] = None
@@ -1235,64 +1231,6 @@ class RefreshRebuildMixin:
             # a trace I/O error must not invalidate completed producer work.
             return
         self._async_producer_writer_route_evidence_count = count
-
-    def _record_deadline_async_producer_gpu_event_pair(
-        self,
-        stage: str,
-        pair: object,
-    ) -> None:
-        if not self._refresh_profile_enabled():
-            return
-        try:
-            evt0, evt1 = pair  # type: ignore[misc]
-        except Exception:
-            return
-        if evt0 is None or evt1 is None:
-            return
-        pairs = getattr(self, "_deadline_async_producer_gpu_event_pairs", None)
-        if not isinstance(pairs, list):
-            pairs = []
-            self._deadline_async_producer_gpu_event_pairs = pairs
-        pairs.append((str(stage), evt0, evt1))
-
-    def _drain_deadline_async_producer_gpu_profile_events(self) -> None:
-        pairs = getattr(self, "_deadline_async_producer_gpu_event_pairs", None)
-        if not isinstance(pairs, list) or not pairs:
-            return
-        kept: List[Tuple[str, object, object]] = []
-        for stage, evt0, evt1 in pairs:
-            try:
-                ready0 = getattr(evt0, "query", None)
-                ready1 = getattr(evt1, "query", None)
-                if callable(ready0) and not bool(ready0()):
-                    kept.append((str(stage), evt0, evt1))
-                    continue
-                if callable(ready1) and not bool(ready1()):
-                    kept.append((str(stage), evt0, evt1))
-                    continue
-                elapsed_ms = max(0.0, float(evt0.elapsed_time(evt1)))
-            except Exception:
-                _log.warning(
-                    "async producer GPU profile event drain failed",
-                    exc_info=True,
-                )
-                kept.append((str(stage), evt0, evt1))
-                continue
-            count_name = f"_deadline_async_producer_{stage}_gpu_count"
-            total_name = f"_deadline_async_producer_{stage}_gpu_ms_total"
-            max_name = f"_deadline_async_producer_{stage}_gpu_ms_max"
-            setattr(self, count_name, int(getattr(self, count_name, 0)) + 1)
-            setattr(
-                self,
-                total_name,
-                float(getattr(self, total_name, 0.0)) + elapsed_ms,
-            )
-            setattr(
-                self,
-                max_name,
-                max(float(getattr(self, max_name, 0.0)), elapsed_ms),
-            )
-        self._deadline_async_producer_gpu_event_pairs = kept
 
     def _record_deadline_async_producer_count(self, name: str) -> None:
         if not self._refresh_profile_enabled():
@@ -2717,7 +2655,7 @@ class RefreshRebuildMixin:
                 with torch.cuda.device(device):
                     with torch.cuda.stream(self.refresh_stream), torch.inference_mode():
                         cur_stream = torch.cuda.current_stream(device=device)
-                        for record_index, record in enumerate(device_records):
+                        for record in device_records:
                             buf_ids = tuple(int(v) for v in record["buf_ids"])
                             for buf in buf_ids:
                                 cur_stream.wait_event(self.chunk_ready_evt[int(buf)])
@@ -2845,8 +2783,6 @@ class RefreshRebuildMixin:
         ):
             return False
         if not _REFRESH_PRODUCER_SPLIT_SELECTOR_WRITER_RELEASE_AUTO_CACHED:
-            if self._refresh_profile_enabled():
-                self._record_deadline_async_producer_count("split_release_forced")
             return True
         target_layer_start = int(target_layer_start)
         min_layer_start = int(
@@ -2855,10 +2791,6 @@ class RefreshRebuildMixin:
         if min_layer_start > 0 and (
             target_layer_start < 0 or target_layer_start < min_layer_start
         ):
-            if self._refresh_profile_enabled():
-                self._record_deadline_async_producer_count(
-                    "split_release_adaptive_layer_gated"
-                )
             return False
         counts = self._refresh_producer_split_release_counts_by_handle
         count = int(counts.get(release_after_handle_id, 0))
@@ -2866,18 +2798,12 @@ class RefreshRebuildMixin:
             _REFRESH_PRODUCER_SPLIT_SELECTOR_WRITER_RELEASE_MAX_PER_HANDLE_CACHED
         )
         if count >= max_per_handle:
-            if self._refresh_profile_enabled():
-                self._record_deadline_async_producer_count(
-                    "split_release_adaptive_gated"
-                )
             return False
         counts[release_after_handle_id] = count + 1
         self._refresh_producer_stream_release_pending = True
         self._refresh_producer_stream_release_generation = (
             int(self._refresh_producer_stream_release_generation) + 1
         )
-        if self._refresh_profile_enabled():
-            self._record_deadline_async_producer_count("split_release_adaptive")
         return True
 
     def _refresh_producer_register_writer_release(
@@ -3465,10 +3391,6 @@ class RefreshRebuildMixin:
                 int(v)
                 for v in (getattr(producer_carrier, "layer_indices", ()) or ())
             ]
-            target_layer_start = int(
-                getattr(producer_carrier, "target_layer_start", -1)
-            )
-            target_layer_end = int(getattr(producer_carrier, "target_layer_end", -1))
             pending_buf_ids = tuple(
                 int(v) % _CAPTURE_IN_FLIGHT
                 for v in (getattr(producer_carrier, "pending_buf_ids", ()) or ())
@@ -3512,8 +3434,6 @@ class RefreshRebuildMixin:
                     )
         else:
             layer_indices = []
-            target_layer_start = -1
-            target_layer_end = -1
         if capture_epoch < 0:
             capture_epoch = self.step_context_epoch
         if producer_carrier is None:
@@ -3527,8 +3447,6 @@ class RefreshRebuildMixin:
                 if layer_index < 0:
                     layer_index = int(payload_index)
                 layer_indices.append(layer_index)
-            target_layer_start = min(layer_indices) if layer_indices else -1
-            target_layer_end = max(layer_indices) if layer_indices else -1
             pending_buf_ids_list: List[int] = []
             map_layer = getattr(self, "_map_global_layer_to_capture_slot", None)
             if callable(map_layer):
@@ -3794,81 +3712,18 @@ class RefreshRebuildMixin:
                                 return
                             if evt0 is None or evt1 is None:
                                 return
-                            stage = field
-                            if stage.startswith("async_producer_"):
-                                stage = stage[len("async_producer_") :]
-                            if stage.endswith("_evt_pairs"):
-                                stage = stage[: -len("_evt_pairs")]
-                            self._record_deadline_async_producer_gpu_event_pair(
-                                stage,
-                                (evt0, evt1),
-                            )
                             if profile_accum is not None:
                                 getattr(profile_accum, field).append((evt0, evt1))
 
                         def _copy_selector_event_pairs(sel: object) -> None:
-                            for field, evt0_name, evt1_name in (
-                                (
-                                    "async_producer_seq_full_evt_pairs",
-                                    "profile_seq_full_evt0",
-                                    "profile_seq_full_evt1",
-                                ),
-                                (
-                                    "async_producer_pure_preproc_evt_pairs",
-                                    "profile_pure_preproc_evt0",
-                                    "profile_pure_preproc_evt1",
-                                ),
-                                (
-                                    "async_producer_selector_bounds_evt_pairs",
-                                    "profile_selector_bounds_evt0",
-                                    "profile_selector_bounds_evt1",
-                                ),
-                                (
-                                    "async_producer_selector_pipeline_evt_pairs",
-                                    "profile_selector_pipeline_evt0",
-                                    "profile_selector_pipeline_evt1",
-                                ),
-                                (
-                                    "async_producer_key_norms_preproc_evt_pairs",
-                                    "profile_key_norms_preproc_evt0",
-                                    "profile_key_norms_preproc_evt1",
-                                ),
-                                (
-                                    "async_producer_key_norms_evt_pairs",
-                                    "profile_key_norms_evt0",
-                                    "profile_key_norms_evt1",
-                                ),
-                                (
-                                    "async_producer_key_norms_h2d_evt_pairs",
-                                    "profile_key_norms_h2d_evt0",
-                                    "profile_key_norms_h2d_evt1",
-                                ),
-                                (
-                                    "async_producer_key_norms_delta_evt_pairs",
-                                    "profile_key_norms_delta_evt0",
-                                    "profile_key_norms_delta_evt1",
-                                ),
-                                (
-                                    "async_producer_key_norms_pack_evt_pairs",
-                                    "profile_key_norms_pack_evt0",
-                                    "profile_key_norms_pack_evt1",
-                                ),
-                                (
-                                    "async_producer_log_s_evt_pairs",
-                                    "profile_log_s_evt0",
-                                    "profile_log_s_evt1",
-                                ),
-                                (
-                                    "async_producer_topk_evt_pairs",
-                                    "profile_topk_evt0",
-                                    "profile_topk_evt1",
-                                ),
-                            ):
+                            for stage in ASYNC_PRODUCER_GPU_PROFILE_STAGES:
+                                if stage in {"body", "selector", "writer"}:
+                                    continue
                                 _append_async_evt_pair(
-                                    field,
+                                    f"async_producer_{stage}_evt_pairs",
                                     (
-                                        getattr(sel, evt0_name, None),
-                                        getattr(sel, evt1_name, None),
+                                        getattr(sel, f"profile_{stage}_evt0", None),
+                                        getattr(sel, f"profile_{stage}_evt1", None),
                                     ),
                                 )
                     else:
@@ -4898,7 +4753,7 @@ class RefreshRebuildMixin:
         layer_index = self.layer_index_by_cache_key.get(payload.cache_key, -1)
         if layer_index < 0:
             raise RuntimeError("refresh capture enqueue missing layer_index")
-        chunk_id, buf_id, slot_in_chunk = self._map_global_layer_to_capture_slot(layer_index)
+        _, buf_id, slot_in_chunk = self._map_global_layer_to_capture_slot(layer_index)
         if slot_in_chunk < 0 or slot_in_chunk >= _CAPTURE_CHUNK:
             raise RuntimeError("refresh capture enqueue slot_in_chunk out of range")
 

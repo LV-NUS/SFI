@@ -40,6 +40,27 @@ if TYPE_CHECKING:
 # Profile data types
 # ---------------------------------------------------------------------------
 
+# Single schema owner for CUDA event-pair fields shared by the async producer,
+# profile serializers, and cold attribution.  ``body`` and ``writer`` are
+# envelope-only stages; every other stage also has a ``refresh_*`` counterpart.
+ASYNC_PRODUCER_GPU_PROFILE_STAGES: Tuple[str, ...] = (
+    "body",
+    "selector",
+    "writer",
+    "seq_full",
+    "pure_preproc",
+    "selector_bounds",
+    "selector_pipeline",
+    "key_norms_preproc",
+    "key_norms",
+    "key_norms_h2d",
+    "key_norms_delta",
+    "key_norms_pack",
+    "log_s",
+    "topk",
+)
+
+
 @dataclass(slots=True)
 class _RefreshProfilePending:
     epoch: int
