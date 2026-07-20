@@ -418,7 +418,7 @@ def snapshot_compact_page_block_pool_state(engine_core: Any) -> dict[str, Any]:
 
 
 def install_engine_core_block_pool_state_utility() -> None:
-    """Install one named exact-run utility on vLLM EngineCore."""
+    """Install the launcher-proof utility on vLLM EngineCore."""
     from vllm.v1.engine.core import EngineCore
 
     existing = getattr(EngineCore, ENGINE_CORE_BLOCK_POOL_STATE_UTILITY, None)

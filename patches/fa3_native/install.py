@@ -628,24 +628,36 @@ def build_vendored_get_flash_attn_version(
 def _sparse_vendored_fa3_probe_requested() -> bool:
     return bool(
         os.environ.get("VLLM_SPARSE_CONTROLLER_JSON")
-        and os.environ.get("VLLM_SPARSE_FA3_UPSTREAM_ROOT")
+        and _vendored_flash_attn_root_requested()
+    )
+
+
+def _vendored_flash_attn_root_requested() -> bool:
+    """Return whether this process received an explicit vendored root.
+
+    ``sitecustomize`` runs in every Python descendant of a benchmark.  The
+    backend/version pair alone therefore cannot identify an engine process:
+    helper interpreters may inherit those generic vLLM settings without the
+    vendored tree being part of their role.  Requiring the root makes bridge
+    activation an atomic environment contract and avoids falling back to a
+    repository-relative path that may not exist in a release checkout.
+    """
+
+    return bool(
+        str(os.environ.get("VLLM_SPARSE_FA3_UPSTREAM_ROOT", "") or "").strip()
     )
 
 
 def _vendored_flash_attn_metadata_probe_requested() -> bool:
     return bool(
-        os.environ.get("VLLM_SPARSE_FA3_UPSTREAM_ROOT")
+        _vendored_flash_attn_root_requested()
         and os.environ.get("VLLM_FLASH_ATTN_VERSION") in ("3", "4")
     )
 
 
 def should_install_vendored_flash_attn_probe_patch() -> bool:
-    flash_backend_probe = (
-        os.environ.get("VLLM_ATTENTION_BACKEND") == "FLASH_ATTN_VLLM_V1"
-        and os.environ.get("VLLM_FLASH_ATTN_VERSION") in ("3", "4")
-    )
     return (
-        flash_backend_probe
+        _flash_backend_probe_requested()
         or _sparse_vendored_fa3_probe_requested()
         or _vendored_flash_attn_metadata_probe_requested()
     )
@@ -653,12 +665,13 @@ def should_install_vendored_flash_attn_probe_patch() -> bool:
 
 def _flash_backend_probe_requested() -> bool:
     return (
-        os.environ.get("VLLM_ATTENTION_BACKEND") == "FLASH_ATTN_VLLM_V1"
+        _vendored_flash_attn_root_requested()
+        and os.environ.get("VLLM_ATTENTION_BACKEND") == "FLASH_ATTN_VLLM_V1"
         and os.environ.get("VLLM_FLASH_ATTN_VERSION") in ("3", "4")
     )
 
 
-# [TRANSFORMERS-PDM-SEED 2026-07-11] 远端 TP8 反馈 §6 残余缺口的源头修。
+# [TRANSFORMERS-PDM-SEED 2026-07-11] vendored 包缺失分发元数据的源头修。
 # transformers 5.x 把"包名→分发名"固化为模块级
 #   import_utils.PACKAGE_DISTRIBUTION_MAPPING = importlib.metadata.packages_distributions()
 # 并在探针里对其【裸下标、无 try/except】(5.6.2 逐行亲证,共 7 处、2 把 key):
@@ -723,6 +736,9 @@ def install_vendored_flash_attn_probe_patch(
         "applied": False,
         "requested_attn_backend": os.environ.get("VLLM_ATTENTION_BACKEND"),
         "requested_flash_attn_version": os.environ.get("VLLM_FLASH_ATTN_VERSION"),
+        "requested_upstream_root": os.environ.get(
+            "VLLM_SPARSE_FA3_UPSTREAM_ROOT"
+        ),
         "sparse_fa3_requested": _sparse_vendored_fa3_probe_requested(),
         "metadata_probe_requested": _vendored_flash_attn_metadata_probe_requested(),
         "patched_modules": [],
@@ -733,6 +749,14 @@ def install_vendored_flash_attn_probe_patch(
     metadata_probe_requested = bool(summary["metadata_probe_requested"])
     full_bridge_requested = flash_probe_requested or sparse_probe_requested
     if not full_bridge_requested and not metadata_probe_requested:
+        bridge_intent_present = bool(
+            os.environ.get("VLLM_SPARSE_CONTROLLER_JSON")
+            or summary["requested_attn_backend"] == "FLASH_ATTN_VLLM_V1"
+            or summary["requested_flash_attn_version"] in ("3", "4")
+        )
+        if bridge_intent_present and not _vendored_flash_attn_root_requested():
+            summary["reason"] = "vendored_upstream_root_missing"
+            return summary
         if summary["requested_attn_backend"] != "FLASH_ATTN_VLLM_V1":
             summary["reason"] = "non_flash_backend"
             return summary

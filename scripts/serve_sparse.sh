@@ -115,9 +115,6 @@ fi
 if [[ "${SFI_TRACE}" == "0" && "${SFI_RUNTIME_PROOF}" == "1" ]]; then
   die "SFI_TRACE=0 requires SFI_RUNTIME_PROOF=0; proof observers need a separate diagnostic run"
 fi
-if [[ -n "${VLLM_SPARSE_FA3_ROUTE_COUNTER_MMAP+x}" ]]; then
-  die "VLLM_SPARSE_FA3_ROUTE_COUNTER_MMAP is retired; unset it"
-fi
 MODEL="$(realpath -e -- "${MODEL}")" || die "MODEL_PATH does not exist: ${MODEL}"
 SERVED_MODEL_ID="${SERVED_MODEL_ID-${MODEL}}"
 [[ -n "${SERVED_MODEL_ID}" && "${SERVED_MODEL_ID}" != *$'\n'* && "${SERVED_MODEL_ID}" != *$'\r'* ]] || \

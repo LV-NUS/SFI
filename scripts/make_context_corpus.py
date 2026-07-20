@@ -12,6 +12,7 @@ import re
 import stat
 import sys
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
@@ -23,6 +24,9 @@ SOURCE_STREAM_MODE = "cyclic_layout_body_token_stream_v1"
 SOURCE_PHASE_SOLVER = "minimal_exact_cyclic_phase_v1"
 WIRE_VALIDATION_CONTRACT = "load_prompt_batch_exact_v1"
 SOURCE_LAYOUT_VALIDATION_CONTRACT = "load_prompt_batch_source_layout_v1"
+SEMANTIC_VALIDATION_CONTRACT = "canonical_v6_render_replay_seal_v1"
+SEMANTIC_VALIDATION_DIGEST_FIELD = "semantic_validation_payload_sha256"
+CACHE_MANIFEST_TSV_PREFIX = "context_corpus_cache_manifest_tsv="
 RAW_SOURCE_LAYOUT = "raw_body_v1"
 LONGBENCH_SOURCE_LAYOUT = "longbench_text_envelope_v1"
 LONGBENCH_TEXT_OPEN = "<text>"
@@ -44,6 +48,17 @@ DEFAULT_SOURCE = (
     / "benchmarks"
     / "longbench_prompt_full_1.txt"
 )
+
+
+@dataclass(frozen=True)
+class ContextCorpusCacheResult:
+    corpus_path: Path
+    cache_hit: bool
+    manifest_path: Path
+    manifest_sha256: str
+    manifest: dict[str, object]
+
+
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
@@ -471,40 +486,99 @@ def _context_corpus_cache_identity_from_snapshot(
     }
 
 
-def _cache_entry_is_valid(
+def _semantic_validation_payload_sha256(
+    manifest: dict[str, object],
+) -> str:
+    payload = dict(manifest)
+    payload.pop("semantic_validation_contract", None)
+    payload.pop(SEMANTIC_VALIDATION_DIGEST_FIELD, None)
+    canonical = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _validate_context_corpus_manifest_structure(
     *,
-    corpus_path: Path,
-    manifest_path: Path,
-    identity: dict[str, object],
-    source_snapshot: bytes,
-    tokenizer: Any,
-) -> bool:
-    try:
-        validated_manifest_path, _, _ = validate_context_corpus_manifest(
-            corpus_path=corpus_path,
-            expected_identity=identity,
-            source_snapshot=source_snapshot,
-            tokenizer=tokenizer,
+    manifest: dict[str, object],
+    expected_identity: dict[str, object],
+    corpus_bytes: bytes,
+) -> tuple[int, ...]:
+    if manifest.get("identity") != expected_identity:
+        raise ValueError("corpus manifest identity mismatch")
+    if expected_identity.get("schema") != CACHE_SCHEMA:
+        raise ValueError("corpus manifest schema mismatch")
+    expected_tokens = normalize_tokens_per_segment_by_request(
+        expected_identity.get("tokens_per_segment_by_request", ())  # type: ignore[arg-type]
+    )
+    expected_segments = len(expected_tokens)
+    if expected_identity.get("segments") != expected_segments:
+        raise ValueError("corpus manifest segment count mismatch")
+
+    exact_fields = {
+        "source_layout_mode": expected_identity.get("source_layout_mode"),
+        "source_layout_template_sha256": expected_identity.get(
+            "source_layout_template_sha256"
+        ),
+        "source_layout_validation_contract": (
+            SOURCE_LAYOUT_VALIDATION_CONTRACT
+        ),
+        "wire_validation_contract": WIRE_VALIDATION_CONTRACT,
+        "corpus_size_bytes": len(corpus_bytes),
+        "corpus_sha256": hashlib.sha256(corpus_bytes).hexdigest(),
+    }
+    for field, expected in exact_fields.items():
+        if manifest.get(field) != expected:
+            raise ValueError(f"corpus manifest field mismatch: {field}")
+
+    wire_token_lengths = manifest.get("wire_token_lengths")
+    if (
+        not isinstance(wire_token_lengths, list)
+        or len(wire_token_lengths) != expected_segments
+        or any(type(length) is not int for length in wire_token_lengths)
+        or tuple(wire_token_lengths) != expected_tokens
+    ):
+        raise ValueError("corpus manifest wire-token proof mismatch")
+    layout_verified = manifest.get("source_layout_verified_by_segment")
+    if (
+        not isinstance(layout_verified, list)
+        or len(layout_verified) != expected_segments
+        or any(value is not True for value in layout_verified)
+    ):
+        raise ValueError("corpus manifest layout proof mismatch")
+    body_tokens_consumed = manifest.get(
+        "source_body_tokens_consumed_by_segment"
+    )
+    if (
+        not isinstance(body_tokens_consumed, list)
+        or len(body_tokens_consumed) != expected_segments
+        or any(
+            type(count) is not int or count <= 0
+            for count in body_tokens_consumed
         )
-        return validated_manifest_path == manifest_path
-    except (OSError, TypeError, ValueError):
-        return False
+    ):
+        raise ValueError("corpus manifest body-consumption proof mismatch")
+    phase = manifest.get("source_phase")
+    phase_period = manifest.get("source_phase_period_tokens")
+    if (
+        type(phase) is not int
+        or type(phase_period) is not int
+        or phase_period <= 0
+        or not 0 <= phase < phase_period
+    ):
+        raise ValueError("corpus manifest cyclic-phase proof mismatch")
+    return expected_tokens
 
 
-def validate_context_corpus_manifest(
+def validate_context_corpus_snapshot(
     *,
     corpus_path: Path,
     expected_identity: dict[str, object],
-    source_snapshot: bytes,
-    tokenizer: Any,
 ) -> tuple[Path, str, dict[str, object]]:
-    """Validate one v6 corpus/manifest pair against its complete identity.
-
-    This is the sole manifest contract shared by cache admission, run
-    preflight, and postflight.  It deliberately validates immutable snapshots
-    of regular files so symlink and partial-contract paths cannot become a
-    second release route.
-    """
+    """Validate a previously replay-sealed cache snapshot without rebuilding."""
 
     corpus = Path(corpus_path)
     manifest_path = corpus.with_suffix(".manifest.json")
@@ -518,34 +592,73 @@ def validate_context_corpus_manifest(
     )
     if not isinstance(manifest, dict):
         raise ValueError("corpus manifest root is not an object")
-    if manifest.get("identity") != expected_identity:
-        raise ValueError("corpus manifest identity mismatch")
-
-    if expected_identity.get("schema") != CACHE_SCHEMA:
-        raise ValueError("corpus manifest schema mismatch")
-    expected_tokens = normalize_tokens_per_segment_by_request(
-        expected_identity.get("tokens_per_segment_by_request", ())  # type: ignore[arg-type]
+    _validate_context_corpus_manifest_structure(
+        manifest=manifest,
+        expected_identity=expected_identity,
+        corpus_bytes=corpus_bytes,
     )
-    expected_segments = len(expected_tokens)
-    if expected_identity.get("segments") != expected_segments:
-        raise ValueError("corpus manifest segment count mismatch")
-    wire_token_lengths = manifest.get("wire_token_lengths")
-    body_tokens_consumed = manifest.get("source_body_tokens_consumed_by_segment")
-    layout_verified = manifest.get("source_layout_verified_by_segment")
-    phase = manifest.get("source_phase")
-    phase_period = manifest.get("source_phase_period_tokens")
-    expected_template = expected_identity.get("source_layout_template_sha256")
-    exact_fields = {
-        "source_layout_mode": expected_identity.get("source_layout_mode"),
-        "source_layout_template_sha256": expected_template,
-        "source_layout_validation_contract": SOURCE_LAYOUT_VALIDATION_CONTRACT,
-        "wire_validation_contract": WIRE_VALIDATION_CONTRACT,
-        "corpus_size_bytes": len(corpus_bytes),
-        "corpus_sha256": hashlib.sha256(corpus_bytes).hexdigest(),
-    }
-    for field, expected in exact_fields.items():
-        if manifest.get(field) != expected:
-            raise ValueError(f"corpus manifest field mismatch: {field}")
+    if manifest.get("semantic_validation_contract") != (
+        SEMANTIC_VALIDATION_CONTRACT
+    ):
+        raise ValueError("corpus semantic validation seal missing or stale")
+    expected_digest = _semantic_validation_payload_sha256(manifest)
+    if manifest.get(SEMANTIC_VALIDATION_DIGEST_FIELD) != expected_digest:
+        raise ValueError("corpus semantic validation seal digest mismatch")
+    return (
+        manifest_path,
+        hashlib.sha256(manifest_bytes).hexdigest(),
+        manifest,
+    )
+
+
+def _seal_context_corpus_manifest(
+    *,
+    corpus_path: Path,
+    expected_identity: dict[str, object],
+    manifest: dict[str, object],
+) -> tuple[Path, str, dict[str, object]]:
+    sealed = dict(manifest)
+    sealed["semantic_validation_contract"] = SEMANTIC_VALIDATION_CONTRACT
+    sealed[SEMANTIC_VALIDATION_DIGEST_FIELD] = (
+        _semantic_validation_payload_sha256(sealed)
+    )
+    manifest_path = Path(corpus_path).with_suffix(".manifest.json")
+    write_text_atomic(
+        manifest_path,
+        json.dumps(sealed, sort_keys=True, separators=(",", ":")) + "\n",
+    )
+    return validate_context_corpus_snapshot(
+        corpus_path=corpus_path,
+        expected_identity=expected_identity,
+    )
+
+
+def validate_context_corpus_manifest(
+    *,
+    corpus_path: Path,
+    expected_identity: dict[str, object],
+    source_snapshot: bytes,
+    tokenizer: Any,
+) -> tuple[Path, str, dict[str, object]]:
+    """Replay the canonical renderer and validate one complete v6 pair."""
+
+    corpus = Path(corpus_path)
+    manifest_path = corpus.with_suffix(".manifest.json")
+    if corpus.is_symlink() or manifest_path.is_symlink():
+        raise ValueError("corpus and manifest must be regular non-symlink files")
+    corpus_bytes = _read_regular_bytes(corpus)
+    manifest_bytes = _read_regular_bytes(manifest_path)
+    manifest = json.loads(
+        manifest_bytes.decode("utf-8"),
+        parse_constant=_reject_json_constant,
+    )
+    if not isinstance(manifest, dict):
+        raise ValueError("corpus manifest root is not an object")
+    expected_tokens = _validate_context_corpus_manifest_structure(
+        manifest=manifest,
+        expected_identity=expected_identity,
+        corpus_bytes=corpus_bytes,
+    )
 
     source_text = bytes(source_snapshot).decode("utf-8")
     if hashlib.sha256(source_snapshot).hexdigest() != expected_identity.get(
@@ -562,32 +675,6 @@ def validate_context_corpus_manifest(
     for field, expected in expected_build_report.items():
         if manifest.get(field) != expected:
             raise ValueError(f"corpus manifest build proof mismatch: {field}")
-    if (
-        not isinstance(wire_token_lengths, list)
-        or len(wire_token_lengths) != expected_segments
-        or any(type(length) is not int for length in wire_token_lengths)
-        or tuple(wire_token_lengths) != expected_tokens
-    ):
-        raise ValueError("corpus manifest wire-token proof mismatch")
-    if (
-        not isinstance(layout_verified, list)
-        or len(layout_verified) != expected_segments
-        or any(value is not True for value in layout_verified)
-    ):
-        raise ValueError("corpus manifest layout proof mismatch")
-    if (
-        not isinstance(body_tokens_consumed, list)
-        or len(body_tokens_consumed) != expected_segments
-        or any(type(count) is not int or count <= 0 for count in body_tokens_consumed)
-    ):
-        raise ValueError("corpus manifest body-consumption proof mismatch")
-    if (
-        type(phase) is not int
-        or type(phase_period) is not int
-        or phase_period <= 0
-        or not 0 <= phase < phase_period
-    ):
-        raise ValueError("corpus manifest cyclic-phase proof mismatch")
     return (
         manifest_path,
         hashlib.sha256(manifest_bytes).hexdigest(),
@@ -665,15 +752,15 @@ def validate_context_corpus_source_layout(
     return tuple(verified)
 
 
-def ensure_context_corpus_cached(
+def _ensure_context_corpus_cached_result(
     *,
     cache_dir: Path,
     source_path: Path,
     model_path: Path,
     tokens_per_segment_by_request: Sequence[int],
     tokenizer_loader: Callable[[Path], Any] = _load_local_tokenizer,
-) -> tuple[Path, bool]:
-    """Return a verified content-addressed corpus, building it once per identity."""
+) -> ContextCorpusCacheResult:
+    """Return one fully validated cache snapshot, building it when needed."""
     source = Path(source_path).expanduser().resolve()
     model = Path(model_path).expanduser().resolve()
     if not source.is_file():
@@ -702,23 +789,96 @@ def ensure_context_corpus_cached(
 
     with lock_path.open("a+", encoding="utf-8") as lock_handle:
         fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
-        tokenizer = tokenizer_loader(model)
-        if _cache_entry_is_valid(
-            corpus_path=corpus_path,
-            manifest_path=manifest_path,
-            identity=identity,
-            source_snapshot=source_snapshot,
-            tokenizer=tokenizer,
-        ):
-            return corpus_path, True
+        try:
+            (
+                validated_manifest_path,
+                manifest_sha256,
+                manifest,
+            ) = validate_context_corpus_snapshot(
+                corpus_path=corpus_path,
+                expected_identity=identity,
+            )
+        except (OSError, TypeError, ValueError):
+            pass
+        else:
+            if validated_manifest_path != manifest_path:
+                raise ValueError("validated cache manifest path mismatch")
+            return ContextCorpusCacheResult(
+                corpus_path=corpus_path,
+                cache_hit=True,
+                manifest_path=manifest_path,
+                manifest_sha256=manifest_sha256,
+                manifest=manifest,
+            )
 
-        write_context_corpus_artifacts(
+        tokenizer = tokenizer_loader(model)
+        try:
+            _, _, manifest = validate_context_corpus_manifest(
+                corpus_path=corpus_path,
+                expected_identity=identity,
+                source_snapshot=source_snapshot,
+                tokenizer=tokenizer,
+            )
+        except (OSError, TypeError, ValueError):
+            pass
+        else:
+            (
+                validated_manifest_path,
+                manifest_sha256,
+                manifest,
+            ) = _seal_context_corpus_manifest(
+                corpus_path=corpus_path,
+                expected_identity=identity,
+                manifest=manifest,
+            )
+            if validated_manifest_path != manifest_path:
+                raise ValueError("sealed cache manifest path mismatch")
+            return ContextCorpusCacheResult(
+                corpus_path=corpus_path,
+                cache_hit=True,
+                manifest_path=manifest_path,
+                manifest_sha256=manifest_sha256,
+                manifest=manifest,
+            )
+
+        (
+            output_path,
+            validated_manifest_path,
+            manifest_sha256,
+            manifest,
+        ) = _write_context_corpus_artifacts_with_manifest(
             output_path=corpus_path,
             source_snapshot=source_snapshot,
             identity=identity,
             tokenizer=tokenizer,
         )
-        return corpus_path, False
+        return ContextCorpusCacheResult(
+            corpus_path=output_path,
+            cache_hit=False,
+            manifest_path=validated_manifest_path,
+            manifest_sha256=manifest_sha256,
+            manifest=manifest,
+        )
+
+
+def ensure_context_corpus_cached(
+    *,
+    cache_dir: Path,
+    source_path: Path,
+    model_path: Path,
+    tokens_per_segment_by_request: Sequence[int],
+    tokenizer_loader: Callable[[Path], Any] = _load_local_tokenizer,
+) -> tuple[Path, bool]:
+    """Return the compatible two-field view of a validated cache result."""
+
+    result = _ensure_context_corpus_cached_result(
+        cache_dir=cache_dir,
+        source_path=source_path,
+        model_path=model_path,
+        tokens_per_segment_by_request=tokens_per_segment_by_request,
+        tokenizer_loader=tokenizer_loader,
+    )
+    return result.corpus_path, result.cache_hit
 
 
 def validate_context_corpus(
@@ -751,13 +911,13 @@ def validate_context_corpus(
     return token_lengths
 
 
-def write_context_corpus_artifacts(
+def _write_context_corpus_artifacts_with_manifest(
     *,
     output_path: Path,
     source_snapshot: bytes,
     identity: dict[str, object],
     tokenizer: Any,
-) -> tuple[Path, Path]:
+) -> tuple[Path, Path, str, dict[str, object]]:
     """Atomically publish a corpus and its mandatory sibling v6 manifest."""
 
     output = Path(output_path)
@@ -809,10 +969,43 @@ def write_context_corpus_artifacts(
         manifest_path,
         json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n",
     )
-    validate_context_corpus_manifest(
+    (
+        validated_manifest_path,
+        manifest_sha256,
+        validated_manifest,
+    ) = validate_context_corpus_manifest(
         corpus_path=output,
         expected_identity=identity,
         source_snapshot=source_snapshot,
+        tokenizer=tokenizer,
+    )
+    if validated_manifest_path != manifest_path:
+        raise ValueError("published corpus manifest path mismatch")
+    (
+        validated_manifest_path,
+        manifest_sha256,
+        validated_manifest,
+    ) = _seal_context_corpus_manifest(
+        corpus_path=output,
+        expected_identity=identity,
+        manifest=validated_manifest,
+    )
+    return output, validated_manifest_path, manifest_sha256, validated_manifest
+
+
+def write_context_corpus_artifacts(
+    *,
+    output_path: Path,
+    source_snapshot: bytes,
+    identity: dict[str, object],
+    tokenizer: Any,
+) -> tuple[Path, Path]:
+    """Atomically publish and validate a corpus and its sibling manifest."""
+
+    output, manifest_path, _, _ = _write_context_corpus_artifacts_with_manifest(
+        output_path=output_path,
+        source_snapshot=source_snapshot,
+        identity=identity,
         tokenizer=tokenizer,
     )
     return output, manifest_path
@@ -832,7 +1025,7 @@ def _parse_args() -> argparse.Namespace:
     output_group.add_argument("--validate", type=Path)
     parser.add_argument(
         "--format",
-        choices=("human", "manifest-tsv"),
+        choices=("human", "manifest-tsv", "cache-manifest-tsv"),
         default="human",
     )
     return parser.parse_args()
@@ -875,6 +1068,8 @@ def _resolve_cli_tokens_per_segment_by_request(
 
 def main() -> int:
     args = _parse_args()
+    if args.format == "cache-manifest-tsv" and args.cache_dir is None:
+        raise SystemExit("--format cache-manifest-tsv requires --cache-dir")
     try:
         token_targets = _resolve_cli_tokens_per_segment_by_request(args)
     except (TypeError, ValueError) as exc:
@@ -941,17 +1136,49 @@ def main() -> int:
         return 0
 
     if args.cache_dir is not None:
-        output_path, cache_hit = ensure_context_corpus_cached(
+        result = _ensure_context_corpus_cached_result(
             cache_dir=args.cache_dir,
             source_path=source_path,
             model_path=model_path,
             tokens_per_segment_by_request=token_targets,
+            tokenizer_loader=_load_local_tokenizer,
         )
         print(
-            f"context corpus cache {'hit' if cache_hit else 'miss'}: {output_path}",
+            "context corpus cache "
+            f"{'hit' if result.cache_hit else 'miss'}: {result.corpus_path}",
             file=os.sys.stderr,
         )
-        print(f"context_corpus_path={output_path}")
+        if args.format == "cache-manifest-tsv":
+            identity = result.manifest.get("identity")
+            layout_verified = result.manifest.get(
+                "source_layout_verified_by_segment"
+            )
+            if not isinstance(identity, dict) or not isinstance(
+                layout_verified, list
+            ):
+                raise SystemExit("validated cache manifest schema is incomplete")
+            print(
+                CACHE_MANIFEST_TSV_PREFIX
+                + "\t".join(
+                    (
+                        str(result.corpus_path),
+                        str(result.manifest["corpus_sha256"]),
+                        str(result.manifest_path),
+                        result.manifest_sha256,
+                        str(identity["schema"]),
+                        str(result.manifest["source_layout_mode"]),
+                        str(
+                            result.manifest[
+                                "source_layout_validation_contract"
+                            ]
+                        ),
+                        str(len(layout_verified)),
+                        "hit" if result.cache_hit else "miss",
+                    )
+                )
+            )
+        else:
+            print(f"context_corpus_path={result.corpus_path}")
         return 0
 
     tokenizer = _load_local_tokenizer(model_path)

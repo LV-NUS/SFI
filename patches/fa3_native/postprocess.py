@@ -14,7 +14,6 @@ from utils.selector_log_s_identity import (
     SELECTOR_LOG_F_COUNTER_SEMANTICS,
     SELECTOR_LOG_F_FAST_ROUTE,
     SELECTOR_LOG_F_GENERIC_ROUTE,
-    SELECTOR_LOG_F_RETIRED_TP8_EXACT_ENV,
     SELECTOR_LOG_F_ROUTES,
     SELECTOR_LOG_F_TILED_ROUTE,
     SELECTOR_LOG_S_EXTENSION_NAME,
@@ -816,19 +815,8 @@ def reset_selector_log_s_runtime_proof_counters() -> None:
     _PROCESS_TILED_ADMISSION_FAILURE_COUNT = 0
 
 
-def _reject_retired_selector_log_f_tp8_exact_env() -> None:
-    raw = os.environ.get(SELECTOR_LOG_F_RETIRED_TP8_EXACT_ENV, "")
-    if raw not in {"", "0"}:
-        raise RuntimeError(
-            "E_RETIRED_SELECTOR_LOG_F_TP8_EXACT_ENV: "
-            f"unset {SELECTOR_LOG_F_RETIRED_TP8_EXACT_ENV}; the dynamic tiled "
-            "route is selected from the validated request contract"
-        )
-
-
 def snapshot_selector_log_s_runtime_proof() -> dict[str, object]:
     """Bind capture-route evidence to the already-loaded worker-local .so."""
-    _reject_retired_selector_log_f_tp8_exact_env()
     from utils import selector_log_s_ext
 
     module = selector_log_s_ext._MODULE
@@ -3785,7 +3773,6 @@ def run_tiled_capture_postprocess_job_cohort(
 ) -> int:
     """Strict bounded-owner API: one all-tiled sequence, exactly four kernels."""
 
-    _reject_retired_selector_log_f_tp8_exact_env()
     jobs = tuple(jobs or tuple())
     if not jobs:
         return 0
@@ -3816,7 +3803,6 @@ def run_capture_postprocess_job_sequence(
 ) -> int:
     """Run an ordered job sequence, coalescing maximal compatible tiled runs."""
 
-    _reject_retired_selector_log_f_tp8_exact_env()
     unique_jobs: list[Any] = []
     seen_objects: set[int] = set()
     owner_by_key: dict[tuple[int, int, int], Any] = {}
@@ -3930,7 +3916,6 @@ def run_capture_postprocess_job_sequence_for_cohort(
     and validate the stricter cohort boundary around it.
     """
 
-    _reject_retired_selector_log_f_tp8_exact_env()
     jobs = tuple(jobs or tuple())
     if not jobs or any(job is None for job in jobs):
         _selector_log_f_contract_error(
@@ -4030,7 +4015,6 @@ def run_capture_postprocess_jobs_for_payloads(
 ) -> int:
     """Validate payload ownership, deduplicate jobs, then run their sequence."""
 
-    _reject_retired_selector_log_f_tp8_exact_env()
     jobs: list[Any] = []
     seen_objects: set[int] = set()
     owner_by_key: dict[tuple[int, int, int], Any] = {}

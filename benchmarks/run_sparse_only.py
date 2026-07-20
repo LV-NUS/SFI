@@ -16,10 +16,8 @@ if str(_REPO_IMPORT_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_IMPORT_ROOT))
 
 from utils.selector_log_s_identity import (
-    SELECTOR_LOG_F_AMORTIZED_TILED_ALLOWED_ROUTES,
     SELECTOR_LOG_F_FAST_ROUTE,
     SELECTOR_LOG_F_GENERIC_ROUTE,
-    SELECTOR_LOG_F_RETIRED_TP8_EXACT_ENV,
     SELECTOR_LOG_F_TILED_ROUTE,
     selector_log_s_artifact_identity,
     selector_log_s_runtime_proof_reasons,
@@ -47,6 +45,7 @@ try:
         benchmark_child_identity,
         reset_cudagraph_runtime_observer,
         resolve_custom_all_reduce_decision,
+        runner_engine_runtime_contract_required,
         stop_cudagraph_runtime_observer,
         summarize_cudagraph_runtime_observer,
     )
@@ -72,6 +71,7 @@ except ModuleNotFoundError:
         benchmark_child_identity,
         reset_cudagraph_runtime_observer,
         resolve_custom_all_reduce_decision,
+        runner_engine_runtime_contract_required,
         stop_cudagraph_runtime_observer,
         summarize_cudagraph_runtime_observer,
     )
@@ -81,7 +81,6 @@ FA3_ROUTE_COUNTER_FIELDS = 10
 FA3_ROUTE_COUNTER_SLOT_BYTES = FA3_ROUTE_COUNTER_FIELDS * 8
 FA3_ROUTE_COUNTER_SLOTS_ENV = "VLLM_SPARSE_FA3_ROUTE_COUNTER_SLOTS"
 FA3_ROUTE_COUNTER_ENABLED_ENV = "VLLM_SPARSE_FA3_ROUTE_COUNTER_ENABLED"
-FA3_ROUTE_COUNTER_RETIRED_MMAP_ENV = "VLLM_SPARSE_FA3_ROUTE_COUNTER_MMAP"
 FA3_ROUTE_COUNTER_RPC_SNAPSHOT_SCHEMA = "sfi.fa3_route_counter.rpc_snapshot.v2"
 FA3_ROUTE_COUNTER_RPC_SNAPSHOT_SOURCE = "worker_collective_rpc"
 FA3_ROUTE_COUNTER_STORAGE = "worker_local"
@@ -122,17 +121,6 @@ def _collect_fa3_route_counter_worker_records(
     records: list[dict[str, object]] = []
     errors: list[str] = []
     valid_pids: list[int] = []
-    retired_exact = os.environ.get(SELECTOR_LOG_F_RETIRED_TP8_EXACT_ENV, "")
-    if retired_exact not in {"", "0"}:
-        raise RuntimeError(
-            "E_RETIRED_SELECTOR_LOG_F_TP8_EXACT_ENV: "
-            f"unset {SELECTOR_LOG_F_RETIRED_TP8_EXACT_ENV}"
-        )
-    selector_expected_route = (
-        SELECTOR_LOG_F_TILED_ROUTE
-        if os.environ.get("SFI_RUNNER_TIER", "") == "tp8x64k"
-        else None
-    )
     selector_artifact_identities: list[tuple[object, ...]] = []
     selector_route_signatures: list[tuple[object, ...]] = []
     for index, raw_record in enumerate(raw_records):
@@ -173,41 +161,39 @@ def _collect_fa3_route_counter_worker_records(
             errors.append(f"rank{rank}.pid={pid!r}")
         else:
             valid_pids.append(pid)
-        if selector_expected_route is not None:
-            proof = record.get("selector_log_s_runtime_proof")
-            proof_reasons = selector_log_s_runtime_proof_reasons(
-                proof,
-                expected_route=selector_expected_route,
-                expected_phase=str(phase).lower(),
-                allowed_routes=SELECTOR_LOG_F_AMORTIZED_TILED_ALLOWED_ROUTES,
+        proof = record.get("selector_log_s_runtime_proof")
+        proof_reasons = selector_log_s_runtime_proof_reasons(
+            proof,
+            expected_route=None,
+            expected_phase=str(phase).lower(),
+        )
+        errors.extend(
+            f"rank{rank}.selector_log_s.{reason}"
+            for reason in proof_reasons
+        )
+        if isinstance(proof, dict) and not proof_reasons:
+            selector_artifact_identities.append(
+                selector_log_s_artifact_identity(proof)
             )
-            errors.extend(
-                f"rank{rank}.selector_log_s.{reason}"
-                for reason in proof_reasons
+            counts = proof["route_counts"]
+            assert isinstance(counts, dict)
+            selector_route_signatures.append(
+                (
+                    proof["last_route"],
+                    proof["last_dispatch_reason"],
+                    proof["last_admission_identity"],
+                    proof["admission_event_count"],
+                    proof["admission_chain_sha256"],
+                    counts[SELECTOR_LOG_F_FAST_ROUTE],
+                    counts[SELECTOR_LOG_F_GENERIC_ROUTE],
+                    counts[SELECTOR_LOG_F_TILED_ROUTE],
+                    proof["tiled_cohort_count"],
+                    proof["tiled_job_count"],
+                    proof["tiled_direct_count"],
+                    proof["tiled_kernel_launch_count"],
+                    proof["tiled_admission_failure_count"],
+                )
             )
-            if isinstance(proof, dict) and not proof_reasons:
-                selector_artifact_identities.append(
-                    selector_log_s_artifact_identity(proof)
-                )
-                counts = proof["route_counts"]
-                assert isinstance(counts, dict)
-                selector_route_signatures.append(
-                    (
-                        proof["last_route"],
-                        proof["last_dispatch_reason"],
-                        proof["last_admission_identity"],
-                        proof["admission_event_count"],
-                        proof["admission_chain_sha256"],
-                        counts[SELECTOR_LOG_F_FAST_ROUTE],
-                        counts[SELECTOR_LOG_F_GENERIC_ROUTE],
-                        counts[SELECTOR_LOG_F_TILED_ROUTE],
-                        proof["tiled_cohort_count"],
-                        proof["tiled_job_count"],
-                        proof["tiled_direct_count"],
-                        proof["tiled_kernel_launch_count"],
-                        proof["tiled_admission_failure_count"],
-                    )
-                )
         records.append(record)
     records.sort(key=lambda record: int(record["rank"]))
     ranks = [int(record["rank"]) for record in records]
@@ -215,21 +201,20 @@ def _collect_fa3_route_counter_worker_records(
         errors.append(f"ranks={ranks!r}:expected={list(range(slots))!r}")
     if len(set(valid_pids)) != slots:
         errors.append(f"worker_pids={valid_pids!r}:expected_unique={slots}")
-    if selector_expected_route is not None:
-        if len(selector_artifact_identities) != slots or len(
-            set(selector_artifact_identities)
-        ) != 1:
-            errors.append(
-                "selector_log_s_artifact_identity_rank_mismatch="
-                f"{selector_artifact_identities!r}"
-            )
-        if len(selector_route_signatures) != slots or len(
-            set(selector_route_signatures)
-        ) != 1:
-            errors.append(
-                "selector_log_s_capture_route_rank_mismatch="
-                f"{selector_route_signatures!r}"
-            )
+    if len(selector_artifact_identities) != slots or len(
+        set(selector_artifact_identities)
+    ) != 1:
+        errors.append(
+            "selector_log_s_artifact_identity_rank_mismatch="
+            f"{selector_artifact_identities!r}"
+        )
+    if len(selector_route_signatures) != slots or len(
+        set(selector_route_signatures)
+    ) != 1:
+        errors.append(
+            "selector_log_s_capture_route_rank_mismatch="
+            f"{selector_route_signatures!r}"
+        )
     if errors:
         raise RuntimeError(
             f"E_TP_ROUTE_COUNTER_{phase_code}_MISMATCH: " + "; ".join(errors)
@@ -335,60 +320,41 @@ def _snapshot_fa3_route_counters_after_measurement(
             "E_TP_ROUTE_COUNTER_WORKER_IDENTITY_CHANGED: reset and snapshot "
             "records came from different rank/worker identities"
         )
-    if os.environ.get("SFI_RUNNER_TIER", "") == "tp8x64k":
-        for reset_record, snapshot_record in zip(
-            reset_records, records, strict=True
-        ):
-            rank = int(reset_record["rank"])
-            reset_proof = reset_record["selector_log_s_runtime_proof"]
-            snapshot_proof = snapshot_record["selector_log_s_runtime_proof"]
-            assert isinstance(reset_proof, dict)
-            assert isinstance(snapshot_proof, dict)
-            if selector_log_s_artifact_identity(
-                snapshot_proof
-            ) != selector_log_s_artifact_identity(reset_proof):
-                raise RuntimeError(
-                    "E_TP_SELECTOR_LOG_S_ARTIFACT_CHANGED: "
-                    f"rank={rank}"
-                )
-            reset_counts = reset_proof["route_counts"]
-            snapshot_counts = snapshot_proof["route_counts"]
-            assert isinstance(reset_counts, dict)
-            assert isinstance(snapshot_counts, dict)
-            regressed_routes = [
-                route
-                for route in (
-                    SELECTOR_LOG_F_FAST_ROUTE,
-                    SELECTOR_LOG_F_GENERIC_ROUTE,
-                    SELECTOR_LOG_F_TILED_ROUTE,
-                )
-                if int(snapshot_counts[route]) < int(reset_counts[route])
-            ]
-            if regressed_routes:
-                raise RuntimeError(
-                    "E_TP_SELECTOR_LOG_S_ROUTE_DRIFT: "
-                    f"rank={rank}:regressed={regressed_routes!r}:"
-                    f"reset={reset_counts!r}:"
-                    f"snapshot={snapshot_counts!r}"
-                )
-            tiled_cohorts = int(snapshot_proof["tiled_cohort_count"])
-            tiled_jobs = int(snapshot_proof["tiled_job_count"])
-            tiled_direct = int(snapshot_proof["tiled_direct_count"])
-            tiled_kernels = int(snapshot_proof["tiled_kernel_launch_count"])
-            tiled_failures = int(snapshot_proof["tiled_admission_failure_count"])
-            if (
-                tiled_cohorts <= 0
-                or tiled_jobs <= tiled_cohorts
-                or tiled_direct != 0
-                or tiled_kernels != tiled_cohorts * 4
-                or tiled_failures != 0
-            ):
-                raise RuntimeError(
-                    "E_TP_SELECTOR_LOG_F_TILED_NOT_AMORTIZED: "
-                    f"rank={rank}:cohorts={tiled_cohorts}:jobs={tiled_jobs}:"
-                    f"direct={tiled_direct}:kernels={tiled_kernels}:"
-                    f"failures={tiled_failures}"
-                )
+    for reset_record, snapshot_record in zip(
+        reset_records, records, strict=True
+    ):
+        rank = int(reset_record["rank"])
+        reset_proof = reset_record["selector_log_s_runtime_proof"]
+        snapshot_proof = snapshot_record["selector_log_s_runtime_proof"]
+        assert isinstance(reset_proof, dict)
+        assert isinstance(snapshot_proof, dict)
+        if selector_log_s_artifact_identity(
+            snapshot_proof
+        ) != selector_log_s_artifact_identity(reset_proof):
+            raise RuntimeError(
+                "E_TP_SELECTOR_LOG_S_ARTIFACT_CHANGED: "
+                f"rank={rank}"
+            )
+        reset_counts = reset_proof["route_counts"]
+        snapshot_counts = snapshot_proof["route_counts"]
+        assert isinstance(reset_counts, dict)
+        assert isinstance(snapshot_counts, dict)
+        regressed_routes = [
+            route
+            for route in (
+                SELECTOR_LOG_F_FAST_ROUTE,
+                SELECTOR_LOG_F_GENERIC_ROUTE,
+                SELECTOR_LOG_F_TILED_ROUTE,
+            )
+            if int(snapshot_counts[route]) < int(reset_counts[route])
+        ]
+        if regressed_routes:
+            raise RuntimeError(
+                "E_TP_SELECTOR_LOG_S_ROUTE_DRIFT: "
+                f"rank={rank}:regressed={regressed_routes!r}:"
+                f"reset={reset_counts!r}:"
+                f"snapshot={snapshot_counts!r}"
+            )
     snapshot = _route_counter_snapshot_from_worker_records(records)
     # The blocking worker RPC return is the measurement linearization point.
     # No live file transport exists; the caller serializes these frozen records
@@ -974,7 +940,14 @@ def _setup_repo_imports() -> Path:
     repo_root = Path(__file__).resolve().parents[1]
     vllm_src = repo_root / "vllm"
     upstream_raw = os.environ.get("VLLM_SPARSE_FA3_UPSTREAM_ROOT", "").strip()
-    fa_upstream = Path(upstream_raw) if upstream_raw else repo_root / "third_party_upstreams" / "vllm-project-flash-attention"
+    fa_upstream = (
+        Path(upstream_raw)
+        if upstream_raw
+        else repo_root
+        / "third_party_upstreams"
+        / "vllm-project-flash-attention"
+    ).expanduser().resolve()
+    os.environ["VLLM_SPARSE_FA3_UPSTREAM_ROOT"] = str(fa_upstream)
     pythonpath_parts: list[str] = []
     if (fa_upstream / "flash_attn").exists():
         pythonpath_parts.append(str(fa_upstream))
@@ -992,6 +965,35 @@ def _setup_repo_imports() -> Path:
     if (fa_upstream / "flash_attn").exists():
         sys.path.insert(0, str(fa_upstream))
     return repo_root
+
+
+def _configure_sparse_flash_attention(repo_root: Path) -> tuple[str, str]:
+    """Install the requested vendored bridge before any vLLM import."""
+
+    requested_version = os.environ.get("VLLM_FLASH_ATTN_VERSION", "3")
+    if requested_version not in {"3", "4"}:
+        requested_version = "3"
+    requested_backend = os.environ.get("VLLM_ATTENTION_BACKEND", "FLASH_ATTN")
+    if requested_backend not in {"FLASH_ATTN", "FLASH_ATTN_VLLM_V1"}:
+        requested_backend = "FLASH_ATTN"
+    if requested_version == "4":
+        requested_backend = "FLASH_ATTN_VLLM_V1"
+    os.environ["VLLM_ATTENTION_BACKEND"] = requested_backend
+    os.environ["VLLM_FLASH_ATTN_VERSION"] = requested_version
+
+    from patches.fa3_native.install import install_vendored_flash_attn_probe_patch
+
+    summary = install_vendored_flash_attn_probe_patch(repo_root=repo_root)
+    bridge_required = bool(os.environ.get("VLLM_SPARSE_CONTROLLER_JSON")) or (
+        requested_backend == "FLASH_ATTN_VLLM_V1"
+    )
+    if bridge_required and not bool(summary.get("applied")):
+        raise RuntimeError(
+            "E_SPARSE_FLASH_ATTN_PROBE_NOT_APPLIED: "
+            f"backend={requested_backend!r} version={requested_version!r} "
+            f"reason={summary.get('reason')!r}"
+        )
+    return requested_backend, requested_version
 
 
 DEFERRED_BRIDGE_ENV_KEYS = (
@@ -1418,11 +1420,6 @@ def main() -> None:
     child_identity = benchmark_child_identity(args)
     apply_deferred_bridge_env(args, os.environ)
     counter_path: Path | None = None
-    if FA3_ROUTE_COUNTER_RETIRED_MMAP_ENV in os.environ:
-        raise RuntimeError(
-            "E_RETIRED_ROUTE_COUNTER_MMAP_ENV: unset "
-            f"{FA3_ROUTE_COUNTER_RETIRED_MMAP_ENV}; live file transport is removed"
-        )
     collect_route_counter_proof = bool(args.collect_route_counter_proof)
     if collect_route_counter_proof:
         route_counter_slots = max(1, int(args.tensor_parallel_size))
@@ -1899,6 +1896,13 @@ def main() -> None:
             os.environ["VLLM_SPARSE_REFRESH_PROFILE_DETAIL"] = "1"
         _truncate_text(refresh_profile_log)
 
+    # The CLI may create the sparse controller after Python has already run
+    # sitecustomize.  Bootstrap explicitly here so direct invocations and
+    # launcher children use the same complete bridge contract.
+    _, requested_flash_attn_version = _configure_sparse_flash_attention(
+        repo_root
+    )
+
     controller = None
     if bool(args.patch_in_parent) and ("VLLM_SPARSE_CONTROLLER_JSON" in os.environ):
         from patches.vllm_sparse_patch import SparseControllerConfig, apply_vllm_sparse_patch
@@ -1917,20 +1921,6 @@ def main() -> None:
         cfg.trigger.refresh_interval = int(args.refresh_interval)
         cfg.trigger.enable_sentence_triggers = not bool(args.disable_sentence_trigger)
         controller = apply_vllm_sparse_patch(cfg)
-
-    # Sparse standalone runs use the current FA3 route by default. Keep this
-    # explicit so stale shell env cannot reopen the retired Triton backend path,
-    # while allowing the SM100 parent runner to request FA4.
-    requested_flash_attn_version = os.environ.get("VLLM_FLASH_ATTN_VERSION", "3")
-    if requested_flash_attn_version not in {"3", "4"}:
-        requested_flash_attn_version = "3"
-    requested_attention_backend = os.environ.get("VLLM_ATTENTION_BACKEND", "FLASH_ATTN")
-    if requested_attention_backend not in {"FLASH_ATTN", "FLASH_ATTN_VLLM_V1"}:
-        requested_attention_backend = "FLASH_ATTN"
-    if requested_flash_attn_version == "4":
-        requested_attention_backend = "FLASH_ATTN_VLLM_V1"
-    os.environ["VLLM_ATTENTION_BACKEND"] = requested_attention_backend
-    os.environ["VLLM_FLASH_ATTN_VERSION"] = requested_flash_attn_version
 
     from vllm import LLM, SamplingParams  # pylint: disable=import-error
 
@@ -2047,7 +2037,7 @@ def main() -> None:
         use_chat_template=bool(args.chat_template),
         enable_thinking=bool(args.enable_thinking),
     )
-    exact_runtime_required = os.environ.get("SFI_RUNNER_TIER", "") == "tp8x64k"
+    runtime_contract_required = runner_engine_runtime_contract_required()
     chat_template_reserve_tokens = int(
         os.environ.get("SFI_RUNNER_CHAT_TEMPLATE_RESERVE_TOKENS", "0") or 0
     )
@@ -2065,13 +2055,13 @@ def main() -> None:
         )
         or 0
     )
-    if exact_runtime_required and (
-        chat_template_reserve_tokens != 512
+    if runtime_contract_required and (
+        chat_template_reserve_tokens < 0
         or compact_blocks_per_slot <= 0
         or expected_kv_bytes_per_token <= 0
     ):
         raise RuntimeError(
-            "E_ENGINE_RUNTIME_CONTRACT_INPUT: exact sparse KV/compact identity missing"
+            "E_ENGINE_RUNTIME_CONTRACT_INPUT: sparse KV/compact identity missing"
         )
     engine_runtime_contract_proof = collect_engine_runtime_contract_proof(
         engine,
@@ -2085,30 +2075,30 @@ def main() -> None:
                     request_max_new_tokens,
                 )
             ]
-            if exact_runtime_required
+            if runtime_contract_required
             else []
         ),
         compact_blocks_per_slot=(
-            compact_blocks_per_slot if exact_runtime_required else 0
+            compact_blocks_per_slot if runtime_contract_required else 0
         ),
         compact_generation_count=(
-            compact_generation_count if exact_runtime_required else 0
+            compact_generation_count if runtime_contract_required else 0
         ),
         expected_kv_bytes_per_token=expected_kv_bytes_per_token,
-        required=exact_runtime_required,
+        required=runtime_contract_required,
     )
     engine_runtime_contract_proof.update(
         collect_engine_core_block_pool_reservation_proof(
             engine,
             engine_runtime_contract_proof=engine_runtime_contract_proof,
             expected_compact_blocks_per_slot=(
-                compact_blocks_per_slot if exact_runtime_required else 0
+                compact_blocks_per_slot if runtime_contract_required else 0
             ),
             expected_compact_generation_count=(
-                compact_generation_count if exact_runtime_required else 0
+                compact_generation_count if runtime_contract_required else 0
             ),
             expected_batch_size=int(args.batch_size),
-            required=exact_runtime_required,
+            required=runtime_contract_required,
         )
     )
     print(

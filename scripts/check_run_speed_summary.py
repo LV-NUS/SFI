@@ -53,9 +53,8 @@ from scripts.make_context_corpus import (
     DEFAULT_SOURCE as CONTEXT_CORPUS_SOURCE,
     LONGBENCH_SOURCE_LAYOUT,
     SOURCE_LAYOUT_VALIDATION_CONTRACT,
-    _load_local_tokenizer,
     context_corpus_cache_identity,
-    validate_context_corpus_manifest,
+    validate_context_corpus_snapshot,
 )
 from utils.model_kv_contract import (
     MODEL_KV_CONTRACT_SCHEMA,
@@ -245,7 +244,6 @@ def _corpus_manifest_reasons(provenance: dict[str, Any]) -> list[str]:
         return reasons
     try:
         model_path = Path(str(provenance.get("model", "") or ""))
-        source_snapshot = CONTEXT_CORPUS_SOURCE.read_bytes()
         request_context_tokens = _exact_positive_int_vector(
             provenance.get("request_context_tokens"),
             expected_count=int(provenance.get("batch_size", 0)),
@@ -258,11 +256,9 @@ def _corpus_manifest_reasons(provenance: dict[str, Any]) -> list[str]:
             tokens_per_segment_by_request=request_context_tokens,
         )
         validated_path, validated_sha256, manifest = (
-            validate_context_corpus_manifest(
+            validate_context_corpus_snapshot(
                 corpus_path=corpus_path,
                 expected_identity=expected_identity,
-                source_snapshot=source_snapshot,
-                tokenizer=_load_local_tokenizer(model_path),
             )
         )
     except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:

@@ -31,6 +31,7 @@ try:
         pull_step_outputs_with_timing,
         reset_cudagraph_runtime_observer,
         resolve_custom_all_reduce_decision,
+        runner_engine_runtime_contract_required,
         stop_cudagraph_runtime_observer,
         summarize_cudagraph_runtime_observer,
     )
@@ -78,6 +79,7 @@ except ModuleNotFoundError:
         pull_step_outputs_with_timing,
         reset_cudagraph_runtime_observer,
         resolve_custom_all_reduce_decision,
+        runner_engine_runtime_contract_required,
         stop_cudagraph_runtime_observer,
         summarize_cudagraph_runtime_observer,
     )
@@ -457,7 +459,14 @@ def _setup_repo_imports() -> Path:
     repo_root = Path(__file__).resolve().parents[1]
     vllm_src = repo_root / "vllm"
     upstream_raw = os.environ.get("VLLM_SPARSE_FA3_UPSTREAM_ROOT", "").strip()
-    fa_upstream = Path(upstream_raw) if upstream_raw else repo_root / "third_party_upstreams" / "vllm-project-flash-attention"
+    fa_upstream = (
+        Path(upstream_raw)
+        if upstream_raw
+        else repo_root
+        / "third_party_upstreams"
+        / "vllm-project-flash-attention"
+    ).expanduser().resolve()
+    os.environ["VLLM_SPARSE_FA3_UPSTREAM_ROOT"] = str(fa_upstream)
     pythonpath_parts: list[str] = []
     if (fa_upstream / "flash_attn").exists():
         pythonpath_parts.append(str(fa_upstream))
@@ -792,7 +801,7 @@ def main() -> None:
         use_chat_template=bool(args.chat_template),
         enable_thinking=bool(args.enable_thinking),
     )
-    exact_runtime_required = os.environ.get("SFI_RUNNER_TIER", "") == "tp8x64k"
+    runtime_contract_required = runner_engine_runtime_contract_required()
     chat_template_reserve_tokens = int(
         os.environ.get("SFI_RUNNER_CHAT_TEMPLATE_RESERVE_TOKENS", "0") or 0
     )
@@ -802,12 +811,12 @@ def main() -> None:
         )
         or 0
     )
-    if exact_runtime_required and (
-        chat_template_reserve_tokens != 512
+    if runtime_contract_required and (
+        chat_template_reserve_tokens < 0
         or expected_kv_bytes_per_token <= 0
     ):
         raise RuntimeError(
-            "E_ENGINE_RUNTIME_CONTRACT_INPUT: exact runner KV/context/chat identity missing"
+            "E_ENGINE_RUNTIME_CONTRACT_INPUT: runner KV/context/chat identity missing"
         )
     engine_runtime_contract_proof = collect_engine_runtime_contract_proof(
         engine,
@@ -821,13 +830,13 @@ def main() -> None:
                     request_max_new_tokens,
                 )
             ]
-            if exact_runtime_required
+            if runtime_contract_required
             else []
         ),
         compact_blocks_per_slot=0,
         compact_generation_count=0,
         expected_kv_bytes_per_token=expected_kv_bytes_per_token,
-        required=exact_runtime_required,
+        required=runtime_contract_required,
     )
     engine_runtime_contract_proof.update(
         collect_engine_core_block_pool_reservation_proof(
@@ -836,7 +845,7 @@ def main() -> None:
             expected_compact_blocks_per_slot=0,
             expected_compact_generation_count=0,
             expected_batch_size=int(args.batch_size),
-            required=exact_runtime_required,
+            required=runtime_contract_required,
         )
     )
     print(

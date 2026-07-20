@@ -318,7 +318,7 @@ for key, expected in expected_env.items():
             f"expected={expected!r}"
         )
 
-forbidden_env = {"VLLM_SPARSE_FA3_ROUTE_COUNTER_MMAP"}
+forbidden_env = set()
 if observer_free_mode:
     cold_startup_provenance = {
         "VLLM_SPARSE_SITE_LOG",

@@ -259,18 +259,6 @@ _FULL_CUDAGRAPH_REPLAY_CUDA_EVENT_LOG_CACHED = os.environ.get(
     "VLLM_SPARSE_FULL_CUDAGRAPH_REPLAY_CUDA_EVENT_LOG",
     "",
 )
-_RETIRED_FULL_CUDAGRAPH_WRAPPER_ENVS = (
-    "VLLM_SPARSE_FULL_CUDAGRAPH_REPLAY_WRAPPER_ABLATE_EXTRA",
-    "VLLM_SPARSE_FULL_CUDAGRAPH_REPLAY_WRAPPER_ABLATE_HIT_LOG",
-)
-for _retired_env_name in _RETIRED_FULL_CUDAGRAPH_WRAPPER_ENVS:
-    _retired_env_value = str(os.environ.get(_retired_env_name, "") or "").strip()
-    if _retired_env_value not in {"", "0"}:
-        raise RuntimeError(
-            "E_SFI_RETIRED_FULL_CUDAGRAPH_WRAPPER_ENV: "
-            f"{_retired_env_name} is retired because it bypassed the RRP "
-            "replay/writer ownership handshake"
-        )
 _FULL_CUDAGRAPH_REPLAY_CUDA_EVENT_ROWS: List[dict] = []
 _FULL_CUDAGRAPH_REPLAY_CUDA_EVENT_PATH = ""
 _FULL_CUDAGRAPH_REPLAY_CUDA_EVENT_REGISTERED = False

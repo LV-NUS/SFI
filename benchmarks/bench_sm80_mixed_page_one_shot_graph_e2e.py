@@ -62,6 +62,7 @@ from benchmarks.scheduler_contract import (
     validate_scheduler_graph_args,
 )
 from utils.selector_cache_identity import selector_cache_abi_key_for_python
+from utils.model_kv_contract import MODEL_KV_CONTRACT_SCHEMA
 from benchmarks.sm80_run_pair import (
     ALLOWED_TRACE_ENV_KEYS,
     FULL_CUDAGRAPH_HOOK_PROFILE_ENV_KEY,
@@ -1818,7 +1819,7 @@ def _default_tp8_arm_teardown_path(output: Path, arm_tag: str) -> Path:
 
 def _tp8_exact_pair_required(args: argparse.Namespace) -> bool:
     return (
-        os.environ.get("SFI_RUNNER_TIER", "") == "tp8x64k"
+        _sparse_dense_pair_contract_kind() == "exact_speedup_verdict"
         and str(args.mode) == "sparse"
     )
 
@@ -2865,37 +2866,6 @@ def _diagnostic_route_counter_proof(
         "resolved_row_ptr_fwd_mixed_page_count": int(resolved),
         "page_resolver_kind0_count": int(kind0),
         "page_resolver_kind4_count": int(kind4),
-    }
-
-
-def _producer_graph_roi_proof(
-    *,
-    graph_enabled: bool,
-    attribution: dict[str, object],
-) -> dict[str, object]:
-    # [2026-07-01] RETIRED-GATE DECOUPLE. The retired producer-graph micrograph
-    # surface is enforced-removed at source by
-    # tests/test_refresh_producer_graph_profile_enablement.py. The
-    # ``_deadline_async_producer_graph_{capture,replay}_count`` counters this
-    # proof used to read are now owned EXCLUSIVELY by the sanctioned task-#9
-    # writer graph (refresh_rebuild_mixin.py records "graph_replay"/"graph_capture";
-    # tests/test_writer_graph_capture.py REQUIRES that replay counter to advance
-    # when the writer graph is ON, and its engagement is reported separately as
-    # ``writer_graph_*``). Reading them here false-failed the gate on healthy
-    # writer-graph replays, so this compat proof no longer borrows them; it only
-    # confirms the retired surface is not re-enabled. ``attribution`` is kept in
-    # the signature for call-site/test compatibility.
-    reasons: list[str] = []
-    if graph_enabled:
-        reasons.append("producer_graph_retired")
-    return {
-        "passed": not reasons,
-        "state": "retired",
-        "reasons": reasons,
-        "graph_enabled": False,
-        "capture_count": 0,
-        "replay_count": 0,
-        "next_action": "none",
     }
 
 
@@ -4407,7 +4377,9 @@ def _apply_scheduler_graph_contract_payload(
             str(key): value
             for source in (nested, metrics)
             for key, value in source.items()
-            if str(key).startswith("engine_runtime_")
+            if str(key).startswith(
+                ("engine_runtime_", "engine_core_block_pool_")
+            )
         }
         runtime_proofs[child] = proof
         payload[f"{child}_engine_runtime_contract_proof"] = proof
@@ -4488,11 +4460,12 @@ def _apply_scheduler_graph_contract_payload(
     payload["decode_step_contract_reasons"] = decode_step_contract_reasons
     reasons.extend(decode_step_contract_reasons)
 
-    exact_runtime_required = (
-        os.environ.get("SFI_RUNNER_TIER", "") == "tp8x64k"
+    runtime_contract_required = (
+        os.environ.get("SFI_RUNNER_MODEL_KV_CONTRACT_SCHEMA")
+        == MODEL_KV_CONTRACT_SCHEMA
     )
     runtime_reasons: list[str] = []
-    if exact_runtime_required:
+    if runtime_contract_required:
         for child, proof in runtime_proofs.items():
             if proof.get("engine_runtime_contract_proof_required") is not True:
                 runtime_reasons.append(f"{child}_runtime_proof_not_required")
@@ -4506,18 +4479,27 @@ def _apply_scheduler_graph_contract_payload(
                 runtime_reasons.append(f"{child}_runtime_full_decode_key_missing")
             if proof.get("engine_runtime_kv_capacity_covers_required_total") is not True:
                 runtime_reasons.append(f"{child}_runtime_kv_capacity_not_green")
+            if proof.get("engine_core_block_pool_proof_required") is not True:
+                runtime_reasons.append(f"{child}_block_pool_proof_not_required")
+            if proof.get("engine_core_block_pool_proof_passed") is not True:
+                runtime_reasons.append(f"{child}_block_pool_proof_not_green")
 
-        if (
-            diagnostic_graph_proof.get(
-                "cudagraph_runtime_observer_all_decode_exact_full"
-            )
-            is not True
-        ):
-            runtime_reasons.append("diagnostic_runtime_graph_steps_not_exact_full")
-        if diagnostic_graph_proof.get(
-            "cudagraph_runtime_observer_missing_step_count"
-        ) != 0:
-            runtime_reasons.append("diagnostic_runtime_graph_steps_missing")
+        if diagnostic_metrics is not None:
+            if (
+                diagnostic_graph_proof.get(
+                    "cudagraph_runtime_observer_all_decode_exact_full"
+                )
+                is not True
+            ):
+                runtime_reasons.append(
+                    "diagnostic_runtime_graph_steps_not_exact_full"
+                )
+            if diagnostic_graph_proof.get(
+                "cudagraph_runtime_observer_missing_step_count"
+            ) != 0:
+                runtime_reasons.append(
+                    "diagnostic_runtime_graph_steps_missing"
+                )
 
         geometries = {
             child: _engine_runtime_pair_geometry(proof)
@@ -4559,14 +4541,17 @@ def _apply_scheduler_graph_contract_payload(
 
 
 def _sparse_dense_pair_contract_kind() -> str:
-    """Resolve the pair verdict without conflating local data with TP8 proof."""
-    if os.environ.get("SFI_RUNNER_TIER", "") == "tp8x64k":
-        return "exact_speedup_verdict"
+    """Resolve the explicitly requested sparse/dense comparison contract."""
     contract = os.environ.get("SFI_RUNNER_PAIR_CONTRACT", "none").strip()
-    if contract not in {"none", "explicit_local_comparison"}:
+    if contract not in {
+        "none",
+        "explicit_local_comparison",
+        "exact_speedup_verdict",
+    }:
         raise RuntimeError(
             "SFI_RUNNER_PAIR_CONTRACT must be none or "
-            f"explicit_local_comparison, got {contract!r}"
+            "explicit_local_comparison or exact_speedup_verdict, "
+            f"got {contract!r}"
         )
     return contract
 
@@ -5556,10 +5541,6 @@ def _gate_d_payload(
         route_summary=route_summary,
         selector_pipeline_cpu_profile=selector_pipeline_cpu_profile,
     )
-    producer_graph_roi_proof = _producer_graph_roi_proof(
-        graph_enabled=False,
-        attribution=deadline_v2_attribution,
-    )
 
     payload: dict[str, Any] = {
         "schema": "sm80_thin_builder_gate_d_run_v1",
@@ -5801,10 +5782,6 @@ def _gate_d_payload(
         **speed_child_custom_all_reduce_runtime,
         "speed_child_custom_all_reduce_runtime_gate_passed": (
             custom_all_reduce_runtime_gate_passed
-        ),
-        "producer_graph_roi_proof": producer_graph_roi_proof,
-        "producer_graph_roi_gate_passed": bool(
-            producer_graph_roi_proof.get("passed", False)
         ),
         "gate_passed": production_gate_passed,
         "production_gate_passed": production_gate_passed,
@@ -6852,11 +6829,6 @@ def _run_gate_d_mode(args: argparse.Namespace) -> int:
         )
         and route_proof_result.passed
         and bool(payload.get("diagnostic_child_route_proof_passed", False))
-        # [2026-07-01] producer_graph_roi retired from the exit gate: its counter
-        # is now owned by the sanctioned task-#9 writer graph (see
-        # _producer_graph_roi_proof). The retired producer-graph surface removal
-        # is enforced by tests/test_refresh_producer_graph_profile_enablement.py.
-        # The ``producer_graph_roi_*`` payload fields remain for compatibility.
         and bool(payload.get("production_gate_passed", False))
         and bool(payload.get("workload_plan_replay_counts_match", True))
     )

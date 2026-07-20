@@ -20,11 +20,6 @@ SELECTOR_LOG_S_RUNTIME_PROOF_SCHEMA = "sfi.selector_log_s_runtime_proof.v6"
 SELECTOR_LOG_S_REQUIRED_TILED_SYMBOL = (
     "reduce_log_f_pre_scratch_r2_alpha0p5_fp16_tiled"
 )
-# This name is retained only so every production entrypoint can reject stale
-# launch recipes deterministically.  It no longer selects a code path.
-SELECTOR_LOG_F_RETIRED_TP8_EXACT_ENV = (
-    "VLLM_SPARSE_SELECTOR_LOG_F_TP8_64K_GROUP"
-)
 
 
 class SelectorLogFRoute(str, Enum):
@@ -336,7 +331,6 @@ __all__ = [
     "SELECTOR_LOG_F_COUNTER_SEMANTICS",
     "SELECTOR_LOG_F_FAST_ROUTE",
     "SELECTOR_LOG_F_GENERIC_ROUTE",
-    "SELECTOR_LOG_F_RETIRED_TP8_EXACT_ENV",
     "SELECTOR_LOG_F_ROUTES",
     "SELECTOR_LOG_F_TILED_ROUTE",
     "SELECTOR_LOG_S_EXTENSION_NAME",

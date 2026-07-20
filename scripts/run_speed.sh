@@ -66,18 +66,6 @@ if [[ "${WITH_DENSE_REFERENCE}" == "1" && "${VERDICT_ONLY:-0}" == "1" ]]; then
   echo "FAIL: WITH_DENSE_REFERENCE=1 forbids VERDICT_ONLY=1; a local timed pair requires the full observer-free sparse+dense contract" >&2
   exit 64
 fi
-RETIRED_ENV_NAMES=(
-  "VLLM_SPARSE_SELECTOR_LOG_F_TP8_64K_GROUP"
-  "VLLM_SPARSE_FULL_CUDAGRAPH_REPLAY_WRAPPER_ABLATE_EXTRA"
-  "VLLM_SPARSE_FULL_CUDAGRAPH_REPLAY_WRAPPER_ABLATE_HIT_LOG"
-)
-for retired_env_name in "${RETIRED_ENV_NAMES[@]}"; do
-  retired_env_value="${!retired_env_name:-}"
-  if [[ -n "${retired_env_value}" && "${retired_env_value}" != "0" ]]; then
-    echo "FAIL: ${retired_env_name} is retired; unset it." >&2
-    exit 64
-  fi
-done
 if [[ ! "${TAG}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
   echo "FAIL: TAG must match ^[A-Za-z0-9][A-Za-z0-9._-]*$: ${TAG}" >&2
   exit 64
@@ -256,6 +244,12 @@ if (( TP <= 0 )); then
 fi
 if (( TP != ${#GPU_IDS[@]} )); then
   echo "FAIL: TP=${TP} must match selected GPU count=${#GPU_IDS[@]}" >&2
+  exit 64
+fi
+if [[ "${MODE}" == "sparse" \
+   && "${VLLM_SPARSE_COMPACT_DUAL_GEN:-1}" != "0" \
+   && "${VLLM_SPARSE_COMPACT_DUAL_GEN:-1}" != "1" ]]; then
+  echo "FAIL: VLLM_SPARSE_COMPACT_DUAL_GEN must be 0 or 1" >&2
   exit 64
 fi
 if [[ "${TIER}" != "tp8x64k" ]] \
@@ -772,7 +766,7 @@ for logical_rank in range(expected):
     frees.append(str(int(free_bytes)))
 print(",".join(totals) + "|" + ",".join(frees))
 ' "${#GPU_IDS[@]}"
-  } 2>&1)" || {
+  })" || {
     echo "FAIL: cannot prove per-rank physical GPU capacity: ${GPU_MEMORY_PROOF}" >&2
     exit 69
   }
@@ -944,13 +938,47 @@ if [[ -n "${CORPUS:-}" ]]; then
   echo "FAIL: explicit CORPUS is retired; release runs require the content-addressed v6 vector corpus cache" >&2
   exit 64
 fi
-CORPUS_RESULT="$("${PY}" "${SFI_ROOT}/scripts/make_context_corpus.py" \
+CORPUS_CACHE_OUTPUT="$("${PY}" "${SFI_ROOT}/scripts/make_context_corpus.py" \
   --model "${MODEL}" --segments "${BS}" \
   --tokens-per-segment-by-request "${REQUEST_CONTEXT_TOKENS}" \
-  --cache-dir "${OUT}/context_corpus_cache")"
-CORPUS="$(printf '%s\n' "${CORPUS_RESULT}" | sed -n 's/^context_corpus_path=//p' | tail -1)"
-if [[ -z "${CORPUS}" || ! -f "${CORPUS}" ]]; then
-  echo "FAIL: context corpus cache returned no readable path" >&2
+  --cache-dir "${OUT}/context_corpus_cache" \
+  --format cache-manifest-tsv)"
+CORPUS_CACHE_TSV=""
+CORPUS_CACHE_RECORD_COUNT=0
+while IFS= read -r corpus_cache_line; do
+  if [[ "${corpus_cache_line}" == context_corpus_cache_manifest_tsv=* ]]; then
+    CORPUS_CACHE_TSV="${corpus_cache_line#context_corpus_cache_manifest_tsv=}"
+    CORPUS_CACHE_RECORD_COUNT=$((CORPUS_CACHE_RECORD_COUNT + 1))
+  fi
+done <<< "${CORPUS_CACHE_OUTPUT}"
+if (( CORPUS_CACHE_RECORD_COUNT != 1 )); then
+  echo "FAIL: context corpus cache emitted ${CORPUS_CACHE_RECORD_COUNT} structured records; expected exactly one" >&2
+  exit 66
+fi
+IFS=$'\t' read -r \
+  CORPUS \
+  CORPUS_SHA256 \
+  SFI_RUNNER_CORPUS_MANIFEST_PATH \
+  SFI_RUNNER_CORPUS_MANIFEST_SHA256 \
+  SFI_RUNNER_CORPUS_MANIFEST_SCHEMA \
+  SFI_RUNNER_CORPUS_LAYOUT_MODE \
+  SFI_RUNNER_CORPUS_LAYOUT_VALIDATION_CONTRACT \
+  SFI_RUNNER_CORPUS_LAYOUT_VERIFIED_COUNT \
+  CORPUS_CACHE_STATUS \
+  <<< "${CORPUS_CACHE_TSV}"
+EXPECTED_CORPUS_MANIFEST_PATH="${CORPUS%.txt}.manifest.json"
+if [[ -z "${CORPUS}" || ! -f "${CORPUS}" \
+   || ! "${CORPUS_SHA256}" =~ ^[0-9a-f]{64}$ \
+   || "${SFI_RUNNER_CORPUS_MANIFEST_PATH}" != "${EXPECTED_CORPUS_MANIFEST_PATH}" \
+   || ! -f "${SFI_RUNNER_CORPUS_MANIFEST_PATH}" \
+   || ! "${SFI_RUNNER_CORPUS_MANIFEST_SHA256}" =~ ^[0-9a-f]{64}$ \
+   || "${SFI_RUNNER_CORPUS_MANIFEST_SCHEMA}" != "sfi.context_corpus_cache.v6" \
+   || -z "${SFI_RUNNER_CORPUS_LAYOUT_MODE}" \
+   || "${SFI_RUNNER_CORPUS_LAYOUT_VALIDATION_CONTRACT}" != "load_prompt_batch_source_layout_v1" \
+   || "${SFI_RUNNER_CORPUS_LAYOUT_VERIFIED_COUNT}" != "${BS}" \
+   || ( "${CORPUS_CACHE_STATUS}" != "hit" \
+        && "${CORPUS_CACHE_STATUS}" != "miss" ) ]]; then
+  echo "FAIL: context corpus cache returned an invalid validated snapshot" >&2
   exit 66
 fi
 SFI_RUNNER_CORPUS_TOKEN_STATUS="cache_exact"
@@ -976,32 +1004,6 @@ export SFI_RUNNER_CHAT_TEMPLATE_RESERVE_TOKENS="${CHAT_TEMPLATE_RESERVE_TOKENS}"
 export SFI_RUNNER_CHAT_TEMPLATE_OVERHEAD_MIN
 export SFI_RUNNER_CHAT_TEMPLATE_OVERHEAD_MAX
 export SFI_RUNNER_CHAT_TEMPLATE_VERIFIED_COUNT
-CORPUS_SHA256="$({
-  "${PY}" -I - "${CORPUS}" <<'PY'
-from hashlib import sha256
-from pathlib import Path
-import sys
-
-print(sha256(Path(sys.argv[1]).read_bytes()).hexdigest())
-PY
-})"
-CORPUS_MANIFEST_TSV="$({
-  "${PY}" -I "${SFI_ROOT}/scripts/make_context_corpus.py" \
-    --model "${MODEL}" --segments "${BS}" \
-    --tokens-per-segment-by-request "${REQUEST_CONTEXT_TOKENS}" \
-    --validate "${CORPUS}" --format manifest-tsv
-})" || {
-  echo "FAIL: cached corpus manifest is not release-semantic grade" >&2
-  exit 78
-}
-IFS=$'\t' read -r \
-  SFI_RUNNER_CORPUS_MANIFEST_PATH \
-  SFI_RUNNER_CORPUS_MANIFEST_SHA256 \
-  SFI_RUNNER_CORPUS_MANIFEST_SCHEMA \
-  SFI_RUNNER_CORPUS_LAYOUT_MODE \
-  SFI_RUNNER_CORPUS_LAYOUT_VALIDATION_CONTRACT \
-  SFI_RUNNER_CORPUS_LAYOUT_VERIFIED_COUNT \
-  <<< "${CORPUS_MANIFEST_TSV}"
 export SFI_RUNNER_CORPUS_PATH="${CORPUS}"
 export SFI_RUNNER_CORPUS_SHA256="${CORPUS_SHA256}"
 export SFI_RUNNER_CORPUS_MANIFEST_PATH

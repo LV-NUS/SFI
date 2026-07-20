@@ -757,13 +757,16 @@ def _build_dense_reference_env(args: argparse.Namespace) -> dict[str, str]:
     env["CUDA_VISIBLE_DEVICES"] = str(args.cuda_visible_devices)
     env.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
     for name in (
-        "VLLM_SPARSE_FA3_UPSTREAM_ROOT",
         "VLLM_SPARSE_ATTENTION_IN_CUDAGRAPH",
         "VLLM_SPARSE_ASYNC_REFRESH",
         "VLLM_SPARSE_FA3_ROUTE_TRACE_LOG",
         "VLLM_SPARSE_CONTROLLER_JSON",
     ):
         env.pop(name, None)
+    # Dense and sparse children share one atomic vendored-bridge identity.
+    # Never leave backend/version active while relying on an implicit checkout
+    # path: this helper is also imported by the current one-shot harness.
+    env["VLLM_SPARSE_FA3_UPSTREAM_ROOT"] = str(args.fa3_upstream_root)
     env["VLLM_ATTENTION_BACKEND"] = "FLASH_ATTN_VLLM_V1"
     env["VLLM_FLASH_ATTN_VERSION"] = "3"
     return env

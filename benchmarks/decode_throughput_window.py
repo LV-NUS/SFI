@@ -11,6 +11,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Tuple
 
+from utils.model_kv_contract import MODEL_KV_CONTRACT_SCHEMA
+
 
 CUSTOM_ALL_REDUCE_RUNTIME_RPC_METHOD = "sfi_custom_all_reduce_runtime_state"
 ENGINE_RUNTIME_CONTRACT_RPC_METHOD = "sfi_engine_runtime_contract_state"
@@ -332,11 +334,9 @@ def _worker_custom_all_reduce_runtime_state(
     }
 
 
-def _attach_tp8_selector_log_s_runtime_proof(
+def _attach_selector_log_s_runtime_proof(
     record: dict[str, object],
 ) -> dict[str, object]:
-    if os.environ.get("SFI_RUNNER_TIER", "") != "tp8x64k":
-        return record
     from patches.fa3_native.postprocess import (
         snapshot_selector_log_s_runtime_proof,
     )
@@ -345,6 +345,45 @@ def _attach_tp8_selector_log_s_runtime_proof(
         snapshot_selector_log_s_runtime_proof()
     )
     return record
+
+
+_RUNNER_ENGINE_CONTRACT_ENV_FIELDS = (
+    "SFI_RUNNER_MODEL_KV_CONTRACT_SCHEMA",
+    "SFI_RUNNER_CHAT_TEMPLATE_RESERVE_TOKENS",
+    "SFI_RUNNER_KV_TOKEN_BYTES_PER_RANK_EFFECTIVE",
+)
+
+
+def runner_engine_runtime_contract_required() -> bool:
+    """Return whether this child belongs to a launcher-managed proof run.
+
+    The model/KV contract is emitted for every ``run_speed.sh`` tier.  Treat
+    its presence as the common cold-start proof boundary instead of using a
+    workload label to change child behavior.  A partially propagated contract
+    is invalid rather than silently disabling the proof.
+    """
+
+    values = {
+        name: str(os.environ.get(name, "") or "").strip()
+        for name in _RUNNER_ENGINE_CONTRACT_ENV_FIELDS
+    }
+    if not any(values.values()):
+        return False
+    missing = [name for name, value in values.items() if not value]
+    if missing:
+        raise RuntimeError(
+            "E_ENGINE_RUNTIME_CONTRACT_INPUT: incomplete runner contract: "
+            f"missing={missing!r}"
+        )
+    if values["SFI_RUNNER_MODEL_KV_CONTRACT_SCHEMA"] != (
+        MODEL_KV_CONTRACT_SCHEMA
+    ):
+        raise RuntimeError(
+            "E_ENGINE_RUNTIME_CONTRACT_INPUT: unsupported model/KV schema: "
+            f"actual={values['SFI_RUNNER_MODEL_KV_CONTRACT_SCHEMA']!r}:"
+            f"expected={MODEL_KV_CONTRACT_SCHEMA!r}"
+        )
+    return True
 
 
 def _runtime_mode_name(value: object) -> str:
@@ -389,28 +428,35 @@ def benchmark_child_identity(args: object) -> dict[str, object]:
     expected_corpus_sha256 = str(
         os.environ.get("SFI_RUNNER_CORPUS_SHA256", "") or ""
     )
-    if os.environ.get("SFI_RUNNER_TIER", "") == "tp8x64k":
-        mismatches = []
-        if model_config_sha256 != expected_model_sha256:
-            mismatches.append(
-                "model_config_sha256="
-                f"{model_config_sha256!r}:expected={expected_model_sha256!r}"
-            )
-        if model_config_sha256 != parent_model_sha256:
-            mismatches.append(
-                "model_config_parent_claim="
-                f"{parent_model_sha256!r}:actual={model_config_sha256!r}"
-            )
-        if corpus_sha256 != expected_corpus_sha256:
-            mismatches.append(
-                "corpus_sha256="
-                f"{corpus_sha256!r}:expected={expected_corpus_sha256!r}"
-            )
-        if mismatches:
-            raise RuntimeError(
-                "E_BENCHMARK_CHILD_IDENTITY_MISMATCH: "
-                + "; ".join(mismatches)
-            )
+    runner_contract_required = runner_engine_runtime_contract_required()
+    mismatches = []
+    if runner_contract_required and not parent_model_sha256:
+        mismatches.append("model_config_parent_claim_missing")
+    if runner_contract_required and not expected_corpus_sha256:
+        mismatches.append("corpus_sha256_parent_claim_missing")
+    if (
+        expected_model_sha256
+        and model_config_sha256 != expected_model_sha256
+    ):
+        mismatches.append(
+            "model_config_sha256="
+            f"{model_config_sha256!r}:expected={expected_model_sha256!r}"
+        )
+    if parent_model_sha256 and model_config_sha256 != parent_model_sha256:
+        mismatches.append(
+            "model_config_parent_claim="
+            f"{parent_model_sha256!r}:actual={model_config_sha256!r}"
+        )
+    if expected_corpus_sha256 and corpus_sha256 != expected_corpus_sha256:
+        mismatches.append(
+            "corpus_sha256="
+            f"{corpus_sha256!r}:expected={expected_corpus_sha256!r}"
+        )
+    if mismatches:
+        raise RuntimeError(
+            "E_BENCHMARK_CHILD_IDENTITY_MISMATCH: "
+            + "; ".join(mismatches)
+        )
 
     return {
         "schema": "sfi.benchmark_child_identity.v1",
@@ -882,7 +928,7 @@ class CustomAllReduceRuntimeWorkerExtension:
         )
 
         reset_selector_log_s_runtime_proof_counters()
-        return _attach_tp8_selector_log_s_runtime_proof(
+        return _attach_selector_log_s_runtime_proof(
             reset_rank_local_route_counter_slot_for_measurement()
         )
 
@@ -893,7 +939,7 @@ class CustomAllReduceRuntimeWorkerExtension:
             snapshot_rank_local_route_counter_slot_after_measurement,
         )
 
-        return _attach_tp8_selector_log_s_runtime_proof(
+        return _attach_selector_log_s_runtime_proof(
             snapshot_rank_local_route_counter_slot_after_measurement()
         )
 

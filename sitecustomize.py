@@ -297,9 +297,12 @@ fa4_dense_gateway_requested = (
     and "VLLM_SPARSE_CONTROLLER_JSON" not in os.environ
 )
 
-vendored_probe_requested = (
-    os.environ.get("VLLM_ATTENTION_BACKEND") == "FLASH_ATTN_VLLM_V1"
-    and os.environ.get("VLLM_FLASH_ATTN_VERSION") in ("3", "4")
+vendored_probe_requested = bool(
+    os.environ.get("VLLM_SPARSE_FA3_UPSTREAM_ROOT")
+    and (
+        os.environ.get("VLLM_SPARSE_CONTROLLER_JSON")
+        or os.environ.get("VLLM_FLASH_ATTN_VERSION") in ("3", "4")
+    )
 )
 
 try:
@@ -308,11 +311,29 @@ try:
         install_vendored_flash_attn_probe_patch,
         should_install_vendored_flash_attn_probe_patch,
     )
+    from utils.model_kv_contract import MODEL_KV_CONTRACT_SCHEMA
 
     vendored_probe_requested = should_install_vendored_flash_attn_probe_patch()
     vendored_probe_summary = install_vendored_flash_attn_probe_patch(
         repo_root=_REPO_ROOT,
     )
+    # The launcher emits the model/KV contract for every TP size.  Combine
+    # that common proof boundary with a successfully installed bridge before
+    # importing EngineCore; helper interpreters such as selector prewarm strip
+    # the bridge env and therefore never import the vLLM engine stack.
+    engine_runtime_proof_requested = (
+        os.environ.get("SFI_RUNNER_MODEL_KV_CONTRACT_SCHEMA")
+        == MODEL_KV_CONTRACT_SCHEMA
+    )
+    if (
+        engine_runtime_proof_requested
+        and vendored_probe_summary.get("applied")
+    ):
+        from patches.page_kv_residency import (
+            install_engine_core_block_pool_state_utility,
+        )
+
+        install_engine_core_block_pool_state_utility()
     dense_route_probe_requested = (
         vendored_probe_requested
         and bool(os.environ.get("VLLM_SPARSE_FA3_ROUTE_TRACE_LOG"))
@@ -357,12 +378,6 @@ except Exception as exc:
         raise SystemExit(
             f"sitecustomize vendored flash-attn probe patch failed: {exc}"
         ) from exc
-
-# (EngineCore step-timing diagnostic hook retired: its installer
-# install_engine_core_step_timing_diagnostic was deleted from patch_installer
-# in an earlier sweep, leaving this entry a hard SystemExit for anyone setting
-# VLLM_DECODE_ENGINE_CORE_STEP_LOG. Orphan state cluster removed with it.)
-
 
 # Native CUDAGraphWrapper replay CUDA-event diagnostic.
 # Default off. Enable with VLLM_NATIVE_FULLGRAPH_REPLAY_CUDA_EVENT_LOG.
@@ -1564,21 +1579,6 @@ if os.environ.get("VLLM_GPU_EXECUTE_PHASE_TIMING_LOG"):
                 )
         raise SystemExit(
             f"sitecustomize synchronize_input_prep phase timing diagnostic failed: {exc}"
-        ) from exc
-
-# Exact TP8 postflight reads scheduler-owned BlockPool state through vLLM's
-# existing named utility transport. Install the project-owned method in every
-# EngineCore process, including the dense arm; no vLLM source is modified.
-if os.environ.get("SFI_RUNNER_TIER", "") == "tp8x64k":
-    try:
-        from patches.page_kv_residency import (
-            install_engine_core_block_pool_state_utility,
-        )
-
-        install_engine_core_block_pool_state_utility()
-    except Exception as exc:
-        raise SystemExit(
-            f"sitecustomize EngineCore BlockPool proof utility failed: {exc}"
         ) from exc
 
 if "VLLM_SPARSE_CONTROLLER_JSON" in os.environ:
