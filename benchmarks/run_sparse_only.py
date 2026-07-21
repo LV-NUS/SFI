@@ -547,7 +547,7 @@ try:
     from benchmarks.decode_throughput_window import (
         DecodeWindowMeter,
         count_new_tokens,
-        pull_step_outputs_with_timing,
+        pull_step_outputs_with_timestamp,
     )
     from benchmarks.prompt_batch_io import (
         build_request_sampling_params,
@@ -574,7 +574,7 @@ except ModuleNotFoundError:
     from decode_throughput_window import (  # type: ignore[no-redef]
         DecodeWindowMeter,
         count_new_tokens,
-        pull_step_outputs_with_timing,
+        pull_step_outputs_with_timestamp,
     )
     from prompt_batch_io import (  # type: ignore[no-redef]
         build_request_sampling_params,
@@ -2145,81 +2145,15 @@ def main() -> None:
         # 长 ctx 大 bs 档 decode 计量窗前段与 prefill 交错（实测 8×32k 占墙钟 81%），
         # decode_tok_per_s 被稀释；all_decode_tok_per_s 反映真实稳态 decode 吞吐。
         decode_meter = DecodeWindowMeter(batch_size=len(prompts))
-        out_tokens = 0
         total_engine_steps = 0
-        first_emit_step_index = -1
-        pre_first_emit_step_wall_s: list[float] = []
-        first_emit_step_wall_s = 0.0
-        step_wall_s_first_16: list[float] = []
-        step_get_output_us_first_16: list[float] = []
-        step_process_outputs_us_first_16: list[float] = []
-        step_abort_requests_us_first_16: list[float] = []
-        step_dummy_batch_us_first_16: list[float] = []
-        step_new_tokens_first_16: list[int] = []
-        capture_all_step_timing = str(
-            os.environ.get("VLLM_DECODE_FULL_STEP_TIMING", "") or ""
-        ).strip().lower() not in {"", "0", "false", "off", "no"}
-        step_wall_s_all: list[float] = []
-        step_get_output_us_all: list[float] = []
-        step_process_outputs_us_all: list[float] = []
-        step_abort_requests_us_all: list[float] = []
-        step_dummy_batch_us_all: list[float] = []
-        step_new_tokens_all: list[int] = []
-        step_engine_core_timing_all: list[dict[str, float]] = []
-        step_host_begin_ns_all: list[int] = []
-        step_host_end_ns_all: list[int] = []
         final_output_items: dict[str, object] = {}
 
         t_total0 = time.perf_counter()
         while engine.llm_engine.has_unfinished_requests():  # type: ignore[attr-defined]
-            step_host_begin_ns = time.time_ns()
-            t_step0 = time.perf_counter()
-            step_out, core_ts, step_timing = pull_step_outputs_with_timing(
+            step_out, core_ts = pull_step_outputs_with_timestamp(
                 engine.llm_engine  # type: ignore[attr-defined]
             )
-            t_step1 = time.perf_counter()
-            step_host_end_ns = time.time_ns()
-            step_wall_s = t_step1 - t_step0
             step_new_tokens = count_new_tokens(step_out, prev_len)
-            if total_engine_steps < 16:
-                step_wall_s_first_16.append(float(step_wall_s))
-                step_get_output_us_first_16.append(
-                    float(step_timing.get("get_output_us", 0.0))
-                )
-                step_process_outputs_us_first_16.append(
-                    float(step_timing.get("process_outputs_us", 0.0))
-                )
-                step_abort_requests_us_first_16.append(
-                    float(step_timing.get("abort_requests_us", 0.0))
-                )
-                step_dummy_batch_us_first_16.append(
-                    float(step_timing.get("dummy_batch_us", 0.0))
-                )
-                step_new_tokens_first_16.append(int(step_new_tokens))
-            if capture_all_step_timing:
-                step_wall_s_all.append(float(step_wall_s))
-                step_get_output_us_all.append(
-                    float(step_timing.get("get_output_us", 0.0))
-                )
-                step_process_outputs_us_all.append(
-                    float(step_timing.get("process_outputs_us", 0.0))
-                )
-                step_abort_requests_us_all.append(
-                    float(step_timing.get("abort_requests_us", 0.0))
-                )
-                step_dummy_batch_us_all.append(
-                    float(step_timing.get("dummy_batch_us", 0.0))
-                )
-                step_new_tokens_all.append(int(step_new_tokens))
-                step_host_begin_ns_all.append(int(step_host_begin_ns))
-                step_host_end_ns_all.append(int(step_host_end_ns))
-                step_engine_core_timing_all.append(
-                    {
-                        str(key): float(value)
-                        for key, value in step_timing.items()
-                        if str(key).startswith(("ec_", "mr_"))
-                    }
-                )
             if args.outputs_json:
                 for item in step_out:
                     rid = getattr(item, "request_id", None)
@@ -2228,13 +2162,6 @@ def main() -> None:
                         continue
                     final_output_items[str(rid)] = item
 
-            if step_new_tokens > 0:
-                if first_emit_step_index < 0:
-                    first_emit_step_index = int(total_engine_steps)
-                    first_emit_step_wall_s = float(step_wall_s)
-                out_tokens += step_new_tokens
-            elif first_emit_step_index < 0:
-                pre_first_emit_step_wall_s.append(float(step_wall_s))
             decode_meter.observe(core_ts, step_new_tokens)
             total_engine_steps += 1
         t_total1 = time.perf_counter()
@@ -2245,7 +2172,8 @@ def main() -> None:
                     item,
                     include_text=False,
                 )
-        decode_elapsed, decode_tokens, _decode_tps, decode_step_durations_s = decode_meter.finalize()
+        decode_elapsed, decode_tokens, decode_step_durations_s = decode_meter.finalize()
+        out_tokens = int(decode_meter.total_tokens)
         ad_elapsed_s, ad_tokens, ad_tps, ad_steps = decode_meter.finalize_all_decode()
         all_decode_contract = decode_meter.all_decode_contract()
         first_emit_delay_s, post_decode_tail_s = decode_meter.boundary_delays(
@@ -2258,48 +2186,11 @@ def main() -> None:
             "all_decode_tok_per_s": float(ad_tps),
             "all_decode_steps": int(ad_steps),
             **all_decode_contract,
-            "_all_decode_start_step_index": (
-                decode_meter.all_decode_start_step_index
-            ),
             "process_pid": int(os.getpid()),
-            "engine_core_step_log": str(
-                os.environ.get("VLLM_DECODE_ENGINE_CORE_STEP_LOG", "") or ""
-            ),
             "request_add_s": float(t_add1 - t_add0),
             "total_engine_steps": int(total_engine_steps),
-            "pre_first_emit_step_count": int(max(0, first_emit_step_index)),
-            "first_emit_step_index": int(first_emit_step_index),
-            "pre_first_emit_step_wall_us": [
-                float(x * 1_000_000.0) for x in pre_first_emit_step_wall_s
-            ],
-            "first_emit_step_wall_us": float(first_emit_step_wall_s * 1_000_000.0),
-            "step_wall_us_first_16": [
-                float(x * 1_000_000.0) for x in step_wall_s_first_16
-            ],
-            "step_get_output_us_first_16": step_get_output_us_first_16,
-            "step_process_outputs_us_first_16": step_process_outputs_us_first_16,
-            "step_abort_requests_us_first_16": step_abort_requests_us_first_16,
-            "step_dummy_batch_us_first_16": step_dummy_batch_us_first_16,
-            "step_new_tokens_first_16": step_new_tokens_first_16,
         }
-        if capture_all_step_timing:
-            boundary_diagnostics.update(
-                {
-                    "step_timing_scope": "all_engine_steps",
-                    "step_wall_us_all": [
-                        float(x * 1_000_000.0) for x in step_wall_s_all
-                    ],
-                    "step_get_output_us_all": step_get_output_us_all,
-                    "step_process_outputs_us_all": step_process_outputs_us_all,
-                    "step_abort_requests_us_all": step_abort_requests_us_all,
-                    "step_dummy_batch_us_all": step_dummy_batch_us_all,
-                    "step_new_tokens_all": step_new_tokens_all,
-                    "step_host_begin_ns_all": step_host_begin_ns_all,
-                    "step_host_end_ns_all": step_host_end_ns_all,
-                    "step_engine_core_timing_all": step_engine_core_timing_all,
-                }
-            )
-        return (t_total1 - t_total0, decode_elapsed, int(out_tokens),
+        return (t_total1 - t_total0, decode_elapsed, out_tokens,
                 int(decode_tokens), decode_step_durations_s,
                 first_emit_delay_s, post_decode_tail_s, boundary_diagnostics)
 
@@ -2392,18 +2283,17 @@ def main() -> None:
             )
         if bool(args.collect_cudagraph_runtime_proof):
             graph_records = stop_cudagraph_runtime_observer(engine.llm_engine)
-            all_decode_start_step_index = int(
-                boundary_diagnostics.pop("_all_decode_start_step_index", -1)
-            )
             boundary_diagnostics.update(
                 summarize_cudagraph_runtime_observer(
                     graph_records,
-                    all_decode_start_step_index=all_decode_start_step_index,
                     expected_full_batch_steps=int(
                         boundary_diagnostics["all_decode_full_batch_steps"]
                     ),
                     expected_partial_batch_steps=int(
                         boundary_diagnostics["all_decode_partial_batch_steps"]
+                    ),
+                    expected_zero_token_steps=int(
+                        boundary_diagnostics["all_decode_zero_token_steps"]
                     ),
                     expected_batch_size=int(args.batch_size),
                     expected_total_engine_steps=int(
@@ -2411,8 +2301,6 @@ def main() -> None:
                     ),
                 )
             )
-        else:
-            boundary_diagnostics.pop("_all_decode_start_step_index", None)
         tps = float(out_tokens) / elapsed if elapsed > 0 else float("nan")
         decode_tps = float(decode_tokens) / decode_elapsed if decode_elapsed > 0 else float("nan")
         decode_metrics = summarize_decode_metrics(

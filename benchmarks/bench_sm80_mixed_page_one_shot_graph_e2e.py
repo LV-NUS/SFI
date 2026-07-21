@@ -199,10 +199,6 @@ class Phase2OneShotGraphRecord:
     sentence_trigger_observation_required: bool = False
     gt1_gate_scope: str = ""
     prefill_last_n_gt1_requested: bool = True
-    pre_first_emit_step_count: int = -1
-    first_emit_step_index: int = -1
-    pre_first_emit_step_wall_us: list[float] = field(default_factory=list)
-    first_emit_step_wall_us: float = -1.0
     first_decode_wait_us: float = -1.0
     blocked_by_unready_request_us: float = -1.0
     prefill_slowdown_us: float = -1.0
@@ -3280,38 +3276,12 @@ def _interval_trigger_requirement_satisfied(
 
 def _boundary_diagnostics_payload(metrics: dict[str, Any]) -> dict[str, Any]:
     boundary_diagnostics = metrics.get("boundary_diagnostics")
-    if not isinstance(boundary_diagnostics, dict):
-        return {
-            "boundary_diagnostics": {},
-            "pre_first_emit_step_count": -1,
-            "first_emit_step_index": -1,
-            "pre_first_emit_step_wall_us": [],
-            "first_emit_step_wall_us": -1.0,
-        }
-
-    pre_first_emit_wall = boundary_diagnostics.get("pre_first_emit_step_wall_us")
-    if isinstance(pre_first_emit_wall, list):
-        pre_first_emit_step_wall_us = [
-            _as_float(value, -1.0) for value in pre_first_emit_wall
-        ]
-    else:
-        pre_first_emit_step_wall_us = []
-
     return {
-        "boundary_diagnostics": dict(boundary_diagnostics),
-        "pre_first_emit_step_count": _as_int(
-            boundary_diagnostics.get("pre_first_emit_step_count"),
-            -1,
-        ),
-        "first_emit_step_index": _as_int(
-            boundary_diagnostics.get("first_emit_step_index"),
-            -1,
-        ),
-        "pre_first_emit_step_wall_us": pre_first_emit_step_wall_us,
-        "first_emit_step_wall_us": _as_float(
-            boundary_diagnostics.get("first_emit_step_wall_us"),
-            -1.0,
-        ),
+        "boundary_diagnostics": (
+            dict(boundary_diagnostics)
+            if isinstance(boundary_diagnostics, dict)
+            else {}
+        )
     }
 
 
@@ -11350,7 +11320,6 @@ def _record_from_result(
     )
     route_proof_passed = bool(route_proof_result.passed) if route_proof_result else False
     route_proof_reasons = list(route_proof_result.reasons) if route_proof_result else []
-    boundary_payload = _boundary_diagnostics_payload(metrics)
     return Phase2OneShotGraphRecord(
         case=str(args.case),
         one_shot_bootstrap_only=True,
@@ -11397,12 +11366,6 @@ def _record_from_result(
         prefill_last_n_gt1_requested=bool(
             max(0, int(getattr(args, "prefill_last_n", 16))) > 1
         ),
-        pre_first_emit_step_count=int(boundary_payload["pre_first_emit_step_count"]),
-        first_emit_step_index=int(boundary_payload["first_emit_step_index"]),
-        pre_first_emit_step_wall_us=list(
-            boundary_payload["pre_first_emit_step_wall_us"]
-        ),
-        first_emit_step_wall_us=float(boundary_payload["first_emit_step_wall_us"]),
         first_decode_wait_us=first_decode_wait_us,
         blocked_by_unready_request_us=blocked_by_unready_request_us,
         prefill_slowdown_us=prefill_slowdown_us,

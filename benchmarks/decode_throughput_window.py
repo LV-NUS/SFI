@@ -6,7 +6,6 @@ import json
 import os
 import sys
 import time
-import types
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Tuple
@@ -26,16 +25,16 @@ CUSTOM_ALL_REDUCE_RUNTIME_WORKER_EXTENSION = (
     "benchmarks.decode_throughput_window.CustomAllReduceRuntimeWorkerExtension"
 )
 CUDAGRAPH_RUNTIME_OBSERVER_SCOPE = (
-    "diagnostic_measurement_all_decode_partitioned"
+    "diagnostic_measurement_post_anchor_partitioned"
 )
 
 
 def collect_single_token_decode_step_proof(engine: object) -> dict[str, object]:
-    """Prove the aggregate all-decode boundary is one-token-per-request.
+    """Prove the aggregate synchronization anchor is one-token-per-request.
 
     This is evaluated once after engine construction.  It keeps speculative
     decoding or buffered multi-step output from invalidating the zero-overhead
-    ``new_tokens == batch_size`` measurement boundary.
+    ``new_tokens == batch_size`` full-output anchor.
     """
     llm_engine = getattr(engine, "llm_engine", None)
     vllm_config = getattr(llm_engine, "vllm_config", None)
@@ -49,7 +48,7 @@ def collect_single_token_decode_step_proof(engine: object) -> dict[str, object]:
     if speculative_config is not None:
         raise RuntimeError(
             "E_DECODE_STEP_CONTRACT_SPECULATIVE: speculative decoding is "
-            "incompatible with the aggregate all-decode boundary"
+            "incompatible with the aggregate full-output anchor"
         )
     if type(stream_interval) is not int or stream_interval != 1:
         raise RuntimeError(
@@ -2140,13 +2139,14 @@ class EngineShutdownGuard:
 
 @dataclass
 class DecodeWindowMeter:
-    """Measure decode throughput in the window [first_emit_ts, last_emit_ts].
+    """Measure decode throughput after first_emit_ts through last_emit_ts.
 
     When *batch_size* is provided, an additional **all-decode window** is
-    tracked: it starts from the first step where ``new_tokens == batch_size``
-    (i.e. all requests have entered decode) and ends at the last emit.  This
-    avoids counting the slow prefill-interleaved steps that occur when
-    different-length prompts finish chunked prefill at different times.
+    tracked.  The first output where ``new_tokens == batch_size`` is the
+    synchronization anchor proving that every request has emitted.  Measured
+    tokens, intervals, and engine records start *after* that anchor and end at
+    the last emit.  This excludes the final mixed-prefill execution that can
+    produce one token for every request without being a BS-sized decode step.
     """
 
     batch_size: int = 0
@@ -2154,21 +2154,15 @@ class DecodeWindowMeter:
     last_emit_ts: float | None = None
     total_tokens: int = 0
     first_emit_tokens: int = 0
-    _prev_emit_ts: float | None = None
     decode_step_durations_s: list[float] = field(default_factory=list)
-    # all-decode window (from first full-batch decode step)
+    # All-decode measurement intervals after the first full-output anchor.
     _ad_start_ts: float | None = None
     _ad_start_tokens: int = 0
-    _ad_steps: int = 0
     _ad_full_batch_steps: int = 0
     _ad_partial_batch_steps: int = 0
     _ad_zero_token_steps: int = 0
-    _observed_steps: int = 0
-    _ad_start_step_index: int = -1
 
     def observe(self, ts: float, new_tokens: int) -> None:
-        step_index = self._observed_steps
-        self._observed_steps += 1
         tokens = int(new_tokens)
         if tokens <= 0:
             if self._ad_start_ts is not None:
@@ -2179,42 +2173,37 @@ class DecodeWindowMeter:
         if self.first_emit_ts is None:
             self.first_emit_ts = timestamp
             self.last_emit_ts = timestamp
-            self._prev_emit_ts = timestamp
             self.first_emit_tokens = tokens
         else:
-            prev_ts = self._prev_emit_ts if self._prev_emit_ts is not None else timestamp
-            dt = timestamp - prev_ts
+            dt = timestamp - self.last_emit_ts  # type: ignore[operator]
             if dt < 0.0:
                 dt = 0.0
             self.decode_step_durations_s.append(float(dt))
-            self._prev_emit_ts = timestamp
             self.last_emit_ts = timestamp
 
-        # all-decode window: starts when tok/step reaches batch_size
-        if self.batch_size > 0 and self._ad_start_ts is None and tokens == self.batch_size:
-            self._ad_start_ts = timestamp
-            self._ad_start_tokens = self.total_tokens
-            self._ad_start_step_index = int(step_index)
-        if self._ad_start_ts is not None:
-            self._ad_steps += 1
-            if tokens == self.batch_size:
-                self._ad_full_batch_steps += 1
-            else:
-                self._ad_partial_batch_steps += 1
+        # The first full-output event closes the prefill-interleaved prefix.
+        # It is the timing anchor, not a measured decode step: its work and
+        # tokens precede the interval whose throughput starts at this timestamp.
+        if self._ad_start_ts is None:
+            if self.batch_size > 0 and tokens == self.batch_size:
+                self._ad_start_ts = timestamp
+                self._ad_start_tokens = self.total_tokens
+            return
+        if tokens == self.batch_size:
+            self._ad_full_batch_steps += 1
+        else:
+            self._ad_partial_batch_steps += 1
 
-    def finalize(self) -> Tuple[float, int, float, list[float]]:
+    def finalize(self) -> Tuple[float, int, list[float]]:
         window_tokens = max(0, int(self.total_tokens) - int(self.first_emit_tokens))
         if self.first_emit_ts is None or self.last_emit_ts is None:
-            return 0.0, int(window_tokens), float("nan"), list(self.decode_step_durations_s)
+            return 0.0, int(window_tokens), self.decode_step_durations_s
 
         decode_elapsed_s = float(self.last_emit_ts - self.first_emit_ts)
         if decode_elapsed_s <= 0.0:
-            return 0.0, int(window_tokens), float("nan"), list(self.decode_step_durations_s)
+            return 0.0, int(window_tokens), self.decode_step_durations_s
 
-        decode_tps = float(window_tokens) / float(decode_elapsed_s)
-        return float(decode_elapsed_s), int(window_tokens), float(decode_tps), list(
-            self.decode_step_durations_s
-        )
+        return float(decode_elapsed_s), int(window_tokens), self.decode_step_durations_s
 
     def boundary_delays(self, total_start_s: float, total_end_s: float) -> Tuple[float, float]:
         if self.first_emit_ts is None or self.last_emit_ts is None:
@@ -2224,30 +2213,31 @@ class DecodeWindowMeter:
         return first_emit_delay_s, post_decode_tail_s
 
     def finalize_all_decode(self) -> Tuple[float, int, float, int]:
-        """Return (elapsed_s, tokens, tok_per_s, steps) for the all-decode window.
+        """Return measured post-anchor (elapsed_s, tokens, tok_per_s, steps).
 
-        The all-decode window is a strict measurement contract.  Returning the
-        ordinary first-emit window here would silently mix chunked prefill into
-        the reported throughput, so a run that never reaches the boundary is
-        invalid instead of having a fallback value.
+        The all-decode window starts after a strict synchronization anchor.
+        Returning the ordinary first-emit window here would silently mix
+        chunked prefill into the reported throughput, so a run that never
+        reaches the anchor is invalid instead of having a fallback value.
         """
         if self._ad_start_ts is None or self.last_emit_ts is None:
             raise RuntimeError(
-                "E_ALL_DECODE_WINDOW_NOT_ENTERED: no full-batch decode step "
-                "was observed"
+                "E_ALL_DECODE_WINDOW_NOT_ENTERED: no full-output "
+                "synchronization anchor was observed"
             )
         ad_elapsed = float(self.last_emit_ts - self._ad_start_ts)
         ad_tokens = max(0, int(self.total_tokens) - int(self._ad_start_tokens))
         if ad_elapsed <= 0.0 or ad_tokens <= 0:
             raise RuntimeError(
-                "E_ALL_DECODE_WINDOW_EMPTY: the full-batch boundary was "
+                "E_ALL_DECODE_WINDOW_EMPTY: the full-output anchor was "
                 "observed without a measurable later decode interval"
             )
         ad_tps = float(ad_tokens) / float(ad_elapsed)
-        return ad_elapsed, ad_tokens, ad_tps, int(self._ad_steps)
+        measured_steps = self._ad_full_batch_steps + self._ad_partial_batch_steps
+        return ad_elapsed, ad_tokens, ad_tps, int(measured_steps)
 
     def all_decode_contract(self) -> dict[str, object]:
-        """Return strict full-batch measurement-window evidence."""
+        """Return strict post-anchor measurement-window evidence."""
         entered = self._ad_start_ts is not None
         return {
             "all_decode_entered": entered,
@@ -2255,11 +2245,6 @@ class DecodeWindowMeter:
             "all_decode_partial_batch_steps": int(self._ad_partial_batch_steps),
             "all_decode_zero_token_steps": int(self._ad_zero_token_steps),
         }
-
-    @property
-    def all_decode_start_step_index(self) -> int:
-        """Internal observer boundary; not part of the public decode contract."""
-        return int(self._ad_start_step_index)
 
 
 def reset_cudagraph_runtime_observer(llm_engine: object) -> None:
@@ -2297,9 +2282,6 @@ def cudagraph_runtime_observer_proof_reasons(
         "cudagraph_runtime_observer_enabled": True,
         "cudagraph_runtime_observer_full_batch_missing_step_count": 0,
         "cudagraph_runtime_observer_partial_batch_missing_step_count": 0,
-        "cudagraph_runtime_observer_full_batch_decode_exact_full": True,
-        "cudagraph_runtime_observer_partial_batch_decode_valid_padded_full": True,
-        "cudagraph_runtime_observer_all_decode_full_mode": True,
     }
     reasons.extend(
         f"field_mismatch:{field}"
@@ -2325,12 +2307,9 @@ def cudagraph_runtime_observer_proof_reasons(
         type(total_steps) is int
         and type(full_steps) is int
         and type(partial_steps) is int
-        and full_steps + partial_steps > total_steps
+        and full_steps + partial_steps >= total_steps
     ):
-        reasons.append("all_decode_step_count_exceeds_total")
-    if proof.get("cudagraph_runtime_observer_exact_full_step_count") != full_steps:
-        reasons.append("exact_full_step_count_mismatch")
-
+        reasons.append("post_anchor_step_count_not_strict_suffix")
     full_distribution = proof.get(
         "cudagraph_runtime_observer_full_batch_distribution"
     )
@@ -2387,13 +2366,13 @@ def cudagraph_runtime_observer_proof_reasons(
 def summarize_cudagraph_runtime_observer(
     records: list[dict[str, object] | None],
     *,
-    all_decode_start_step_index: int,
     expected_full_batch_steps: int,
     expected_partial_batch_steps: int,
+    expected_zero_token_steps: int,
     expected_batch_size: int,
     expected_total_engine_steps: int,
 ) -> dict[str, object]:
-    """Validate full-batch and partial-tail graph dispatch separately."""
+    """Validate measured full-batch and partial-tail dispatch separately."""
     from collections import Counter
 
     if len(records) != int(expected_total_engine_steps):
@@ -2401,31 +2380,36 @@ def summarize_cudagraph_runtime_observer(
             "E_CUDAGRAPH_RUNTIME_OBSERVER_STEP_MISMATCH: "
             f"records={len(records)} expected={expected_total_engine_steps}"
         )
-    start = int(all_decode_start_step_index)
-    if start < 0 or start >= len(records):
-        raise RuntimeError(
-            "E_CUDAGRAPH_RUNTIME_OBSERVER_WINDOW: "
-            f"all_decode_start_step_index={start} records={len(records)}"
-        )
     full_batch_steps = int(expected_full_batch_steps)
-    end = start + full_batch_steps
-    if full_batch_steps <= 0 or end > len(records):
+    if full_batch_steps <= 0:
         raise RuntimeError(
             "E_CUDAGRAPH_RUNTIME_OBSERVER_FULL_BATCH_WINDOW: "
-            f"start={start} full_batch_steps={full_batch_steps} "
-            f"records={len(records)}"
+            f"full_batch_steps={full_batch_steps} records={len(records)}"
         )
     partial_batch_steps = int(expected_partial_batch_steps)
-    tail_end = end + partial_batch_steps
-    if partial_batch_steps < 0 or tail_end != len(records):
+    if partial_batch_steps < 0:
         raise RuntimeError(
             "E_CUDAGRAPH_RUNTIME_OBSERVER_PARTIAL_BATCH_WINDOW: "
-            f"start={start} full_batch_steps={full_batch_steps} "
             f"partial_batch_steps={partial_batch_steps} records={len(records)}"
         )
-    # Requests only leave this fixed offline batch after the all-decode
-    # boundary, so full-batch decode is a prefix.  The remaining records are a
-    # legal partial tail and do not belong to the exact BS-sized graph proof.
+    zero_token_steps = int(expected_zero_token_steps)
+    if zero_token_steps != 0:
+        raise RuntimeError(
+            "E_CUDAGRAPH_RUNTIME_OBSERVER_ZERO_TOKEN_WINDOW: "
+            f"zero_token_steps={zero_token_steps}"
+        )
+    measured_steps = full_batch_steps + partial_batch_steps
+    start = len(records) - measured_steps
+    if start <= 0 or start >= len(records):
+        raise RuntimeError(
+            "E_CUDAGRAPH_RUNTIME_OBSERVER_POST_ANCHOR_WINDOW: "
+            f"records={len(records)} measured_steps={measured_steps}"
+        )
+    end = start + full_batch_steps
+    tail_end = end + partial_batch_steps
+    # After the synchronization anchor, requests only leave this fixed offline
+    # batch.  Full-batch decode is therefore a prefix; the remaining records
+    # are a legal partial tail outside the exact BS-sized graph proof.
     full_batch_window = records[start:end]
     partial_batch_window = records[end:tail_end]
 
@@ -2450,33 +2434,6 @@ def summarize_cudagraph_runtime_observer(
     partial_batch_missing = sum(record is None for record in partial_batch_window)
     full_batch_distribution = _distribution(full_batch_window)
     partial_batch_distribution = _distribution(partial_batch_window)
-    expected_signature = (expected_batch_size, expected_batch_size, 0, "FULL")
-    exact_steps = int(full_batch_distribution.get(expected_signature, 0))
-    full_batch_exact = bool(
-        full_batch_missing == 0
-        and exact_steps == len(full_batch_window)
-        and len(full_batch_window) > 0
-    )
-
-    def _valid_partial_signature(signature: tuple[object, ...]) -> bool:
-        unpadded, padded, paddings, runtime_mode = signature
-        return bool(
-            type(unpadded) is int
-            and 0 < unpadded < expected_batch_size
-            and type(padded) is int
-            and padded == expected_batch_size
-            and type(paddings) is int
-            and paddings == expected_batch_size - unpadded
-            and runtime_mode == "FULL"
-        )
-
-    partial_batch_valid = bool(
-        partial_batch_missing == 0
-        and all(
-            _valid_partial_signature(signature)
-            for signature in partial_batch_distribution
-        )
-    )
 
     def _serialized_distribution(
         distribution: Counter[tuple[object, ...]],
@@ -2508,16 +2465,6 @@ def summarize_cudagraph_runtime_observer(
         "cudagraph_runtime_observer_partial_batch_missing_step_count": (
             partial_batch_missing
         ),
-        "cudagraph_runtime_observer_exact_full_step_count": exact_steps,
-        "cudagraph_runtime_observer_full_batch_decode_exact_full": (
-            full_batch_exact
-        ),
-        "cudagraph_runtime_observer_partial_batch_decode_valid_padded_full": (
-            partial_batch_valid
-        ),
-        "cudagraph_runtime_observer_all_decode_full_mode": bool(
-            full_batch_exact and partial_batch_valid
-        ),
         "cudagraph_runtime_observer_full_batch_distribution": (
             _serialized_distribution(full_batch_distribution)
         ),
@@ -2547,368 +2494,15 @@ def count_new_tokens(request_outputs: Iterable[Any], prev_len: dict[str, int]) -
     return int(step_new_tokens)
 
 
-_INNER_TIMING_FALSE_VALUES = {"", "0", "false", "off", "no"}
-
-
-def _engine_core_inner_timing_enabled() -> bool:
-    value = str(os.environ.get("VLLM_DECODE_ENGINE_CORE_INNER_TIMING", "") or "")
-    return value.strip().lower() not in _INNER_TIMING_FALSE_VALUES
-
-
-def _elapsed_us(start_s: float) -> float:
-    return float((time.perf_counter() - start_s) * 1_000_000.0)
-
-
-def _record_engine_core_timing(engine_core: Any, timing: dict[str, float]) -> None:
-    try:
-        setattr(engine_core, "_decode_inner_timing_last_us", dict(timing))
-    except Exception:
-        return
-
-
-def _maybe_install_model_runner_segment_timing(engine_core: Any) -> dict[str, float]:
-    """[MR-SEGMENT-TIMING] in-proc 下再往下包一层 model_runner 关键段。
-
-    ec_execute_model_submit 是黑盒总量（in-proc=同步整个 execute_model）；这里
-    对 runner 的 _prepare_inputs / execute_model / sample_tokens 各包一层
-    perf_counter，写进共享 dict，由 timed_step 并入 inner（mr_* 键）随
-    step_engine_core_timing_all 落盘。诊断专用（INNER_TIMING 门控内），
-    monkey-patch 只装一次，失败静默降级（返回空 dict 不影响原计时）。
-    """
-    seg: dict[str, float] = {}
-    try:
-        wrapper = engine_core.model_executor.driver_worker
-        # UniProcExecutor.driver_worker 是 WorkerWrapperBase，真 Worker 在 .worker
-        worker = getattr(wrapper, "worker", None) or wrapper
-        runner = worker.model_runner
-    except Exception as exc:
-        print(f"[mr-seg-timing] install skipped: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
-        return seg
-    print(f"[mr-seg-timing] installed on {type(runner).__name__}", file=sys.stderr, flush=True)
-    if bool(getattr(runner, "_mr_segment_timing_installed", False)):
-        return getattr(runner, "_mr_segment_timing_shared", seg)
-
-    def _wrap(name: str) -> bool:
-        orig = getattr(runner, name, None)
-        if not callable(orig):
-            return False
-
-        def timed(*args: Any, _orig: Any = orig, _key: str = f"mr_{name}_us", **kwargs: Any):
-            t0 = time.perf_counter()
-            try:
-                return _orig(*args, **kwargs)
-            finally:
-                seg[_key] = seg.get(_key, 0.0) + _elapsed_us(t0)
-
-        setattr(runner, name, timed)
-        return True
-
-    for method in ("_prepare_inputs", "sample_tokens"):
-        _wrap(method)
-
-    # [MR-GPU-CLOCK] execute_model 额外做 CUDA event 对钟，回答 host/GPU 重叠：
-    # mr_gpu_span_us = 主流上本步首尾 event 跨度（含流内空隙）；
-    # mr_gpu_done_at_return = host 返回时刻 GPU 是否已完成（1/0）。
-    # 判读：span≈host 且 done=0 ⇒ GPU 主导（泡小）；span<<host 且 done=1 ⇒
-    # host 尾部纯 CPU 段=可重叠泡。event 对轮转成对（上一步的 elapsed 在
-    # 下一步开头收割，完成才读，零阻塞）。诊断门（INNER_TIMING）内。
-    def _wrap_execute_with_gpu_clock() -> bool:
-        orig = getattr(runner, "execute_model", None)
-        if not callable(orig):
-            return False
-        try:
-            import torch as _torch
-        except Exception:
-            return False
-        if not _torch.cuda.is_available():
-            return _wrap("execute_model")
-        ring = [
-            (_torch.cuda.Event(enable_timing=True), _torch.cuda.Event(enable_timing=True))
-            for _ in range(2)
-        ]
-        slot_state = {"next": 0, "pending": None}
-
-        def timed(*args: Any, **kwargs: Any):
-            pend = slot_state["pending"]
-            if pend is not None:
-                p_start, p_end = pend
-                if p_end.query():
-                    try:
-                        seg["mr_gpu_span_prev_us"] = float(
-                            p_start.elapsed_time(p_end) * 1000.0
-                        )
-                    except Exception:
-                        pass
-                    slot_state["pending"] = None
-            s_evt, e_evt = ring[slot_state["next"] % 2]
-            slot_state["next"] += 1
-            t0 = time.perf_counter()
-            s_evt.record()
-            try:
-                return orig(*args, **kwargs)
-            finally:
-                e_evt.record()
-                seg["mr_execute_model_us"] = (
-                    seg.get("mr_execute_model_us", 0.0) + _elapsed_us(t0)
-                )
-                seg["mr_gpu_done_at_return"] = 1.0 if e_evt.query() else 0.0
-                slot_state["pending"] = (s_evt, e_evt)
-
-        setattr(runner, "execute_model", timed)
-        return True
-
-    _wrap_execute_with_gpu_clock()
-    runner._mr_segment_timing_installed = True
-    runner._mr_segment_timing_shared = seg
-    return seg
-
-
-def _maybe_install_engine_core_inner_timing(llm_engine: Any) -> None:
-    if not _engine_core_inner_timing_enabled():
-        return
-    client = getattr(llm_engine, "engine_core", None)
-    engine_core = getattr(client, "engine_core", None)
-    if engine_core is None or bool(
-        getattr(engine_core, "_decode_inner_timing_installed", False)
-    ):
-        return
-    mr_seg = _maybe_install_model_runner_segment_timing(engine_core)
-
-    def timed_step(self: Any):
-        inner: dict[str, float] = {}
-        total0 = time.perf_counter()
-        try:
-            has0 = time.perf_counter()
-            has_requests = bool(self.scheduler.has_requests())
-            inner["ec_has_requests_us"] = _elapsed_us(has0)
-            if not has_requests:
-                inner["ec_total_us"] = _elapsed_us(total0)
-                _record_engine_core_timing(self, inner)
-                return {}, False
-
-            t0 = time.perf_counter()
-            scheduler_output = self.scheduler.schedule()
-            inner["ec_schedule_us"] = _elapsed_us(t0)
-
-            t0 = time.perf_counter()
-            future = self.model_executor.execute_model(
-                scheduler_output, non_block=True
-            )
-            inner["ec_execute_model_submit_us"] = _elapsed_us(t0)
-
-            t0 = time.perf_counter()
-            grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
-            inner["ec_grammar_bitmask_us"] = _elapsed_us(t0)
-
-            with (
-                self.log_error_detail(scheduler_output),
-                self.log_iteration_details(scheduler_output),
-            ):
-                t0 = time.perf_counter()
-                model_output = future.result()
-                inner["ec_future_result_us"] = _elapsed_us(t0)
-                if model_output is None:
-                    t0 = time.perf_counter()
-                    model_output = self.model_executor.sample_tokens(grammar_output)
-                    inner["ec_sample_tokens_us"] = _elapsed_us(t0)
-                else:
-                    inner["ec_sample_tokens_us"] = 0.0
-
-            t0 = time.perf_counter()
-            self._process_aborts_queue()
-            inner["ec_process_aborts_queue_us"] = _elapsed_us(t0)
-
-            t0 = time.perf_counter()
-            engine_core_outputs = self.scheduler.update_from_output(
-                scheduler_output, model_output
-            )
-            inner["ec_update_from_output_us"] = _elapsed_us(t0)
-            if mr_seg:
-                inner.update(mr_seg)
-                mr_seg.clear()
-            inner["ec_total_us"] = _elapsed_us(total0)
-            _record_engine_core_timing(self, inner)
-            return (
-                engine_core_outputs,
-                scheduler_output.total_num_scheduled_tokens > 0,
-            )
-        except Exception:
-            inner["ec_total_us"] = _elapsed_us(total0)
-            _record_engine_core_timing(self, inner)
-            raise
-
-    def timed_step_with_batch_queue(self: Any):
-        inner: dict[str, float] = {}
-        total0 = time.perf_counter()
-        try:
-            batch_queue = self.batch_queue
-            assert batch_queue is not None
-            assert len(batch_queue) < self.batch_queue_size
-
-            model_executed = False
-            deferred_scheduler_output = None
-            t0 = time.perf_counter()
-            has_requests = bool(self.scheduler.has_requests())
-            inner["ec_has_requests_us"] = _elapsed_us(t0)
-            if has_requests:
-                t0 = time.perf_counter()
-                scheduler_output = self.scheduler.schedule()
-                inner["ec_schedule_us"] = _elapsed_us(t0)
-                with self.log_error_detail(scheduler_output):
-                    t0 = time.perf_counter()
-                    exec_future = self.model_executor.execute_model(
-                        scheduler_output, non_block=True
-                    )
-                    inner["ec_execute_model_submit_us"] = _elapsed_us(t0)
-                if self.is_ec_consumer:
-                    model_executed = scheduler_output.total_num_scheduled_tokens > 0
-
-                if self.is_pooling_model or not model_executed:
-                    future = exec_future
-                    inner["ec_grammar_bitmask_us"] = 0.0
-                    inner["ec_sample_tokens_submit_us"] = 0.0
-                else:
-                    if not scheduler_output.pending_structured_output_tokens:
-                        t0 = time.perf_counter()
-                        grammar_output = self.scheduler.get_grammar_bitmask(
-                            scheduler_output
-                        )
-                        inner["ec_grammar_bitmask_us"] = _elapsed_us(t0)
-                        t0 = time.perf_counter()
-                        future = self.model_executor.sample_tokens(
-                            grammar_output, non_block=True
-                        )
-                        inner["ec_sample_tokens_submit_us"] = _elapsed_us(t0)
-                    else:
-                        deferred_scheduler_output = scheduler_output
-
-                if not deferred_scheduler_output:
-                    batch_queue.appendleft((future, scheduler_output, exec_future))
-                    if (
-                        model_executed
-                        and len(batch_queue) < self.batch_queue_size
-                        and not batch_queue[-1][0].done()
-                    ):
-                        inner["ec_returned_none_us"] = _elapsed_us(total0)
-                        inner["ec_total_us"] = _elapsed_us(total0)
-                        _record_engine_core_timing(self, inner)
-                        return None, True
-
-            elif not batch_queue:
-                inner["ec_total_us"] = _elapsed_us(total0)
-                _record_engine_core_timing(self, inner)
-                return None, False
-
-            t0 = time.perf_counter()
-            future, scheduler_output, exec_model_fut = batch_queue.pop()
-            inner["ec_batch_queue_pop_us"] = _elapsed_us(t0)
-            with (
-                self.log_error_detail(scheduler_output),
-                self.log_iteration_details(scheduler_output),
-            ):
-                t0 = time.perf_counter()
-                model_output = future.result()
-                inner["ec_future_result_us"] = _elapsed_us(t0)
-                if model_output is None:
-                    t0 = time.perf_counter()
-                    exec_model_fut.result()
-                    inner["ec_exec_model_future_result_us"] = _elapsed_us(t0)
-                    raise RuntimeError("unexpected error")
-
-            t0 = time.perf_counter()
-            self._process_aborts_queue()
-            inner["ec_process_aborts_queue_us"] = _elapsed_us(t0)
-
-            t0 = time.perf_counter()
-            engine_core_outputs = self.scheduler.update_from_output(
-                scheduler_output, model_output
-            )
-            inner["ec_update_from_output_us"] = _elapsed_us(t0)
-            if mr_seg:
-                inner.update(mr_seg)
-                mr_seg.clear()
-
-            if deferred_scheduler_output:
-                if self.use_spec_decode:
-                    t0 = time.perf_counter()
-                    draft_token_ids = self.model_executor.take_draft_token_ids()
-                    inner["ec_take_draft_token_ids_us"] = _elapsed_us(t0)
-                    assert draft_token_ids is not None
-                    t0 = time.perf_counter()
-                    self.scheduler.update_draft_token_ids_in_output(
-                        draft_token_ids, deferred_scheduler_output
-                    )
-                    inner["ec_update_draft_token_ids_us"] = _elapsed_us(t0)
-                t0 = time.perf_counter()
-                grammar_output = self.scheduler.get_grammar_bitmask(
-                    deferred_scheduler_output
-                )
-                inner["ec_deferred_grammar_bitmask_us"] = _elapsed_us(t0)
-                t0 = time.perf_counter()
-                future = self.model_executor.sample_tokens(grammar_output, non_block=True)
-                inner["ec_deferred_sample_tokens_submit_us"] = _elapsed_us(t0)
-                batch_queue.appendleft(
-                    (future, deferred_scheduler_output, exec_future)
-                )
-
-            inner["ec_total_us"] = _elapsed_us(total0)
-            _record_engine_core_timing(self, inner)
-            return engine_core_outputs, model_executed
-        except Exception:
-            inner["ec_total_us"] = _elapsed_us(total0)
-            _record_engine_core_timing(self, inner)
-            raise
-
-    original_post_step = engine_core.post_step
-
-    def timed_post_step(self: Any, model_executed: bool) -> None:
-        t0 = time.perf_counter()
-        try:
-            return original_post_step(model_executed)
-        finally:
-            inner = dict(getattr(self, "_decode_inner_timing_last_us", {}) or {})
-            inner["ec_post_step_us"] = _elapsed_us(t0)
-            inner["ec_total_plus_post_us"] = float(
-                inner.get("ec_total_us", 0.0) + inner["ec_post_step_us"]
-            )
-            _record_engine_core_timing(self, inner)
-
-    engine_core.step = types.MethodType(timed_step, engine_core)
-    engine_core.step_with_batch_queue = types.MethodType(
-        timed_step_with_batch_queue, engine_core
-    )
-    engine_core.post_step = types.MethodType(timed_post_step, engine_core)
-    engine_core.step_fn = (
-        engine_core.step
-        if getattr(engine_core, "batch_queue", None) is None
-        else engine_core.step_with_batch_queue
-    )
-    setattr(engine_core, "_decode_inner_timing_installed", True)
-
-
-def pull_step_outputs_with_timing(llm_engine) -> tuple[list[Any], float, dict[str, float]]:
-    timing = {
-        "dummy_batch_us": 0.0,
-        "get_output_us": 0.0,
-        "process_outputs_us": 0.0,
-        "abort_requests_us": 0.0,
-    }
-    # Keep parity with LLMEngine.step(): execute dummy batch once if requested.
-    if bool(getattr(llm_engine, "should_execute_dummy_batch", False)):
+def pull_step_outputs_with_timestamp(llm_engine) -> tuple[list[Any], float]:
+    """Mirror ``LLMEngine.step`` without debug timing instrumentation."""
+    if getattr(llm_engine, "should_execute_dummy_batch", False):
         llm_engine.should_execute_dummy_batch = False
-        t0 = time.perf_counter()
         llm_engine.engine_core.execute_dummy_batch()
-        t1 = time.perf_counter()
-        timing["dummy_batch_us"] = float((t1 - t0) * 1_000_000.0)
-        return [], float("nan"), timing
+        return [], float("nan")
 
-    _maybe_install_engine_core_inner_timing(llm_engine)
-    t0 = time.perf_counter()
     outputs = llm_engine.engine_core.get_output()
-    t1 = time.perf_counter()
-    if bool(
-        getattr(llm_engine, "_sfi_cudagraph_runtime_observer_enabled", False)
-    ):
+    if getattr(llm_engine, "_sfi_cudagraph_runtime_observer_enabled", False):
         scheduler_stats = getattr(outputs, "scheduler_stats", None)
         cudagraph_stats = getattr(scheduler_stats, "cudagraph_stats", None)
         runtime_record: dict[str, object] | None = None
@@ -2931,26 +2525,11 @@ def pull_step_outputs_with_timing(llm_engine) -> tuple[list[Any], float, dict[st
                 "E_CUDAGRAPH_RUNTIME_OBSERVER_UNAVAILABLE: record sink"
             )
         records.append(runtime_record)
-    engine_core = getattr(llm_engine.engine_core, "engine_core", None)
-    inner_timing = getattr(engine_core, "_decode_inner_timing_last_us", None)
-    if isinstance(inner_timing, dict):
-        for key, value in inner_timing.items():
-            if key.startswith("ec_") or key.startswith("mr_"):
-                timing[str(key)] = float(value)
+    timestamp = float(outputs.timestamp)
     processed_outputs = llm_engine.output_processor.process_outputs(
         outputs.outputs,
-        engine_core_timestamp=float(outputs.timestamp),
+        engine_core_timestamp=timestamp,
         iteration_stats=None,
     )
-    t2 = time.perf_counter()
     llm_engine.engine_core.abort_requests(processed_outputs.reqs_to_abort)
-    t3 = time.perf_counter()
-    timing["get_output_us"] = float((t1 - t0) * 1_000_000.0)
-    timing["process_outputs_us"] = float((t2 - t1) * 1_000_000.0)
-    timing["abort_requests_us"] = float((t3 - t2) * 1_000_000.0)
-    return list(processed_outputs.request_outputs), float(outputs.timestamp), timing
-
-
-def pull_step_outputs_with_timestamp(llm_engine) -> tuple[list[Any], float]:
-    request_outputs, timestamp, _timing = pull_step_outputs_with_timing(llm_engine)
-    return request_outputs, timestamp
+    return list(processed_outputs.request_outputs), timestamp
