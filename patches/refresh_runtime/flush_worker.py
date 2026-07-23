@@ -2022,8 +2022,9 @@ def flush_prefill_batches_impl(
                             "bootstrap_full_kv_handoff": True,
                         },
                     )
-                    # Real deferred path: the producer has not run yet. The step
-                    # boundary calls _launch_deferred_bootstrap_producer_jobs.
+                    # Real deferred path: the producer has not run yet. A later
+                    # step stages an immutable launch intent; its model-forward
+                    # owner submits the producer only after anchor kernels.
                     if chunk_cohort_stamped:
                         cohort_tape_deferred_producer_used = True
                     return

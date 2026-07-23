@@ -8,6 +8,7 @@ OWNS:
   - _compute_wait_decision(): main/stream wait arbitration
   - _main_stream_wait_for_chunk_done(): CUDA stream synchronization
   - _consume_step_wait_token(): per-step wait token consumption
+  - _stage/_take/_drain/_reset_deferred_bootstrap_*(): launch-intent ownership
 
 DEPENDS_ON:
   - patches.refresh_runtime.entry.run_refresh_step
@@ -156,9 +157,10 @@ class WaitDeciderMixin:
         self._one_shot_group_ready_compact_slots_cache_value: Tuple[int, ...] = (
             tuple()
         )
-        # Step-boundary code only stages immutable launch intents.  The sole
-        # execution owner is the post-model-forward hook, which atomically
-        # detaches and drains this queue after anchor kernels are submitted.
+        # Step-boundary code only stages immutable launch intents.  The model
+        # forward owner swaps the shared queue for a private batch at entry,
+        # then drains only that batch after anchor kernels are submitted.
+        # Logical intent epochs may advance ahead of that physical owner.
         self._deferred_bootstrap_launch_intents: List[
             _DeferredProducerLaunchIntent
         ] = []
@@ -603,12 +605,6 @@ class WaitDeciderMixin:
             self._deferred_bootstrap_launch_intents = intents_obj
         if not isinstance(intents_obj, list):
             raise RuntimeError("deferred producer launch intent queue is invalid")
-        for existing in intents_obj:
-            if int(existing[0]) != ep:
-                raise RuntimeError(
-                    "deferred producer launch intent epoch drift: "
-                    f"staged={int(existing[0])} current={ep}"
-                )
         seen_epoch = int(
             getattr(self, "_deferred_bootstrap_launch_intent_seen_epoch", -1)
         )
@@ -617,6 +613,11 @@ class WaitDeciderMixin:
             "_deferred_bootstrap_launch_intent_identities",
             None,
         )
+        if seen_epoch > ep:
+            raise RuntimeError(
+                "deferred producer launch intent epoch is non-monotonic: "
+                f"previous={seen_epoch} current={ep}"
+            )
         if seen_epoch != ep:
             seen_identities = set()
             self._deferred_bootstrap_launch_intent_seen_epoch = ep
@@ -661,46 +662,43 @@ class WaitDeciderMixin:
                 if not str(getattr(staged_job, "failure_reason", "") or ""):
                     setattr(staged_job, "failure_reason", str(reason))
 
-    def _discard_staged_deferred_bootstrap_producer_jobs(
+    def _take_staged_deferred_bootstrap_producer_jobs(
         self,
-        *,
-        reason: str,
-    ) -> int:
-        intents = tuple(
-            getattr(self, "_deferred_bootstrap_launch_intents", tuple()) or tuple()
-        )
+    ) -> Tuple[_DeferredProducerLaunchIntent, ...]:
+        """Transfer the shared queue to one model-forward owner."""
+        intents_obj = getattr(self, "_deferred_bootstrap_launch_intents", None)
+        if intents_obj is None:
+            return tuple()
+        if not isinstance(intents_obj, list):
+            raise RuntimeError("deferred producer launch intent queue is invalid")
+        if not intents_obj:
+            return tuple()
         self._deferred_bootstrap_launch_intents = []
-        if intents:
+        return tuple(intents_obj)
+
+    def _reset_deferred_bootstrap_launch_state(self, *, reason: str) -> None:
+        """Retire request-owned launch state at an explicit lifecycle boundary."""
+        owned_intents = self._take_staged_deferred_bootstrap_producer_jobs()
+        if owned_intents:
             self._fail_deferred_bootstrap_launch_intents(
-                intents,
+                owned_intents,
                 reason=str(reason),
             )
-        return len(intents)
+        self._deferred_bootstrap_launch_intent_seen_epoch = -1
+        self._deferred_bootstrap_launch_intent_identities = set()
 
     def _drain_staged_deferred_bootstrap_producer_jobs(
         self,
         *,
-        epoch: int,
+        intents: Sequence[_DeferredProducerLaunchIntent],
     ) -> int:
-        """Atomically detach and execute this forward's staged launch intents."""
-        ep = int(epoch)
-        intents = tuple(
-            getattr(self, "_deferred_bootstrap_launch_intents", tuple()) or tuple()
-        )
-        self._deferred_bootstrap_launch_intents = []
-        if not intents:
+        """Execute an owner-private FIFO batch after its model forward."""
+        owned_intents = tuple(intents)
+        if not owned_intents:
             return 0
-        drifted = tuple(intent for intent in intents if int(intent[0]) != ep)
-        if drifted:
-            reason = (
-                "deferred producer post-forward drain epoch drift: "
-                f"staged={tuple(int(intent[0]) for intent in intents)!r} current={ep}"
-            )
-            self._fail_deferred_bootstrap_launch_intents(intents, reason=reason)
-            raise RuntimeError(reason)
         launched = 0
         try:
-            for intent_epoch, only_ids, allow_same, job_snapshot in intents:
+            for intent_epoch, only_ids, allow_same, job_snapshot in owned_intents:
                 launched += self._launch_deferred_bootstrap_producer_jobs(
                     epoch=int(intent_epoch),
                     only_request_ids=tuple(only_ids),
@@ -710,7 +708,7 @@ class WaitDeciderMixin:
                 )
         except Exception as exc:
             self._fail_deferred_bootstrap_launch_intents(
-                intents,
+                owned_intents,
                 reason=f"deferred producer post-forward drain failed: {exc}",
             )
             raise

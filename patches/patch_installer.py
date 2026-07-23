@@ -233,23 +233,6 @@ _FULL_CUDAGRAPH_REPLAY_REFRESH_DEFER_TO_DEADLINE_CACHED = (
     )
     == "1"
 )
-# Cut A: defer the writer-ready CPU commit (publish/accept/clear/rebuild) until
-# after the cudagraph replay (original_call). Default OFF -> byte-identical.
-_FULL_CUDAGRAPH_REPLAY_REFRESH_DEFER_COMMIT_CACHED = (
-    os.environ.get(
-        "VLLM_SPARSE_FULL_CUDAGRAPH_REPLAY_REFRESH_DEFER_COMMIT",
-        "0",
-    )
-    == "1"
-)
-# Cut B: skip the diagnostic-only submit_summary dict in production. Default OFF.
-_FULL_CUDAGRAPH_REPLAY_REFRESH_SKIP_SUBMIT_SUMMARY_CACHED = (
-    os.environ.get(
-        "VLLM_SPARSE_FULL_CUDAGRAPH_REPLAY_REFRESH_SKIP_SUBMIT_SUMMARY",
-        "0",
-    )
-    == "1"
-)
 
 _FULL_CUDAGRAPH_HOOK_PROFILE_LOG_CACHED = os.environ.get(
     "VLLM_SPARSE_FULL_CUDAGRAPH_HOOK_PROFILE_LOG",
@@ -7489,16 +7472,7 @@ def _wait_replay_refresh_selectors_before_full_cudagraph_replay(
                 for buf_id in sorted(clearable_writer_done_bufs):
                     controller._pending_work_clear_buf(buf_id=int(buf_id))
 
-    if _FULL_CUDAGRAPH_REPLAY_REFRESH_DEFER_COMMIT_CACHED:
-        # Stash the commit to run AFTER original_call (overlap with the replay).
-        # The wait_event GPU ordering + in-loop drop/lease work already ran above.
-        setattr(
-            controller,
-            "_deferred_full_cudagraph_replay_refresh_commit",
-            _run_writer_ready_commit,
-        )
-    else:
-        _run_writer_ready_commit()
+    _run_writer_ready_commit()
     _full_cudagraph_pre_timing_add(
         profile_pre_timing,
         "pre_replay_refresh_selector_wait_us",
@@ -7555,11 +7529,15 @@ def _wait_pending_async_refresh_before_full_cudagraph_replay(
         except Exception:
             pass
 
-    setattr(
-        controller,
-        "_mixed_page_full_cudagraph_last_selector_writer_submit_summary",
-        None,
+    collect_submit_diagnostics = bool(
+        profile_pre_timing is not None or _fa3_route_trace_enabled()
     )
+    if collect_submit_diagnostics:
+        setattr(
+            controller,
+            "_mixed_page_full_cudagraph_last_selector_writer_submit_summary",
+            None,
+        )
     if pending_queue and bool(controller._refresh_producer_stream_release_pending):
         step_authority = _full_cudagraph_current_step_authority(controller)
         handle_id = int(getattr(step_authority, "step_handle_id", -1) or -1)
@@ -7574,16 +7552,16 @@ def _wait_pending_async_refresh_before_full_cudagraph_replay(
                     )
                 )
             )
-            pending_before = int(len(tuple(pending_queue)))
             submit_debug: list[dict[str, object]] | None = (
-                []
-                if profile_pre_timing is not None or _fa3_route_trace_enabled()
-                else None
+                [] if collect_submit_diagnostics else None
             )
             setattr(
                 controller,
                 "_mixed_page_full_cudagraph_last_selector_writer_submit_debug",
                 submit_debug,
+            )
+            pending_before = (
+                int(len(pending_queue)) if collect_submit_diagnostics else 0
             )
             submitted = int(controller._submit_due_selector_prepared_refresh_writers(
                 handle_id=handle_id,
@@ -7591,11 +7569,7 @@ def _wait_pending_async_refresh_before_full_cudagraph_replay(
             ))
             pending_queue = controller._pending_refresh_rebuilds
             submit_summary = None
-            if (
-                not _FULL_CUDAGRAPH_REPLAY_REFRESH_SKIP_SUBMIT_SUMMARY_CACHED
-                or profile_pre_timing is not None
-                or _fa3_route_trace_enabled()
-            ):
+            if collect_submit_diagnostics:
                 submit_summary = {
                     "handle_id": int(handle_id),
                     "force_req_ids": list(force_req_ids),
@@ -9993,59 +9967,45 @@ def _patch_model_forward_refresh_owner() -> None:
         controller = _GLOBAL_CONTROLLER
         if controller is None:
             return original_model_forward(self, *args, **kwargs)
-        staged_intents = tuple(
-            getattr(controller, "_deferred_bootstrap_launch_intents", tuple())
-            or tuple()
-        )
-        staged_identity = None
-        try:
-            if staged_intents:
-                staged_identity = _current_model_forward_refresh_identity(
-                    controller,
-                    stage="deferred producer post-forward owner entry",
+        stale_ready = getattr(controller, ready_attr, None)
+        if stale_ready is not None:
+            raise RuntimeError(
+                "model-forward refresh owner found an unconsumed generation at "
+                f"forward entry: ready={stale_ready!r}"
+            )
+        if bool(getattr(controller, active_attr, False)):
+            raise RuntimeError(
+                "model-forward refresh owner does not support nested entry"
+            )
+        staged_intents = ()
+        if getattr(controller, "_deferred_bootstrap_launch_intents", None):
+            take_staged_intents = getattr(
+                controller,
+                "_take_staged_deferred_bootstrap_producer_jobs",
+                None,
+            )
+            drain_staged_intents = getattr(
+                controller,
+                "_drain_staged_deferred_bootstrap_producer_jobs",
+                None,
+            )
+            fail_staged_intents = getattr(
+                controller,
+                "_fail_deferred_bootstrap_launch_intents",
+                None,
+            )
+            if not all(
+                callable(method)
+                for method in (
+                    take_staged_intents,
+                    drain_staged_intents,
+                    fail_staged_intents,
                 )
-                staged_epochs = tuple(int(intent[0]) for intent in staged_intents)
-                if any(epoch != int(staged_identity[0]) for epoch in staged_epochs):
-                    raise RuntimeError(
-                        "deferred producer launch intent epoch drift at model-forward "
-                        f"entry: staged={staged_epochs!r} current={staged_identity[0]}"
-                    )
-                if not callable(
-                    getattr(
-                        controller,
-                        "_drain_staged_deferred_bootstrap_producer_jobs",
-                        None,
-                    )
-                ):
-                    raise RuntimeError(
-                        "model-forward owner requires deferred producer intent drain"
-                    )
-            stale_ready = getattr(controller, ready_attr, None)
-            if stale_ready is not None:
+            ):
                 raise RuntimeError(
-                    "model-forward refresh owner found an unconsumed generation at "
-                    f"forward entry: ready={stale_ready!r}"
+                    "model-forward owner requires deferred producer ownership methods"
                 )
-            if bool(getattr(controller, active_attr, False)):
-                raise RuntimeError(
-                    "model-forward refresh owner does not support nested entry"
-                )
-        except Exception as exc:
-            if staged_intents:
-                discard = getattr(
-                    controller,
-                    "_discard_staged_deferred_bootstrap_producer_jobs",
-                    None,
-                )
-                if not callable(discard):
-                    raise RuntimeError(
-                        "model-forward owner preflight cannot retire staged deferred "
-                        "producer intents"
-                    ) from exc
-                discard(
-                    reason=f"model-forward owner preflight failed: {exc}"
-                )
-            raise
+            staged_intents = tuple(take_staged_intents())
         setattr(controller, active_attr, True)
         try:
             result = original_model_forward(self, *args, **kwargs)
@@ -10053,17 +10013,9 @@ def _patch_model_forward_refresh_owner() -> None:
             setattr(controller, ready_attr, None)
             setattr(controller, active_attr, False)
             if staged_intents:
-                discard = getattr(
-                    controller,
-                    "_discard_staged_deferred_bootstrap_producer_jobs",
-                    None,
-                )
-                if not callable(discard):
-                    raise RuntimeError(
-                        "model-forward failure cannot retire staged deferred "
-                        "producer intents"
-                    ) from exc
-                discard(
+                assert callable(fail_staged_intents)
+                fail_staged_intents(
+                    staged_intents,
                     reason=f"model forward failed before deferred producer drain: {exc}"
                 )
             raise
@@ -10072,13 +10024,9 @@ def _patch_model_forward_refresh_owner() -> None:
         setattr(controller, ready_attr, None)
         deferred_launch_count = 0
         if staged_intents:
-            assert staged_identity is not None
-            drain = getattr(
-                controller,
-                "_drain_staged_deferred_bootstrap_producer_jobs",
-            )
+            assert callable(drain_staged_intents)
             deferred_launch_count = int(
-                drain(epoch=int(staged_identity[0]))
+                drain_staged_intents(intents=staged_intents)
             )
         if not isinstance(ready, dict):
             return result
@@ -10696,23 +10644,6 @@ def _patch_cuda_graph_wrapper_for_sparse_cudagraph() -> None:
                 state=profile_prebound_rrp_graph_state,
                 replay_proof=profile_prebound_rrp_replay_proof,
             )
-        # Cut A: run the deferred writer-ready commit now (post-replay), BEFORE
-        # the deferred-replay drain + post-replay enqueue below -- those mutate /
-        # coalesce / re-register _pending_refresh_rebuilds, so the commit
-        # (publish/accept/clear + deque rebuild) must complete first to preserve
-        # is-latest / coalesce semantics. Pop-and-run so it fires at most once.
-        _deferred_full_cudagraph_replay_refresh_commit = getattr(
-            controller,
-            "_deferred_full_cudagraph_replay_refresh_commit",
-            None,
-        )
-        if _deferred_full_cudagraph_replay_refresh_commit is not None:
-            setattr(
-                controller,
-                "_deferred_full_cudagraph_replay_refresh_commit",
-                None,
-            )
-            _deferred_full_cudagraph_replay_refresh_commit()
         if (
             refresh_enabled
             and pre_call_had_cudagraph

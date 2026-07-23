@@ -1421,6 +1421,9 @@ class VLLMSparseController(
             if pending:
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
+        self._reset_deferred_bootstrap_launch_state(
+            reason="idle buffer release retired deferred producer launch",
+        )
         if self._pending_refresh_rebuilds:
             for pending in self._pending_refresh_rebuilds:
                 # [SELECTED-OUT-RING] 整批丢弃绕过 clear 漏斗:逐个释放环槽。
@@ -2684,6 +2687,9 @@ class VLLMSparseController(
         layer 注册、compact reserved pages 或 RRP arena，避免破坏 warm graph。
         """
         self._drain_async_work_at_request_run_boundary()
+        self._reset_deferred_bootstrap_launch_state(
+            reason="request-run reset retired deferred producer launch",
+        )
         finished_ids: Set[str] = set()
         for rid in getattr(self, "request_states", {}).keys():
             if isinstance(rid, str) and rid and not _is_free_slot_id(rid):
@@ -2766,6 +2772,9 @@ class VLLMSparseController(
 
     def reset_for_new_engine(self) -> None:
         """重置与 engine/kv-cache 绑定的状态，避免跨 engine 污染。"""
+        self._reset_deferred_bootstrap_launch_state(
+            reason="engine reset retired deferred producer launch",
+        )
         self.layer_states.clear()
         self.layer_cache_keys.clear()
         self.layer_index_by_cache_key.clear()
