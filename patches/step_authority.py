@@ -33,8 +33,11 @@ class StepAuthority:
     is_decode_only: bool
     has_prefill_by_prompt: bool
 
-    # ── 行级 bootstrap ──
-    bootstrap_done_by_row: Tuple[bool, ...]
+    # ── 行级路由就绪 ──
+    # True 表示该行已具备合法 decode 路由，既包括 compact 可读，也包括
+    # short/crossing 保护下的 dense；与 request bootstrap lifecycle 和
+    # per-layer compact_ready 均不是同一状态。
+    row_policy_ready_by_row: Tuple[bool, ...]
     short_dense_by_row: Tuple[bool, ...]
 
     # ── 行级 slot/mode ──
@@ -136,7 +139,22 @@ class StepAuthority:
         short_dense = self.short_dense_by_row
         is_prefill = self.is_prefill_by_row
         layer_refresh = self.layer_effective_refresh_by_row
-        rows = min(len(new_last_n), len(new_capacity), int(self.batch_size))
+        rows = int(self.batch_size)
+        if (
+            len(new_last_n) != rows
+            or len(new_capacity) != rows
+            or len(use_compact) != rows
+            or len(short_dense) != rows
+            or len(is_prefill) != rows
+            or len(layer_refresh) != rows
+        ):
+            raise RuntimeError(
+                "StepAuthority.with_logits requires exact row coverage: "
+                f"batch={rows} last_n={len(new_last_n)} "
+                f"capacity={len(new_capacity)} compact={len(use_compact)} "
+                f"short_dense={len(short_dense)} prefill={len(is_prefill)} "
+                f"refresh={len(layer_refresh)}"
+            )
 
         dispatch_list: list[int] = []
         needs_list: list[bool] = []
@@ -146,8 +164,8 @@ class StepAuthority:
 
         for idx in range(rows):
             last_n = int(new_last_n[idx])
-            compact = bool(use_compact[idx]) if idx < len(use_compact) else False
-            dense_short = bool(short_dense[idx]) if idx < len(short_dense) else False
+            compact = bool(use_compact[idx])
+            dense_short = bool(short_dense[idx])
             if compact:
                 producer = int(_LOGF_PRODUCER_NONE)
                 needs_logits = False

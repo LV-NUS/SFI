@@ -29,12 +29,32 @@ class CompactRecentRailDecision:
     requires_decode_capture: bool
 
 
-def _prefix_bool(values: Sequence[object], rows: int) -> tuple[bool, ...]:
-    return tuple(bool(values[idx]) if idx < len(values) else False for idx in range(rows))
+def _exact_bool(
+    values: Sequence[object],
+    rows: int,
+    label: str,
+) -> tuple[bool, ...]:
+    if len(values) != rows:
+        raise ValueError(
+            f"{label} must exactly match batch_size: {len(values)} != {rows}"
+        )
+    if isinstance(values, tuple):
+        return values
+    return tuple(bool(values[idx]) for idx in range(rows))
 
 
-def _prefix_int(values: Sequence[object], rows: int) -> tuple[int, ...]:
-    return tuple(int(values[idx]) if idx < len(values) else 0 for idx in range(rows))
+def _exact_int(
+    values: Sequence[object],
+    rows: int,
+    label: str,
+) -> tuple[int, ...]:
+    if len(values) != rows:
+        raise ValueError(
+            f"{label} must exactly match batch_size: {len(values)} != {rows}"
+        )
+    if isinstance(values, tuple):
+        return values
+    return tuple(int(values[idx]) for idx in range(rows))
 
 
 def resolve_compact_recent_rail_mode(step_authority: object) -> CompactRecentRailDecision:
@@ -43,28 +63,29 @@ def resolve_compact_recent_rail_mode(step_authority: object) -> CompactRecentRai
     This function intentionally does not import torch and must not inspect GPU
     tensors. It is the host route fact used before launching compact_recent.
     """
-    raw_use_compact = tuple(getattr(step_authority, "use_compact_by_row", ()))
-    batch_size = int(getattr(step_authority, "batch_size", len(raw_use_compact)))
+    raw_use_compact = step_authority.use_compact_by_row
+    batch_size = int(step_authority.batch_size)
     if batch_size < 0:
         raise ValueError("batch_size must be non-negative")
-    if len(raw_use_compact) < batch_size:
-        raise ValueError(
-            "use_compact_by_row coverage insufficient: "
-            f"{len(raw_use_compact)} < batch_size {batch_size}"
-        )
-
-    use_compact = _prefix_bool(raw_use_compact, batch_size)
-    needs_logits = _prefix_bool(
-        tuple(getattr(step_authority, "needs_logits_by_row", ())),
+    use_compact = _exact_bool(
+        raw_use_compact,
         batch_size,
+        "use_compact_by_row",
     )
-    logits_last_n = _prefix_int(
-        tuple(getattr(step_authority, "logits_last_n_by_row", ())),
+    needs_logits = _exact_bool(
+        step_authority.needs_logits_by_row,
         batch_size,
+        "needs_logits_by_row",
     )
-    is_prefill = _prefix_bool(
-        tuple(getattr(step_authority, "is_prefill_by_row", ())),
+    logits_last_n = _exact_int(
+        step_authority.logits_last_n_by_row,
         batch_size,
+        "logits_last_n_by_row",
+    )
+    is_prefill = _exact_bool(
+        step_authority.is_prefill_by_row,
+        batch_size,
+        "is_prefill_by_row",
     )
 
     decode_capture_rows = tuple(

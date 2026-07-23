@@ -80,9 +80,9 @@ def ensure_step_recent_descriptors(
     if page_size <= 0:
         raise ValueError("page_size must be positive")
     batch_size = int(step_meta.batch_size)
-    if len(layer_effective_refresh_by_row) < batch_size:
+    if len(layer_effective_refresh_by_row) != batch_size:
         raise ValueError(
-            f"layer_effective_refresh_by_row shorter than batch_size: "
+            f"layer_effective_refresh_by_row must exactly match batch_size: "
             f"rows={len(layer_effective_refresh_by_row)} batch={batch_size}"
         )
     if (
@@ -101,7 +101,7 @@ def ensure_step_recent_descriptors(
         batch_size=batch_size,
     )
 
-    refresh_by_row = tuple(bool(v) for v in layer_effective_refresh_by_row[:batch_size])
+    refresh_by_row = layer_effective_refresh_by_row
 
     if recent_page_slots <= 0:
         # Contract rejection: refresh requires a non-zero recent budget because

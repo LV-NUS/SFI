@@ -1316,23 +1316,43 @@ class VLLMSparseController(
             if int(last_n or 0) > 0
         }
         lookahead_only = not active_capture_by_req
-        compact_threshold = self._compact_threshold_tokens() if lookahead_only else 0
+        compact_threshold = (
+            int(step_authority.compact_bootstrap_threshold)
+            if lookahead_only
+            else 0
+        )
         candidates: list[tuple[int, int]] = []
         kv_needed = 0
-        is_prefill_by_row = tuple(bool(v) for v in step_authority.is_prefill_by_row)
-        for row, rid in enumerate(step_authority.req_ids[: step_authority.batch_size]):
-            if row >= len(is_prefill_by_row) or not bool(is_prefill_by_row[row]):
+        batch_size = int(step_authority.batch_size)
+        req_ids = step_authority.req_ids
+        is_prefill_by_row = step_authority.is_prefill_by_row
+        context_kv_len_by_row = step_authority.context_kv_len_by_row
+        if (
+            len(req_ids) != batch_size
+            or len(is_prefill_by_row) != batch_size
+            or len(context_kv_len_by_row) != batch_size
+            or len(slot_by_row) != batch_size
+            or (
+                step_context.prompt_lens is not None
+                and len(step_context.prompt_lens) != batch_size
+            )
+        ):
+            raise RuntimeError(
+                "prefill capture arena requires exact row coverage: "
+                f"batch={batch_size} req_ids={len(req_ids)} "
+                f"prefill={len(is_prefill_by_row)} "
+                f"context={len(context_kv_len_by_row)} slots={len(slot_by_row)} "
+                f"prompt_lens={len(step_context.prompt_lens) if step_context.prompt_lens is not None else 0}"
+            )
+        for row, rid in enumerate(req_ids):
+            if not bool(is_prefill_by_row[row]):
                 continue
             if not lookahead_only and int(active_capture_by_req.get(str(rid), 0) or 0) <= 0:
                 continue
             tracking = self.request_states.get(str(rid))
             if tracking is None or bool(getattr(tracking, "bootstrap_done", False)):
                 continue
-            used_tokens = (
-                int(step_authority.context_kv_len_by_row[row])
-                if row < len(step_authority.context_kv_len_by_row)
-                else 0
-            )
+            used_tokens = int(context_kv_len_by_row[row])
             used_tokens = max(0, int(used_tokens))
             if used_tokens <= 0:
                 continue
@@ -1341,13 +1361,12 @@ class VLLMSparseController(
                 if (
                     total_req <= 0
                     and step_context.prompt_lens is not None
-                    and row < len(step_context.prompt_lens)
                 ):
                     total_req = int(step_context.prompt_lens[row])
                 used_tokens = max(int(total_req), int(used_tokens))
                 if compact_threshold > 0 and used_tokens <= int(compact_threshold):
                     continue
-            slot = int(slot_by_row[row]) if row < len(slot_by_row) else -1
+            slot = int(slot_by_row[row])
             if slot < 0:
                 continue
             candidates.append((int(slot), int(row)))
@@ -1876,20 +1895,11 @@ class VLLMSparseController(
                     layer_data_list_ordered.append(layer_data)
             if reason is None and not layer_data_list_ordered:
                 reason = "no_layer_data"
-            # Compact readiness guard: when any row has left short-dense
-            # (expects compact mode), verify every layer has compact data
-            # before allowing ordered reuse.  Pure CPU check — no GPU sync.
+            # Compact readiness guard consumes the resolved row-mode authority;
+            # geometric "not short" is not equivalent to compact consumption
+            # while a refresh or dense-protection window is active.
             if reason is None and layer_data_list_ordered:
-                _needs_compact = (
-                    step_authority is not None
-                    and any(
-                        not sd
-                        for sd in step_authority.short_dense_by_row[
-                            : step_meta.batch_size
-                        ]
-                    )
-                )
-                if _needs_compact:
+                if bool(step_authority.has_compact_row):
                     for _ld in layer_data_list_ordered:
                         if _ld.compact_kv_len_max <= 0:
                             reason = "compact_not_ready"
@@ -2992,17 +3002,6 @@ class VLLMSparseController(
         self.kv_cache_dtype = None
         self._step_decode_spec_key = None
 
-    def _all_slots_bootstrapped(self, state: LayerState) -> bool:
-        if not state.batch_request_ids:
-            return False
-        for req_id in state.batch_request_ids:
-            if _is_free_slot_id(req_id):
-                continue
-            tracking = self.request_states.get(req_id)
-            if tracking is None or (not tracking.bootstrap_done):
-                return False
-        return True
-
     def _request_compact_ready_all_layers(self, req_id: str) -> bool:
         """Whether request may consume compact buffers on every registered layer."""
         if _is_free_slot_id(req_id):
@@ -3586,7 +3585,7 @@ class VLLMSparseController(
                 refresh_rows=tuple(),
                 refresh_reqs=tuple(),
                 refresh_reason="compact",
-                bootstrap_done=False,
+                all_request_lifecycle_done=False,
                 plan_signature=(
                     self.step_context_epoch,
                     tuple(),
@@ -3702,16 +3701,16 @@ class VLLMSparseController(
                 )
             return changed_local
 
-        bootstrap_done = True
+        all_request_lifecycle_done = True
         for rid in request_ids:
             tracking = tracking_by_req[rid]
             if not tracking.bootstrap_done:
-                bootstrap_done = False
+                all_request_lifecycle_done = False
                 break
 
         if (
             bool(getattr(self.config, "one_shot_bootstrap_only", False))
-            and bootstrap_done
+            and all_request_lifecycle_done
             and not continuous_producer_enabled(self.config)
         ):
             mode_by_row = tuple(StepRefreshMode.NONE for _ in request_ids)
@@ -3750,7 +3749,7 @@ class VLLMSparseController(
                 refresh_rows=tuple(),
                 refresh_reqs=tuple(),
                 refresh_reason="one_shot_bootstrap_only",
-                bootstrap_done=True,
+                all_request_lifecycle_done=True,
                 plan_signature=(
                     self.step_context_epoch,
                     request_ids,
@@ -5120,7 +5119,7 @@ class VLLMSparseController(
             refresh_rows=refresh_rows,
             refresh_reqs=refresh_reqs,
             refresh_reason=last_reason,
-            bootstrap_done=bootstrap_done,
+            all_request_lifecycle_done=all_request_lifecycle_done,
             plan_signature=(
                 self.step_context_epoch,
                 request_ids,
@@ -5129,7 +5128,7 @@ class VLLMSparseController(
                 refresh_rows,
                 refresh_reqs,
                 last_reason,
-                bootstrap_done,
+                all_request_lifecycle_done,
             ),
             force_dense_while_inflight_by_row=tuple(
                 force_dense_while_inflight_by_row_list

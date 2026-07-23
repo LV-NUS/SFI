@@ -629,7 +629,7 @@ class SparseControllerConfig:
     # - off: 严格按 request 自身 interval 触发，不提前合并
     interval_merge_policy: str = "delta1"
     # refresh 时按 layer 组做 sub-sampling（默认 1=全层；2=交错奇偶层）。
-    # 仅在 decode 且全 batch bootstrap_done 时启用（避免破坏 prefill/bootstrap）。
+    # 仅在 decode 且全 batch bootstrap 生命周期终态时启用。
     refresh_layer_groups: int = 1
     enabled: bool = True
     log_prefix: str = "[vllm-sparse]"
@@ -732,7 +732,6 @@ class StepEnvelopeV2:
     refresh_reqs: Tuple[str, ...]
     layer_effective_refresh_by_row: Tuple[bool, ...]
     refresh_reason: str = ""
-    bootstrap_done: bool = False
     plan_signature: Tuple[object, ...] = tuple()
     layer_group_active: int = -1
     layer_group_enabled: bool = False
@@ -794,7 +793,7 @@ class StepRefreshPlan:
     refresh_rows: Tuple[int, ...]
     refresh_reqs: Tuple[str, ...]
     refresh_reason: str
-    bootstrap_done: bool
+    all_request_lifecycle_done: bool
     plan_signature: Tuple[object, ...] = tuple()
     force_dense_while_inflight_by_row: Tuple[bool, ...] = tuple()
 
@@ -999,17 +998,17 @@ class CompactRecentLaunchPlan:
 class StepMeta:
     """每 step 构建一次，所有层共享，存储在 VLLMSparseController 中。
 
-    包含跨层共享的信息（常量 + GPU tensors），用于消除 per-layer 的 Python 循环。
+    只承载跨层共享的物理缓存元数据（常量 + GPU tensors），用于消除
+    per-layer 的 Python 循环。行级阶段、路由与生命周期只由 StepAuthority
+    持有，避免两个 carrier 漂移。
     通过 epoch 机制与 LayerState.step_cache_* 保持同步。
 
-    注意：slot_by_row 和 use_compact_mask 是 per-layer 的（因为 slot 分配是 per-layer），
-    存储在 LayerState.step_cache_* 中，而不是这里。
+    request 行到全局 slot 的映射和 use_compact 路由均由 StepAuthority 冻结；
+    LayerState 只保留各层 compact buffer 的物理可读状态。
     """
     epoch: int                              # 用于判断缓存是否过期
     batch_size: int
-    max_batch_size: int                     # 预分配 buffer 的最大 batch 大小（避免热路径 slice）
     req_ids: Tuple[str, ...]
-    req_id_to_index: Dict[str, int]         # req_id → batch 中的 row index
 
     # 跨层共享的数据（在 prepare_step_context 中构建）
     context_kv_len: Tuple[int, ...]         # seqused_k (CPU tuple)
@@ -1020,20 +1019,6 @@ class StepMeta:
     recent_cap: int
     sink_tokens: int
     block_size: int
-    compact_bootstrap_threshold: int
-
-    # request 级别的状态（跨层共享，因为 bootstrap_done 是 request 级别的）
-    bootstrap_done_by_row: Tuple[bool, ...]     # 每个 request 是否已 bootstrap
-    q_lens: Tuple[int, ...]                     # 每个 request 的 q_len
-    # 阶段判定（跨层共享，避免 per-layer 反复扫描 prompt/computed 或 request_states）
-    is_prefill_by_row: Tuple[bool, ...]         # True=prefill, False=decode
-    has_prefill_row: bool                       # batch 内是否存在 prefill row
-    has_decode_row: bool                        # batch 内是否存在 decode row
-    prefill_rows: Tuple[int, ...]               # batch 内 prefill 行号（用于 mixed request-phase 过滤）
-    is_decode_only: bool                        # 是否全部是 decode（q_len == 1）
-    # 仅当 vLLM 提供 prompt_lens/num_computed_tokens 时有效：用于防止“prefill 尾 chunk q_len==1”被误判为 decode-only
-    has_prefill_by_prompt: bool                 # batch 内是否存在仍处于 prefill 的 request
-    short_dense_by_row: Tuple[bool, ...]        # 是否短上下文（避免每步重建 use_compact）
     # 运行时消费层唯一正式 real-KV length carrier。边界层一次性规范化，后续只读消费。
     canonical_real_kv_len_cpu: Tuple[int, ...] = tuple()
     canonical_real_kv_len_i32_gpu: Optional[torch.Tensor] = None
@@ -1446,7 +1431,8 @@ class RequestTracking:
     # request 级 prefill 完成标记（用于避免 prefill 计划阶段读取 GPU tensor 触发 DtoH 同步）
     prefill_done: bool = False
     # prefill bootstrap（selector+compact rebuild）异步流水线中：已入队但尚未确认完成。
-    # 仅用于阶段/门禁判定；bootstrap_done 只在确认完成后置位。
+    # 仅用于阶段/门禁判定；bootstrap_done 在 producer 确认后置位，或由无需
+    # producer 的 short-dense 直接进入合法生命周期终态。
     bootstrap_pending: bool = False
     # bootstrap_pending 对应的 step_context_epoch（用于避免在同一 step 内误置位 bootstrap_done）
     bootstrap_pending_epoch: int = -1

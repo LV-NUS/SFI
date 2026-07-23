@@ -14,7 +14,7 @@ DEPENDS_ON:
   - WaitDeciderMixin._pending_work_mark_submitted / _pending_work_reset
   - CaptureRingMixin._map_global_layer_to_capture_slot
   - Main controller: _update_selection_tracking, _rebuild_compact_slots_batched_layers_from_selection,
-    _set_request_pending_refresh, _all_slots_bootstrapped
+    _set_request_pending_refresh
 
 ENTRY_POINTS:
   - _init_refresh_rebuild_state(): called from VLLMSparseController.__init__
@@ -4786,4 +4786,3 @@ class RefreshRebuildMixin:
         state.prefill_fifo_counts_cpu = None
         state.prefill_total_chunks = None
         state.prefill_chunks_seen = None
-        state.bootstrap_done = self._all_slots_bootstrapped(state)

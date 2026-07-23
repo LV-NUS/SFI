@@ -108,7 +108,7 @@ from patches.decode_runtime.launch_template import (
     apply_launch_template_row_delta,
     compile_launch_template,
 )
-from patches.decode_runtime.row_policy import classify_one_shot_bootstrap_decode_guard
+from patches.decode_runtime.row_policy import classify_one_shot_decode_admission
 from patches.decode_runtime.thin_builder_state import (
     DecodeDeltaPacket,
     DecodeRuntimeMode,
@@ -1555,15 +1555,10 @@ def _ensure_current_recent_descriptors_for_launch_template(
     page_size: int,
 ) -> None:
     batch_size = int(step_authority.batch_size)
-    layer_effective_refresh_by_row = tuple(
-        bool(v)
-        for v in tuple(
-            getattr(step_authority, "layer_effective_refresh_by_row", tuple())
-        )[:batch_size]
-    )
-    if len(layer_effective_refresh_by_row) < batch_size:
+    layer_effective_refresh_by_row = step_authority.layer_effective_refresh_by_row
+    if len(layer_effective_refresh_by_row) != batch_size:
         raise RuntimeError(
-            "launch template delta requires layer_effective_refresh_by_row coverage; "
+            "launch template delta requires exact layer_effective_refresh_by_row coverage; "
             f"batch_size={batch_size} coverage={len(layer_effective_refresh_by_row)}"
         )
 
@@ -6277,35 +6272,46 @@ def maybe_build_step_decode_data_from_metadata_impl(
             bool(getattr(getattr(self, "config", None), "one_shot_bootstrap_only", False))
             and bool(getattr(step_authority, "is_decode_only", False))
         ):
-            req_ids = tuple(str(rid) for rid in step_authority.req_ids[:batch_size])
+            request_states = self.request_states
             (
                 bridge_not_ready,
                 blocked_not_ready,
-                decode_phase,
-            ) = classify_one_shot_bootstrap_decode_guard(
-                req_ids,
-                compact_ready_all_layers=self._request_compact_ready_all_layers,
+            ) = classify_one_shot_decode_admission(
+                step_authority.req_ids[:batch_size],
+                row_policy_ready_by_row=step_authority.row_policy_ready_by_row[
+                    :batch_size
+                ],
+                request_states=request_states,
                 can_bridge_bootstrap_decode=self._request_can_bridge_bootstrap_decode,
+                compact_ready_all_layers=self._request_compact_ready_all_layers,
             )
-            setattr(
-                self,
-                "_one_shot_bootstrap_bridge_active_request_ids",
-                tuple(bridge_not_ready),
-            )
-            setattr(self, "_one_shot_bootstrap_decode_phase", decode_phase)
             if blocked_not_ready:
                 blocked_details = []
-                request_states = getattr(self, "request_states", {})
                 for blocked_rid in blocked_not_ready:
-                    tracking = (
-                        request_states.get(str(blocked_rid))
-                        if isinstance(request_states, dict)
-                        else None
-                    )
+                    row = int(step_authority.req_id_to_index.get(blocked_rid, -1))
+                    tracking = request_states.get(blocked_rid)
                     ready_state = getattr(tracking, "producer_ready_state", None)
                     blocked_details.append(
                         {
                             "rid": str(blocked_rid),
+                            "row": row,
+                            "short_dense_geometry": (
+                                0 <= row < len(step_authority.short_dense_by_row)
+                                and bool(step_authority.short_dense_by_row[row])
+                            ),
+                            "dense_protection_active": bool(
+                                getattr(tracking, "_was_short_dense", False)
+                            ),
+                            "row_mode": (
+                                int(step_authority.row_mode_by_row[row])
+                                if 0 <= row < len(step_authority.row_mode_by_row)
+                                else -1
+                            ),
+                            "context_kv_len": (
+                                int(step_authority.context_kv_len_by_row[row])
+                                if 0 <= row < len(step_authority.context_kv_len_by_row)
+                                else -1
+                            ),
                             "bootstrap_pending": bool(
                                 getattr(tracking, "bootstrap_pending", False)
                             ),
@@ -6335,30 +6341,31 @@ def maybe_build_step_decode_data_from_metadata_impl(
                         }
                     )
                 raise RuntimeError(
-                    "one-shot bootstrap graph decode requires compact_ready before replay: "
+                    "one-shot graph decode has no authoritative row readiness, "
+                    "terminal bootstrap lifecycle, or active bridge: "
                     + ", ".join(blocked_not_ready)
                     + f"; details={blocked_details!r}"
                 )
             if bridge_not_ready:
                 self._mark_bridge_decode_metadata_accepted(
-                    req_ids=tuple(bridge_not_ready),
+                    req_ids=bridge_not_ready,
                     epoch=int(step_authority.epoch),
                 )
-        q_start_loc = step_authority.q_start_loc[: batch_size + 1]
-        if len(q_start_loc) < batch_size + 1:
+        q_start_loc = step_authority.q_start_loc
+        if len(q_start_loc) != batch_size + 1:
             raise RuntimeError(
-                "metadata prebuild q_start_loc coverage mismatch; "
+                "metadata prebuild requires exact q_start_loc coverage; "
                 f"q_start={len(q_start_loc)} batch={batch_size}"
             )
         if (
-            len(step_authority.q_lens_by_row) < batch_size
-            or len(step_authority.context_kv_len_by_row) < batch_size
-            or len(step_authority.logits_last_n_by_row) < batch_size
-            or len(step_authority.logits_capacity_by_row) < batch_size
-            or len(step_authority.logf_mask_by_row) < batch_size
+            len(step_authority.q_lens_by_row) != batch_size
+            or len(step_authority.context_kv_len_by_row) != batch_size
+            or len(step_authority.logits_last_n_by_row) != batch_size
+            or len(step_authority.logits_capacity_by_row) != batch_size
+            or len(step_authority.logf_mask_by_row) != batch_size
         ):
             raise RuntimeError(
-                "metadata prebuild step_authority row coverage mismatch; "
+                "metadata prebuild requires exact StepAuthority row coverage; "
                 f"q_lens={len(step_authority.q_lens_by_row)} "
                 f"context={len(step_authority.context_kv_len_by_row)} "
                 f"last_n={len(step_authority.logits_last_n_by_row)} "
@@ -6367,10 +6374,10 @@ def maybe_build_step_decode_data_from_metadata_impl(
                 f"batch={batch_size}"
             )
         layer_effective_refresh_by_row_step = step_authority.layer_effective_refresh_by_row
-        if len(layer_effective_refresh_by_row_step) < step_authority.batch_size:
+        if len(layer_effective_refresh_by_row_step) != batch_size:
             raise RuntimeError(
-                "metadata prebuild requires full layer_effective_refresh_by_row coverage; "
-                f"rows={len(layer_effective_refresh_by_row_step)} batch={step_authority.batch_size}"
+                "metadata prebuild requires exact layer_effective_refresh_by_row coverage; "
+                f"rows={len(layer_effective_refresh_by_row_step)} batch={batch_size}"
             )
         _fp_hit_result = _try_run_steady_decode_metadata_fast_path(
             self,
@@ -6978,13 +6985,13 @@ def maybe_build_step_decode_data_from_metadata_impl(
             if isinstance(_sa_row_mode, tuple) and len(_sa_row_mode) == _batch_size_i
             else tuple(int(_sa_row_mode[_idx]) for _idx in range(_batch_size_i))
         )
-        _sa_bootstrap_done = step_authority.bootstrap_done_by_row
+        _sa_row_policy_ready = step_authority.row_policy_ready_by_row
         _sa_short_dense = step_authority.short_dense_by_row
         _ck_prefix_active = (
             _sa_req_ids,
             _sa_slot_sig,
             _sa_row_mode_sig,
-            _sa_bootstrap_done,
+            _sa_row_policy_ready,
             _sa_short_dense,
             _refresh_sig_active,
         )
@@ -7066,14 +7073,12 @@ def maybe_build_step_decode_data_from_metadata_impl(
             if state.step_cache_key != cache_key:
                 if _lsc_step_invariants is None:
                     _lsc_step_invariants = build_step_cache_invariants(
-                        state=state,
                         step_meta=step_meta,
                         step_authority=step_authority,
                         step_bound_meta=self.step_bound_meta,
                         device=state.device,
                         force_dense=False,
                         force_compact_off=False,
-                        layer_effective_refresh_by_row=layer_effective_refresh_by_row,
                     )
                 _build_layer_step_cache(
                     state=state,
@@ -7258,9 +7263,9 @@ def maybe_build_step_decode_data_from_metadata_impl(
         )
         _mark_xlayer_detail("buffer_ready_check")
         row_mode_by_row: Tuple[int, ...] = step_authority.row_mode_by_row
-        if len(row_mode_by_row) < batch_size:
+        if len(row_mode_by_row) != batch_size:
             raise RuntimeError(
-                "decode metadata missing step_authority.row_mode_by_row; "
+                "decode metadata requires exact step_authority.row_mode_by_row; "
                 f"batch_size={batch_size} row_mode_len={len(row_mode_by_row)}"
             )
         _xlayer_plan = (
@@ -7268,13 +7273,20 @@ def maybe_build_step_decode_data_from_metadata_impl(
             if self.step_bound_meta is not None
             else None
         )
-        _plan_slot_signature = tuple(
-            int(v)
-            for v in tuple(getattr(_xlayer_plan, "slot_signature", tuple()))[:batch_size]
-        )
-        if len(_plan_slot_signature) < batch_size:
+        if _xlayer_plan is not None and bool(
+            getattr(_xlayer_plan, "valid", False)
+        ):
             _plan_slot_signature = tuple(
-                int(v) for v in step_authority.slot_by_row[:batch_size]
+                int(v) for v in _xlayer_plan.slot_signature
+            )
+            if len(_plan_slot_signature) != batch_size:
+                raise RuntimeError(
+                    "decode metadata launch-plan slot signature mismatch: "
+                    f"slots={len(_plan_slot_signature)} batch={batch_size}"
+                )
+        else:
+            _plan_slot_signature = tuple(
+                int(v) for v in step_authority.slot_by_row
             )
         _compact_layout_generation = int(
             getattr(_xlayer_plan, "compact_meta_epoch", -1)
@@ -8187,21 +8199,21 @@ def build_step_bound_meta_from_metadata_impl(
             f"decode_data={step_decode_data.cache_key!r} current={step_decode_cache_key!r}"
         )
     batch_size = int(step_authority.batch_size)
-    q_start_loc = tuple(int(v) for v in step_authority.q_start_loc[: batch_size + 1])
-    if len(q_start_loc) < batch_size + 1:
+    q_start_loc = tuple(int(v) for v in step_authority.q_start_loc)
+    if len(q_start_loc) != batch_size + 1:
         raise RuntimeError(
-            "bound-meta build q_start_loc coverage mismatch; "
+            "bound-meta build requires exact q_start_loc coverage; "
             f"q_start={len(q_start_loc)} batch={batch_size}"
         )
     if (
-        len(step_authority.q_lens_by_row) < batch_size
-        or len(step_authority.context_kv_len_by_row) < batch_size
-        or len(step_authority.logits_last_n_by_row) < batch_size
-        or len(step_authority.logits_capacity_by_row) < batch_size
-        or len(step_authority.logf_mask_by_row) < batch_size
+        len(step_authority.q_lens_by_row) != batch_size
+        or len(step_authority.context_kv_len_by_row) != batch_size
+        or len(step_authority.logits_last_n_by_row) != batch_size
+        or len(step_authority.logits_capacity_by_row) != batch_size
+        or len(step_authority.logf_mask_by_row) != batch_size
     ):
         raise RuntimeError(
-            "bound-meta build step_authority row coverage mismatch; "
+            "bound-meta build requires exact StepAuthority row coverage; "
             f"q_lens={len(step_authority.q_lens_by_row)} "
             f"context={len(step_authority.context_kv_len_by_row)} "
             f"last_n={len(step_authority.logits_last_n_by_row)} "

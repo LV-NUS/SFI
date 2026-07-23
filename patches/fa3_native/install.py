@@ -331,43 +331,57 @@ def build_fa3_step_trace_event(
     step_context: object | None = None,
     source: str,
 ) -> dict[str, Any]:
-    req_ids = tuple(str(v) for v in getattr(step_authority, "req_ids", tuple()))
-    is_prefill_by_row = tuple(bool(v) for v in getattr(step_authority, "is_prefill_by_row", tuple()))
-    bootstrap_done_by_row = tuple(bool(v) for v in getattr(step_authority, "bootstrap_done_by_row", tuple()))
-    use_compact_by_row = tuple(bool(v) for v in getattr(step_authority, "use_compact_by_row", tuple()))
-    dispatch_logf_producer_by_row = tuple(
-        int(v) for v in getattr(step_authority, "dispatch_logf_producer_by_row", tuple())
+    req_ids = step_authority.req_ids
+    is_prefill_by_row = step_authority.is_prefill_by_row
+    row_policy_ready_by_row = step_authority.row_policy_ready_by_row
+    use_compact_by_row = step_authority.use_compact_by_row
+    dispatch_logf_producer_by_row = (
+        step_authority.dispatch_logf_producer_by_row
     )
-    logits_last_n_by_row = tuple(int(v) for v in getattr(step_authority, "logits_last_n_by_row", tuple()))
-    row_mode_by_row = tuple(int(v) for v in getattr(step_authority, "row_mode_by_row", tuple()))
-    layer_effective_refresh_by_row = tuple(
-        bool(v) for v in getattr(step_authority, "layer_effective_refresh_by_row", tuple())
+    logits_last_n_by_row = step_authority.logits_last_n_by_row
+    row_mode_by_row = step_authority.row_mode_by_row
+    layer_effective_refresh_by_row = (
+        step_authority.layer_effective_refresh_by_row
     )
-    batch_size = int(getattr(step_authority, "batch_size", len(req_ids)))
-    rows = min(
-        batch_size,
-        len(req_ids),
-        len(is_prefill_by_row),
-        len(bootstrap_done_by_row),
-        len(use_compact_by_row),
-        len(dispatch_logf_producer_by_row),
-        len(logits_last_n_by_row),
-        len(row_mode_by_row),
-        len(layer_effective_refresh_by_row),
-    )
+    batch_size = int(step_authority.batch_size)
+    row_vectors = {
+        "req_ids": req_ids,
+        "is_prefill_by_row": is_prefill_by_row,
+        "row_policy_ready_by_row": row_policy_ready_by_row,
+        "use_compact_by_row": use_compact_by_row,
+        "dispatch_logf_producer_by_row": dispatch_logf_producer_by_row,
+        "logits_last_n_by_row": logits_last_n_by_row,
+        "row_mode_by_row": row_mode_by_row,
+        "layer_effective_refresh_by_row": layer_effective_refresh_by_row,
+    }
+    mismatched = {
+        name: len(values)
+        for name, values in row_vectors.items()
+        if len(values) != batch_size
+    }
+    if batch_size < 0 or mismatched:
+        raise RuntimeError(
+            "fa3 step trace requires exact StepAuthority row coverage: "
+            f"batch={batch_size} mismatched={mismatched}"
+        )
+    rows = batch_size
 
     return {
         "event": "fa3_step_state",
         "source": str(source),
-        "epoch": int(getattr(step_authority, "epoch", -1)),
-        "step_handle_id": int(getattr(step_authority, "step_handle_id", -1)),
-        "step_handle_generation": int(getattr(step_authority, "step_handle_generation", -1)),
+        "epoch": int(step_authority.epoch),
+        "step_handle_id": int(step_authority.step_handle_id),
+        "step_handle_generation": int(step_authority.step_handle_generation),
         "step_identity_token": int(getattr(step_context, "step_identity_token", 0) or 0),
         "batch_size": int(batch_size),
         "rows_traced": int(rows),
         "req_ids": list(req_ids[:rows]),
         "is_prefill_by_row": [bool(v) for v in is_prefill_by_row[:rows]],
-        "bootstrap_done_by_row": [bool(v) for v in bootstrap_done_by_row[:rows]],
+        # Wire key retained for release-checker compatibility. Runtime state
+        # ownership uses the unambiguous row_policy_ready_by_row name.
+        "bootstrap_done_by_row": [
+            bool(v) for v in row_policy_ready_by_row[:rows]
+        ],
         "use_compact_by_row": [bool(v) for v in use_compact_by_row[:rows]],
         "dispatch_logf_producer_by_row": [int(v) for v in dispatch_logf_producer_by_row[:rows]],
         "logits_last_n_by_row": [int(v) for v in logits_last_n_by_row[:rows]],
@@ -375,7 +389,9 @@ def build_fa3_step_trace_event(
         "layer_effective_refresh_by_row": [bool(v) for v in layer_effective_refresh_by_row[:rows]],
         "prefill_row_count": sum(1 for v in is_prefill_by_row[:rows] if bool(v)),
         "decode_row_count": sum(1 for v in is_prefill_by_row[:rows] if not bool(v)),
-        "bootstrap_done_row_count": sum(1 for v in bootstrap_done_by_row[:rows] if bool(v)),
+        "bootstrap_done_row_count": sum(
+            1 for v in row_policy_ready_by_row[:rows] if bool(v)
+        ),
         "selected_row_count": sum(1 for v in use_compact_by_row[:rows] if bool(v)),
         "capture_row_count": sum(1 for v in dispatch_logf_producer_by_row[:rows] if int(v) != 0),
         "refresh_row_count": sum(1 for v in layer_effective_refresh_by_row[:rows] if bool(v)),

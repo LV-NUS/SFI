@@ -41,7 +41,7 @@ class StepCacheInvariants:
     """[T2-HOST-DIET 2026-07-10] build_layer_step_cache_impl 的步级不变量包。
 
     世代 commit 步 36 层 cache 全 miss 时,预备段(标量提取/合同校验/plan
-    取用/seqused 合同/veto 行分类/page-sparse 门/trace 开关)只依赖 step 级
+    取用/seqused 合同/row admission/page-sparse 门/trace 开关)只依赖 step 级
     输入,却曾被每层重算 36 遍(cProfile 定谳:controller 三连+函数内
     import+env 读 46 次/步)。由 build_step_cache_invariants 每步构建一次并
     thread 进 impl(P12 precomputed_cache_key/active_slots 同款惯用法);
@@ -63,7 +63,6 @@ class StepCacheInvariants:
         "plan_valid",
         "seqused_k_gpu",
         "slot_by_row",
-        "want_compact_by_row",
         "request_selected_rows",
         "any_selected",
         "page_sparse_gate_on",
@@ -83,7 +82,6 @@ class StepCacheInvariants:
         plan_valid: bool,
         seqused_k_gpu: torch.Tensor,
         slot_by_row: Tuple[int, ...],
-        want_compact_by_row: Tuple[bool, ...],
         request_selected_rows: Tuple[bool, ...],
         any_selected: bool,
         page_sparse_gate_on: bool,
@@ -99,7 +97,6 @@ class StepCacheInvariants:
         self.plan_valid = plan_valid
         self.seqused_k_gpu = seqused_k_gpu
         self.slot_by_row = slot_by_row
-        self.want_compact_by_row = want_compact_by_row
         self.request_selected_rows = request_selected_rows
         self.any_selected = any_selected
         self.page_sparse_gate_on = page_sparse_gate_on
@@ -108,23 +105,19 @@ class StepCacheInvariants:
 
 def build_step_cache_invariants(
     *,
-    state: LayerState,
     step_meta: "StepMeta",
     step_authority: "StepAuthority",
     step_bound_meta: Optional["StepBoundMeta"],
     device: torch.device,
     force_dense: bool,
     force_compact_off: bool,
-    layer_effective_refresh_by_row: Tuple[bool, ...],
 ) -> StepCacheInvariants:
-    """步级不变量构建(原 impl 预备段原样搬迁,校验 raise 文案不变)。"""
+    """从 StepAuthority 构建一次跨层共享的步级不变量。"""
     batch_size = int(step_authority.batch_size)
     max_batch_size = int(step_authority.max_batch_size)
     block_size = int(step_meta.block_size)
-    compact_threshold = int(step_authority.compact_bootstrap_threshold)
     req_ids = step_authority.req_ids
     decode_plan_version = int(getattr(step_authority, "decode_plan_version", -1))
-    context_kv_len_cpu = step_authority.context_kv_len_by_row
     if int(step_meta.epoch) != int(step_authority.epoch):
         raise RuntimeError(
             "step cache carrier epoch mismatch between StepMeta and StepAuthority; "
@@ -136,25 +129,15 @@ def build_step_cache_invariants(
             f"meta_batch={int(step_meta.batch_size)} auth_batch={batch_size}"
         )
     if (
-        len(req_ids) < batch_size
-        or len(context_kv_len_cpu) < batch_size
-        or len(step_authority.bootstrap_done_by_row) < batch_size
-        or len(step_authority.q_lens_by_row) < batch_size
-        or len(step_authority.is_prefill_by_row) < batch_size
-        or len(step_authority.short_dense_by_row) < batch_size
+        len(req_ids) != batch_size
+        or len(step_authority.slot_by_row) != batch_size
+        or len(step_authority.use_compact_by_row) != batch_size
     ):
         raise RuntimeError(
-            "step cache requires full StepAuthority row coverage "
-            f"(batch={batch_size}, req={len(req_ids)}, context={len(context_kv_len_cpu)}, "
-            f"bootstrap={len(step_authority.bootstrap_done_by_row)}, "
-            f"q_lens={len(step_authority.q_lens_by_row)}, "
-            f"is_prefill={len(step_authority.is_prefill_by_row)}, "
-            f"short_dense={len(step_authority.short_dense_by_row)})"
-        )
-    if len(layer_effective_refresh_by_row) < batch_size:
-        raise RuntimeError(
-            "step cache missing layer_effective_refresh_by_row rows; "
-            f"rows={len(layer_effective_refresh_by_row)} batch={batch_size}"
+            "step cache requires exact StepAuthority row coverage "
+            f"(batch={batch_size}, req={len(req_ids)}, "
+            f"slots={len(step_authority.slot_by_row)}, "
+            f"use_compact={len(step_authority.use_compact_by_row)})"
         )
     plan = (
         getattr(step_bound_meta, "compact_recent_launch_plan", None)
@@ -174,36 +157,17 @@ def build_step_cache_invariants(
             "post_kernel_worker requires canonical_real_kv_len_i32_gpu to satisfy contract; "
             f"batch_size={int(batch_size)}"
         )
-    # veto 行分类:除 compact_ready(经 state.compact_kv_len,真 per-layer)外,
-    # use_compact 判定链全为步级输入。原 per-layer 循环的 q_len 读取是死读
-    # (不参与判定),不再保留。
-    slot_by_row = tuple(
-        int(state.request_id_to_slot.get(req_id, -1)) for req_id in req_ids
-    )
-    want_compact_list = []
-    for row in range(len(req_ids)):
-        bootstrap_done = bool(step_authority.bootstrap_done_by_row[row])
-        is_prefill = bool(step_authority.is_prefill_by_row[row])
-        is_refresh = bool(layer_effective_refresh_by_row[row])
-        context_kv_len = int(context_kv_len_cpu[row])
-        short_dense = bool(step_authority.short_dense_by_row[row])
-        if (not short_dense) and compact_threshold > 0 and context_kv_len <= compact_threshold:
-            # Keep semantic parity with previous threshold-derived behavior.
-            short_dense = True
-        want_compact_list.append(
-            not (
-                force_dense
-                or force_compact_off
-                or is_prefill
-                or (not bootstrap_done)
-                or short_dense
-                or is_refresh
-            )
-        )
-    request_selected_rows = tuple(
-        bool(v) for v in getattr(step_authority, "use_compact_by_row", tuple())[:batch_size]
-    )
+    # StepAuthority.use_compact_by_row 是 request row-mode 的唯一权威；
+    # per-layer 只保留 state.compact_kv_len 的物理可读性校验。
+    slot_by_row = step_authority.slot_by_row
+    request_selected_rows = step_authority.use_compact_by_row
     any_selected = any(request_selected_rows)
+    if (force_dense or force_compact_off) and any_selected:
+        raise RuntimeError(
+            "StepAuthority compact rows conflict with force-dense routing: "
+            f"force_dense={bool(force_dense)} "
+            f"force_compact_off={bool(force_compact_off)}"
+        )
     # page-sparse 门(操作数全步级;import 从 per-layer 函数体提为 per-step,
     # 保持函数内 import 以避免模块环)。
     from patches.sparse_constants import should_skip_page_sparse_state
@@ -220,8 +184,9 @@ def build_step_cache_invariants(
     page_sparse_gate_on = (
         not should_skip_page_sparse_state(_attn_mode_peripheral)
         and not force_dense
+        and not force_compact_off
         and int(batch_size) > 0
-        and bool(getattr(step_meta, "has_decode_row", False))
+        and bool(step_authority.has_decode_row)
         and any_selected
     )
     return StepCacheInvariants(
@@ -235,7 +200,6 @@ def build_step_cache_invariants(
         plan_valid=plan_valid,
         seqused_k_gpu=seqused_k_gpu,
         slot_by_row=slot_by_row,
-        want_compact_by_row=tuple(want_compact_list),
         request_selected_rows=request_selected_rows,
         any_selected=any_selected,
         page_sparse_gate_on=page_sparse_gate_on,
@@ -533,14 +497,12 @@ def build_layer_step_cache_impl(
     # force 标志护栏 fail-close:bundle 与本调用不一致=错传,响亮 raise。
     if step_invariants is None:
         step_invariants = build_step_cache_invariants(
-            state=state,
             step_meta=step_meta,
             step_authority=step_authority,
             step_bound_meta=step_bound_meta,
             device=device,
             force_dense=force_dense,
             force_compact_off=force_compact_off,
-            layer_effective_refresh_by_row=layer_effective_refresh_by_row,
         )
     elif (
         bool(step_invariants.force_dense) != bool(force_dense)
@@ -579,9 +541,9 @@ def build_layer_step_cache_impl(
         use_compact_list = None
     else:
         # ❌ cache miss: 仍按 per-row 规则计算 use_compact 以维护 step_cache_has_compact
-        # / step_cache_all_compact 预计算值。veto 链为步级不变量(inv.want_compact_by_row),
+        # / step_cache_all_compact 预计算值。row-mode 直接消费 StepAuthority 单源，
         # 真 per-layer 输入只剩 compact_ready(state.compact_kv_len)。
-        _want_compact = inv.want_compact_by_row
+        _want_compact = inv.request_selected_rows
         _slot_by_row = inv.slot_by_row
         _compact_kv_len = state.compact_kv_len
         _ckl_len = len(_compact_kv_len)

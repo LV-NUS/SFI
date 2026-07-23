@@ -183,7 +183,7 @@ def _attrib_compact_consume_delay_steps() -> int:
     return _COMPACT_CONSUME_DELAY_STEPS_CACHED
 
 
-def _bootstrap_done_for_row_policy(
+def _lifecycle_ready_for_row_policy(
     *,
     config: object,
     tracking: object,
@@ -219,9 +219,9 @@ def _publish_bootstrap_readiness_before_step_authority(
     if not defer_bootstrap_producer:
         # [TP-BOOTSTRAP-SUBMISSION-BOUNDARY] Request-local final events are
         # produced by rank-local async flushes. Validate the host-owned
-        # submission boundary before bootstrap_done becomes row-policy-visible;
-        # otherwise one TP rank may consume compact while another still consumes
-        # native KV. A device wait cannot synthesize a missing host finalize.
+        # submission boundary before the request lifecycle becomes terminal;
+        # StepAuthority still checks physical compact readiness before routing.
+        # A device wait cannot synthesize a missing host finalize.
         self._validate_prefill_submission_before_bootstrap_publish(
             req_ids=req_ids_tuple,
             epoch=self.step_context_epoch,
@@ -282,13 +282,13 @@ def _publish_bootstrap_readiness_before_step_authority(
         )
     else:
         # full-cudagraph one-shot async bootstrap：在 StepAuthority 构建前把
-        # request-local finalize events 排进主流，随后可安全发布 bootstrap_done。
+        # request-local finalize events 排进主流，随后可安全结束 request lifecycle。
         self._wait_and_publish_bootstrap_requests_for_graph_decode(
             epoch=self.step_context_epoch
         )
         # step 边界先用轻量 event-query 提升真正 ready 的 bootstrap 请求。
-        # 这样后续 StepAuthority 只消费严格语义的 bootstrap_done，
-        # 不会把 bootstrap_pending 过早物化为 selected-ready。
+        # 这样后续 StepAuthority 只消费严格发布的 lifecycle state，再结合
+        # per-layer 物理就绪形成唯一 row-policy readiness。
         self._publish_ready_bootstrap_requests_at_step_boundary(
             epoch=self.step_context_epoch
         )
@@ -309,11 +309,7 @@ def _resolve_consume_selected_scope_binding(
     )
 
     if int(target_epoch) > int(current_epoch):
-        previous_has_selected_consume = any(
-            bool(v)
-            for v in tuple(getattr(previous_step_authority, "use_compact_by_row", tuple()))
-        )
-        if not previous_has_selected_consume:
+        if not bool(previous_step_authority.has_compact_row):
             return consume_key, consume_handle
         previous_publish_key = getattr(
             previous_step_authority, "target_selected_scope_key", None
@@ -351,7 +347,8 @@ class _StepAuthorityBuilderScratch:
     __slots__ = (
         "is_prefill_by_row",
         "prefill_rows",
-        "bootstrap_done",
+        "row_policy_ready",
+        "dense_protection_by_row",
         "row_mode_by_row",
         "logf_producer_by_row",
         "needs_logits_by_row",
@@ -366,7 +363,8 @@ class _StepAuthorityBuilderScratch:
     def __init__(self) -> None:
         self.is_prefill_by_row: List[bool] = []
         self.prefill_rows: List[int] = []
-        self.bootstrap_done: List[bool] = []
+        self.row_policy_ready: List[bool] = []
+        self.dense_protection_by_row: List[bool] = []
         self.row_mode_by_row: List[int] = []
         self.logf_producer_by_row: List[int] = []
         self.needs_logits_by_row: List[bool] = []
@@ -380,7 +378,8 @@ class _StepAuthorityBuilderScratch:
     def reset(self, *, batch_size: int) -> None:
         self.is_prefill_by_row.clear()
         self.prefill_rows.clear()
-        self.bootstrap_done.clear()
+        self.row_policy_ready.clear()
+        self.dense_protection_by_row.clear()
         self.row_mode_by_row.clear()
         self.logf_producer_by_row.clear()
         self.needs_logits_by_row.clear()
@@ -590,18 +589,27 @@ def prepare_step_context_impl(
         req_ids_tuple=req_ids_tuple,
     )
 
-    # 预先构建 per-row 阶段判定与 bootstrap_done 列表，减少后续重复遍历。
+    # 预先构建 per-row 阶段判定与 row-policy readiness，减少后续重复遍历。
     is_prefill_by_row_list = scratch.is_prefill_by_row
     has_prefill_row = False
     has_decode_row = False
     prefill_rows_list = scratch.prefill_rows
-    bootstrap_done_list = scratch.bootstrap_done
+    row_policy_ready_list = scratch.row_policy_ready
+    dense_protection_by_row = scratch.dense_protection_by_row
     compact_consume_delay_steps = _attrib_compact_consume_delay_steps()
+    compact_bootstrap_threshold = self._compact_threshold_tokens()
+    compact_disabled = compact_bootstrap_threshold <= 0
+    short_dense_by_row = tuple(
+        compact_disabled
+        or (
+            seq_len > 0
+            and seq_len <= compact_bootstrap_threshold
+        )
+        for seq_len in seq_lens_tuple
+    )
 
-    compact_ready_for_row_policy_by_req: dict[str, bool] = {}
-
-    def _bootstrap_done_for_compact_row_policy(rid: str, tracking: object) -> bool:
-        boot = _bootstrap_done_for_row_policy(
+    def _row_policy_ready(rid: str, tracking: object) -> bool:
+        boot = _lifecycle_ready_for_row_policy(
             config=self.config,
             tracking=tracking,
             compact_consume_delay_steps=compact_consume_delay_steps,
@@ -610,16 +618,11 @@ def prepare_step_context_impl(
             return False
         if bool(getattr(tracking, "_was_short_dense", False)):
             return True
-        cached = compact_ready_for_row_policy_by_req.get(rid)
-        if cached is None:
-            cached = bool(self._request_compact_ready_all_layers(rid))
-            compact_ready_for_row_policy_by_req[rid] = cached
-        return bool(cached)
+        return bool(self._request_compact_ready_all_layers(rid))
 
     # Step-wise 更新 decode_step：使用 vLLM 提供的 num_computed_tokens_cpu 与 num_prompt_tokens，
     # 避免依赖 append_output_token_ids 的回调时序（multi_step_stream_outputs 下可能滞后）。
     if has_prompt_counter:
-        compact_threshold = self._compact_threshold_tokens()
         for idx, rid in enumerate(req_ids_tuple):
             prompt_len = prompt_len_list[idx]
             computed = computed_list[idx]
@@ -708,10 +711,9 @@ def prepare_step_context_impl(
                 tracking.prefill_done = bool(computed >= prompt_len)
             # 短上下文（无需 compact bootstrap）：一旦 prompt 完成即可直接视为“已 bootstrapped”
             if tracking.prefill_done and not tracking.bootstrap_done:
-                ctx_len = seq_lens_tuple[idx]
                 # 约定：只有“真正超过阈值”才离开 short（ctx_len > threshold）。
                 # 因此在 ctx_len == threshold 时仍视为 short。
-                if compact_threshold <= 0 or (ctx_len > 0 and ctx_len <= compact_threshold):
+                if short_dense_by_row[idx]:
                     tracking.bootstrap_done = True
                     tracking.bootstrap_pending = False
                     tracking.bootstrap_pending_epoch = -1
@@ -723,10 +725,9 @@ def prepare_step_context_impl(
             # 构建 compact cache（last_n=1 的 decode refresh），避免 compact_only kernel 对
             # 该行仍以 FULL_CONTEXT_FLAG 遍历全部 paged blocks（效率低）。
             if tracking.prefill_done and tracking.bootstrap_done:
-                ctx_len = seq_lens_tuple[idx]
                 was_short = tracking._was_short_dense
                 # 与上面的 short 语义保持一致：<= threshold 仍为 short。
-                is_short = compact_threshold > 0 and ctx_len > 0 and ctx_len <= compact_threshold
+                is_short = short_dense_by_row[idx]
                 if was_short and not is_short:
                     crossing_step = int(tracking.decode_step) if tracking.decode_step is not None else -1
                     if crossing_step < 0:
@@ -790,12 +791,15 @@ def prepare_step_context_impl(
             ):
                 self._reset_request_sparse_state_for_resume(rid, tracking)
 
-            boot = _bootstrap_done_for_compact_row_policy(rid, tracking)
-            bootstrap_done_list.append(boot)
+            row_ready = _row_policy_ready(rid, tracking)
+            row_policy_ready_list.append(row_ready)
+            dense_protection_by_row.append(
+                bool(getattr(tracking, "_was_short_dense", False))
+            )
             if prompt_len > 0:
                 is_prefill = computed < prompt_len
             else:
-                is_prefill = not boot
+                is_prefill = not row_ready
             # q_len(=num_scheduled_tokens) 是调度器权威、owner 矩阵的派发依据:
             # q_len>1 的行必须归 prefill(多 token),即使 prompt 边界计数已
             # computed>=prompt_len——resume/preempt 重算续吞已生成 token 段、或
@@ -815,9 +819,14 @@ def prepare_step_context_impl(
     else:
         for idx, rid in enumerate(req_ids_tuple):
             tracking = self.request_states.get(rid)
-            boot = bool(tracking.bootstrap_done) if tracking is not None else False
-            bootstrap_done_list.append(boot)
-            is_prefill = not boot
+            lifecycle_done = (
+                bool(tracking.bootstrap_done) if tracking is not None else False
+            )
+            row_policy_ready_list.append(_row_policy_ready(rid, tracking))
+            dense_protection_by_row.append(
+                bool(getattr(tracking, "_was_short_dense", False))
+            )
+            is_prefill = not lifecycle_done
             if not is_prefill and idx < len(q_lens) and int(q_lens[idx]) > 1:
                 is_prefill = True
             is_prefill_by_row_list.append(is_prefill)
@@ -829,8 +838,9 @@ def prepare_step_context_impl(
 
     # mixchunk 判定：仅使用“当前 step 事实”，不依赖跨步粘连状态。
     # 当同一步内同时存在 prefill row 和 decode row 时，视为 mixed-phase。
-    # prefill_rows 是 row phase 的唯一不可变签名；StepMeta/StepAuthority 也直接
-    # 复用这一份冻结结果，避免 helper 与两个下游各自重复分配 tuple。
+    row_policy_ready_by_row = tuple(row_policy_ready_list)
+    # prefill_rows 是 row phase 的唯一不可变签名；StepAuthority 直接复用
+    # 这一份冻结结果，避免 helper 与下游各自重复分配 tuple。
     prefill_rows = tuple(prefill_rows_list)
     has_request_phase_mix = bool(has_prefill_row and has_decode_row)
     # prefill buffer 生命周期跟随执行 owner，而不是仅表示 prompt ingest 进度
@@ -905,7 +915,9 @@ def prepare_step_context_impl(
     step_refresh_nonempty = bool(refresh_plan.has_refresh_reqs)
     refresh_reqs = tuple(refresh_plan.refresh_reqs)
     refresh_reason = str(refresh_plan.refresh_reason)
-    bootstrap_done = bool(refresh_plan.bootstrap_done)
+    all_request_lifecycle_done = bool(
+        refresh_plan.all_request_lifecycle_done
+    )
     refresh_mode_by_row = tuple(refresh_plan.mode_by_row)
     if len(refresh_mode_by_row) != num_reqs:
         raise RuntimeError(
@@ -955,10 +967,8 @@ def prepare_step_context_impl(
         _psc_rows = tuple(
             (
                 bool(is_prefill_by_row_list[_r]),
-                bool(bootstrap_done_list[_r]) if _r < len(bootstrap_done_list) else False,
-                bool((self.request_states.get(req_ids_tuple[_r]) or None) is not None
-                     and getattr(self.request_states.get(req_ids_tuple[_r]),
-                                 '_was_short_dense', False)),
+                bool(row_policy_ready_list[_r]),
+                bool(dense_protection_by_row[_r]),
             )
             for _r in range(num_reqs)
         )
@@ -970,7 +980,7 @@ def prepare_step_context_impl(
             tuple(int(v) for v in refresh_mode_by_row),
             refresh_rows,
             bool(step_refresh_nonempty),
-            bool(bootstrap_done),
+            all_request_lifecycle_done,
             force_dense_while_inflight_by_row,
             refresh_reqs,
             slot_by_row,
@@ -998,10 +1008,9 @@ def prepare_step_context_impl(
         needs_logits_by_row_list = scratch.needs_logits_by_row
         logits_last_n_by_row_list = scratch.logits_last_n_by_row
         for idx, rid in enumerate(req_ids_tuple):
-            tracking = self.request_states.get(rid)
             is_prefill_row = is_prefill_by_row_list[idx]
-            short_dense_row = tracking._was_short_dense if tracking is not None else False
-            boot_done_row = bootstrap_done_list[idx] if idx < len(bootstrap_done_list) else False
+            dense_protection_active = dense_protection_by_row[idx]
+            row_policy_ready = row_policy_ready_list[idx]
             is_refresh_row = refresh_row_mask[idx]
             force_dense_for_pending_refresh = (
                 idx < len(force_dense_while_inflight_by_row)
@@ -1010,8 +1019,8 @@ def prepare_step_context_impl(
             row_mode, logf_producer = resolve_decode_row_policy(
                 is_prefill_row=is_prefill_row,
                 is_refresh_row=is_refresh_row,
-                is_short_dense_row=short_dense_row,
-                bootstrap_done_row=boot_done_row,
+                dense_protection_active=dense_protection_active,
+                row_policy_ready=row_policy_ready,
                 force_dense_for_pending_refresh=force_dense_for_pending_refresh,
             )
             if row_mode == _ROW_MODE_COMPACT and logf_producer == _LOGF_PRODUCER_ATTN:
@@ -1053,13 +1062,13 @@ def prepare_step_context_impl(
         for _slot_idx in range(num_reqs):
             if not refresh_row_mask[_slot_idx]:
                 continue
-            if _slot_idx < len(is_prefill_by_row_list) and bool(is_prefill_by_row_list[_slot_idx]):
+            if bool(is_prefill_by_row_list[_slot_idx]):
                 continue
             _slot = int(slot_by_row[_slot_idx]) if _slot_idx < len(slot_by_row) else -1
             if _slot < 0:
                 continue
             _refresh_slot_set.add(_slot)
-            if _slot_idx < len(bootstrap_done_list) and not bool(bootstrap_done_list[_slot_idx]):
+            if not bool(row_policy_ready_list[_slot_idx]):
                 _bootstrap_slot_set.add(_slot)
         _refresh_slots = normalize_refresh_slot_list(_refresh_slot_set)
         _bootstrap_slots = normalize_refresh_slot_list(_bootstrap_slot_set)
@@ -1110,20 +1119,20 @@ def prepare_step_context_impl(
             slot_by_row=slot_by_row,
             row_mode_by_row=row_mode_by_row,
             layer_effective_refresh_by_row=layer_effective_refresh_by_row,
-            bootstrap_done_by_row=tuple(bootstrap_done_list),
+            row_policy_ready_by_row=row_policy_ready_by_row,
         )
         # layer-group gating: inline computation for step envelope，避免 per-layer
         # controller attribute reads 与 dispatcher 侧回退判定。
         _lg_groups = self.config.refresh_layer_groups or 1
         if _lg_groups < 1:
             _lg_groups = 1
-        _lg_decode_bd = bool(bootstrap_done)
+        _lg_decode_bd = all_request_lifecycle_done
         if _lg_groups == 2 and is_prefill_by_row_list:
             _lg_decode_bd = True
             for _lg_idx, _lg_pf in enumerate(is_prefill_by_row_list):
                 if _lg_pf:
                     continue
-                if _lg_idx >= len(bootstrap_done_list) or not bootstrap_done_list[_lg_idx]:
+                if not row_policy_ready_list[_lg_idx]:
                     _lg_decode_bd = False
                     break
         _lg_enabled = _lg_groups == 2 and _lg_decode_bd and has_decode_row
@@ -1212,7 +1221,6 @@ def prepare_step_context_impl(
             refresh_reqs=refresh_reqs,
             layer_effective_refresh_by_row=layer_effective_refresh_by_row,
             refresh_reason=refresh_reason,
-            bootstrap_done=bootstrap_done,
             plan_signature=plan_signature,
             layer_group_active=_lg_active,
             layer_group_enabled=_lg_enabled,
@@ -1338,33 +1346,15 @@ def prepare_step_context_impl(
     if num_reqs > self.max_batch_size:
         self.max_batch_size = num_reqs
 
-    compact_bootstrap_threshold = self._compact_threshold_tokens()
-    short_dense_by_row = tuple(
-        (compact_bootstrap_threshold > 0 and seq_len > 0 and seq_len <= compact_bootstrap_threshold)
-        for seq_len in seq_lens_tuple
-    )
-
     self.step_meta = StepMeta(
         epoch=self.step_context_epoch,
         batch_size=num_reqs,
-        max_batch_size=self.max_batch_size,
         req_ids=req_ids_tuple,
-        req_id_to_index=req_id_to_index,
         context_kv_len=seq_lens_tuple,
         seqused_k_gpu=None,  # 延迟构建：在 preheat 开始时构建一次
         recent_cap=recent_cap,
         sink_tokens=validate_sink_tokens(semantic_snapshot.sink_tokens),
         block_size=block_size,
-        compact_bootstrap_threshold=compact_bootstrap_threshold,
-        bootstrap_done_by_row=tuple(bootstrap_done_list),
-        q_lens=q_lens,
-        is_prefill_by_row=tuple(is_prefill_by_row_list),
-        has_prefill_row=has_prefill_row,
-        has_decode_row=has_decode_row,
-        prefill_rows=prefill_rows,
-        is_decode_only=is_decode_only,
-        has_prefill_by_prompt=bool(has_prefill_by_prompt),
-        short_dense_by_row=short_dense_by_row,
         decode_plan_version=int(decode_plan_version),
         request_kv_rows=tuple(range(num_reqs)),
     )
@@ -1479,7 +1469,7 @@ def prepare_step_context_impl(
             prefill_rows=prefill_rows,
             is_decode_only=is_decode_only,
             has_prefill_by_prompt=bool(has_prefill_by_prompt),
-            bootstrap_done_by_row=tuple(bootstrap_done_list),
+            row_policy_ready_by_row=row_policy_ready_by_row,
             short_dense_by_row=short_dense_by_row,
             slot_by_row=slot_by_row,
             row_mode_by_row=row_mode_by_row,
@@ -1492,7 +1482,7 @@ def prepare_step_context_impl(
             logf_dirty_rows=decode_logf_dirty_rows,
             logits_last_n_by_row=logits_last_n_by_row,
             logits_capacity_by_row=decode_logf_capacity_by_row,
-            use_compact_by_row=tuple(_use_compact),
+            use_compact_by_row=_use_compact,
             slot_by_row_has_negative=any(_slot < 0 for _slot in slot_by_row),
             hint_has_log_f=_hint_has_log_f,
             hint_all_compact=_hint_all_compact,
@@ -1689,7 +1679,7 @@ def prepare_step_context_impl(
             for _f in ('req_ids', 'slot_by_row', 'row_mode_by_row',
                        'refresh_signals', 'refresh_rows', 'refresh_reqs',
                        'layer_effective_refresh_by_row', 'refresh_reason',
-                       'bootstrap_done', 'plan_signature', 'layer_group_active',
+                       'plan_signature', 'layer_group_active',
                        'layer_group_enabled', 'cache_signature'):
                 if getattr(_ce, _f) != getattr(step_envelope_v2, _f):
                     try:

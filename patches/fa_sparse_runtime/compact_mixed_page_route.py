@@ -624,9 +624,9 @@ def resolve_compact_mixed_page_overlay_cpu_geometry(
     compact_valid = tuple(
         int(v) for v in getattr(launch_plan, "compact_valid_tokens_cpu", tuple())
     )
-    if len(compact_valid) < int(batch_size):
+    if len(compact_valid) != int(batch_size):
         raise RuntimeError(
-            "compact mixed-page overlay requires CPU compact_valid_tokens coverage"
+            "compact mixed-page overlay requires exact CPU compact_valid_tokens coverage"
         )
 
     real_kv_len = _first_available_cpu_int_tuple_value(
@@ -644,12 +644,10 @@ def resolve_compact_mixed_page_overlay_cpu_geometry(
             "refusing implicit GPU sync"
         )
 
-    row_is_compact = tuple(
-        bool(v) for v in tuple(getattr(step_authority, "use_compact_by_row", tuple()))
-    )
-    if len(row_is_compact) < int(batch_size):
+    row_is_compact = step_authority.use_compact_by_row
+    if len(row_is_compact) != int(batch_size):
         raise RuntimeError(
-            "compact mixed-page overlay requires use_compact_by_row coverage"
+            "compact mixed-page overlay requires exact use_compact_by_row coverage"
         )
 
     recent_cap = _first_int_attr(

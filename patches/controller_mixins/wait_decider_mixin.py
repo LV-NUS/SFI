@@ -120,8 +120,6 @@ class WaitDeciderMixin:
         self._main_wait_chunk_id_by_buf: List[int] = [-1 for _ in range(int(_CAPTURE_IN_FLIGHT))]
         # hints-driven wait dedup: per step per buf only trigger once
         self._step_wait_consumed_token_by_buf: List[int] = [0 for _ in range(int(_CAPTURE_IN_FLIGHT))]
-        self._step_has_compact_consumer_cache_key: Tuple[int, int, int] | None = None
-        self._step_has_compact_consumer_cache_value: bool = False
         # bootstrap (prefill selector+compact build) completion confirmation
         self._bootstrap_pending_request_ids: Set[str] = set()
         # Deterministic host-side transition ledger. Exact capture-plan
@@ -152,7 +150,7 @@ class WaitDeciderMixin:
         ] = {}
         self._one_shot_group_ready_full_graph_wait_required: bool = False
         self._one_shot_group_ready_compact_slots_cache_key: (
-            Tuple[int, int, int, int, int] | None
+            Tuple[int, int, int, int] | None
         ) = None
         self._one_shot_group_ready_compact_slots_cache_value: Tuple[int, ...] = (
             tuple()
@@ -858,44 +856,14 @@ class WaitDeciderMixin:
         authority = getattr(self, "step_authority", None)
         if authority is None:
             return True
-        has_decode_row = getattr(authority, "has_decode_row", None)
-        if has_decode_row is not None:
-            return bool(has_decode_row)
-        return bool(getattr(authority, "is_decode_only", False))
+        return bool(authority.has_decode_row)
 
     def _step_has_compact_consumer(self) -> bool:
         """Whether the current step actually consumes compact rows."""
         authority = getattr(self, "step_authority", None)
         if authority is None:
             return True
-        has_compact_row = getattr(authority, "has_compact_row", None)
-        if has_compact_row is not None:
-            return bool(has_compact_row)
-        use_compact = getattr(authority, "use_compact_by_row", None)
-        if use_compact is not None:
-            cache_key: Tuple[int, int, int] | None = None
-            try:
-                cache_key = (id(authority), id(use_compact), len(use_compact))
-            except TypeError:
-                cache_key = None
-            if cache_key is not None and getattr(
-                self,
-                "_step_has_compact_consumer_cache_key",
-                None,
-            ) == cache_key:
-                return bool(
-                    getattr(
-                        self,
-                        "_step_has_compact_consumer_cache_value",
-                        False,
-                    )
-                )
-            result = any(bool(value) for value in tuple(use_compact))
-            if cache_key is not None:
-                self._step_has_compact_consumer_cache_key = cache_key
-                self._step_has_compact_consumer_cache_value = bool(result)
-            return bool(result)
-        return False
+        return bool(authority.has_compact_row)
 
     def _pending_work_blockers(self, *, epoch: int) -> bool:
         """Return whether global blockers require wait even if flags are empty."""
@@ -1329,12 +1297,14 @@ class WaitDeciderMixin:
     ) -> int:
         """Validate the async-prefill submission boundary before publish.
 
-        ``bootstrap_done`` is a TP-visible routing decision.  The producer's
-        CUDA completion may differ across ranks, but the request must not expose
-        compact state until every rank has submitted its request-local final
-        event.  Submission is host-owned state: a device wait cannot create a
-        missing finalize record.  The transition ledger keeps steady decode
-        outside both the request scan and all CUDA work.
+        ``bootstrap_done`` is the request lifecycle publication boundary.
+        Row routing is resolved later by StepAuthority after physical compact
+        readiness is checked. The producer's CUDA completion may differ across
+        ranks, but the lifecycle must not become terminal until every rank has
+        submitted its request-local final event. Submission is host-owned
+        state: a device wait cannot create a missing finalize record. The
+        transition ledger keeps steady decode outside both the request scan and
+        all CUDA work.
         """
         pending_epoch_by_id = getattr(
             self,
@@ -1583,52 +1553,46 @@ class WaitDeciderMixin:
         authority = getattr(self, "step_authority", None)
         if authority is None:
             return tuple()
-        use_compact = getattr(authority, "use_compact_by_row", None)
-        slot_by_row = getattr(authority, "slot_by_row", None)
-        if use_compact is None or slot_by_row is None:
+        if not bool(authority.has_compact_row):
             return tuple()
-        cache_key: Tuple[int, int, int, int, int] | None = None
-        try:
-            cache_key = (
-                id(authority),
-                id(use_compact),
-                id(slot_by_row),
-                len(use_compact),
-                len(slot_by_row),
+        use_compact = authority.use_compact_by_row
+        slot_by_row = authority.slot_by_row
+        batch_size = int(authority.batch_size)
+        if len(use_compact) != batch_size or len(slot_by_row) != batch_size:
+            raise RuntimeError(
+                "one-shot group-ready requires exact row coverage: "
+                f"compact={len(use_compact)} slots={len(slot_by_row)} "
+                f"batch={batch_size}"
             )
-        except TypeError:
-            cache_key = None
-        if cache_key is not None and getattr(
+        cache_key = (
+            id(authority),
+            id(use_compact),
+            id(slot_by_row),
+            batch_size,
+        )
+        if getattr(
             self,
             "_one_shot_group_ready_compact_slots_cache_key",
             None,
         ) == cache_key:
-            return tuple(
-                getattr(
-                    self,
-                    "_one_shot_group_ready_compact_slots_cache_value",
-                    tuple(),
-                )
+            return getattr(
+                self,
+                "_one_shot_group_ready_compact_slots_cache_value",
+                tuple(),
             )
-        try:
-            use_values = tuple(use_compact)
-            slot_values = tuple(slot_by_row)
-        except TypeError:
-            return tuple()
         slots: list[int] = []
         seen: set[int] = set()
-        for row, use_value in enumerate(use_values):
-            if not bool(use_value) or int(row) >= len(slot_values):
+        for row in range(batch_size):
+            if not bool(use_compact[row]):
                 continue
-            slot = int(slot_values[int(row)])
+            slot = int(slot_by_row[row])
             if slot < 0 or slot in seen:
                 continue
             seen.add(slot)
             slots.append(slot)
         compact_slots = tuple(slots)
-        if cache_key is not None:
-            self._one_shot_group_ready_compact_slots_cache_key = cache_key
-            self._one_shot_group_ready_compact_slots_cache_value = compact_slots
+        self._one_shot_group_ready_compact_slots_cache_key = cache_key
+        self._one_shot_group_ready_compact_slots_cache_value = compact_slots
         return compact_slots
 
     def _wait_and_publish_bootstrap_requests_for_graph_decode(

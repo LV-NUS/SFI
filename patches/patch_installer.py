@@ -262,12 +262,6 @@ _ORIGINAL_KV_CACHE_MANAGER_INIT = None
 _ORIGINAL_BLOCK_POOL_METHODS = None
 _COMPACT_PAGE_BLOCK_POOL_CLS = None
 _COMPACT_PAGE_KV_CACHE_MANAGER_CLS = None
-_FA3_LIVE_ROUTE_REQUIRED_AUTHORITY_FIELDS = (
-    "is_prefill_by_row",
-    "use_compact_by_row",
-    "dispatch_logf_producer_by_row",
-    "logits_last_n_by_row",
-)
 
 
 def _cached_or_dynamic_env(name: str, cached: str, default: str = "") -> str:
@@ -1191,7 +1185,7 @@ def _build_vllm_profile_step_context(
         prefill_rows=prefill_rows,
         is_decode_only=not has_prefill_row,
         has_prefill_by_prompt=has_prefill_row,
-        bootstrap_done_by_row=(True,) * batch_size,
+        row_policy_ready_by_row=(True,) * batch_size,
         short_dense_by_row=false_by_row,
         slot_by_row=slot_by_row,
         row_mode_by_row=row_mode_by_row,
@@ -1722,16 +1716,8 @@ def bind_fa3_native_attn_metadata_contracts(
             )
         if target_scope_key is None or scope_wait_handle is None:
             return snapshot
-        has_selected_consume = any(
-            bool(v)
-            for v in tuple(getattr(effective_step_authority, "use_compact_by_row", tuple()))
-        )
-        has_capture = any(
-            int(v) == int(_LOGF_PRODUCER_ATTN)
-            for v in tuple(
-                getattr(effective_step_authority, "dispatch_logf_producer_by_row", tuple())
-            )
-        )
+        has_selected_consume = bool(effective_step_authority.has_compact_row)
+        has_capture = bool(effective_step_authority.hint_has_log_f)
         selected_scope_key = SelectedScopeKey(
             int(target_scope_key.consumer_step_id),
             int(target_scope_key.layer_group_id),
@@ -2811,12 +2797,12 @@ def _ensure_selected_no_capture_recent_descriptors(
     from patches.fa_sparse_runtime.runtime_cache import ensure_step_recent_descriptors
 
     batch_size = int(step_meta.batch_size)
-    layer_effective_refresh_by_row = tuple(
-        bool(v)
-        for v in tuple(
-            getattr(step_authority, "layer_effective_refresh_by_row", (False,) * batch_size)
-        )[:batch_size]
-    )
+    layer_effective_refresh_by_row = step_authority.layer_effective_refresh_by_row
+    if len(layer_effective_refresh_by_row) != batch_size:
+        raise RuntimeError(
+            "recent descriptor build requires exact refresh-row coverage: "
+            f"rows={len(layer_effective_refresh_by_row)} batch={batch_size}"
+        )
     ensure_step_recent_descriptors(
         step_meta=step_meta,
         page_size=page_size,
@@ -3073,24 +3059,35 @@ def _build_prefill_capture_last_n_by_row(
     if not capture_plan_by_req or batch_size <= 0:
         return tuple(0 for _ in range(max(0, int(batch_size))))
 
-    req_ids = tuple(str(rid) for rid in getattr(step_ctx, "req_ids", tuple()))
-    q_lens = tuple(int(v) for v in getattr(step_ctx, "q_lens", tuple()))
+    req_ids = step_ctx.req_ids
+    q_lens = step_ctx.q_lens
     step_authority = getattr(step_ctx, "step_authority", None)
-    is_prefill_by_row = tuple(
-        bool(v) for v in getattr(step_authority, "is_prefill_by_row", tuple())
-    )
+    if step_authority is None:
+        raise RuntimeError("prefill FA3 route requires StepAuthority")
+    is_prefill_by_row = step_authority.is_prefill_by_row
+    if (
+        int(step_authority.batch_size) != int(batch_size)
+        or len(req_ids) != int(batch_size)
+        or len(q_lens) != int(batch_size)
+        or len(is_prefill_by_row) != int(batch_size)
+    ):
+        raise RuntimeError(
+            "prefill FA3 route requires exact row coverage: "
+            f"batch={int(batch_size)} authority={int(step_authority.batch_size)} "
+            f"req_ids={len(req_ids)} q_lens={len(q_lens)} "
+            f"prefill={len(is_prefill_by_row)}"
+        )
     last_n_by_row = [0] * int(batch_size)
-    for row in range(min(int(batch_size), len(req_ids))):
-        if row < len(is_prefill_by_row) and (not bool(is_prefill_by_row[row])):
+    for row in range(int(batch_size)):
+        if not bool(is_prefill_by_row[row]):
             continue
         req_id = req_ids[row]
         last_n = int(capture_plan_by_req.get(req_id, 0) or 0)
         if last_n <= 0:
             continue
-        if row < len(q_lens):
-            q_len = int(q_lens[row])
-            if q_len > 0:
-                last_n = min(int(last_n), int(q_len))
+        q_len = int(q_lens[row])
+        if q_len > 0:
+            last_n = min(int(last_n), int(q_len))
         last_n_by_row[row] = max(0, int(last_n))
     return tuple(last_n_by_row)
 
@@ -3140,48 +3137,28 @@ def resolve_live_fa3_launch_route(
         step_authority = getattr(controller, "step_authority", None)
     if step_authority is None:
         raise RuntimeError("native FA3 launch route requires step_authority")
-    for field in _FA3_LIVE_ROUTE_REQUIRED_AUTHORITY_FIELDS:
-        if not hasattr(step_authority, field):
-            missing_fields = [
-                name
-                for name in _FA3_LIVE_ROUTE_REQUIRED_AUTHORITY_FIELDS
-                if not hasattr(step_authority, name)
-            ]
-            raise RuntimeError(
-                "native FA3 launch route step_authority missing required fields: "
-                + ", ".join(missing_fields)
-            )
     is_profile_step = bool(getattr(attn_metadata, "sparse_vllm_profile_step", False))
     if is_profile_step:
         if int(getattr(step_ctx, "epoch", 0)) != -1:
             raise RuntimeError(
                 "vLLM profile FA3 route requires an isolated profile step context"
             )
-        if (
-            any(
-                bool(v)
-                for v in tuple(
-                    getattr(step_authority, "use_compact_by_row", tuple())
-                )
-            )
-            and not _profile_mixed_page_cudagraph_capture_enabled(controller)
+        if bool(step_authority.has_compact_row) and not (
+            _profile_mixed_page_cudagraph_capture_enabled(controller)
         ):
             raise RuntimeError("vLLM profile FA3 route must remain dense")
         valid_profile_row_modes = {int(_ROW_MODE_DENSE), int(_ROW_MODE_COMPACT)}
-        profile_row_modes = tuple(
-            int(v)
-            for v in tuple(getattr(step_authority, "row_mode_by_row", tuple()))
-        )
+        profile_row_modes = step_authority.row_mode_by_row
         if any(v not in valid_profile_row_modes for v in profile_row_modes):
             raise RuntimeError(
                 "vLLM profile row_mode invalid: expected legacy dense/compact row modes"
             )
         if any(
             int(v) != int(_LOGF_PRODUCER_NONE)
-            for v in tuple(getattr(step_authority, "dispatch_logf_producer_by_row", tuple()))
+            for v in step_authority.dispatch_logf_producer_by_row
         ):
             raise RuntimeError("vLLM profile FA3 route must not publish log_f")
-        if any(int(v) > 0 for v in tuple(getattr(step_authority, "logits_last_n_by_row", tuple()))):
+        if any(int(v) > 0 for v in step_authority.logits_last_n_by_row):
             raise RuntimeError("vLLM profile FA3 route must not request logits capture")
     step_token = _step_context_identity_token(step_ctx)
 
@@ -3218,7 +3195,26 @@ def resolve_live_fa3_launch_route(
         return str(cached_route)
 
     effective_step_authority = step_authority
-    total_rows = int(batch_size if batch_size is not None else len(getattr(step_authority, "is_prefill_by_row", tuple())))
+    authority_rows = int(step_authority.batch_size)
+    total_rows = int(batch_size) if batch_size is not None else authority_rows
+    if total_rows != authority_rows:
+        raise RuntimeError(
+            "native FA3 launch route requires exact StepAuthority batch coverage: "
+            f"metadata={total_rows} authority={authority_rows}"
+        )
+    if (
+        len(step_authority.req_ids) != total_rows
+        or len(step_authority.q_lens_by_row) != total_rows
+        or len(step_authority.row_policy_ready_by_row) != total_rows
+        or len(step_authority.row_mode_by_row) != total_rows
+    ):
+        raise RuntimeError(
+            "native FA3 launch route requires exact authority row vectors: "
+            f"batch={total_rows} req_ids={len(step_authority.req_ids)} "
+            f"q_lens={len(step_authority.q_lens_by_row)} "
+            f"row_ready={len(step_authority.row_policy_ready_by_row)} "
+            f"row_mode={len(step_authority.row_mode_by_row)}"
+        )
     if hasattr(controller, "get_step_prefill_plan_by_req"):
         prefill_capture_last_n_by_row = _build_prefill_capture_last_n_by_row(
             controller=controller,
@@ -3226,40 +3222,58 @@ def resolve_live_fa3_launch_route(
             batch_size=total_rows,
         )
         if any(int(v) > 0 for v in prefill_capture_last_n_by_row):
-            producer_src = tuple(
-                int(v) for v in getattr(step_authority, "dispatch_logf_producer_by_row")
-            )
-            last_n_src = tuple(int(v) for v in getattr(step_authority, "logits_last_n_by_row"))
+            producer_src = step_authority.dispatch_logf_producer_by_row
+            last_n_src = step_authority.logits_last_n_by_row
+            if (
+                len(producer_src) != total_rows
+                or len(last_n_src) != total_rows
+                or len(prefill_capture_last_n_by_row) != total_rows
+            ):
+                raise RuntimeError(
+                    "prefill FA3 route overlay requires exact row coverage: "
+                    f"batch={total_rows} producer={len(producer_src)} "
+                    f"last_n={len(last_n_src)} "
+                    f"planned={len(prefill_capture_last_n_by_row)}"
+                )
             effective_producer = []
             effective_last_n = []
+            effective_has_capture = False
             for row in range(total_rows):
-                existing_producer = int(producer_src[row]) if row < len(producer_src) else 0
-                existing_last_n = int(last_n_src[row]) if row < len(last_n_src) else 0
-                planned_last_n = int(prefill_capture_last_n_by_row[row]) if row < len(prefill_capture_last_n_by_row) else 0
+                existing_producer = int(producer_src[row])
+                existing_last_n = int(last_n_src[row])
+                planned_last_n = int(prefill_capture_last_n_by_row[row])
                 if planned_last_n > 0:
                     effective_producer.append(int(_LOGF_PRODUCER_ATTN))
                     effective_last_n.append(int(planned_last_n))
                 else:
                     effective_producer.append(int(existing_producer))
                     effective_last_n.append(int(existing_last_n))
+                if int(effective_producer[-1]) == int(_LOGF_PRODUCER_ATTN):
+                    effective_has_capture = True
             effective_step_authority = type("EffectiveStepAuthority", (), {})()
-            effective_step_authority.is_prefill_by_row = getattr(step_authority, "is_prefill_by_row")
-            effective_step_authority.use_compact_by_row = getattr(step_authority, "use_compact_by_row")
+            effective_step_authority.batch_size = int(step_authority.batch_size)
+            effective_step_authority.is_prefill_by_row = (
+                step_authority.is_prefill_by_row
+            )
+            effective_step_authority.use_compact_by_row = (
+                step_authority.use_compact_by_row
+            )
             effective_step_authority.dispatch_logf_producer_by_row = tuple(effective_producer)
             effective_step_authority.logits_last_n_by_row = tuple(effective_last_n)
+            effective_step_authority.has_compact_row = bool(
+                step_authority.has_compact_row
+            )
+            effective_step_authority.hint_has_log_f = bool(
+                effective_has_capture
+            )
     row_plan = build_mixed_page_row_plan(
         effective_step_authority,
         batch_size=batch_size,
         device="cpu",
     )
     live_has_selected = bool(row_plan.has_selected_consume)
-    profile_q_lens = getattr(step_authority, "q_lens_by_row", None)
-    profile_decode_like = (
-        profile_q_lens is not None
-        and not isinstance(profile_q_lens, torch.Tensor)
-        and len(profile_q_lens) >= int(total_rows)
-        and all(int(v) <= 1 for v in tuple(profile_q_lens)[: int(total_rows)])
-    )
+    profile_q_lens = step_authority.q_lens_by_row
+    profile_decode_like = all(int(v) <= 1 for v in profile_q_lens)
     if (
         is_profile_step
         and bool(profile_decode_like)
@@ -3267,9 +3281,7 @@ def resolve_live_fa3_launch_route(
     ):
         live_has_selected = True
     live_has_capture = bool(row_plan.has_capture)
-    is_prefill_by_row = tuple(
-        bool(v) for v in tuple(getattr(step_authority, "is_prefill_by_row", tuple()))[:total_rows]
-    )
+    is_prefill_by_row = step_authority.is_prefill_by_row
     live_has_compact_recent = False
     live_route = route_attention_launch(
         has_selected_consume=live_has_selected,
@@ -3303,19 +3315,19 @@ def resolve_live_fa3_launch_route(
                 ],
                 "bootstrap_done_by_row": [
                     bool(v)
-                    for v in tuple(getattr(step_authority, "bootstrap_done_by_row", tuple()))[:total_rows]
+                    for v in step_authority.row_policy_ready_by_row
                 ],
                 "use_compact_by_row": [
                     bool(v)
-                    for v in tuple(getattr(step_authority, "use_compact_by_row", tuple()))[:total_rows]
+                    for v in step_authority.use_compact_by_row
                 ],
                 "row_mode_by_row": [
                     int(v)
-                    for v in tuple(getattr(step_authority, "row_mode_by_row", tuple()))[:total_rows]
+                    for v in step_authority.row_mode_by_row
                 ],
                 "logits_last_n_by_row": [
                     int(v)
-                    for v in tuple(getattr(step_authority, "logits_last_n_by_row", tuple()))[:total_rows]
+                    for v in step_authority.logits_last_n_by_row
                 ],
             }
         )

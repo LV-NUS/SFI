@@ -172,7 +172,6 @@ class LayerState:
         # 避免同一步内重复 align_slots（由 controller 传入 step epoch）
         self._align_epoch_seen: int = -1
         # batch_last_seq_len removed - use RequestTracking.last_seq_len per request instead
-        self.bootstrap_done: bool = False
         self.last_refresh_step: int = -1
         # per-slot refresh step（request-wise 触发计时）— GPU 版已废弃，仅保留 CPU 版
         self.last_refresh_step_per_slot_cpu: Optional[List[int]] = None
@@ -825,7 +824,6 @@ class LayerState:
             heapq.heapify(self.free_slots)
 
         self.bump_compact_meta_epoch()
-        self.bootstrap_done = False
         self._resize_prefill_counters()
         self._resize_refresh_steps()
         self.last_active_request_ids = tuple(req_ids)
@@ -1184,7 +1182,6 @@ class LayerState:
 
         self.bump_compact_meta_epoch()
 
-        self.bootstrap_done = False
         self._resize_prefill_counters()
         self._resize_refresh_steps()
         self.last_active_request_ids = tuple(request_ids)

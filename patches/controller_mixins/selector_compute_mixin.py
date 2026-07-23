@@ -2843,24 +2843,40 @@ class SelectorComputeMixin:
         seq_lens = step_context.seq_lens
         num_reqs = int(step_context.num_reqs)
         step_authority = getattr(step_context, "step_authority", None)
-        is_prefill_by_row = tuple(
-            bool(v) for v in getattr(step_authority, "is_prefill_by_row", tuple())
-        )
-
-        compact_threshold = self._compact_threshold_tokens()
+        if step_authority is None:
+            raise RuntimeError("prefill capture plan requires StepAuthority")
+        is_prefill_by_row = step_authority.is_prefill_by_row
+        short_dense_by_row = step_authority.short_dense_by_row
+        if (
+            int(step_authority.batch_size) != num_reqs
+            or len(req_ids) != num_reqs
+            or len(q_lens) != num_reqs
+            or len(seq_lens) != num_reqs
+            or len(is_prefill_by_row) != num_reqs
+            or len(short_dense_by_row) != num_reqs
+        ):
+            raise RuntimeError(
+                "prefill capture plan requires exact row coverage: "
+                f"authority={int(step_authority.batch_size)} "
+                f"req_ids={len(req_ids)} q_lens={len(q_lens)} "
+                f"seq_lens={len(seq_lens)} "
+                f"prefill={len(is_prefill_by_row)} "
+                f"short_dense={len(short_dense_by_row)} requests={num_reqs}"
+            )
 
         for idx in range(num_reqs):
-            req_id = req_ids[idx] if idx < len(req_ids) else f"prefill:{idx}"
+            req_id = req_ids[idx]
             tracking = self._ensure_request(req_id)
-            if idx < len(is_prefill_by_row) and (not bool(is_prefill_by_row[idx])):
+            if not bool(is_prefill_by_row[idx]):
                 continue
-            # 仅以 bootstrap_done 作为“全层可用”的完成信号：
+            # 仅以 bootstrap_done 作为 request bootstrap 生命周期终态：
+            # 它既可表示 compact 已发布，也可表示无需 compact 的 short-dense。
             # - prefill_done 可能在 chunk 级异步流水线中提前置位（仅代表某个 chunk 已 enqueue），
             #   若在这里跳过会导致后续 chunk 的层不再 capture，从而出现“只 bootstrap 前几层”的静默错误。
             if bool(getattr(tracking, "bootstrap_done", False)):
                 continue
 
-            used_tokens = int(seq_lens[idx]) if idx < len(seq_lens) else 0
+            used_tokens = int(seq_lens[idx])
             if used_tokens <= 0:
                 continue
 
@@ -2874,7 +2890,7 @@ class SelectorComputeMixin:
 
             chunk_size = int(tracking.prompt_chunk_size or 0)
             if chunk_size <= 0:
-                q_len = int(q_lens[idx]) if idx < len(q_lens) else 1
+                q_len = int(q_lens[idx])
                 chunk_size = max(1, q_len)
                 tracking.prompt_chunk_size = int(chunk_size)
 
@@ -2882,8 +2898,8 @@ class SelectorComputeMixin:
             # - compact 的建立由 prefill capture + refresh_stream 异步完成；
             # - 若 slot 复用/清理存在 bug 导致某层 compact_ready 意外为 True，这属于更高优先级的错误，
             #   不应让 plan 与层相关而产生静默分叉。
-            # 与 decode 阶段统一：<= threshold 仍属于 short。
-            short_dense = bool(compact_threshold > 0 and int(used_tokens) <= compact_threshold)
+            # 与 decode 阶段共用同一几何分类，避免独立阈值推导漂移。
+            short_dense = bool(short_dense_by_row[idx])
 
             if configured > 0:
                 if short_dense:
@@ -3396,7 +3412,6 @@ class SelectorComputeMixin:
                     ):
                         steps_decode_cpu[slot] = int(req_req_step)
                 state.last_refresh_step = slot_step
-            state.bootstrap_done = self._all_slots_bootstrapped(state)
         if pending_cleared:
             self._bump_refresh_nonce()
         if profile_cpu_detail and t_post0_ns is not None:

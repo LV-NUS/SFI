@@ -147,17 +147,15 @@ def _make_decode_plan_version(
 
 
 def normalize_layer_effective_refresh_signature(
-    layer_effective_refresh_by_row: Optional[Sequence[bool]],
+    layer_effective_refresh_by_row: Sequence[bool],
     *,
     batch_size: int,
 ) -> Tuple[object, ...]:
     if batch_size <= 0:
         return tuple()
-    if layer_effective_refresh_by_row is None:
-        return ALL_FALSE_SIGNATURE
-    if len(layer_effective_refresh_by_row) < batch_size:
+    if len(layer_effective_refresh_by_row) != batch_size:
         raise RuntimeError(
-            "layer_effective_refresh_by_row shorter than batch size: "
+            "layer_effective_refresh_by_row must exactly match batch size: "
             f"rows={len(layer_effective_refresh_by_row)} batch={batch_size}"
         )
     signature = tuple(bool(layer_effective_refresh_by_row[i]) for i in range(batch_size))
@@ -172,45 +170,42 @@ def build_step_plan_signature(
     slot_by_row: Sequence[int],
     row_mode_by_row: Sequence[int],
     layer_effective_refresh_by_row: Sequence[bool],
-    bootstrap_done_by_row: Optional[Sequence[bool]] = None,
+    row_policy_ready_by_row: Sequence[bool],
 ) -> Tuple[object, ...]:
     """Build stable signatures for step plan caches."""
     batch_size = len(req_ids)
-    if len(slot_by_row) < batch_size:
+    if len(slot_by_row) != batch_size:
         raise RuntimeError(
-            "slot_by_row shorter than req_ids: "
+            "slot_by_row must exactly match req_ids: "
             f"slots={len(slot_by_row)} reqs={batch_size}"
         )
-    if len(row_mode_by_row) < batch_size:
+    if len(row_mode_by_row) != batch_size:
         raise RuntimeError(
-            "row_mode_by_row shorter than req_ids: "
+            "row_mode_by_row must exactly match req_ids: "
             f"modes={len(row_mode_by_row)} reqs={batch_size}"
         )
-    if len(layer_effective_refresh_by_row) < batch_size:
+    if len(layer_effective_refresh_by_row) != batch_size:
         raise RuntimeError(
-            "layer_effective_refresh_by_row shorter than req_ids: "
+            "layer_effective_refresh_by_row must exactly match req_ids: "
             f"rows={len(layer_effective_refresh_by_row)} reqs={batch_size}"
         )
     layer_effective_refresh_signature = normalize_layer_effective_refresh_signature(
         layer_effective_refresh_by_row,
         batch_size=batch_size,
     )
-    bootstrap_effective_signature: Tuple[object, ...]
-    if bootstrap_done_by_row is None:
-        bootstrap_effective_signature = ALL_FALSE_SIGNATURE
-    else:
-        if len(bootstrap_done_by_row) < batch_size:
-            raise RuntimeError(
-                "bootstrap_done_by_row shorter than req_ids: "
-                f"rows={len(bootstrap_done_by_row)} reqs={batch_size}"
-            )
-        bootstrap_effective = tuple(
-            bool(layer_effective_refresh_by_row[row]) and (not bool(bootstrap_done_by_row[row]))
-            for row in range(batch_size)
+    if len(row_policy_ready_by_row) != batch_size:
+        raise RuntimeError(
+            "row_policy_ready_by_row must exactly match req_ids: "
+            f"rows={len(row_policy_ready_by_row)} reqs={batch_size}"
         )
-        bootstrap_effective_signature = (
-            bootstrap_effective if any(bootstrap_effective) else ALL_FALSE_SIGNATURE
-        )
+    bootstrap_refresh = tuple(
+        bool(layer_effective_refresh_by_row[row])
+        and (not bool(row_policy_ready_by_row[row]))
+        for row in range(batch_size)
+    )
+    bootstrap_refresh_signature = (
+        bootstrap_refresh if any(bootstrap_refresh) else ALL_FALSE_SIGNATURE
+    )
     if isinstance(req_ids, tuple) and len(req_ids) == batch_size:
         req_sig = req_ids
     else:
@@ -228,7 +223,7 @@ def build_step_plan_signature(
         slot_sig,
         row_mode_sig,
         layer_effective_refresh_signature,
-        bootstrap_effective_signature,
+        bootstrap_refresh_signature,
     )
     return plan_signature
 
@@ -239,7 +234,7 @@ def _make_step_cache_key(
     *,
     force_dense: bool,
     force_compact_off: bool,
-    layer_effective_refresh_by_row: Optional[Sequence[bool]],
+    layer_effective_refresh_by_row: Sequence[bool],
 ) -> Tuple[object, ...]:
     """构造 per-layer step cache 的稳定 key（避免每步重建）。"""
     batch_size = int(step_authority.batch_size)
@@ -247,14 +242,14 @@ def _make_step_cache_key(
         layer_effective_refresh_by_row,
         batch_size=batch_size,
     )
-    if len(step_authority.slot_by_row) < batch_size:
+    if len(step_authority.slot_by_row) != batch_size:
         raise RuntimeError(
-            "slot_by_row shorter than batch size: "
+            "slot_by_row must exactly match batch size: "
             f"slots={len(step_authority.slot_by_row)} batch={batch_size}"
         )
-    if len(step_authority.row_mode_by_row) < batch_size:
+    if len(step_authority.row_mode_by_row) != batch_size:
         raise RuntimeError(
-            "row_mode_by_row shorter than batch size: "
+            "row_mode_by_row must exactly match batch size: "
             f"modes={len(step_authority.row_mode_by_row)} batch={batch_size}"
         )
     slot_by_row = step_authority.slot_by_row
@@ -273,7 +268,7 @@ def _make_step_cache_key(
         step_authority.req_ids,
         slot_signature,
         row_mode_signature,
-        step_authority.bootstrap_done_by_row,
+        step_authority.row_policy_ready_by_row,
         step_authority.short_dense_by_row,
         refresh_row_signature,
         state.compact_meta_epoch,
@@ -286,7 +281,7 @@ def _make_step_decode_cache_key(
     step_authority: "StepAuthority",
     *,
     layer_cache_keys: Sequence[int],
-    layer_effective_refresh_by_row: Optional[Sequence[bool]],
+    layer_effective_refresh_by_row: Sequence[bool],
     compact_layout_generation: int,
     refresh_signature_override: Optional[Tuple[object, ...]] = None,
 ) -> Tuple[object, ...]:
@@ -299,14 +294,14 @@ def _make_step_decode_cache_key(
             layer_effective_refresh_by_row,
             batch_size=batch_size,
         )
-    if len(step_authority.slot_by_row) < batch_size:
+    if len(step_authority.slot_by_row) != batch_size:
         raise RuntimeError(
-            "slot_by_row shorter than batch size: "
+            "slot_by_row must exactly match batch size: "
             f"slots={len(step_authority.slot_by_row)} batch={batch_size}"
         )
-    if len(step_authority.row_mode_by_row) < batch_size:
+    if len(step_authority.row_mode_by_row) != batch_size:
         raise RuntimeError(
-            "row_mode_by_row shorter than batch size: "
+            "row_mode_by_row must exactly match batch size: "
             f"modes={len(step_authority.row_mode_by_row)} batch={batch_size}"
         )
     slot_by_row = step_authority.slot_by_row
@@ -325,7 +320,7 @@ def _make_step_decode_cache_key(
         step_authority.req_ids,
         slot_signature,
         row_mode_signature,
-        step_authority.bootstrap_done_by_row,
+        step_authority.row_policy_ready_by_row,
         step_authority.short_dense_by_row,
         tuple(layer_cache_keys),
         int(compact_layout_generation),

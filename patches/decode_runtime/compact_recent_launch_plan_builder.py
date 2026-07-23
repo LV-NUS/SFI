@@ -176,11 +176,13 @@ def build_compact_recent_launch_plan(
 ) -> Optional[CompactRecentLaunchPlan]:
     """Construct the step-level launch plan.
 
-    Returns None if batch_size == 0 or required inputs are absent. Returns a
-    plan with valid=False when the rail mode is NO_COMPACT, unless the caller
-    explicitly requests the full-KV handoff route. That handoff route still
-    uses the mixed-page/RRP carrier family; it just encodes every row as a
-    full-recent row with compact_valid_tokens=0.
+    Returns None only when there is no batch or a physical launch prerequisite
+    (page size/layer state) is unavailable. Authoritative row vectors must have
+    exact coverage and fail closed on mismatch. Returns a plan with valid=False
+    when the rail mode is NO_COMPACT, unless the caller explicitly requests the
+    full-KV handoff route. That handoff route still uses the mixed-page/RRP
+    carrier family; it just encodes every row as a full-recent row with
+    compact_valid_tokens=0.
     """
     # Late imports to avoid circular deps at module load time.
     from patches.fa_sparse_runtime.compact_recent_route_authority import (
@@ -188,7 +190,7 @@ def build_compact_recent_launch_plan(
         resolve_compact_recent_rail_mode,
     )
 
-    batch_size = int(getattr(step_authority, "batch_size", 0))
+    batch_size = int(step_authority.batch_size)
     if batch_size <= 0:
         return None
 
@@ -230,61 +232,67 @@ def build_compact_recent_launch_plan(
         compact_offset_tokens_list = []
 
     # --- Step-level inputs from step_authority / step_bound_meta ---
-    use_compact_by_row = tuple(
-        bool(v) for v in getattr(step_authority, "use_compact_by_row", ())
-    )
-    context_kv_len_by_row = tuple(
-        int(v) for v in getattr(step_authority, "context_kv_len_by_row", ())
-    )
-    canonical_real_kv_len_cpu = tuple(
-        int(v) for v in getattr(step_bound_meta, "canonical_real_kv_len_cpu", ())
-    )
-    real_kv_len_by_row = (
-        canonical_real_kv_len_cpu
-        if len(canonical_real_kv_len_cpu) >= batch_size
-        else context_kv_len_by_row
-    )
-    slot_by_row = tuple(
-        int(v) for v in getattr(step_authority, "slot_by_row", ())
-    )
-    is_prefill_by_row = tuple(
-        bool(v) for v in getattr(step_authority, "is_prefill_by_row", ())
-    )
-    recent_first_tuple = tuple(
-        int(v) for v in getattr(step_bound_meta, "request_recent_first_logical_page", ())
-    )
-    recent_count_tuple = tuple(
-        int(v) for v in getattr(step_bound_meta, "request_recent_page_count", ())
-    )
-    if len(recent_first_tuple) < batch_size or len(recent_count_tuple) < batch_size:
+    use_compact_by_row = step_authority.use_compact_by_row
+    context_kv_len_by_row = step_authority.context_kv_len_by_row
+    slot_by_row = step_authority.slot_by_row
+    is_prefill_by_row = step_authority.is_prefill_by_row
+    if (
+        len(use_compact_by_row) != batch_size
+        or len(context_kv_len_by_row) != batch_size
+        or len(slot_by_row) != batch_size
+        or len(is_prefill_by_row) != batch_size
+    ):
+        raise RuntimeError(
+            "compact_recent launch plan requires exact StepAuthority row coverage: "
+            f"batch={batch_size} compact={len(use_compact_by_row)} "
+            f"context={len(context_kv_len_by_row)} slots={len(slot_by_row)} "
+            f"prefill={len(is_prefill_by_row)}"
+        )
+
+    canonical_real_kv_len_cpu = step_bound_meta.canonical_real_kv_len_cpu
+    if len(canonical_real_kv_len_cpu) == batch_size:
+        real_kv_len_by_row = canonical_real_kv_len_cpu
+    elif not canonical_real_kv_len_cpu:
+        real_kv_len_by_row = context_kv_len_by_row
+    else:
+        raise RuntimeError(
+            "compact_recent launch plan requires exact canonical real-KV coverage: "
+            f"rows={len(canonical_real_kv_len_cpu)} batch={batch_size}"
+        )
+
+    recent_first_tuple = step_bound_meta.request_recent_first_logical_page
+    recent_count_tuple = step_bound_meta.request_recent_page_count
+    if (
+        len(recent_first_tuple) != batch_size
+        or len(recent_count_tuple) != batch_size
+    ):
         from patches.fa_sparse_runtime.runtime_cache import ensure_step_recent_descriptors
 
-        layer_effective_refresh_by_row = tuple(
-            bool(v)
-            for v in getattr(step_authority, "layer_effective_refresh_by_row", ())
+        layer_effective_refresh_by_row = (
+            step_authority.layer_effective_refresh_by_row
         )
-        if len(layer_effective_refresh_by_row) < batch_size:
-            layer_effective_refresh_by_row = (False,) * batch_size
+        if len(layer_effective_refresh_by_row) != batch_size:
+            raise RuntimeError(
+                "compact_recent launch plan requires exact refresh-row coverage: "
+                f"rows={len(layer_effective_refresh_by_row)} batch={batch_size}"
+            )
         ensure_step_recent_descriptors(
             step_meta=step_bound_meta,
             page_size=page_size,
             layer_effective_refresh_by_row=layer_effective_refresh_by_row,
         )
-        recent_first_tuple = tuple(
-            int(v) for v in getattr(step_bound_meta, "request_recent_first_logical_page", ())
-        )
-        recent_count_tuple = tuple(
-            int(v) for v in getattr(step_bound_meta, "request_recent_page_count", ())
-        )
+        recent_first_tuple = step_bound_meta.request_recent_first_logical_page
+        recent_count_tuple = step_bound_meta.request_recent_page_count
 
     if (
-        len(use_compact_by_row) < batch_size
-        or len(real_kv_len_by_row) < batch_size
-        or len(slot_by_row) < batch_size
-        or len(recent_first_tuple) < batch_size
-        or len(recent_count_tuple) < batch_size
+        len(recent_first_tuple) != batch_size
+        or len(recent_count_tuple) != batch_size
     ):
-        return None
+        raise RuntimeError(
+            "compact_recent launch plan failed to materialize exact recent descriptors: "
+            f"first={len(recent_first_tuple)} count={len(recent_count_tuple)} "
+            f"batch={batch_size}"
+        )
     compact_alignment = _compact_valid_alignment_tokens(
         canonical_state=canonical_state,
         page_size=page_size,
@@ -314,7 +322,7 @@ def build_compact_recent_launch_plan(
         first = max(0, int(recent_first_tuple[row]))
         count = max(0, int(recent_count_tuple[row]))
         slot = int(slot_by_row[row])
-        is_prefill_row = bool(is_prefill_by_row[row]) if row < len(is_prefill_by_row) else False
+        is_prefill_row = bool(is_prefill_by_row[row])
         compact_row = (
             bool(use_compact_by_row[row])
             and not is_prefill_row
