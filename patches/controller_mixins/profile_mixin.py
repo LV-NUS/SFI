@@ -87,7 +87,6 @@ class ProfileMixin:
         self._step_profile_req_decode_steps: Tuple[int, ...] = tuple()
         self._step_profile_req_last_decode_refresh_steps: Tuple[int, ...] = tuple()
         self._step_profile_req_interval_deltas: Tuple[int, ...] = tuple()
-        self._step_profile_req_scheduled_decode_refresh_steps: Tuple[int, ...] = tuple()
         self._step_profile_req_ticket_pending: Tuple[bool, ...] = tuple()
         self._step_profile_req_ticket_pending_steps: Tuple[int, ...] = tuple()
         self._step_profile_req_ticket_pending_reasons: Tuple[str, ...] = tuple()
@@ -208,7 +207,6 @@ class ProfileMixin:
         self._step_profile_req_decode_steps = tuple()
         self._step_profile_req_last_decode_refresh_steps = tuple()
         self._step_profile_req_interval_deltas = tuple()
-        self._step_profile_req_scheduled_decode_refresh_steps = tuple()
         self._step_profile_req_ticket_pending = tuple()
         self._step_profile_req_ticket_pending_steps = tuple()
         self._step_profile_req_ticket_pending_reasons = tuple()
@@ -235,7 +233,6 @@ class ProfileMixin:
             decode_steps: List[int] = []
             last_decode_refresh_steps: List[int] = []
             interval_deltas: List[int] = []
-            scheduled_decode_refresh_steps: List[int] = []
             ticket_pending: List[bool] = []
             ticket_pending_steps: List[int] = []
             ticket_pending_reasons: List[str] = []
@@ -249,16 +246,12 @@ class ProfileMixin:
                 last_decode_refresh = int(
                     getattr(tracking, "last_decode_refresh_step", -1)
                 )
-                scheduled_decode_refresh = int(
-                    getattr(tracking, "scheduled_decode_refresh_step", -1)
-                )
                 interval_delta = -1
                 if decode_step >= 0 and last_decode_refresh >= 0:
                     interval_delta = int(decode_step - last_decode_refresh)
                 decode_steps.append(int(decode_step))
                 last_decode_refresh_steps.append(int(last_decode_refresh))
                 interval_deltas.append(int(interval_delta))
-                scheduled_decode_refresh_steps.append(int(scheduled_decode_refresh))
 
                 ticket = (
                     tickets.get(rid)
@@ -278,9 +271,6 @@ class ProfileMixin:
                 last_decode_refresh_steps
             )
             self._step_profile_req_interval_deltas = tuple(interval_deltas)
-            self._step_profile_req_scheduled_decode_refresh_steps = tuple(
-                scheduled_decode_refresh_steps
-            )
             self._step_profile_req_ticket_pending = tuple(ticket_pending)
             self._step_profile_req_ticket_pending_steps = tuple(
                 ticket_pending_steps
@@ -444,9 +434,6 @@ class ProfileMixin:
                 self._step_profile_req_last_decode_refresh_steps
             )
             rec["req_interval_deltas"] = list(self._step_profile_req_interval_deltas)
-            rec["req_scheduled_decode_refresh_steps"] = list(
-                self._step_profile_req_scheduled_decode_refresh_steps
-            )
             rec["req_ticket_pending"] = list(self._step_profile_req_ticket_pending)
             rec["req_ticket_pending_steps"] = list(
                 self._step_profile_req_ticket_pending_steps

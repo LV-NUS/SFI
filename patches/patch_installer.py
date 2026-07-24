@@ -7338,6 +7338,9 @@ def _wait_replay_refresh_selectors_before_full_cudagraph_replay(
                 controller._resolve_refresh_lease(
                     req_ids=drop_req_ids,
                     reason="pending_rebuild_drop_non_latest_full_cudagraph_replay",
+                    publish_key=controller._pending_refresh_rebuild_publish_key(
+                        item
+                    ),
                 )
             controller._pending_refresh_rebuild_clear(item)
         completed_item_ids.add(id(item))
@@ -7417,15 +7420,16 @@ def _wait_replay_refresh_selectors_before_full_cudagraph_replay(
         covered_bufs.difference_update(uncovered_bufs)
         writer_done_bufs.difference_update(uncovered_bufs)
     def _run_writer_ready_commit() -> None:
-        # Writer-ready CPU commit (publish_tracking / commit_compact_meta /
-        # mark_accepted / clear_pending + _pending_refresh_rebuilds rebuild +
+        # Writer-ready CPU commit (unified read-side publish / mark_accepted /
+        # clear_pending + _pending_refresh_rebuilds rebuild +
         # clearable-buf clears). Mutates bookkeeping consumed by FUTURE steps,
         # NOT by this step's original_call (the graph replay). Closes over the
         # wait-phase locals: writer_ready_items, completed_item_ids, pending,
         # writer_done_bufs, uncovered_bufs.
         if writer_ready_items:
-            publish_tracking = controller._publish_pending_refresh_rebuild_selection_tracking
-            commit_compact_meta = controller._commit_pending_refresh_rebuild_compact_meta
+            publish_read_side = (
+                controller._publish_pending_refresh_rebuild_read_side
+            )
             mark_accepted = controller._mark_pending_refresh_rebuild_accepted
             clear_pending = controller._pending_refresh_rebuild_clear
             is_latest = controller._pending_refresh_rebuild_is_latest
@@ -7434,7 +7438,13 @@ def _wait_replay_refresh_selectors_before_full_cudagraph_replay(
                 req_ids = tuple(controller._pending_refresh_rebuild_drop_req_ids(item))
                 if not req_ids:
                     return
-                controller._resolve_refresh_lease(req_ids=req_ids, reason=str(reason))
+                controller._resolve_refresh_lease(
+                    req_ids=req_ids,
+                    reason=str(reason),
+                    publish_key=controller._pending_refresh_rebuild_publish_key(
+                        item
+                    ),
+                )
 
             for item in writer_ready_items:
                 if not bool(is_latest(item)):
@@ -7449,16 +7459,7 @@ def _wait_replay_refresh_selectors_before_full_cudagraph_replay(
                     clear_pending(item)
                     completed_item_ids.add(id(item))
                     continue
-                result = getattr(item, "result", None)
-                commit_compact_meta(item)
-                if not bool(getattr(item, "tracking_published", False)):
-                    if result is None:
-                        raise RuntimeError(
-                            "full cudagraph replay pending refresh writer_done_event "
-                            "has no selection result"
-                        )
-                    publish_tracking(item, result)
-                    setattr(item, "tracking_published", True)
+                publish_read_side(item)
                 mark_accepted(item)
                 clear_pending(item)
                 completed_item_ids.add(id(item))
@@ -7514,7 +7515,6 @@ def _wait_pending_async_refresh_before_full_cudagraph_replay(
     flags: tuple[int, ...] = ()
     if isinstance(flags_obj, (list, tuple)):
         flags = tuple(int(value) for value in flags_obj)
-    blockers = False
     blockers = bool(controller._pending_work_blockers(epoch=epoch))
     pending_queue = controller._pending_refresh_rebuilds
     if (
@@ -8460,6 +8460,13 @@ def _flush_full_cudagraph_refresh_payloads_batched_after_replay(
         _, buf_id, _ = map_layer(layer_index)
         layer_to_buf[int(layer_index)] = int(buf_id) % int(_CAPTURE_IN_FLIGHT)
     buf_ids = tuple(sorted(set(layer_to_buf.values())))
+    if do_async and not buf_ids:
+        raise RuntimeError(
+            "batched replay refresh has no buffer owner for async publication"
+        )
+    # Every group is ordered by one refresh stream. Publish from the highest
+    # covered buffer so earlier buffer waits cannot expose a partial group.
+    publication_buf = int(buf_ids[-1]) if buf_ids else -1
     if stage_profile_enabled:
         _stage_add(
             "flush_group_setup_us",
@@ -8534,6 +8541,7 @@ def _flush_full_cudagraph_refresh_payloads_batched_after_replay(
         )
         if not callable(rebuild):
             raise RuntimeError("batched replay refresh requires compact rebuild hook")
+        compact_meta_commit_log: list[dict[str, object]] = []
         writer_start_ns = time.perf_counter_ns() if stage_profile_enabled else 0
         fused_ok = rebuild(
             payloads,
@@ -8542,6 +8550,8 @@ def _flush_full_cudagraph_refresh_payloads_batched_after_replay(
             bootstrap_slots_by_layer=[
                 getattr(payload, "bootstrap_slots", None) for payload in payloads
             ],
+            defer_compact_meta_publish=True,
+            compact_meta_commit_log=compact_meta_commit_log,
         )
         if stage_profile_enabled:
             _stage_add(
@@ -8550,6 +8560,24 @@ def _flush_full_cudagraph_refresh_payloads_batched_after_replay(
             )
         if not fused_ok:
             raise RuntimeError("batched replay refresh compact rebuild failed")
+        if do_async:
+            controller._stage_flush_compact_meta_round(
+                buf_id=publication_buf,
+                commit_log=compact_meta_commit_log,
+                refresh_payloads=payloads,
+            )
+        else:
+            receipt = controller._freeze_refresh_publish_receipt(payloads)
+            live_req_ids = controller._commit_compact_meta_log_entries(
+                tuple(compact_meta_commit_log),
+                source="full_cudagraph_direct_sync",
+                refresh_receipt=receipt,
+            )
+            if receipt is not None:
+                controller._publish_refresh_receipt(
+                    receipt,
+                    live_req_ids=live_req_ids,
+                )
     def _run_refresh() -> None:
         selector = getattr(controller, "_apply_alpha_selector_batched_fused", None)
         if not callable(selector):
@@ -8566,7 +8594,10 @@ def _flush_full_cudagraph_refresh_payloads_batched_after_replay(
                 (time.perf_counter_ns() - selector_start_ns) / 1000.0,
             )
         if result is None:
-            return
+            raise RuntimeError(
+                "batched replay refresh selector returned no result for "
+                "non-empty payloads"
+            )
         _publish_refresh_writer(result)
 
     if getattr(controller, "_refresh_layer_group_enabled", False):
@@ -9124,13 +9155,13 @@ def _enqueue_full_cudagraph_refresh_payloads_after_replay(
             tracking = request_states.get(req_id) if isinstance(request_states, dict) else None
             pending_reason_code = int(getattr(ticket, "pending_reason_code", 0))
             compact_ready = False
-            compact_ready_all_layers = getattr(
+            compact_ready_diagnostic = getattr(
                 controller,
-                "_request_compact_ready_all_layers",
+                "_diagnose_request_compact_ready_all_layers",
                 None,
             )
-            if callable(compact_ready_all_layers):
-                compact_ready = bool(compact_ready_all_layers(req_id))
+            if callable(compact_ready_diagnostic):
+                compact_ready = bool(compact_ready_diagnostic(req_id))
             pending_rebuild_ids_for_req = getattr(
                 controller,
                 "_pending_refresh_rebuild_ids_for_req",
@@ -9149,11 +9180,25 @@ def _enqueue_full_cudagraph_refresh_payloads_after_replay(
                     "last_decode_refresh_step": int(
                         getattr(tracking, "last_decode_refresh_step", -1)
                     ),
-                    "scheduled_decode_refresh_step": int(
-                        getattr(tracking, "scheduled_decode_refresh_step", -1)
+                    "refresh_publish_key": list(
+                        getattr(tracking, "refresh_publish_key", ()) or ()
                     ),
-                    "scheduled_refresh_ctrl_step": int(
-                        getattr(tracking, "scheduled_refresh_ctrl_step", -1)
+                    "refresh_publish_enqueued_layers": int(
+                        getattr(
+                            tracking,
+                            "refresh_publish_enqueued_layer_mask",
+                            0,
+                        )
+                    ).bit_count(),
+                    "refresh_publish_published_layers": int(
+                        getattr(
+                            tracking,
+                            "refresh_publish_published_layer_mask",
+                            0,
+                        )
+                    ).bit_count(),
+                    "refresh_publish_sealed": bool(
+                        getattr(tracking, "refresh_publish_sealed", False)
                     ),
                     "trigger_intent_decode_step": int(
                         getattr(tracking, "trigger_intent_decode_step", -1)
@@ -9239,7 +9284,6 @@ def _enqueue_full_cudagraph_refresh_payloads_after_replay(
             raise RuntimeError(
                 "batched replay refresh requires refresh commit note hooks"
             )
-    batched_inflight_commit_noted = False
     first_payload_slot_req_ids: Optional[tuple[str, ...]] = None
     # [ROW-SNAPSHOT-CARRIER 2026-07-07] 票自带提交时刻 block_table 快照(attn
     # kernel tail_fill_page"表满合法页不变量"同款哲学):payload 的 row_list 与
@@ -9481,9 +9525,6 @@ def _enqueue_full_cudagraph_refresh_payloads_after_replay(
             stagger_layer_index=int(layer_index),
         )
         if batched_flush_enabled:
-            if not batched_inflight_commit_noted:
-                batched_note_inflight(payload_obj)
-                batched_inflight_commit_noted = True
             if batched_payloads is None:
                 raise RuntimeError("batched replay refresh payload workspace missing")
             batched_payloads.append(payload_obj)
@@ -9526,6 +9567,15 @@ def _enqueue_full_cudagraph_refresh_payloads_after_replay(
             handle_id=handle_id,
             handle_generation=handle_generation,
             count=int(enqueued),
+        )
+        if not callable(batched_note_inflight) or not batched_payloads:
+            raise RuntimeError("batched replay refresh inflight commit hook missing")
+        batched_note_inflight(
+            batched_payloads[0],
+            layer_indices=tuple(
+                int(getattr(payload.state, "layer_index", -1))
+                for payload in batched_payloads
+            ),
         )
     record_refresh_payloads = getattr(
         controller,
@@ -9822,6 +9872,7 @@ def _enqueue_full_cudagraph_refresh_payloads_after_replay(
                 setattr(controller, "_refresh_layer_group_event_idx", 0)
                 raise
         setattr(controller, "_refresh_layer_group_any_refresh", False)
+        controller._seal_step_refresh_publish()
     if route_trace_enabled:
         try:
             from patches.fa3_native.install import append_fa3_route_trace

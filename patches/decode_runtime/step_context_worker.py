@@ -220,7 +220,7 @@ def _publish_bootstrap_readiness_before_step_authority(
         # [TP-BOOTSTRAP-SUBMISSION-BOUNDARY] Request-local final events are
         # produced by rank-local async flushes. Validate the host-owned
         # submission boundary before the request lifecycle becomes terminal;
-        # StepAuthority still checks physical compact readiness before routing.
+        # lifecycle publication itself owns the full-layer compact proof.
         # A device wait cannot synthesize a missing host finalize.
         self._validate_prefill_submission_before_bootstrap_publish(
             req_ids=req_ids_tuple,
@@ -286,9 +286,8 @@ def _publish_bootstrap_readiness_before_step_authority(
         self._wait_and_publish_bootstrap_requests_for_graph_decode(
             epoch=self.step_context_epoch
         )
-        # step 边界先用轻量 event-query 提升真正 ready 的 bootstrap 请求。
-        # 这样后续 StepAuthority 只消费严格发布的 lifecycle state，再结合
-        # per-layer 物理就绪形成唯一 row-policy readiness。
+        # step 边界发布 bootstrap lifecycle。后续 StepAuthority 只消费该
+        # 单一权威；逐层物理证明留在发布边界，不能复制到每 token 路径。
         self._publish_ready_bootstrap_requests_at_step_boundary(
             epoch=self.step_context_epoch
         )
@@ -608,17 +607,12 @@ def prepare_step_context_impl(
         for seq_len in seq_lens_tuple
     )
 
-    def _row_policy_ready(rid: str, tracking: object) -> bool:
-        boot = _lifecycle_ready_for_row_policy(
+    def _row_policy_ready(tracking: object) -> bool:
+        return _lifecycle_ready_for_row_policy(
             config=self.config,
             tracking=tracking,
             compact_consume_delay_steps=compact_consume_delay_steps,
         )
-        if not boot:
-            return False
-        if bool(getattr(tracking, "_was_short_dense", False)):
-            return True
-        return bool(self._request_compact_ready_all_layers(rid))
 
     # Step-wise 更新 decode_step：使用 vLLM 提供的 num_computed_tokens_cpu 与 num_prompt_tokens，
     # 避免依赖 append_output_token_ids 的回调时序（multi_step_stream_outputs 下可能滞后）。
@@ -719,27 +713,29 @@ def prepare_step_context_impl(
                     tracking.bootstrap_pending_epoch = -1
                     tracking.bootstrap_pending_events = []
                     self._bootstrap_pending_request_ids.discard(rid)
-                    tracking._was_short_dense = True
+                    tracking.short_dense_decision_active = True
+                    tracking.dense_until_compact_ready = True
 
             # Threshold crossing 检测：short_dense → not short_dense 时强行触发 decode refresh
             # 构建 compact cache（last_n=1 的 decode refresh），避免 compact_only kernel 对
             # 该行仍以 FULL_CONTEXT_FLAG 遍历全部 paged blocks（效率低）。
             if tracking.prefill_done and tracking.bootstrap_done:
-                was_short = tracking._was_short_dense
+                short_decision_active = tracking.short_dense_decision_active
                 # 与上面的 short 语义保持一致：<= threshold 仍为 short。
                 is_short = short_dense_by_row[idx]
-                if was_short and not is_short:
+                if short_decision_active and not is_short:
                     crossing_step = int(tracking.decode_step) if tracking.decode_step is not None else -1
                     if crossing_step < 0:
                         raise RuntimeError(
                             f"threshold crossing pending requires decode_step>=0 for request {rid!r}"
                         )
                     ticket = self._ensure_request_ticket(rid)
-                    # [TP-DET-TRIGGER] 票 commit 后由读侧在飞镜像承载 FORCE_NOW
-                    # 存续(至 publish final);crossing 保护不得因票提前清而重复
-                    # 落票或提前放开。
+                    # [TP-DET-TRIGGER] 票 commit 后由物理发布账本承载
+                    # FORCE_NOW 到 writer/metadata 收据闭合，防止决定论锁存
+                    # 在 commit 前重复落票；
+                    # compact 可读性由独立 dense_until_compact_ready 承载。
                     _inflight_force_now = (
-                        int(getattr(tracking, "inflight_policy", -1))
+                        int(tracking.inflight_policy)
                         == int(PendingPolicy.FORCE_NOW)
                     )
                     if (
@@ -752,10 +748,11 @@ def prepare_step_context_impl(
                         )
                     ):
                         mark_threshold_crossing(ticket=ticket, decode_step=crossing_step)
-                    # crossing 命中后保持 short-dense 保护，直到世代读侧终局。
-                    tracking._was_short_dense = True
+                    # 决策锁存保持到 host enqueue commit；独立的读侧保护则
+                    # 保持到 compact generation 全层发布。二者不得共用终点。
+                    tracking.short_dense_decision_active = True
                 else:
-                    if was_short:
+                    if short_decision_active:
                         ticket = self._request_intent_tickets.get(rid)
                         if (
                             ticket is not None
@@ -763,14 +760,14 @@ def prepare_step_context_impl(
                             and ticket.pending_policy
                             == PendingPolicy.FORCE_NOW
                         ) or (
-                            int(getattr(tracking, "inflight_policy", -1))
+                            int(tracking.inflight_policy)
                             == int(PendingPolicy.FORCE_NOW)
                         ):
-                            tracking._was_short_dense = True
+                            tracking.short_dense_decision_active = True
                         else:
-                            tracking._was_short_dense = is_short
+                            tracking.short_dense_decision_active = is_short
                     else:
-                        tracking._was_short_dense = is_short
+                        tracking.short_dense_decision_active = is_short
 
             # 记录 prompt-ingest 进度；has_prefill_by_prompt 保留诊断语义，
             # buffer release 还会在逐行 owner 分类完成后纳入 q_len>1 执行事实。
@@ -791,11 +788,10 @@ def prepare_step_context_impl(
             ):
                 self._reset_request_sparse_state_for_resume(rid, tracking)
 
-            row_ready = _row_policy_ready(rid, tracking)
+            dense_protection_active = tracking.dense_until_compact_ready
+            row_ready = _row_policy_ready(tracking)
             row_policy_ready_list.append(row_ready)
-            dense_protection_by_row.append(
-                bool(getattr(tracking, "_was_short_dense", False))
-            )
+            dense_protection_by_row.append(dense_protection_active)
             if prompt_len > 0:
                 is_prefill = computed < prompt_len
             else:
@@ -822,10 +818,12 @@ def prepare_step_context_impl(
             lifecycle_done = (
                 bool(tracking.bootstrap_done) if tracking is not None else False
             )
-            row_policy_ready_list.append(_row_policy_ready(rid, tracking))
-            dense_protection_by_row.append(
-                bool(getattr(tracking, "_was_short_dense", False))
+            dense_protection_active = bool(
+                tracking is not None
+                and tracking.dense_until_compact_ready
             )
+            row_policy_ready_list.append(_row_policy_ready(tracking))
+            dense_protection_by_row.append(dense_protection_active)
             is_prefill = not lifecycle_done
             if not is_prefill and idx < len(q_lens) and int(q_lens[idx]) > 1:
                 is_prefill = True

@@ -1,14 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import Enum, IntEnum, auto
+from enum import IntEnum
 from typing import Mapping, Sequence, Tuple
-
-
-class TicketState(Enum):
-    NOT_READY = auto()
-    PENDING_REFRESH = auto()
-    READY_COMPACT = auto()
 
 
 class PendingPolicy(IntEnum):
@@ -87,7 +81,6 @@ def pending_reason_code_to_text(reason_code: int) -> str:
 
 @dataclass(slots=True)
 class RequestIntentTicket:
-    state: TicketState = TicketState.NOT_READY
     pending_refresh: bool = False
     pending_reason_code: int = int(PendingReasonCode.NONE)
     pending_decode_step: int = -1
@@ -119,7 +112,6 @@ def mark_threshold_crossing(ticket: RequestIntentTicket, decode_step: int) -> No
     ticket.pending_reason_code = int(PendingReasonCode.COMPACT_THRESHOLD_CROSSED)
     ticket.pending_decode_step = step
     ticket.pending_policy = int(PendingPolicy.FORCE_NOW)
-    ticket.state = TicketState.PENDING_REFRESH
 
 
 def materialize_refresh_reqs(

@@ -3247,7 +3247,6 @@ class SelectorComputeMixin:
         phase: str,
         profile_cpu_detail: bool,
         t_post0_ns: Optional[int],
-        pending_refresh_rebuild: Optional[object] = None,
     ) -> None:
         need_coverage_metrics = False
         cfg = self.config
@@ -3275,29 +3274,6 @@ class SelectorComputeMixin:
         # 预先收集所有 slot 的 req_req_step（用于后续 per-layer state 更新）
         slot_req_steps: Dict[int, int] = {}  # slot -> req_req_step
         first_state = payloads[0].state if payloads else None
-        pending_cleared = False
-
-        def _pending_refresh_rebuild_publish_is_final(req_id: str) -> bool:
-            if pending_refresh_rebuild is None:
-                return True
-            target_end = int(getattr(pending_refresh_rebuild, "target_layer_end", -1))
-            if target_end < 0:
-                return True
-            pending_by_req = getattr(self, "_pending_refresh_rebuild_by_req", None)
-            if not pending_by_req:
-                return True
-            max_registered_end = target_end
-            for key in pending_by_req:
-                if not isinstance(key, tuple) or len(key) < 3:
-                    continue
-                if str(key[0]) != str(req_id):
-                    continue
-                try:
-                    layer_end = int(key[2])
-                except (TypeError, ValueError):
-                    continue
-                max_registered_end = max(max_registered_end, layer_end)
-            return target_end >= max_registered_end
 
         if phase == "decode" and refreshed_slots and first_state is not None:
             # 一次性更新所有 request tracking（不在 layer 循环里重复）
@@ -3309,32 +3285,14 @@ class SelectorComputeMixin:
                     tracking = self._ensure_request(req_id)
                     # [TP-DET-TRIGGER 2026-07-07] 决策终局已全部提交点化
                     # (enqueue commit single-writer,决定论):last 推进/trigger
-                    # 计时归零/清票/_was_short_dense 翻转不再发生于 publish——
+                    # 计时归零/清票/short 决策锁存不再发生于 publish——
                     # publish 时机依赖 GPU writer 完成(per-rank 异步),曾使
                     # partial/final 分叉把非确定时序注入触发决策 → TP>1 各 rank
-                    # 决策发散 → NCCL 集合发散挂死。此处仅保留:
-                    #   1) slot_req_steps(per-layer state 的 refresh 步标记);
-                    #   2) 读侧终局:全层 ready 且 publish final 时清 scheduled_*
-                    #      = off-rail/dense-consume 路由的解除点(读路由允许
-                    #      per-rank 时序,近似语义;决策路径不再消费该状态)。
-                    planned = int(getattr(tracking, "scheduled_decode_refresh_step", -1))
-                    if planned >= 0:
-                        req_req_step = planned
-                    else:
-                        req_req_step = int(tracking.decode_step) if tracking.decode_step is not None else -1
+                    # 决策发散 → NCCL 集合发散挂死。此处只更新 per-layer
+                    # refresh 步标记；请求级物理终局由 writer/metadata 收据
+                    # 单独负责，selector 不再读取 compact readiness。
+                    req_req_step = int(tracking.last_decode_refresh_step)
                     slot_req_steps[slot] = req_req_step
-                    all_layers_compact_ready = self._request_compact_ready_all_layers(req_id)
-                    publish_final_for_req = _pending_refresh_rebuild_publish_is_final(req_id)
-                    if all_layers_compact_ready and publish_final_for_req:
-                        tracking.scheduled_decode_refresh_step = -1
-                        tracking.scheduled_refresh_ctrl_step = -1
-                        tracking.inflight_reason_code = -1
-                        tracking.inflight_policy = -1
-        elif phase != "decode" and first_state is not None:
-            # prefill 的 request-facing 提交边界不在 selector tracking。
-            # bootstrap_pending / bootstrap_done 统一由 flush 成功后的 finalize boundary
-            # 与 wait_decider 负责，避免在 prefill 中途提前暴露 selected-ready。
-            pass
 
         # 轻量更新 per-layer state（coverage/capped + refresh steps）
         for layer_idx, payload in enumerate(payloads):
@@ -3412,8 +3370,6 @@ class SelectorComputeMixin:
                     ):
                         steps_decode_cpu[slot] = int(req_req_step)
                 state.last_refresh_step = slot_step
-        if pending_cleared:
-            self._bump_refresh_nonce()
         if profile_cpu_detail and t_post0_ns is not None:
             result.profile_cpu_post_us = (time.perf_counter_ns() - t_post0_ns) / 1000.0
 

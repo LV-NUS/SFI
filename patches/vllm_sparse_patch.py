@@ -95,7 +95,6 @@ from patches.request_intent_ticket import (
     PendingPolicy,
     PendingReasonCode,
     RequestIntentTicket,
-    TicketState,
     materialize_refresh_reqs,
     pending_reason_code_to_text,
     pending_reason_to_code,
@@ -1452,6 +1451,9 @@ class VLLMSparseController(
                     self._resolve_refresh_lease(
                         req_ids=req_ids,
                         reason="idle_pending_rebuild_release",
+                        publish_key=self._pending_refresh_rebuild_publish_key(
+                            pending
+                        ),
                     )
                 elif pending.payloads:
                     raise RuntimeError("pending refresh rebuild missing req_ids during idle release")
@@ -1519,8 +1521,6 @@ class VLLMSparseController(
         self._step_cql_tensor = None
         self._step_refresh_commit_handle_id = -1
         self._step_refresh_commit_handle_generation = -1
-        self._step_refresh_commit_written_handle_id = -1
-        self._step_refresh_commit_written_handle_generation = -1
         if hasattr(self, "_step_refresh_commit_written_req_ids"):
             self._step_refresh_commit_written_req_ids.clear()
         self.step_exec_hints = None
@@ -2321,6 +2321,11 @@ class VLLMSparseController(
             _invalidate_page_sparse_step_cache_truth(state)
             state._slot_row_map_key = None
         tracking.bootstrap_done = False
+        # resume 重新进入 bootstrap 生命周期；旧 short-dense 的决策锁存和
+        # 读侧保护都不属于新世代。短 prompt 完成时会按几何重新置位。
+        tracking.short_dense_decision_active = False
+        tracking.dense_until_compact_ready = False
+        self._reset_request_refresh_publish_state(tracking)
         self._bootstrap_submission_boundary_pending_epoch_by_id.pop(
             request_id,
             None,
@@ -2334,12 +2339,10 @@ class VLLMSparseController(
         # 世代物化进"压缩态刚清零+prefill 半途"的行:轻则纵深断言
         # (_mark_bootstrap_request_ready)/FORCE_NOW 不变量 fail-fast 崩引擎,
         # 重则消费重算半途 capture(错值窗)。源头根修=清弹药本体而非给门打
-        # 补丁;全部弹药均为可再生派生态(crossing 由 was_short×is_short 重
-        # 检测/句边界由 token 重喂/interval 由时钟重锚/lease 由重 bootstrap
-        # 重建),清除无饿死面。
-        self._clear_request_pending_refresh(
-            request_id=request_id, ready_compact=False
-        )
+        # 补丁;全部弹药均为可再生派生态(crossing 决策锁存在 short prompt
+        # 完成时按几何重建/句边界由 token 重喂/interval 由时钟重锚/lease
+        # 由重 bootstrap 重建),清除无饿死面。
+        self._clear_request_pending_refresh(request_id=request_id)
         self._clear_request_trigger_intent(request_id=request_id)
         self._clear_request_lease_rearm(request_id=request_id)
         tracking.post_bridge_refresh_due_decode_step = -1
@@ -2349,8 +2352,8 @@ class VLLMSparseController(
         # 重锚前不误触发;下一分类步由 step_context_worker 首-decode 锚
         # (decode_step>=0 ∧ last<0 ⇒ last=decode_step)以当前 token 计数重锚,
         # 节拍自 resume 点重新起算——与新请求 bootstrap 后的 interval 语义
-        # 一致。scheduled_*/inflight_* 镜像有意**不清**:它们是抢占时刻已在
-        # 飞世代的读侧闸与纵深断言绊线,清除=致盲(该子案取证后另行定谳)。
+        # 一致。旧物理世代已在本函数入口按 handle 身份整体作废；迟到收据
+        # 无权污染新 bootstrap 世代。
         tracking.last_decode_refresh_step = -1
         # [CHUNKED-CAPTURE-ACCUMULATE 2026-07-06] resume=从头重算=捕获窗重新
         # 分片；同长 prompt 不触发 record_prompt_tokens 的 != 归零，跨片累计
@@ -2475,61 +2478,12 @@ class VLLMSparseController(
         tracking.lease_rearm_decode_step = -1
         return changed
 
-    def _set_request_pending_refresh(
-        self,
-        *,
-        request_id: str,
-        reason: Optional[str] = None,
-        reason_code: Optional[int] = None,
-        decode_step: int,
-        pending_policy: Optional[int] = None,
-        pending_ctrl_step: Optional[int] = None,
-    ) -> bool:
-        self._ensure_request(request_id)
-        ticket = self._ensure_request_ticket(request_id)
-        if reason_code is None:
-            reason_norm = reason or "refresh"
-            reason_code_int = pending_reason_to_code(reason_norm)
-        else:
-            reason_code_int = int(reason_code)
-        step_int = decode_step
-        if pending_policy is None:
-            policy_int = ticket.pending_policy
-        else:
-            policy_int = pending_policy
-        ctrl_step_cur = ticket.pending_ctrl_step
-        if pending_ctrl_step is None:
-            if ticket.pending_refresh and ctrl_step_cur >= 0:
-                ctrl_step_int = ctrl_step_cur
-            else:
-                ctrl_step_int = self.step_context_epoch
-        else:
-            ctrl_step_int = pending_ctrl_step
-        changed = (
-            (not ticket.pending_refresh)
-            or ticket.pending_reason_code != reason_code_int
-            or ticket.pending_decode_step != step_int
-            or ticket.pending_ctrl_step != ctrl_step_int
-            or ticket.pending_policy != policy_int
-            or ticket.state != TicketState.PENDING_REFRESH
-        )
-        ticket.pending_refresh = True
-        ticket.pending_reason_code = reason_code_int
-        ticket.pending_decode_step = step_int
-        ticket.pending_ctrl_step = ctrl_step_int
-        ticket.pending_policy = policy_int
-        ticket.state = TicketState.PENDING_REFRESH
-        return changed
-
     def _clear_request_pending_refresh(
         self,
         *,
         request_id: str,
-        ready_compact: bool,
     ) -> bool:
-        tracking = self._ensure_request(request_id)
         ticket = self._ensure_request_ticket(request_id)
-        next_state = TicketState.READY_COMPACT if ready_compact else TicketState.NOT_READY
         changed = (
             ticket.pending_refresh
             or ticket.pending_reason_code
@@ -2537,34 +2491,14 @@ class VLLMSparseController(
             or ticket.pending_decode_step != -1
             or ticket.pending_ctrl_step != -1
             or ticket.pending_policy != PendingPolicy.COALESCEABLE
-            or ticket.state != next_state
         )
         ticket.pending_refresh = False
         ticket.pending_reason_code = PendingReasonCode.NONE
         ticket.pending_decode_step = -1
         ticket.pending_ctrl_step = -1
         ticket.pending_policy = PendingPolicy.COALESCEABLE
-        ticket.state = next_state
-        if ready_compact:
-            # [SCHED-RESIDUE-FIX 2026-07-07] ready_compact 清除 = 世代对该
-            # request 终局;scheduled_* 必须一并终局,否则 publish 时刻 GPU
-            # writer 未完(_update_selection_tracking 走 partial 分支置
-            # scheduled)、随后 plan 以 covered-by-ready-compact 清 ticket 的
-            # 请求会永久滞留 scheduled → inflight_refresh 恒真 → 该 request
-            # 的 sentence/interval 触发从此全部静默(bs8x12k 实测每请求首个
-            # sentence 世代后 interval_trigger_intents 恒 0)。正常完成路径
-            # (_update_selection_tracking final 分支)本就先清 scheduled 再
-            # 调本函数,此处幂等。
-            if (
-                int(getattr(tracking, "scheduled_decode_refresh_step", -1)) >= 0
-                or int(getattr(tracking, "scheduled_refresh_ctrl_step", -1)) >= 0
-            ):
-                tracking.scheduled_decode_refresh_step = -1
-                tracking.scheduled_refresh_ctrl_step = -1
-                changed = True
-            # [TP-DET-TRIGGER] 读侧在飞镜像随终局清除。
-            tracking.inflight_reason_code = -1
-            tracking.inflight_policy = -1
+        # Ticket 是决定论意图合同，不拥有 writer/metadata 生命周期。物理
+        # 发布账本只能由 publish receipt 或显式 lease invalidation 终结。
         return changed
 
     def acquire_global_slot(self, request_id: str) -> int:
@@ -2880,12 +2814,11 @@ class VLLMSparseController(
         self._pending_refresh_rebuild_id = 0
         self._step_refresh_commit_handle_id = -1
         self._step_refresh_commit_handle_generation = -1
-        self._step_refresh_commit_written_handle_id = -1
-        self._step_refresh_commit_written_handle_generation = -1
         if hasattr(self, "_step_refresh_commit_written_req_ids"):
             self._step_refresh_commit_written_req_ids.clear()
         self._step_refresh_handle_ledger = []
         self._step_refresh_handle_ledger_size = 0
+        self._step_refresh_handle_checked_through = 0
         self._refresh_rebuild_delay_max = 0
         self._refresh_rebuild_delay_max_epoch = -1
         self.step_prefill_epoch = -1
@@ -3002,8 +2935,8 @@ class VLLMSparseController(
         self.kv_cache_dtype = None
         self._step_decode_spec_key = None
 
-    def _request_compact_ready_all_layers(self, req_id: str) -> bool:
-        """Whether request may consume compact buffers on every registered layer."""
+    def _diagnose_request_compact_ready_all_layers(self, req_id: str) -> bool:
+        """Cold diagnostic for attributing a blocked lifecycle state."""
         if _is_free_slot_id(req_id):
             return False
         tracking = self.request_states.get(req_id)
@@ -3610,7 +3543,6 @@ class VLLMSparseController(
         else:
             tickets_plan_by_req = {
                 rid: RequestIntentTicket(
-                    state=ticket.state,
                     pending_refresh=ticket.pending_refresh,
                     pending_reason_code=ticket.pending_reason_code,
                     pending_decode_step=ticket.pending_decode_step,
@@ -3619,7 +3551,6 @@ class VLLMSparseController(
                 )
                 for rid, ticket in tickets_by_req.items()
             }
-        pending_updates: Dict[str, tuple[int, int, int, int, bool]] = {}
 
         def _queue_set_pending_refresh(
             *,
@@ -3654,51 +3585,28 @@ class VLLMSparseController(
                 or ticket_local.pending_decode_step != step_local
                 or ticket_local.pending_ctrl_step != ctrl_step_local
                 or ticket_local.pending_policy != policy_local
-                or ticket_local.state != TicketState.PENDING_REFRESH
             )
             ticket_local.pending_refresh = True
             ticket_local.pending_reason_code = reason_code_local
             ticket_local.pending_decode_step = step_local
             ticket_local.pending_ctrl_step = ctrl_step_local
             ticket_local.pending_policy = policy_local
-            ticket_local.state = TicketState.PENDING_REFRESH
-            if update_state:
-                pending_updates[request_id] = (
-                    reason_code_local,
-                    step_local,
-                    policy_local,
-                    ctrl_step_local,
-                    False,
-                )
             return changed_local
 
-        def _queue_clear_pending_refresh(*, request_id: str, ready_compact: bool) -> bool:
+        def _queue_clear_pending_refresh(*, request_id: str) -> bool:
             ticket_local = tickets_plan_by_req[request_id]
-            next_state_local = (
-                TicketState.READY_COMPACT if ready_compact else TicketState.NOT_READY
-            )
             changed_local = (
                 ticket_local.pending_refresh
                 or ticket_local.pending_reason_code != PendingReasonCode.NONE
                 or ticket_local.pending_decode_step != -1
                 or ticket_local.pending_ctrl_step != -1
                 or ticket_local.pending_policy != PendingPolicy.COALESCEABLE
-                or ticket_local.state != next_state_local
             )
             ticket_local.pending_refresh = False
             ticket_local.pending_reason_code = PendingReasonCode.NONE
             ticket_local.pending_decode_step = -1
             ticket_local.pending_ctrl_step = -1
             ticket_local.pending_policy = PendingPolicy.COALESCEABLE
-            ticket_local.state = next_state_local
-            if update_state:
-                pending_updates[request_id] = (
-                    int(PendingReasonCode.NONE),
-                    -1,
-                    PendingPolicy.COALESCEABLE,
-                    -1,
-                    ready_compact,
-                )
             return changed_local
 
         all_request_lifecycle_done = True
@@ -3718,30 +3626,7 @@ class VLLMSparseController(
             for rid in request_ids:
                 pending_cleared = _queue_clear_pending_refresh(
                     request_id=rid,
-                    ready_compact=True,
                 ) or pending_cleared
-            if update_state:
-                for rid, update in pending_updates.items():
-                    (
-                        reason_code_update,
-                        step_update,
-                        policy_update,
-                        ctrl_update,
-                        clear_ready_compact,
-                    ) = update
-                    if clear_ready_compact:
-                        self._clear_request_pending_refresh(
-                            request_id=rid,
-                            ready_compact=True,
-                        )
-                    else:
-                        self._set_request_pending_refresh(
-                            request_id=rid,
-                            reason_code=reason_code_update,
-                            decode_step=step_update,
-                            pending_policy=policy_update,
-                            pending_ctrl_step=ctrl_update,
-                        )
             result = StepRefreshPlan(
                 epoch=self.step_context_epoch,
                 req_ids=request_ids,
@@ -3769,15 +3654,12 @@ class VLLMSparseController(
         refresh_set: Set[str] = set()
         replay_forced_refresh_set: Set[str] = set()
         decode_step_by_req: Dict[str, int] = {}
-        inflight_by_req: Dict[str, bool] = {}
-        pending_rebuild_inflight_by_req: Dict[str, bool] = {}
         pending_reason_code: Optional[int] = None
         interval_reason_code: Optional[int] = None
         earliest_pending_decode: Optional[int] = None
         last_reason: str = "none"
-        pending_cleared = False
         coalesced = False
-        inflight_dense_consume_set: Set[str] = set()
+        inflight_dense_consume_by_row: List[bool] = []
         workload_plan_replay_active = self._workload_plan_replay is not None
 
         def _bootstrap_hold(rid_local: str) -> bool:
@@ -3827,7 +3709,7 @@ class VLLMSparseController(
 
         def _is_short_dense_blocked(rid_local: str) -> bool:
             tracking_local = tracking_by_req[rid_local]
-            if not bool(getattr(tracking_local, "_was_short_dense", False)):
+            if not tracking_local.short_dense_decision_active:
                 return False
             ticket_local = tickets_plan_by_req[rid_local]
             # short 阶段仅放行 crossing 的 FORCE_NOW refresh。
@@ -4079,35 +3961,11 @@ class VLLMSparseController(
             )
             return int(ready_chunk) < int(_CAPTURE_CHUNK)
 
-        # [CREDIT-RETIRE 2026-07-07] _post_bridge_refresh_credit_active/_due
-        # 与 _reset_sentence_trigger_refresh_gap 已随 credit 状态机整机退休
-        # (见 sentence intent 落票处注记);gap 归零由世代完成路径
-        # (selector_compute_mixin 更新 tracking 时)统一执行。
-
-        # [TP-DET-TRIGGER 2026-07-07] _pending_refresh_covered_by_ready_compact
-        # 已随 covered 清票段整体退休:票在 enqueue commit 点转 consumed,不再
-        # 存在"挂着等 GPU writer 完成"的票形态(其判定读 GPU 完成态,是 TP>1
-        # 决策发散根之一)。
-
-        def _pending_rebuild_ticket_decode_step(
-            rid_local: str,
-            ticket_local: RequestIntentTicket,
-        ) -> int:
-            if not self._pending_refresh_rebuild_has_req(rid_local):
-                return -1
-            pending_decode = int(ticket_local.pending_decode_step)
-            if pending_decode < 0:
-                return -1
-            pending_ctrl = int(ticket_local.pending_ctrl_step)
-            if pending_ctrl >= 0 and pending_ctrl > self.step_context_epoch:
-                return -1
-            return pending_decode
+        # Sentence/interval 决策在确定性的 enqueue commit 点终结；GPU
+        # writer/metadata 完成只推进读侧发布，不得反馈 TP trigger 决策。
 
         def _sentence_intent_covered_by_inflight_refresh(
-            rid_local: str,
             tracking_local: RequestTracking,
-            ticket_local: RequestIntentTicket,
-            pending_rebuild_inflight_local: bool,
         ) -> bool:
             intent_step = int(tracking_local.trigger_intent_decode_step)
             if intent_step < 0:
@@ -4117,17 +3975,8 @@ class VLLMSparseController(
                 != int(PendingReasonCode.SENTENCE)
             ):
                 return False
-            scheduled_decode = int(
-                getattr(tracking_local, "scheduled_decode_refresh_step", -1)
-            )
-            if scheduled_decode < 0 and pending_rebuild_inflight_local:
-                scheduled_decode = _pending_rebuild_ticket_decode_step(
-                    rid_local,
-                    ticket_local,
-                )
-            if scheduled_decode < 0 and pending_rebuild_inflight_local:
-                return True
-            return scheduled_decode >= intent_step
+            committed_step = int(tracking_local.last_decode_refresh_step)
+            return committed_step < 0 or committed_step >= intent_step
 
         def _dual_gen_inflight_compact_readable(
             tracking_local: RequestTracking,
@@ -4142,32 +3991,23 @@ class VLLMSparseController(
             # 旧代"的代理是错的:短态 bootstrap 行(prompt<=threshold 直接 done,
             # 从未有 compact 内容,step_context_worker.py:733-743)done=True 却
             # 无旧代可读。今天被行路由 compact-ready 门遮蔽无害,按无 fallback
-            # 纪律根修代理本身:_was_short_dense 恒 True 直到 crossing 世代
-            # 提交点(读侧终局,A3 合同钉死)——它为 True 的全窗(短态+crossing
-            # 首刷在飞)恰是"无旧代"的准确范围,提交后翻 False=旧代已可读。
-            return bool(tracking_local.bootstrap_done) and not bool(
-                getattr(tracking_local, "_was_short_dense", False)
+            # 纪律根修代理本身:dense_until_compact_ready 只在全层 compact
+            # metadata 发布后翻 False。host enqueue 只终结 trigger 决策，
+            # 不能被当作旧代已经可读。
+            return (
+                tracking_local.bootstrap_done
+                and not tracking_local.dense_until_compact_ready
             )
 
-        def _pending_rebuild_requires_dense_consume(
-            rid_local: str,
+        def _refresh_publish_requires_dense_consume(
             tracking_local: RequestTracking,
-            ticket_local: RequestIntentTicket,
-            pending_rebuild_inflight_local: bool,
         ) -> bool:
-            if not pending_rebuild_inflight_local:
+            if tracking_local.refresh_publish_key is None:
                 return False
-            # [TP-DET-TRIGGER] 票在 commit 转 consumed;在飞窗的 reason/policy
-            # 由读侧镜像(commit 写/publish final 清)承载——防 torn-read 的
-            # dense 闸不得因票提前清除而失效(4B 实测 illegal address 教训)。
-            if ticket_local.pending_refresh:
-                reason_code_local = int(ticket_local.pending_reason_code)
-                policy_local = int(ticket_local.pending_policy)
-            else:
-                reason_code_local = int(
-                    getattr(tracking_local, "inflight_reason_code", -1)
-                )
-                policy_local = int(getattr(tracking_local, "inflight_policy", -1))
+            # Ticket 在 host commit 即 consumed。读路由只消费物理账本同生共灭
+            # 的 reason/policy，避免后来的 ticket 覆盖当前 writer 世代。
+            reason_code_local = int(tracking_local.inflight_reason_code)
+            policy_local = int(tracking_local.inflight_policy)
             if reason_code_local >= 0 or policy_local >= 0:
                 if reason_code_local == int(PendingReasonCode.LEASE_REARM):
                     # [DUAL-GEN-L2b] 容量重排可能整体 reset 旧代内容,
@@ -4185,53 +4025,12 @@ class VLLMSparseController(
                         return False
                     return True
             if _sentence_intent_covered_by_inflight_refresh(
-                rid_local,
                 tracking_local,
-                ticket_local,
-                pending_rebuild_inflight_local,
             ):
                 if _dual_gen_inflight_compact_readable(tracking_local):
                     return False
                 return True
             return False
-
-        def _has_pending_refresh_work_ledger() -> bool:
-            flags_local = getattr(self, "_buf_pending_work_flags", ())
-            for flag in flags_local:
-                try:
-                    if (int(flag) & 2) != 0:
-                        return True
-                except Exception:
-                    continue
-            return False
-
-        def _request_has_pending_rebuild_inflight(
-            rid_local: str,
-            tracking_local: RequestTracking,
-            ticket_local: RequestIntentTicket,
-        ) -> bool:
-            if not self._pending_refresh_rebuild_has_req(rid_local):
-                return bool(
-                    ticket_local.pending_refresh
-                    and _has_pending_refresh_work_ledger()
-                )
-            scheduled_ctrl = int(
-                getattr(tracking_local, "scheduled_refresh_ctrl_step", -1)
-            )
-            scheduled_decode = int(
-                getattr(tracking_local, "scheduled_decode_refresh_step", -1)
-            )
-            if scheduled_decode < 0:
-                scheduled_decode = _pending_rebuild_ticket_decode_step(
-                    rid_local,
-                    ticket_local,
-                )
-            if scheduled_decode < 0:
-                return scheduled_ctrl < 0 or scheduled_ctrl <= self.step_context_epoch
-            return (
-                (scheduled_ctrl < 0 or scheduled_ctrl <= self.step_context_epoch)
-                and scheduled_decode >= 0
-            )
 
         def _record_sentence_trigger_admission_coalesced(
             detail_counter_attr: str,
@@ -4257,24 +4056,10 @@ class VLLMSparseController(
             ticket = tickets_plan_by_req[rid]
             decode_step = int(tracking.decode_step) if tracking.decode_step is not None else -1
             decode_step_by_req[rid] = decode_step
-            scheduled_ctrl = tracking.scheduled_refresh_ctrl_step
-            pending_rebuild_inflight = _request_has_pending_rebuild_inflight(
-                rid,
-                tracking,
-                ticket,
+            inflight_refresh = tracking.refresh_publish_key is not None
+            inflight_dense_consume_by_row.append(
+                _refresh_publish_requires_dense_consume(tracking)
             )
-            pending_rebuild_inflight_by_req[rid] = pending_rebuild_inflight
-            inflight_refresh = (
-                scheduled_ctrl >= 0 and scheduled_ctrl < self.step_context_epoch
-            ) or pending_rebuild_inflight
-            inflight_by_req[rid] = inflight_refresh
-            if _pending_rebuild_requires_dense_consume(
-                rid,
-                tracking,
-                ticket,
-                pending_rebuild_inflight,
-            ):
-                inflight_dense_consume_set.add(rid)
             last_decode_refresh = (
                 int(tracking.last_decode_refresh_step)
                 if tracking.last_decode_refresh_step is not None
@@ -4291,7 +4076,6 @@ class VLLMSparseController(
                 if ticket.pending_refresh:
                     _queue_clear_pending_refresh(
                         request_id=rid,
-                        ready_compact=False,
                     )
                     ticket = tickets_plan_by_req[rid]
                 if update_state and tracking.trigger_intent_decode_step >= 0:
@@ -4351,7 +4135,7 @@ class VLLMSparseController(
                     self._clear_request_trigger_intent(request_id=rid)
                     detail_counter_attr = (
                         "_sentence_trigger_admission_coalesced_pending_rebuild_total"
-                        if pending_rebuild_inflight_by_req.get(rid, False)
+                        if inflight_refresh
                         else "_sentence_trigger_admission_coalesced_inflight_total"
                     )
                     _record_sentence_trigger_admission_coalesced(detail_counter_attr)
@@ -4670,8 +4454,8 @@ class VLLMSparseController(
                     # [INTERVAL-TICKET-NO-RESTAMP 2026-07-10] 已有 INTERVAL 票
                     # (defer 残留):到点 ⇒ decode-last≥interval≥gap ⇒ 上方残留
                     # 票段 gap 必放行、已 materialize;此处原每步幂等重立票+
-                    # 无条件重写 pending_updates(→_set_request_pending_refresh)
-                    # =纯 host 记账浪费(触发→提交排队窗每步重记账,远端 intents
+                    # 旧实现还会无条件二次回放同一 ticket，形成纯 host
+                    # 记账浪费(触发→提交排队窗每步重写,远端 intents
                     # 膨胀头号嫌疑)。票面逐位等价论证:重立参数(reason=INTERVAL/
                     # step=票面/policy=COALESCEABLE 为 INTERVAL 票不变式/ctrl=
                     # 票面,残留段已补 ctrl<0)与票面全同。保留 interval 拍点
@@ -4809,7 +4593,9 @@ class VLLMSparseController(
             )
 
         self._current_decode_step_by_req_epoch = int(self.step_context_epoch)
-        self._current_decode_step_by_req = dict(decode_step_by_req)
+        # 该快照在此后只读，直接转交本步唯一字典；避免 planner 每步再复制
+        # 一份 BS 大小映射。下一步会整体替换，不存在跨步原位修改。
+        self._current_decode_step_by_req = decode_step_by_req
 
         # refresh coalescing：允许在小窗口内合并相邻 request 的 refresh，避免形成极小 batch。
         coalesce_window = self.config.refresh_coalesce_window
@@ -4956,29 +4742,6 @@ class VLLMSparseController(
                 decode_step=inferred_pending_step,
             )
 
-        if update_state:
-            for rid, update in pending_updates.items():
-                (
-                    reason_code_update,
-                    step_update,
-                    policy_update,
-                    ctrl_update,
-                    clear_ready_compact,
-                ) = update
-                if clear_ready_compact:
-                    self._clear_request_pending_refresh(
-                        request_id=rid,
-                        ready_compact=True,
-                    )
-                else:
-                    self._set_request_pending_refresh(
-                        request_id=rid,
-                        reason_code=reason_code_update,
-                        decode_step=step_update,
-                        pending_policy=policy_update,
-                        pending_ctrl_step=ctrl_update,
-                    )
-
         if refresh_set:
             # [TP-DET-TRIGGER] 终审过滤 inflight → 决定论 gap。
             refresh_set = {
@@ -5048,9 +4811,9 @@ class VLLMSparseController(
                 last_reason = pending_reason_code_to_text(interval_reason_code)
             else:
                 last_reason = last_reason or "refresh"
-            # 方案 B（single-source commit）：planner 只产出计划，不写 inflight/scheduled。
-            # scheduled_* 仅在 payload 真正 enqueue 成功时由 commit 路径写入，
-            # 避免“计划成功但未提交”被错误标记为 inflight，导致 sentence/interval 静默失效。
+            # Planner 只产出计划；host enqueue commit 终结决定论 ticket，
+            # writer/metadata 收据独立拥有物理发布状态。计划成功但未提交
+            # 不会伪造在飞世代。
         elif allowed and (not allow_materialize):
             # 空转步（无 kernel 执行）只允许保留 pending 语义，不允许 materialize 成本步 refresh_reqs；
             # 否则会出现“计划触发但执行路径不存在”的 ghost plan。
@@ -5062,9 +4825,9 @@ class VLLMSparseController(
         refresh_rows = tuple(idx for idx, rid in enumerate(request_ids) if rid in refresh_reqs_set)
         mode_by_row_list: List[int] = []
         force_dense_while_inflight_by_row_list: List[bool] = []
-        for rid in request_ids:
+        for row_idx, rid in enumerate(request_ids):
             ticket = tickets_plan_by_req[rid]
-            is_inflight = inflight_by_req.get(rid, False)
+            is_inflight = tracking_by_req[rid].refresh_publish_key is not None
             if rid in refresh_reqs_set:
                 mode = (
                     StepRefreshMode.MUST_NOW
@@ -5080,24 +4843,10 @@ class VLLMSparseController(
             mode_by_row_list.append(mode)
             force_dense_while_inflight_by_row_list.append(
                 mode == StepRefreshMode.INFLIGHT
-                and rid in inflight_dense_consume_set
+                and inflight_dense_consume_by_row[row_idx]
             )
-
-        for idx, rid in enumerate(request_ids):
-            mode = mode_by_row_list[idx]
-            if mode == StepRefreshMode.MUST_NOW and rid not in refresh_reqs_set:
-                raise RuntimeError(
-                    "refresh plan invariant violated: MUST_NOW row missing in refresh_reqs "
-                    f"(req={rid!r}, step={self.step_context_epoch})"
-                )
-            if mode == StepRefreshMode.INFLIGHT and rid in refresh_reqs_set:
-                raise RuntimeError(
-                    "refresh plan invariant violated: INFLIGHT row appears in refresh_reqs "
-                    f"(req={rid!r}, step={self.step_context_epoch})"
-                )
-            ticket = tickets_plan_by_req[rid]
             if (
-                (not inflight_by_req.get(rid, False))
+                (not is_inflight)
                 and ticket.pending_refresh
                 and ticket.pending_policy == PendingPolicy.FORCE_NOW
                 and rid not in refresh_reqs_set
@@ -5136,16 +4885,7 @@ class VLLMSparseController(
         )
         if update_state:
             self._should_refresh_cache[cache_key] = result
-            if pending_cleared:
-                self._bump_refresh_nonce()
         return result
-
-    def should_refresh(self, state: LayerState) -> Tuple[bool, List[int]]:
-        """遗留分支：已下线，refresh 由 dispatcher StepAuthority 单源路径统一处理。"""
-        del state
-        raise RuntimeError(
-            "should_refresh direct branch is disabled; use dispatcher StepAuthority path"
-        )
 
     def layer_stats(self) -> Dict[int, Dict[str, object]]:
         stats: Dict[int, Dict[str, object]] = {}

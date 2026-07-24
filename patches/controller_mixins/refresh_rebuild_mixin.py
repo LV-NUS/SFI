@@ -5,7 +5,7 @@ OWNS:
   - _init_refresh_rebuild_state(): refresh/rebuild state initialization
   - _async_refresh_enabled: refresh feature flag
   - _pending_refresh_rebuild_register / _pending_refresh_rebuild_clear(): rebuild tracking
-  - _submit_pending_refresh_rebuild / _enqueue_pending_refresh_rebuild(): rebuild submission pipeline
+  - _submit_pending_refresh_rebuild_batch / _enqueue_pending_refresh_rebuild(): rebuild submission pipeline
   - _compact_pending_refresh_payloads(): payload compaction for chunked refresh
 
 DEPENDS_ON:
@@ -14,7 +14,7 @@ DEPENDS_ON:
   - WaitDeciderMixin._pending_work_mark_submitted / _pending_work_reset
   - CaptureRingMixin._map_global_layer_to_capture_slot
   - Main controller: _update_selection_tracking, _rebuild_compact_slots_batched_layers_from_selection,
-    _set_request_pending_refresh
+    _clear_request_pending_refresh
 
 ENTRY_POINTS:
   - _init_refresh_rebuild_state(): called from VLLMSparseController.__init__
@@ -44,7 +44,12 @@ from patches.request_intent_ticket import PendingPolicy, PendingReasonCode
 from patches.refresh_runtime.producer_workspace import (
     build_refresh_producer_work_item,
 )
-from patches.sparse_types import ASYNC_PRODUCER_GPU_PROFILE_STAGES
+from patches.sparse_types import (
+    ASYNC_PRODUCER_GPU_PROFILE_STAGES,
+    DeferredCompactMetaRound,
+    PendingRefreshRebuild,
+    RefreshPublishReceipt,
+)
 from patches.selector_runtime.selected_out_ring import (
     SLOT_VALID_SET_ATTR,
     SelectedOutRing,
@@ -75,7 +80,6 @@ from patches.sparse_utils import _is_stream_capturing_or_raise
 if TYPE_CHECKING:
     from patches.sparse_types import (
         LayerState,
-        PendingRefreshRebuild,
         SelectorBatchPayload,
         SelectorResult,
     )
@@ -195,8 +199,6 @@ class RefreshRebuildMixin:
         self._step_refresh_commit_payload_enqueues: int = 0
         self._step_refresh_commit_replay_payload_claims: int = 0
         # commit-path single writer（exactly-once per request within one step-handle）
-        self._step_refresh_commit_written_handle_id: int = -1
-        self._step_refresh_commit_written_handle_generation: int = -1
         self._step_refresh_commit_written_req_ids: Set[str] = set()
         # handle-ledger ring（slot = handle_id % ring_size）：
         # [handle_id, generation, planned_reqs, planned_rows, num_actual_tokens,
@@ -204,6 +206,7 @@ class RefreshRebuildMixin:
         #  step_identity_token]
         self._step_refresh_handle_ledger: List[List[int]] = []
         self._step_refresh_handle_ledger_size: int = 0
+        self._step_refresh_handle_checked_through: int = 0
         # pending refresh rebuilds
         self._pending_refresh_rebuilds: Deque[PendingRefreshRebuild] = deque()
         self._pending_refresh_rebuild_id: int = 0
@@ -388,6 +391,20 @@ class RefreshRebuildMixin:
         return bool(
             RefreshRebuildMixin._pending_refresh_rebuild_ids_for_req(self, req_id)
         )
+
+    @staticmethod
+    def _pending_refresh_rebuild_publish_key(
+        pending: PendingRefreshRebuild,
+    ) -> Tuple[int, int]:
+        publish_key = (
+            int(getattr(pending, "capture_handle_id", -1)),
+            int(getattr(pending, "capture_handle_generation", -1)),
+        )
+        if publish_key[0] <= 0 or publish_key[1] <= 0:
+            raise RuntimeError(
+                "pending refresh rebuild is missing its publication generation"
+            )
+        return publish_key
 
     def _pending_refresh_rebuild_register(
         self,
@@ -624,7 +641,6 @@ class RefreshRebuildMixin:
         )
         self._pending_refresh_rebuild_forget_writer_release(pending)
         pending.selector_scratch_refs = tuple()
-        pending.compact_meta_defer_publish = False
         pending.compact_meta_commit_log = None
         req_ids = pending.req_ids
         if not req_ids or pending.pending_id < 0:
@@ -836,6 +852,7 @@ class RefreshRebuildMixin:
             self._resolve_refresh_lease(
                 req_ids=drop_req_ids,
                 reason=str(lease_reason),
+                publish_key=self._pending_refresh_rebuild_publish_key(pending),
             )
         self._pending_refresh_rebuild_clear(pending)
         return drop_req_ids
@@ -1516,6 +1533,9 @@ class RefreshRebuildMixin:
                     self._resolve_refresh_lease(
                         req_ids=drop_req_ids,
                         reason="pending_rebuild_drop_finished",
+                        publish_key=self._pending_refresh_rebuild_publish_key(
+                            pending
+                        ),
                     )
                 self._pending_refresh_rebuild_clear(pending)
                 dropped += 1
@@ -1696,14 +1716,7 @@ class RefreshRebuildMixin:
                     if event_id not in waited_writer_event_ids:
                         cur_stream.wait_event(writer_event)
                         waited_writer_event_ids.add(event_id)
-                    self._commit_pending_refresh_rebuild_compact_meta(
-                        pending
-                    )
-                    if not pending.tracking_published and pending.result is not None:
-                        self._publish_pending_refresh_rebuild_selection_tracking(
-                            pending, pending.result
-                        )
-                        pending.tracking_published = True
+                    self._publish_pending_refresh_rebuild_read_side(pending)
                     self._mark_pending_refresh_rebuild_accepted(pending)
                     self._pending_refresh_rebuild_clear_completed_buf_work(
                         pending,
@@ -1848,31 +1861,250 @@ class RefreshRebuildMixin:
             self._validate_pending_refresh_rebuild_result(pending, result)
         return result
 
-    def _publish_pending_refresh_rebuild_selection_tracking(
+    def _publish_pending_refresh_rebuild_read_side(
         self,
         pending: PendingRefreshRebuild,
-        result: "SelectorResult",
     ) -> None:
-        self._update_selection_tracking(
-            pending.payloads,
-            result,
-            phase=pending.selection_phase,
-            profile_cpu_detail=False,
-            t_post0_ns=None,
-            pending_refresh_rebuild=pending,
+        """Publish a rebuild only after its compact generation is readable.
+
+        The caller establishes writer completion or same-stream ordering.
+        Compact metadata must become authoritative before request tracking can
+        retire dense protection. This is the shared async/sync cold boundary.
+        """
+        if pending.read_side_published:
+            return
+        receipt = self._freeze_refresh_publish_receipt(pending.payloads)
+        commit_log = getattr(pending, "compact_meta_commit_log", None)
+        live_req_ids: Optional[Tuple[str, ...]] = None
+        if receipt is not None and commit_log is None:
+            raise RuntimeError(
+                "pending refresh publication has no deferred metadata transaction"
+            )
+        if commit_log is not None:
+            live_req_ids = self._commit_compact_meta_log_entries(
+                tuple(commit_log),
+                source="pending_rebuild",
+                refresh_receipt=receipt,
+            )
+        pending.compact_meta_commit_log = None
+        result = pending.result
+        if result is None:
+            raise RuntimeError(
+                "pending refresh read-side publish requires selector result"
+            )
+        if live_req_ids:
+            self._update_selection_tracking(
+                pending.payloads,
+                result,
+                phase=pending.selection_phase,
+                profile_cpu_detail=False,
+                t_post0_ns=None,
+            )
+        if receipt is not None:
+            self._publish_refresh_receipt(
+                receipt,
+                live_req_ids=live_req_ids,
+            )
+        pending.read_side_published = True
+
+    def _freeze_refresh_publish_receipt(
+        self,
+        payloads: Sequence["SelectorBatchPayload"],
+    ) -> Optional[RefreshPublishReceipt]:
+        if not payloads:
+            return None
+        first = payloads[0]
+        handle_id = int(first.capture_handle_id)
+        handle_generation = int(first.capture_handle_generation)
+        if handle_id <= 0 or handle_generation <= 0:
+            raise RuntimeError(
+                "refresh publish receipt requires a positive handle identity"
+            )
+        req_ids = self._normalize_refresh_req_ids(
+            tuple(first.slot_req_ids or tuple())
         )
+        if not req_ids:
+            raise RuntimeError(
+                "refresh publish receipt requires submission-step request ids"
+            )
+        layer_mask = 0
+        for payload in payloads:
+            if (
+                int(payload.capture_handle_id) != handle_id
+                or int(payload.capture_handle_generation) != handle_generation
+            ):
+                raise RuntimeError(
+                    "refresh publish receipt spans multiple handle generations"
+                )
+            payload_req_ids = self._normalize_refresh_req_ids(
+                tuple(payload.slot_req_ids or tuple())
+            )
+            if payload_req_ids != req_ids:
+                raise RuntimeError(
+                    "refresh publish receipt request cohort differs across layers"
+                )
+            layer_index = int(payload.state.layer_index)
+            if layer_index < 0:
+                raise RuntimeError(
+                    "refresh publish receipt requires non-negative global layer indices"
+                )
+            layer_bit = 1 << layer_index
+            if layer_mask & layer_bit:
+                raise RuntimeError(
+                    "refresh publish receipt requires unique global layer indices"
+                )
+            layer_mask |= layer_bit
+        return RefreshPublishReceipt(
+            handle_id=handle_id,
+            handle_generation=handle_generation,
+            req_ids=req_ids,
+            layer_mask=layer_mask,
+        )
+
+    @staticmethod
+    def _reset_request_refresh_publish_state(tracking: object) -> None:
+        tracking.refresh_publish_key = None
+        tracking.refresh_publish_enqueued_layer_mask = 0
+        tracking.refresh_publish_published_layer_mask = 0
+        tracking.refresh_publish_sealed = False
+        tracking.inflight_reason_code = -1
+        tracking.inflight_policy = -1
+
+    def _finalize_request_refresh_publish_if_complete(
+        self,
+        tracking: object,
+    ) -> None:
+        if tracking.refresh_publish_key is None:
+            return
+        enqueued_mask = int(tracking.refresh_publish_enqueued_layer_mask)
+        published_mask = int(tracking.refresh_publish_published_layer_mask)
+        unexpected_mask = published_mask & ~enqueued_mask
+        if unexpected_mask:
+            raise RuntimeError(
+                "refresh publish receipt contains layers outside the producer ledger: "
+                f"unexpected_mask={unexpected_mask:#x} "
+                f"published_mask={published_mask:#x} "
+                f"enqueued_mask={enqueued_mask:#x}"
+            )
+        if (
+            not bool(tracking.refresh_publish_sealed)
+            or enqueued_mask == 0
+            or published_mask != enqueued_mask
+        ):
+            return
+        if bool(tracking.dense_until_compact_ready):
+            # Exact layer coverage and nonempty per-request metadata were
+            # proven atomically before the receipt became visible.
+            tracking.dense_until_compact_ready = False
+        RefreshRebuildMixin._reset_request_refresh_publish_state(tracking)
+
+    def _seal_step_refresh_publish(self) -> None:
+        handle_id = int(self._step_refresh_commit_handle_id)
+        handle_generation = int(self._step_refresh_commit_handle_generation)
+        req_ids = tuple(self._step_refresh_commit_written_req_ids)
+        if handle_id <= 0 or handle_generation <= 0 or not req_ids:
+            return
+        layer_count = len(self.layer_cache_keys)
+        if layer_count <= 0:
+            raise RuntimeError(
+                "refresh publish seal has no registered physical layers"
+            )
+        expected_layer_mask = (1 << layer_count) - 1
+        expected_key = (handle_id, handle_generation)
+        request_states = self.request_states
+        for rid in req_ids:
+            tracking = request_states.get(rid)
+            if tracking is None:
+                continue
+            if tracking.refresh_publish_key != expected_key:
+                raise RuntimeError(
+                    "refresh publish seal does not own the request generation: "
+                    f"request={rid!r} expected={expected_key!r} "
+                    f"actual={tracking.refresh_publish_key!r}"
+                )
+            enqueued_mask = int(tracking.refresh_publish_enqueued_layer_mask)
+            if enqueued_mask != expected_layer_mask:
+                raise RuntimeError(
+                    "refresh publish seal requires the exact registered layer set: "
+                    f"request={rid!r} handle={expected_key!r} "
+                    f"missing_mask={expected_layer_mask & ~enqueued_mask:#x} "
+                    f"unexpected_mask={enqueued_mask & ~expected_layer_mask:#x}"
+                )
+            tracking.refresh_publish_sealed = True
+            self._finalize_request_refresh_publish_if_complete(tracking)
+
+    def _publish_refresh_receipt(
+        self,
+        receipt: RefreshPublishReceipt,
+        *,
+        live_req_ids: Optional[Sequence[str]] = None,
+    ) -> None:
+        expected_key = (int(receipt.handle_id), int(receipt.handle_generation))
+        live_set = (
+            None
+            if live_req_ids is None
+            else set(self._normalize_refresh_req_ids(live_req_ids))
+        )
+        receipt_layer_mask = int(receipt.layer_mask)
+        if receipt_layer_mask <= 0:
+            raise RuntimeError("refresh publish receipt contains no physical layers")
+        invalidated: List[str] = []
+        request_states = self.request_states
+        for rid in receipt.req_ids:
+            tracking = request_states.get(rid)
+            if tracking is None or tracking.refresh_publish_key != expected_key:
+                continue
+            if live_set is not None and rid not in live_set:
+                invalidated.append(rid)
+                continue
+            enqueued_mask = int(tracking.refresh_publish_enqueued_layer_mask)
+            published_mask = int(tracking.refresh_publish_published_layer_mask)
+            unexpected_mask = receipt_layer_mask & ~enqueued_mask
+            if unexpected_mask:
+                raise RuntimeError(
+                    "refresh publish receipt contains a layer not owned by the "
+                    f"producer generation: request={rid!r} "
+                    f"unexpected_mask={unexpected_mask:#x} "
+                    f"enqueued_mask={enqueued_mask:#x}"
+                )
+            duplicate_mask = receipt_layer_mask & published_mask
+            if duplicate_mask:
+                raise RuntimeError(
+                    "refresh publish receipt repeats an already published layer: "
+                    f"request={rid!r} duplicate_mask={duplicate_mask:#x}"
+                )
+            tracking.refresh_publish_published_layer_mask = (
+                published_mask | receipt_layer_mask
+            )
+            self._finalize_request_refresh_publish_if_complete(tracking)
+        if invalidated:
+            self._resolve_refresh_lease(
+                req_ids=tuple(invalidated),
+                reason="refresh_publish_slot_ownership_invalidated",
+                publish_key=expected_key,
+            )
 
     def _commit_compact_meta_log_entries(
         self,
         commit_log: Sequence[Dict[str, object]],
         *,
         source: str = "?",
-    ) -> None:
+        refresh_receipt: Optional[RefreshPublishReceipt] = None,
+    ) -> Optional[Tuple[str, ...]]:
+        commit_entries = tuple(commit_log)
+
         def _reset_compact_slot_metadata(state: "LayerState", slot: int) -> None:
             if slot < 0 or slot >= state.batch_size:
-                return
+                raise RuntimeError(
+                    "deferred compact metadata reset references a live slot "
+                    f"outside the layer batch: slot={slot} batch={state.batch_size}"
+                )
             if slot >= len(state.compact_k):
-                return
+                raise RuntimeError(
+                    "deferred compact metadata reset references a live slot "
+                    f"outside compact storage: slot={slot} "
+                    f"capacity={len(state.compact_k)}"
+                )
             empty_k = torch.empty(0, device=state.device)
             empty_v = torch.empty(0, device=state.device)
             empty_p = torch.empty(0, device=state.device, dtype=torch.int32)
@@ -1900,7 +2132,7 @@ class RefreshRebuildMixin:
         # exact round plus the live per-layer generation table instead.
         _audit_round: Dict[str, object] = {
             "src": str(source),
-            "n": len(tuple(commit_log)),
+            "n": len(commit_entries),
             "entries": [],
         }
         # A deferred metadata transaction is valid only while the request that
@@ -1908,6 +2140,10 @@ class RefreshRebuildMixin:
         # maps once per payload group; each layer entry shares the same tuple.
         _owner_map_by_snapshot_id: Dict[int, Dict[int, str]] = {}
         _owner_liveness_by_slot_req: Dict[Tuple[int, str], bool] = {}
+        _refresh_owner_keys: Set[Tuple[int, str]] = set()
+        _refresh_layer_mask = 0
+        _refresh_owner_snapshot: Optional[Tuple[Tuple[int, str], ...]] = None
+        _refresh_entry_by_layer: Dict[int, Dict[str, object]] = {}
 
         def _entry_live_owned_slots(
             entry: Dict[str, object],
@@ -1978,10 +2214,128 @@ class RefreshRebuildMixin:
                     rows.append(f"L{_li}:{int(_rg[slot])}")
             return ",".join(rows)
 
-        for entry in tuple(commit_log):
+        prepared_entries: List[
+            Tuple[
+                Dict[str, object],
+                "LayerState",
+                Dict[int, str],
+                Set[int],
+                str,
+            ]
+        ] = []
+        for entry in commit_entries:
             state = entry["state"]
             owner_by_slot, live_owned_slots = _entry_live_owned_slots(entry, state)
+            entry_phase = str(entry.get("phase", ""))
+            if entry_phase == "refresh":
+                layer_index = int(getattr(state, "layer_index", -1))
+                if layer_index < 0:
+                    raise RuntimeError(
+                        "refresh metadata transaction has invalid layer identity: "
+                        f"layer_index={layer_index}"
+                    )
+                layer_bit = 1 << layer_index
+                if _refresh_layer_mask & layer_bit:
+                    raise RuntimeError(
+                        "refresh metadata transaction repeats a physical layer: "
+                        f"layer_index={layer_index}"
+                    )
+                _refresh_layer_mask |= layer_bit
+                _refresh_entry_by_layer[layer_index] = entry
+                owner_snapshot = tuple(
+                    sorted(
+                        (int(slot), str(req_id))
+                        for slot, req_id in owner_by_slot.items()
+                    )
+                )
+                if _refresh_owner_snapshot is None:
+                    _refresh_owner_snapshot = owner_snapshot
+                    _refresh_owner_keys.update(owner_snapshot)
+                elif owner_snapshot != _refresh_owner_snapshot:
+                    raise RuntimeError(
+                        "refresh metadata request-slot cohort differs across layers"
+                    )
+                if refresh_receipt is not None:
+                    layer_req_ids = tuple(
+                        sorted(req_id for _, req_id in owner_snapshot)
+                    )
+                    expected_req_ids = tuple(sorted(refresh_receipt.req_ids))
+                    if layer_req_ids != expected_req_ids:
+                        raise RuntimeError(
+                            "refresh metadata layer request cohort does not "
+                            "match its publication receipt: "
+                            f"layer={layer_index} committed={layer_req_ids!r} "
+                            f"expected={expected_req_ids!r}"
+                        )
+            prepared_entries.append(
+                (
+                    entry,
+                    state,
+                    owner_by_slot,
+                    live_owned_slots,
+                    entry_phase,
+                )
+            )
 
+        refresh_cohort_live = True
+        if refresh_receipt is not None:
+            if _refresh_layer_mask != int(refresh_receipt.layer_mask):
+                raise RuntimeError(
+                    "refresh metadata transaction does not match its publication "
+                    f"receipt: committed_mask={_refresh_layer_mask:#x} "
+                    f"expected_mask={int(refresh_receipt.layer_mask):#x}"
+                )
+            refresh_cohort_live = all(
+                _owner_liveness_by_slot_req.get(owner_key, False)
+                for owner_key in _refresh_owner_keys
+            )
+            if refresh_cohort_live:
+                expected_slots = {
+                    int(slot)
+                    for slot, _ in (_refresh_owner_snapshot or tuple())
+                }
+                for layer_index, entry in _refresh_entry_by_layer.items():
+                    committed_slots: Set[int] = set()
+                    for raw_commit in tuple(
+                        entry.get("slot_meta_commits", tuple())
+                    ):
+                        if not isinstance(raw_commit, tuple) or len(raw_commit) != 4:
+                            raise RuntimeError(
+                                "refresh metadata slot commit is malformed: "
+                                f"layer={layer_index}"
+                            )
+                        slot = int(raw_commit[0])
+                        kv_len = int(raw_commit[3])
+                        if slot in committed_slots:
+                            raise RuntimeError(
+                                "refresh metadata repeats a request slot in one layer: "
+                                f"layer={layer_index} slot={slot}"
+                            )
+                        if slot not in expected_slots:
+                            raise RuntimeError(
+                                "refresh metadata commits an unowned request slot: "
+                                f"layer={layer_index} slot={slot}"
+                            )
+                        if kv_len <= 0:
+                            raise RuntimeError(
+                                "refresh metadata commits an empty compact row: "
+                                f"layer={layer_index} slot={slot} kv_len={kv_len}"
+                            )
+                        committed_slots.add(slot)
+                    if committed_slots != expected_slots:
+                        raise RuntimeError(
+                            "refresh metadata does not cover the exact request "
+                            f"cohort: layer={layer_index} "
+                            f"missing_slots={sorted(expected_slots - committed_slots)!r}"
+                        )
+
+        for (
+            entry,
+            state,
+            owner_by_slot,
+            live_owned_slots,
+            entry_phase,
+        ) in prepared_entries:
             def _tracked_slot(raw_slot: object, *, field: str) -> int:
                 slot = int(raw_slot)
                 if slot not in owner_by_slot:
@@ -1991,12 +2345,21 @@ class RefreshRebuildMixin:
                     )
                 return slot
 
+            if (
+                entry_phase == "refresh"
+                and refresh_receipt is not None
+                and not refresh_cohort_live
+            ):
+                # A refresh receipt is cohort-atomic. If any submission owner
+                # is gone, publish none of its layers; non-refresh entries in a
+                # mixed round may still commit independently.
+                continue
             if not live_owned_slots:
                 # The producing request completed or the physical slot was
                 # rebound before publication.  Its GPU write targets an obsolete
                 # lease and must not mutate metadata for the new owner.
                 continue
-            if str(entry.get("phase", "")) == "refresh":
+            if entry_phase == "refresh":
                 state.last_reason = "refresh"
             for raw_slot in tuple(entry.get("reset_slot_commits", tuple())):
                 slot = _tracked_slot(raw_slot, field="reset_slot_commits")
@@ -2091,7 +2454,11 @@ class RefreshRebuildMixin:
                 if slot not in live_owned_slots:
                     continue
                 if slot < 0 or slot >= len(state.compact_kv_len):
-                    continue
+                    raise RuntimeError(
+                        "deferred compact metadata commit references a live slot "
+                        f"outside compact storage: slot={slot} "
+                        f"capacity={len(state.compact_kv_len)}"
+                    )
                 state.compact_sink_len[slot] = int(raw_sink_len)
                 state.compact_persist_len[slot] = int(raw_persist_len)
                 state.compact_kv_len[slot] = int(raw_kv_len)
@@ -2101,8 +2468,13 @@ class RefreshRebuildMixin:
                 slot = _tracked_slot(raw_slot, field="pad_marker_commits")
                 if slot not in live_owned_slots:
                     continue
-                if 0 <= slot < len(state.compact_pad_zeroed_len):
-                    state.compact_pad_zeroed_len[slot] = int(raw_marker)
+                if slot < 0 or slot >= len(state.compact_pad_zeroed_len):
+                    raise RuntimeError(
+                        "deferred compact pad marker references a live slot "
+                        f"outside compact storage: slot={slot} "
+                        f"capacity={len(state.compact_pad_zeroed_len)}"
+                    )
+                state.compact_pad_zeroed_len[slot] = int(raw_marker)
             for raw_slot in tuple(entry.get("bootstrap_slots", tuple())):
                 slot = _tracked_slot(raw_slot, field="bootstrap_slots")
                 if slot not in live_owned_slots:
@@ -2112,37 +2484,79 @@ class RefreshRebuildMixin:
                         f"bootstrap slot {slot} has empty compact buffer after rebuild"
                     )
             state.bump_compact_meta_epoch()
-
-    def _commit_pending_refresh_rebuild_compact_meta(
-        self,
-        pending: PendingRefreshRebuild,
-    ) -> None:
-        commit_log = getattr(pending, "compact_meta_commit_log", None)
-        if not commit_log:
-            pending.compact_meta_commit_log = None
-            return
-        self._commit_compact_meta_log_entries(
-            tuple(commit_log), source="pending_rebuild"
+        if refresh_receipt is not None and not refresh_cohort_live:
+            return tuple()
+        if not _refresh_owner_keys:
+            return None
+        return tuple(
+            sorted(
+                {
+                    req_id
+                    for slot, req_id in _refresh_owner_keys
+                    if _owner_liveness_by_slot_req.get((slot, req_id), False)
+                }
+            )
         )
-        pending.compact_meta_commit_log = None
+
+    def _stage_flush_compact_meta_round(
+        self,
+        *,
+        buf_id: int,
+        commit_log: Sequence[Dict[str, object]],
+        refresh_payloads: Sequence["SelectorBatchPayload"],
+    ) -> None:
+        receipt = self._freeze_refresh_publish_receipt(refresh_payloads)
+        rounds_by_buf = getattr(self, "_flush_compact_meta_rounds_by_buf", None)
+        target_size = max(
+            int(buf_id) + 1,
+            len(getattr(self, "chunk_done_evt", ()) or ()),
+        )
+        if not isinstance(rounds_by_buf, list):
+            rounds_by_buf = [[] for _ in range(target_size)]
+            self._flush_compact_meta_rounds_by_buf = rounds_by_buf
+        elif len(rounds_by_buf) < target_size:
+            rounds_by_buf.extend(
+                [] for _ in range(target_size - len(rounds_by_buf))
+            )
+        rounds_by_buf[int(buf_id)].append(
+            DeferredCompactMetaRound(
+                commit_log=tuple(commit_log),
+                refresh_receipt=receipt,
+            )
+        )
 
     def _commit_flush_compact_meta_for_buf(self, buf_id: int) -> None:
-        commit_logs = getattr(self, "_flush_compact_meta_commit_log_by_buf", None)
-        if not isinstance(commit_logs, list) or not commit_logs:
+        rounds_by_buf = getattr(self, "_flush_compact_meta_rounds_by_buf", None)
+        if not isinstance(rounds_by_buf, list) or not rounds_by_buf:
             return
-        buf = int(buf_id) % len(commit_logs)
+        buf = int(buf_id) % len(rounds_by_buf)
         # [FLUSH-META-LOG-QUEUE 2026-07-08] 槽=轮队列(见 flush_worker stage
         # 侧注释:覆写形态会静默丢整轮 slot_meta/翻代提交)。按 stage 顺序
         # 逐轮 commit,轮边界保持=parity 守卫语义不变。
-        rounds = commit_logs[buf]
+        rounds = rounds_by_buf[buf]
         if not rounds:
-            commit_logs[buf] = []
+            rounds_by_buf[buf] = []
             return
-        commit_logs[buf] = []
-        for round_idx, commit_log in enumerate(rounds):
-            if commit_log:
-                self._commit_compact_meta_log_entries(
-                    tuple(commit_log), source=f"flush_buf{buf}#{round_idx}"
+        rounds_by_buf[buf] = []
+        for round_idx, publish_round in enumerate(rounds):
+            if not isinstance(publish_round, DeferredCompactMetaRound):
+                raise RuntimeError(
+                    "flush compact metadata queue contains an obsolete round"
+                )
+            live_req_ids: Optional[Tuple[str, ...]] = None
+            if (
+                publish_round.commit_log
+                or publish_round.refresh_receipt is not None
+            ):
+                live_req_ids = self._commit_compact_meta_log_entries(
+                    publish_round.commit_log,
+                    source=f"flush_buf{buf}#{round_idx}",
+                    refresh_receipt=publish_round.refresh_receipt,
+                )
+            if publish_round.refresh_receipt is not None:
+                self._publish_refresh_receipt(
+                    publish_round.refresh_receipt,
+                    live_req_ids=live_req_ids,
                 )
 
     # ------------------------------------------------------------------
@@ -2445,26 +2859,19 @@ class RefreshRebuildMixin:
         pending: PendingRefreshRebuild,
         result: "SelectorResult",
     ) -> None:
-        defer_compact_meta_publish = bool(
-            getattr(pending, "compact_meta_defer_publish", False)
-        )
-        pending.compact_meta_defer_publish = False
-        compact_meta_commit_log: Optional[List[Dict[str, object]]] = (
-            [] if defer_compact_meta_publish else None
-        )
+        compact_meta_commit_log: List[Dict[str, object]] = []
         fused_ok = self._rebuild_compact_slots_batched_layers_from_selection(
             pending.payloads,
             result.selected_indices,
             phase=pending.rebuild_phase,
             bootstrap_slots_by_layer=pending.bootstrap_slots_by_layer,
-            defer_compact_meta_publish=bool(defer_compact_meta_publish),
+            defer_compact_meta_publish=True,
             compact_meta_commit_log=compact_meta_commit_log,
         )
         if not fused_ok:
             pending.compact_meta_commit_log = None
             raise RuntimeError("pending refresh compact rebuild: fused gather failed")
-        if defer_compact_meta_publish:
-            pending.compact_meta_commit_log = compact_meta_commit_log
+        pending.compact_meta_commit_log = compact_meta_commit_log
 
 
     def _mark_pending_refresh_rebuild_accepted(
@@ -2767,6 +3174,7 @@ class RefreshRebuildMixin:
             self._resolve_refresh_lease(
                 req_ids=drop_req_ids,
                 reason=str(reason),
+                publish_key=self._pending_refresh_rebuild_publish_key(pending),
             )
         self._restore_pending_refresh_rebuild_buf_state(prior_buf_state)
 
@@ -3111,6 +3519,9 @@ class RefreshRebuildMixin:
                 self._resolve_refresh_lease(
                     req_ids=drop_req_ids,
                     reason="pending_rebuild_target_scope_stale",
+                    publish_key=self._pending_refresh_rebuild_publish_key(
+                        pending
+                    ),
                 )
             return None
 
@@ -3129,7 +3540,8 @@ class RefreshRebuildMixin:
             profile_enabled = bool(self._refresh_profile_enabled())
             writer_t0_ns = time.perf_counter_ns() if profile_enabled else 0
             try:
-                pending.compact_meta_defer_publish = bool(do_async)
+                # Sync and async writers share one metadata transaction. The
+                # later read-side boundary owns both commit and receipt.
                 self._run_pending_refresh_rebuild_compact_writer(
                     pending,
                     pending.result,
@@ -3193,39 +3605,27 @@ class RefreshRebuildMixin:
                 self._resolve_refresh_lease(
                     req_ids=drop_req_ids,
                     reason="pending_rebuild_target_scope_stale",
+                    publish_key=self._pending_refresh_rebuild_publish_key(
+                        pending
+                    ),
                 )
             return
 
         result = self._resolve_pending_refresh_rebuild_result(pending)
         if result is None:
             return
-        self._publish_pending_refresh_rebuild_selection_tracking(pending, result)
-        pending.tracking_published = True
-        # The fallback submitters call this body inline on the consumer CUDA
-        # stream.  They still need the same atomic compact-metadata transaction
-        # as the asynchronous producer: dual-gen writers target the inactive
-        # half, so no layer may flip its read generation until every layer's
-        # writer launch has been submitted.  Deferring here and committing
-        # immediately after the writer preserves stream ordering without a GPU
-        # synchronize or an extra event.  This path is deadline/finished-drain
-        # only; the steady async producer keeps its writer-done publication
-        # boundary.
-        pending.compact_meta_defer_publish = True
+        # Deadline submitters run inline on the consumer CUDA stream. The
+        # writer launch therefore orders the next consumer without a new event,
+        # but host-visible compact metadata and request readiness still share
+        # the same commit-before-publish boundary as the async path.
         self._run_pending_refresh_rebuild_compact_writer(pending, result)
-        self._commit_pending_refresh_rebuild_compact_meta(pending)
+        self._publish_pending_refresh_rebuild_read_side(pending)
         self._mark_pending_refresh_rebuild_accepted(pending)
 
     def _submit_pending_refresh_rebuild_batch(
         self,
         pending_items: Sequence[PendingRefreshRebuild],
     ) -> None:
-        if (
-            type(self)._submit_pending_refresh_rebuild
-            is not RefreshRebuildMixin._submit_pending_refresh_rebuild
-        ):
-            for pending in pending_items:
-                self._submit_pending_refresh_rebuild(pending)
-            return
         # Off-loop pre-publish defense (spec 2026-05-10): skip any pending
         # whose writer_done_event was already recorded at enqueue time. Such
         # pendings must be drained via the wait-only branch in
@@ -3237,95 +3637,14 @@ class RefreshRebuildMixin:
         ]
         if not pendings:
             return
-        first = pendings[0].payloads[0]
-        device = first.key_cache.device
-        for pending in pendings[1:]:
-            cur_payload = pending.payloads[0]
-            if cur_payload.key_cache.device != device:
-                for item in pendings:
-                    self._submit_pending_refresh_rebuild(item)
-                return
-        self._ensure_refresh_stream(device)
-        do_async = (
-            self.refresh_stream is not None
-            and self.chunk_ready_evt
-            and self.chunk_done_evt
-            and self._async_refresh_enabled()
-        )
-        if do_async and _is_stream_capturing_or_raise(
-            stage="pending_refresh_rebuild_submit_batch"
-        ):
-            do_async = False
-        if do_async:
-            # This fallback submit path clears pending state at the call site and
-            # has no per-pending writer_done_event publication boundary. Keep it
-            # synchronous; the normal off-loop enqueue path remains async.
-            do_async = False
-
-        buf_ids: List[int] = []
         for pending in pendings:
             for buf in self._pending_refresh_rebuild_buf_ids(pending):
-                buf_ids.append(int(buf))
                 self._pending_work_mark_submitted(
                     buf_id=buf,
                     kind="refresh",
-                    async_mode=do_async,
+                    async_mode=False,
                     epoch=self.step_context_epoch,
                 )
-        unique_buf_ids = tuple(sorted(set(buf_ids)))
-        if do_async:
-            def _run_all_bodies() -> bool:
-                for pending in pendings:
-                    self._run_pending_refresh_rebuild_body(pending)
-                return True
-            self._record_async_refresh_work(
-                device=device,
-                buf_ids=unique_buf_ids,
-                body=_run_all_bodies,
-            )
-        else:
-            for pending in pendings:
-                self._run_pending_refresh_rebuild_body(pending)
-
-    def _submit_pending_refresh_rebuild(self, pending: PendingRefreshRebuild) -> None:
-        payloads = pending.payloads
-        if not payloads:
-            return
-        first = payloads[0]
-        device = first.key_cache.device
-        self._ensure_refresh_stream(device)
-        do_async = (
-            self.refresh_stream is not None
-            and self.chunk_ready_evt
-            and self.chunk_done_evt
-            and self._async_refresh_enabled()
-        )
-        if do_async and _is_stream_capturing_or_raise(stage="pending_refresh_rebuild_submit"):
-            do_async = False
-        if do_async:
-            # This fallback submit path does not retain a writer_done_event on
-            # the pending item, so async execution would expose metadata before
-            # the lifecycle commit boundary.
-            do_async = False
-
-        pending_buf_ids = self._pending_refresh_rebuild_buf_ids(pending)
-        for buf in pending_buf_ids:
-            self._pending_work_mark_submitted(
-                buf_id=buf,
-                kind="refresh",
-                async_mode=do_async,
-                epoch=self.step_context_epoch,
-            )
-        if do_async:
-            def _run_one_body() -> bool:
-                self._run_pending_refresh_rebuild_body(pending)
-                return True
-            self._record_async_refresh_work(
-                device=device,
-                buf_ids=pending_buf_ids,
-                body=_run_one_body,
-            )
-        else:
             self._run_pending_refresh_rebuild_body(pending)
 
     # ------------------------------------------------------------------
@@ -3634,9 +3953,9 @@ class RefreshRebuildMixin:
         # 异步 refresh 启用且不处于 cudagraph capture 时，立即在 refresh
         # stream 上跑 selector + writer，把 writer_done_event 录到 pending；
         # drain 只 wait + publish + accept，不再触发 selector/writer 启动。
-        # tracking publish 仍延迟到 drain：它会 mutate request ticket /
-        # scheduled_decode_refresh_step，必须在 GPU writer 完成后才能让下
-        # 一次 trigger 看到正确状态。
+        # read-side publish 仍延迟到 drain：只有 writer/metadata 收据可以
+        # 推进物理 layer mask 并解除 dense-consume；trigger 决策已在 host enqueue
+        # commit 闭合，不读取该 rank-local 完成时序。
         if (
             payloads
             and self._async_refresh_enabled()
@@ -3885,7 +4204,6 @@ class RefreshRebuildMixin:
                                 torch.cuda.current_stream(device=device)
                             )
                         try:
-                            pending.compact_meta_defer_publish = True
                             self._run_pending_refresh_rebuild_compact_writer(
                                 pending,
                                 sel,
@@ -4159,13 +4477,13 @@ class RefreshRebuildMixin:
             isinstance(ledger, list)
             and ledger_size == ring_size
             and len(ledger) == ring_size
-            and all(isinstance(entry, list) and len(entry) == 9 for entry in ledger)
         ):
             return
         self._step_refresh_handle_ledger_size = ring_size
         self._step_refresh_handle_ledger = [
             [-1, -1, 0, 0, 0, 0, 0, 0, 0] for _ in range(ring_size)
         ]
+        self._step_refresh_handle_checked_through = 0
 
     def _step_refresh_handle_ledger_clear_slot(self, *, slot: int) -> None:
         ledger = self._step_refresh_handle_ledger
@@ -4190,10 +4508,17 @@ class RefreshRebuildMixin:
     ) -> Optional[List[int]]:
         if handle_id <= 0 or handle_generation <= 0:
             return None
-        self._step_refresh_handle_ledger_ensure()
+        if (
+            self._step_refresh_handle_ledger_size <= 0
+            or len(self._step_refresh_handle_ledger)
+            != self._step_refresh_handle_ledger_size
+        ):
+            self._step_refresh_handle_ledger_ensure()
         ring_size = self._step_refresh_handle_ledger_size
         slot = handle_id % ring_size
         entry = self._step_refresh_handle_ledger[slot]
+        if not isinstance(entry, list) or len(entry) != 9:
+            raise RuntimeError("refresh commit handle-ledger entry is malformed")
         if entry[0] != handle_id or entry[1] != handle_generation:
             return None
         return entry
@@ -4205,19 +4530,44 @@ class RefreshRebuildMixin:
         stage: str,
     ) -> None:
         self._step_refresh_handle_ledger_ensure()
-        close_before_handle = next_handle_hint - 1
-        if close_before_handle <= 0:
+        # StepHandle IDs are allocated strictly monotonically. Beginning N
+        # closes through N-2 (one prepare cycle of grace); the cursor validates
+        # each newly expired ring slot exactly once instead of rescanning all
+        # 128 slots at both prepare and begin.
+        close_through_handle = int(next_handle_hint) - 2
+        checked_through = int(self._step_refresh_handle_checked_through)
+        if close_through_handle <= checked_through:
             return
+        ring_size = self._step_refresh_handle_ledger_size
+        if close_through_handle - checked_through > ring_size:
+            raise RuntimeError(
+                "refresh commit handle-ledger validation fell behind its ring: "
+                f"checked_through={checked_through} "
+                f"close_through={close_through_handle} ring={ring_size}"
+            )
         noop_empty = self._step_profile_refresh_noop_empty
         payload_none = self._step_profile_refresh_payload_none
         slot_empty = self._step_profile_refresh_slot_empty
-        for slot, entry in enumerate(self._step_refresh_handle_ledger):
-            handle_id = entry[0]
-            if handle_id <= 0:
+        for handle_id in range(
+            max(1, checked_through + 1),
+            close_through_handle + 1,
+        ):
+            slot = handle_id % ring_size
+            entry = self._step_refresh_handle_ledger[slot]
+            if not isinstance(entry, list) or len(entry) != 9:
+                raise RuntimeError(
+                    "refresh commit handle-ledger entry is malformed"
+                )
+            recorded_handle_id = entry[0]
+            if recorded_handle_id <= 0:
                 continue
-            # 给上一 step 一个 prepare 周期的缓冲，避免"先 prepare 后执行"的时序误报。
-            if handle_id >= close_before_handle:
-                continue
+            if recorded_handle_id != handle_id:
+                raise RuntimeError(
+                    "refresh commit handle-ledger slot was overwritten before "
+                    "validation: "
+                    f"expected={handle_id} actual={recorded_handle_id} "
+                    f"slot={slot} stage={stage}"
+                )
             handle_generation = entry[1]
             planned = entry[2]
             planned_rows = entry[3]
@@ -4256,6 +4606,7 @@ class RefreshRebuildMixin:
                     f"slot_empty={slot_empty})"
                 )
             self._step_refresh_handle_ledger_clear_slot(slot=slot)
+        self._step_refresh_handle_checked_through = close_through_handle
 
     def _step_refresh_commit_begin(
         self,
@@ -4292,8 +4643,6 @@ class RefreshRebuildMixin:
         self._step_refresh_commit_num_actual_tokens = max(0, num_actual_tokens)
         self._step_refresh_commit_payload_enqueues = 0
         self._step_refresh_commit_replay_payload_claims = 0
-        self._step_refresh_commit_written_handle_id = commit_handle_id
-        self._step_refresh_commit_written_handle_generation = commit_handle_generation
         self._step_refresh_commit_written_req_ids.clear()
         self._step_refresh_handle_ledger_ensure()
         ring_size = self._step_refresh_handle_ledger_size
@@ -4309,18 +4658,6 @@ class RefreshRebuildMixin:
         entry[7] = 0
         entry[8] = commit_identity_token
         return self._step_refresh_commit_id
-
-    def _step_refresh_commit_note_enqueue(
-        self,
-        *,
-        handle_id: int,
-        handle_generation: int,
-    ) -> None:
-        self._step_refresh_commit_note_enqueues(
-            handle_id=handle_id,
-            handle_generation=handle_generation,
-            count=1,
-        )
 
     def _step_refresh_commit_note_enqueues(
         self,
@@ -4434,37 +4771,62 @@ class RefreshRebuildMixin:
             f"enqueued={enqueued} expected={expected_payload_count}"
         )
 
-    def _step_refresh_commit_note_inflight_from_payload(self, payload: "SelectorBatchPayload") -> None:
-        """Commit-phase single writer for scheduled refresh markers.
+    def _step_refresh_commit_note_inflight_from_payload(
+        self,
+        payload: "SelectorBatchPayload",
+        *,
+        layer_indices: Optional[Sequence[int]] = None,
+    ) -> None:
+        """Commit one producer generation and its exact physical layer set.
 
-        Planner must stay pure (no inflight write). We only mark scheduled_* after
-        payload enqueue succeeds to avoid silent trigger loss on ghost plans.
+        Planner stays pure. Trigger state closes at this deterministic host
+        commit, while the read-side ledger remains until writer publication.
         """
-        state = getattr(payload, "state", None)
-        if state is None:
-            return
-        payload_handle_id = int(getattr(payload, "capture_handle_id", -1))
-        payload_handle_generation = int(getattr(payload, "capture_handle_generation", -1))
+        state = payload.state
+        if layer_indices is None:
+            normalized_layer_indices = (int(getattr(state, "layer_index", -1)),)
+        else:
+            normalized_layer_indices = tuple(int(v) for v in layer_indices)
+        layer_mask = 0
+        for layer_index in normalized_layer_indices:
+            if layer_index < 0:
+                raise RuntimeError(
+                    "refresh commit requires non-negative global layer indices"
+                )
+            layer_bit = 1 << layer_index
+            if layer_mask & layer_bit:
+                raise RuntimeError(
+                    "refresh commit contains a duplicate global layer index: "
+                    f"layer={layer_index}"
+                )
+            layer_mask |= layer_bit
+        if layer_mask == 0:
+            raise RuntimeError("refresh commit requires at least one physical layer")
+        payload_handle_id = int(payload.capture_handle_id)
+        payload_handle_generation = int(payload.capture_handle_generation)
         if payload_handle_id <= 0 or payload_handle_generation <= 0:
             raise RuntimeError(
                 "refresh commit inflight update missing payload handle identity: "
                 f"handle_id={payload_handle_id} generation={payload_handle_generation}"
             )
         if (
-            self._step_refresh_commit_written_handle_id != payload_handle_id
-            or self._step_refresh_commit_written_handle_generation
+            self._step_refresh_commit_handle_id != payload_handle_id
+            or self._step_refresh_commit_handle_generation
             != payload_handle_generation
         ):
-            self._step_refresh_commit_written_handle_id = payload_handle_id
-            self._step_refresh_commit_written_handle_generation = payload_handle_generation
-            self._step_refresh_commit_written_req_ids.clear()
-        batch_req_ids = getattr(state, "batch_request_ids", None)
+            raise RuntimeError(
+                "refresh payload does not belong to the active step commit: "
+                f"payload=({payload_handle_id}, {payload_handle_generation}) "
+                f"active=({self._step_refresh_commit_handle_id}, "
+                f"{self._step_refresh_commit_handle_generation})"
+            )
+        batch_req_ids = state.batch_request_ids
         if batch_req_ids is None:
             raise RuntimeError("refresh commit requires state.batch_request_ids snapshot")
-        slot_list = getattr(payload, "slot_list", None)
+        slot_list = payload.slot_list
         if not slot_list:
             return
-        raw_slot_req_ids = getattr(payload, "slot_req_ids", None)
+        raw_slot_req_ids = payload.slot_req_ids
         slot_req_ids: Optional[Tuple[str, ...]] = None
         if raw_slot_req_ids is not None:
             slot_req_ids = self._normalize_refresh_req_ids(raw_slot_req_ids)
@@ -4475,6 +4837,7 @@ class RefreshRebuildMixin:
                 )
         request_states = self.request_states
         tickets = self._request_intent_tickets
+        publish_key = (payload_handle_id, payload_handle_generation)
         for idx, slot in enumerate(slot_list):
             if slot_req_ids is not None:
                 req_id = slot_req_ids[idx]
@@ -4488,20 +4851,47 @@ class RefreshRebuildMixin:
                 req_id = batch_req_ids[slot_idx]
             if not req_id or _is_free_slot_id(req_id):
                 continue
-            if req_id in self._step_refresh_commit_written_req_ids:
-                continue
             tracking = request_states.get(req_id)
-            ticket = tickets.get(req_id)
-            if tracking is None or ticket is None or (not ticket.pending_refresh):
+            if tracking is None:
                 continue
+            if req_id in self._step_refresh_commit_written_req_ids:
+                if tracking.refresh_publish_key != publish_key:
+                    raise RuntimeError(
+                        "refresh producer layer set lost its generation owner: "
+                        f"request={req_id!r} expected={publish_key!r} "
+                        f"actual={tracking.refresh_publish_key!r}"
+                    )
+                if tracking.refresh_publish_sealed:
+                    raise RuntimeError(
+                        "refresh producer appended layers after generation seal"
+                    )
+                enqueued_mask = int(tracking.refresh_publish_enqueued_layer_mask)
+                duplicate_mask = enqueued_mask & layer_mask
+                if duplicate_mask:
+                    raise RuntimeError(
+                        "refresh producer enqueued the same physical layer twice: "
+                        f"request={req_id!r} duplicate_mask={duplicate_mask:#x}"
+                    )
+                tracking.refresh_publish_enqueued_layer_mask = (
+                    enqueued_mask | layer_mask
+                )
+                continue
+            ticket = tickets.get(req_id)
+            if ticket is None or (not ticket.pending_refresh):
+                continue
+            if tracking.refresh_publish_key is not None:
+                raise RuntimeError(
+                    "refresh producer overlap before prior physical publication: "
+                    f"request={req_id!r} prior={tracking.refresh_publish_key!r} "
+                    f"next={publish_key!r}"
+                )
             pending_step = ticket.pending_decode_step
             if pending_step < 0:
                 pending_step = int(tracking.decode_step) if tracking.decode_step is not None else -1
-            pending_ctrl_step = ticket.pending_ctrl_step
-            if pending_ctrl_step < 0:
-                pending_ctrl_step = self.step_context_epoch
-            tracking.scheduled_decode_refresh_step = pending_step
-            tracking.scheduled_refresh_ctrl_step = pending_ctrl_step
+            tracking.refresh_publish_key = publish_key
+            tracking.refresh_publish_enqueued_layer_mask = layer_mask
+            tracking.refresh_publish_published_layer_mask = 0
+            tracking.refresh_publish_sealed = False
             # [TP-DET-TRIGGER 2026-07-07] 决策终局提交点化(TP>1 NCCL 发散根修):
             # 触发线的全部决策状态在 enqueue 成功的 commit 点一次性终局——该点
             # 是纯 host 同步路径(方案 B single-writer),对所有 TP rank 逐 step
@@ -4511,8 +4901,8 @@ class RefreshRebuildMixin:
             # GPU 完成从此只服务读侧路由(off-rail/compact),不进决策。
             pending_policy_commit = int(ticket.pending_policy)
             pending_reason_commit = int(ticket.pending_reason_code)
-            # 读侧在飞镜像:reason/policy 存续到 publish final(读侧闸消费:
-            # dense-consume 防 torn-read + short_dense crossing 保护)。
+            # 读侧 reason/policy 随物理发布账本存续，供 dense-consume
+            # 防 torn-read；short-dense 可读性由独立状态承载。
             tracking.inflight_reason_code = pending_reason_commit
             tracking.inflight_policy = pending_policy_commit
             tracking.last_refresh_step = self.step_context_epoch
@@ -4524,7 +4914,7 @@ class RefreshRebuildMixin:
             # 时钟推进到提交点 decode_step——host 计划量,[TP-DET-TRIGGER] 合同
             # 保持(与上方 pending_step<0 fallback 同源,非 GPU 完成时刻)。
             # max()=decode 时钟未立(bootstrap,-1)回退票面;post_bridge lookahead
-            # 票(票面=step+1)不倒退。scheduled_* 保留票面(意图/观测语义不变)。
+            # 票(票面=step+1)不倒退。
             _commit_decode_step = (
                 int(tracking.decode_step)
                 if tracking.decode_step is not None
@@ -4541,7 +4931,9 @@ class RefreshRebuildMixin:
                 or pending_reason_commit
                 == int(PendingReasonCode.COMPACT_THRESHOLD_CROSSED)
             ):
-                tracking._was_short_dense = False
+                # 这里只终结 TP 决策锁存；dense_until_compact_ready 是读侧
+                # 权威，必须留到 writer 完成后的统一 publish boundary。
+                tracking.short_dense_decision_active = False
             # [REFRESH-AMNESTY 2026-07-12] 电平语义大赦(规范:sentence/interval
             # =同一"需要 refresh"电平的两个信号源,任一 refresh 兑现即统一消解,
             # 不冲突不堆积;TRIGGER_INTERPLAY_AUDIT_2026-07-12.md §3/§6):本请求
@@ -4562,7 +4954,7 @@ class RefreshRebuildMixin:
             if 0 <= _amn_intent_step <= _amnesty_last:
                 self._clear_request_trigger_intent(request_id=req_id)
             # ② lease_rearm(G-2 堆积实锤,审查档 §5-P2):rearm 置位(世代作废
-            #   行需重排)与 scheduled_*/inflight_* 清除同步,其后任何 commit
+            #   行需重排)与读侧世代清除同步,其后任何 commit
             #   必属新世代 ⇒ 本次提交已重建该行,rearm 诉求满足;不清则 gap
             #   放行后再开 FORCE_NOW 世代=同一需求二次兑现。rearm_step>提交步
             #   (commit 后新置)不赦,保留新电平。
@@ -4580,12 +4972,10 @@ class RefreshRebuildMixin:
             )
             if 0 <= _amn_due_step <= _amnesty_last:
                 tracking.post_bridge_refresh_due_decode_step = -1
-            # 票转 consumed:决策面生命周期在提交点闭合(ready_compact=False
-            # 不触碰刚写入的 scheduled_*;scheduled 转为读侧/观测语义,其读侧
-            # 清除仍在 publish final——读路由允许 per-rank 时序,近似语义)。
+            # 票转 consumed:决策面生命周期在提交点闭合。物理发布账本不属于
+            # ticket，由 writer/metadata 收据单独闭合。
             self._clear_request_pending_refresh(
                 request_id=req_id,
-                ready_compact=False,
             )
             self._step_refresh_commit_written_req_ids.add(req_id)
 
@@ -4619,7 +5009,7 @@ class RefreshRebuildMixin:
         out: List[str] = []
         seen: Set[str] = set()
         for rid in req_ids:
-            if not rid:
+            if not rid or _is_free_slot_id(rid):
                 continue
             rid_str = str(rid)
             if rid_str in seen:
@@ -4633,21 +5023,27 @@ class RefreshRebuildMixin:
         *,
         req_ids: Sequence[str],
         reason: str,
+        publish_key: Tuple[int, int],
     ) -> None:
         normalized_ids = self._normalize_refresh_req_ids(tuple(req_ids) if req_ids is not None else tuple())
         if not normalized_ids:
             return
+        expected_key = (int(publish_key[0]), int(publish_key[1]))
+        if expected_key[0] <= 0 or expected_key[1] <= 0:
+            raise RuntimeError(
+                "refresh lease invalidation requires a positive publication generation"
+            )
         changed = False
         reason_str = reason
         for rid in normalized_ids:
             tracking = self.request_states.get(rid)
             if tracking is None:
                 continue
-            tracking.scheduled_refresh_ctrl_step = -1
-            tracking.scheduled_decode_refresh_step = -1
-            # [TP-DET-TRIGGER] lease 重排=世代作废,读侧在飞镜像同步清除。
-            tracking.inflight_reason_code = -1
-            tracking.inflight_policy = -1
+            if tracking.refresh_publish_key != expected_key:
+                continue
+            # Lease 重排作废整个物理世代；旧 writer 之后到达时因 handle
+            # identity 不再匹配，不能终结或污染新世代。
+            RefreshRebuildMixin._reset_request_refresh_publish_state(tracking)
             try:
                 cur_decode = int(tracking.decode_step) if tracking.decode_step is not None else -1
             except Exception:
@@ -4724,9 +5120,10 @@ class RefreshRebuildMixin:
                 "refresh capture enqueue missing payload handle identity: "
                 f"handle_id={payload_handle_id} generation={payload_handle_generation}"
             )
-        self._step_refresh_commit_note_enqueue(
+        self._step_refresh_commit_note_enqueues(
             handle_id=payload_handle_id,
             handle_generation=payload_handle_generation,
+            count=1,
         )
         # [DETERMINISTIC-REQIDS-SNAPSHOT 2026-07-03] slot_req_ids 提交步物化:
         # 多数构造点不填该字段,deferred 消费点曾 fallback 读 live 的

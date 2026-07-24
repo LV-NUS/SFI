@@ -19,7 +19,7 @@ def classify_one_shot_decode_admission(
     row_policy_ready_by_row: tuple[bool, ...],
     request_states: Mapping[str, object],
     can_bridge_bootstrap_decode: Callable[[str], object],
-    compact_ready_all_layers: Callable[[str], object],
+    diagnose_compact_ready_all_layers: Callable[[str], object],
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
     if len(row_policy_ready_by_row) != len(req_ids):
         raise RuntimeError(
@@ -46,7 +46,7 @@ def classify_one_shot_decode_admission(
         tracking = request_states.get(rid)
         if (
             bool(getattr(tracking, "bootstrap_done", False))
-            and bool(compact_ready_all_layers(rid))
+            and bool(diagnose_compact_ready_all_layers(rid))
         ):
             continue
         blocked_not_ready.append(rid)

@@ -1342,8 +1342,8 @@ class PendingRefreshRebuild:
     #    buffers; compact writer completion remains tracked by writer_done_event.
     #    The waited keys are per consumer stream; a single boolean would hide
     #    multi-stream replay hazards.
-    #  - tracking_published: drain idempotency flag so a re-drain (e.g.
-    #    supersede edge case) does not republish selection tracking twice.
+    #  - read_side_published: drain idempotency flag so a re-drain (e.g.
+    #    supersede edge case) does not republish metadata/tracking/readiness.
     #  - producer_work_item: frozen enqueue-time descriptor for deadline,
     #    layer span, and decode-step attribution. Consumer drain reads this
     #    instead of re-deriving producer metadata from request state.
@@ -1355,13 +1355,30 @@ class PendingRefreshRebuild:
     writer_done_event: Any = None
     writer_done_event_waited_for_replay_key: Tuple[int, int] | None = None
     writer_release_after_handle_id: int = -1
-    tracking_published: bool = False
-    compact_meta_defer_publish: bool = False
+    read_side_published: bool = False
     compact_meta_commit_log: Optional[List[Dict[str, object]]] = None
     # [SELECTED-OUT-RING 2026-07-09] 本 pending 的 selector run 占用的稳定环
     # 槽(spill/环关闭=None)。终局唯一漏斗 _pending_refresh_rebuild_clear
     # 释放(存 writer_done_event 消费序);释放前该槽绝不被后续 run 重用。
     selected_out_ring_slot: Any = None
+
+
+@dataclass(frozen=True, slots=True)
+class RefreshPublishReceipt:
+    """Immutable proof for one physically ordered refresh layer set."""
+
+    handle_id: int
+    handle_generation: int
+    req_ids: Tuple[str, ...]
+    layer_mask: int
+
+
+@dataclass(frozen=True, slots=True)
+class DeferredCompactMetaRound:
+    """One async writer round and its request-facing publication receipt."""
+
+    commit_log: Tuple[Dict[str, object], ...]
+    refresh_receipt: Optional[RefreshPublishReceipt]
 
 
 def _normalize_prefill_capture_config(config: SparseControllerConfig) -> None:
@@ -1408,10 +1425,6 @@ class RequestTracking:
 
     last_seq_len: int = 0
     trigger: Optional[RefreshTrigger] = None
-    # refresh 计划时 latch 的 decode_step（用于异步 refresh：避免用"执行时刻"的 decode_step 更新 last_decode_refresh_step）
-    scheduled_decode_refresh_step: int = -1
-    # refresh 计划时 latch 的 controller.step（用于异步 refresh：避免在 refresh 完成前重复计划 interval refresh）
-    scheduled_refresh_ctrl_step: int = -1
     total_prompt_tokens: int = 0
     prompt_chunk_size: int = 0
     prefill_chunks_seen: int = 0
@@ -1443,22 +1456,16 @@ class RequestTracking:
     # Kept as Any to avoid importing CUDA-facing runtime helpers from the
     # shared type module.
     producer_ready_state: Any = None
-    # one-shot deferred bootstrap bridge state. Epochs are scalar generation
-    # counters for the single request-scoped bootstrap job; they do not imply a
-    # second compact arena or multiple active versions.
+    # one-shot deferred bootstrap bridge state. Producer identity and build
+    # epochs live only on the immutable DeferredProducerJob; request tracking
+    # keeps the counters that directly drive bridge routing.
     deferred_producer_job: Any = None
     bootstrap_bridge_active: bool = False
     bridge_token_count: int = 0
     bridge_token_positions: List[int] = field(default_factory=list)
     bridge_max_tokens: int = 0
-    producer_job_epoch: int = -1
     producer_launch_step: int = -1
     bridge_last_counted_epoch: int = -1
-    building_compact_epoch: int = -1
-    ready_compact_epoch: int = -1
-    active_compact_epoch: int = -1
-    bridge_graph_policy: str = ""
-    bootstrap_publish_skipped_reason: str = ""
     # one-shot bridge 后的轻量 catch-up refresh；避免 compact cache 对
     # bridge 后生成 token 的更新完全依赖 sentence trigger 是否碰巧命中。
     # [CREDIT-RETIRE 2026-07-07] post_bridge_refresh_done(credit 状态机)
@@ -1478,12 +1485,22 @@ class RequestTracking:
     lease_rearm: bool = False
     lease_rearm_reason: str = "none"
     lease_rearm_decode_step: int = -1
-    # 短上下文标记（原为动态 setattr，提升为正式字段以配合 slots=True）
-    _was_short_dense: bool = False
-    # [TP-DET-TRIGGER 2026-07-07] 在飞世代的读侧镜像:票在 enqueue commit 点
-    # 转 consumed(决策面),但读侧闸(dense-consume 防 torn-read/short_dense
-    # crossing 保护)需要 reason/policy 存续到 GPU 终局——commit 写入,
-    # selector publish final(读侧终局)清除。决策路径禁止消费。
+    # short-dense 的决定论决策锁存：短态置位，threshold refresh 成功入队后
+    # 在 host commit 点清除。只供触发/物化决策使用，禁止承载 GPU 可读性。
+    short_dense_decision_active: bool = False
+    # short-dense 首个 compact generation 发布前的读侧保护。该状态只在
+    # compact metadata 全层原子发布后清除，不参与 TP trigger 决策。
+    dense_until_compact_ready: bool = False
+    # Refresh 物理发布账本。enqueue/publish 分别按全局 layer id 置位；
+    # last-layer seal 关闭生产端。只有 sealed 且两个精确 layer mask 相等
+    # 才解除读侧在飞状态，避免“重复层收据 + 漏层”被计数相等误判完成。
+    # 该账本不参与 sentence/interval 触发决策，避免把 rank-local GPU
+    # 时序注入 TP 决策。
+    refresh_publish_key: Optional[Tuple[int, int]] = None
+    refresh_publish_enqueued_layer_mask: int = 0
+    refresh_publish_published_layer_mask: int = 0
+    refresh_publish_sealed: bool = False
+    # 读侧 reason/policy 与上述账本同生共灭，仅供 dense-consume 防 torn-read。
     inflight_reason_code: int = -1
     inflight_policy: int = -1
     # TP>1 sentence trigger: 已 feed 给 trigger 的 decode observed 计数

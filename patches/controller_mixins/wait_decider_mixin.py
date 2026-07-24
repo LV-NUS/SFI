@@ -927,18 +927,18 @@ class WaitDeciderMixin:
         # [BOOTSTRAP-MATERIALIZE-GATE 纵深断言 2026-07-10] ready 全层 commit
         # 前,该请求不得有在飞 refresh 世代(chunk 分轮 commit 与本 commit 交错
         # =层间 read_gen 错开=[DUAL-GEN-LAYER-PARITY] 崩)。planner 咽喉门保证
-        # bridge 窗内票一律不 materialize ⇒ scheduled_* 恒 -1(scheduled 仅在
-        # payload enqueue 成功的 commit 路径写入);此处 fail-fast 把门破/交错
+        # bridge 窗内票一律不 materialize ⇒ publish key 恒空；此处 fail-fast 把门破/交错
         # 在源头暴露,替代 parity 守卫的下游兜捕。调用点全部经
         # bootstrap_pending=True 门(ready 后不重复 commit),无误炸面。
-        _sched_ctrl = int(getattr(tracking, "scheduled_refresh_ctrl_step", -1))
-        _sched_decode = int(getattr(tracking, "scheduled_decode_refresh_step", -1))
-        if _sched_ctrl >= 0 or _sched_decode >= 0:
+        publish_key = tracking.refresh_publish_key
+        if publish_key is not None:
             raise RuntimeError(
                 "[BOOTSTRAP-MATERIALIZE-GATE] bootstrap ready commit while a "
                 f"refresh generation is in flight for req={rid!r} "
-                f"(scheduled_refresh_ctrl_step={_sched_ctrl}, "
-                f"scheduled_decode_refresh_step={_sched_decode}): chunk-round "
+                f"(publish_key={publish_key!r}, "
+                f"enqueued={int(tracking.refresh_publish_enqueued_layer_mask).bit_count()}, "
+                f"published={int(tracking.refresh_publish_published_layer_mask).bit_count()}, "
+                f"sealed={bool(tracking.refresh_publish_sealed)}): chunk-round "
                 "commits would interleave with the bootstrap full-layer commit "
                 "(dual-gen layer parity risk); the planner materialize gate "
                 "must hold tickets of bootstrap_pending requests"
@@ -961,9 +961,6 @@ class WaitDeciderMixin:
         if was_bridge_active:
             ep = int(epoch)
             tracking.bootstrap_bridge_active = False
-            if ep >= 0:
-                tracking.ready_compact_epoch = ep
-                tracking.active_compact_epoch = ep
             bridge_token_count = int(getattr(tracking, "bridge_token_count", 0) or 0)
             try:
                 refresh_interval = int(
@@ -1021,12 +1018,6 @@ class WaitDeciderMixin:
                             "bridge_token_positions": list(bridge_token_positions),
                             "producer_launch_step": int(
                                 getattr(tracking, "producer_launch_step", -1)
-                            ),
-                            "ready_compact_epoch": int(
-                                getattr(tracking, "ready_compact_epoch", -1)
-                            ),
-                            "active_compact_epoch": int(
-                                getattr(tracking, "active_compact_epoch", -1)
                             ),
                             "bootstrap_full_kv_handoff": True,
                         },
@@ -1087,11 +1078,6 @@ class WaitDeciderMixin:
             if self._bootstrap_submission_boundary_blocks_publish(rid=rid):
                 continue
             if self._request_bridge_token_budget_remaining(str(rid)):
-                setattr(
-                    tracking,
-                    "bootstrap_publish_skipped_reason",
-                    "bridge_budget_not_exhausted",
-                )
                 continue
             if not WaitDeciderMixin._bootstrap_request_events_submitted(
                 tracking=tracking
@@ -1298,13 +1284,13 @@ class WaitDeciderMixin:
         """Validate the async-prefill submission boundary before publish.
 
         ``bootstrap_done`` is the request lifecycle publication boundary.
-        Row routing is resolved later by StepAuthority after physical compact
-        readiness is checked. The producer's CUDA completion may differ across
-        ranks, but the lifecycle must not become terminal until every rank has
-        submitted its request-local final event. Submission is host-owned
-        state: a device wait cannot create a missing finalize record. The
-        transition ledger keeps steady decode outside both the request scan and
-        all CUDA work.
+        It owns the full-layer compact proof; StepAuthority later consumes that
+        lifecycle without another per-token layer scan. The producer's CUDA
+        completion may differ across ranks, but the lifecycle must not become
+        terminal until every rank has submitted its request-local final event.
+        Submission is host-owned state: a device wait cannot create a missing
+        finalize record. The transition ledger keeps steady decode outside both
+        the request scan and all CUDA work.
         """
         pending_epoch_by_id = getattr(
             self,
@@ -1348,7 +1334,7 @@ class WaitDeciderMixin:
                     "E_TP_BOOTSTRAP_SUBMISSION_LEDGER_BYPASSED: "
                     f"request={rid!r} bootstrap_done before validation"
                 )
-            if bool(getattr(tracking, "_was_short_dense", False)):
+            if tracking.dense_until_compact_ready:
                 raise RuntimeError(
                     "E_TP_BOOTSTRAP_SUBMISSION_LEDGER_SCOPE_DRIFT: "
                     f"request={rid!r} is short-dense"
@@ -1637,11 +1623,6 @@ class WaitDeciderMixin:
             if self._bootstrap_submission_boundary_blocks_publish(rid=rid):
                 continue
             if self._request_bridge_token_budget_remaining(str(rid)):
-                setattr(
-                    tracking,
-                    "bootstrap_publish_skipped_reason",
-                    "bridge_active_without_producer_wait",
-                )
                 continue
             ready_state = getattr(tracking, "producer_ready_state", None)
             if ready_state is not None:
@@ -1661,11 +1642,6 @@ class WaitDeciderMixin:
                     False,
                 )
             ):
-                setattr(
-                    tracking,
-                    "bootstrap_publish_skipped_reason",
-                    "one_shot_producer_ready_state_missing",
-                )
                 continue
             events = tuple(getattr(tracking, "bootstrap_pending_events", tuple()) or tuple())
             if not events or any(evt is None for evt in events):

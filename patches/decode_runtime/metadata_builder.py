@@ -6283,7 +6283,9 @@ def maybe_build_step_decode_data_from_metadata_impl(
                 ],
                 request_states=request_states,
                 can_bridge_bootstrap_decode=self._request_can_bridge_bootstrap_decode,
-                compact_ready_all_layers=self._request_compact_ready_all_layers,
+                diagnose_compact_ready_all_layers=(
+                    self._diagnose_request_compact_ready_all_layers
+                ),
             )
             if blocked_not_ready:
                 blocked_details = []
@@ -6300,7 +6302,8 @@ def maybe_build_step_decode_data_from_metadata_impl(
                                 and bool(step_authority.short_dense_by_row[row])
                             ),
                             "dense_protection_active": bool(
-                                getattr(tracking, "_was_short_dense", False)
+                                tracking is not None
+                                and tracking.dense_until_compact_ready
                             ),
                             "row_mode": (
                                 int(step_authority.row_mode_by_row[row])
@@ -7845,8 +7848,9 @@ def maybe_build_step_decode_data_from_metadata_impl(
             self.step_decode_data.decode_plan_version = int(
                 getattr(step_authority, "decode_plan_version", -1)
             )
-        # NOTE: compact readiness is now checked per-layer in
-        # _build_step_dispatch_plan (CPU-only, no GPU sync).
+        # Compact readiness is proven at lifecycle/refresh publication
+        # boundaries. Dispatch consumes StepAuthority without repeating a
+        # per-layer scan on every decode step.
 
         if (
             self.step_dispatch_plan is None

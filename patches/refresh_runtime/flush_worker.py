@@ -408,13 +408,6 @@ def flush_prefill_batches_impl(
         def _stage_flush_compact_meta_commit_log() -> None:
             if flush_compact_meta_commit_log is None:
                 return
-            commit_logs = getattr(self, "_flush_compact_meta_commit_log_by_buf", None)
-            target_size = max(int(buf) + 1, len(getattr(self, "chunk_done_evt", ()) or ()))
-            if not isinstance(commit_logs, list):
-                commit_logs = [[] for _ in range(target_size)]
-                self._flush_compact_meta_commit_log_by_buf = commit_logs
-            elif len(commit_logs) < target_size:
-                commit_logs.extend([] for _ in range(target_size - len(commit_logs)))
             # [FLUSH-META-LOG-QUEUE 2026-07-08] 槽内容从"单轮(覆写)"改为
             # "轮队列(追加)"。旧形态下,同 buf 在上一轮尚未被 step-prep 消费
             # 前再次 stage(环深 2<每世代 3 chunk 的复用节奏下可达)会静默丢
@@ -423,7 +416,11 @@ def flush_prefill_batches_impl(
             # 不能 merge 成一轮:同层同 slot 双翻会误触 [DUAL-GEN-LAYER-PARITY]
             # 守卫;消费端按轮序分批 commit,GPU 序由"消费前 wait 最新
             # chunk_done"覆盖(更早轮同流更早完成)。
-            commit_logs[int(buf)].append(list(flush_compact_meta_commit_log))
+            self._stage_flush_compact_meta_round(
+                buf_id=int(buf),
+                commit_log=flush_compact_meta_commit_log,
+                refresh_payloads=refresh_payloads,
+            )
 
         lastn1_direct_count = 0
         gt1_reduce_count = 0
@@ -721,14 +718,35 @@ def flush_prefill_batches_impl(
             *,
             profile_accum: Optional[Any] = None,
         ) -> bool:
+            refresh_meta_commit_log = (
+                flush_compact_meta_commit_log
+                if flush_compact_meta_commit_log is not None
+                else []
+            )
             fused_ok = self._rebuild_compact_slots_batched_layers_from_selection(
                 refresh_payloads,
                 refresh_result.selected_indices,
                 phase="refresh",
                 bootstrap_slots_by_layer=refresh_carrier.bootstrap_slots_by_layer,
-                defer_compact_meta_publish=flush_compact_meta_commit_log is not None,
-                compact_meta_commit_log=flush_compact_meta_commit_log,
+                defer_compact_meta_publish=True,
+                compact_meta_commit_log=refresh_meta_commit_log,
             )
+            if fused_ok and flush_compact_meta_commit_log is None:
+                # Same-stream writer ordering permits an immediate host metadata
+                # commit without a device sync; request readiness follows it.
+                refresh_receipt = self._freeze_refresh_publish_receipt(
+                    refresh_payloads
+                )
+                live_req_ids = self._commit_compact_meta_log_entries(
+                    tuple(refresh_meta_commit_log),
+                    source="flush_sync_refresh",
+                    refresh_receipt=refresh_receipt,
+                )
+                if refresh_receipt is not None:
+                    self._publish_refresh_receipt(
+                        refresh_receipt,
+                        live_req_ids=live_req_ids,
+                    )
             if profile_accum is not None:
                 _capture_writer_kernel_variant(profile_accum)
             return bool(fused_ok)
@@ -755,7 +773,9 @@ def flush_prefill_batches_impl(
                     prof.refresh_sel_evt1.record(torch.cuda.current_stream(device=device))
                 if refresh_result is None:
                     prof.refresh_total_cpu_us = (time.perf_counter_ns() - t_total0_ns) / 1000.0
-                    return
+                    raise RuntimeError(
+                        "refresh selector returned no result for non-empty payloads"
+                    )
                 selector_done_ns = t_sel1_ns
                 # 仅在 profiling detail 中做集合重合度采样（避免影响热路径）。
                 if self._refresh_profile_detail_enabled():
@@ -962,7 +982,9 @@ def flush_prefill_batches_impl(
             if refresh_result is None:
                 if _micro:
                     prof.micro_selector_ns = _mt1 - _mt0
-                return
+                raise RuntimeError(
+                    "refresh selector returned no result for non-empty payloads"
+                )
             fused_ok = _publish_refresh_writer(
                 refresh_result,
                 profile_accum=prof,
@@ -1820,7 +1842,7 @@ def flush_prefill_batches_impl(
                     except Exception:
                         _log.debug("prefill producer timeline append failed", exc_info=True)
 
-                def _mark_attribution_bootstrap_ready(*, mode: str) -> None:
+                def _mark_attribution_bootstrap_ready() -> None:
                     if os.environ.get("VLLM_SPARSE_FORCE_COMPACT_OFF", "0") != "1":
                         raise RuntimeError(
                             "VLLM_SPARSE_ATTRIB_PREFILL_PRODUCER requires "
@@ -1849,9 +1871,6 @@ def flush_prefill_batches_impl(
                         tracking.bootstrap_pending_epoch = -1
                         if hasattr(tracking, "bootstrap_pending_events"):
                             tracking.bootstrap_pending_events = []
-                        tracking.bootstrap_publish_skipped_reason = (
-                            f"attribution_{mode}_force_compact_off"
-                        )
                         self._bootstrap_pending_request_ids.discard(req_id)
 
                 if one_shot_bootstrap_only:
@@ -1993,14 +2012,7 @@ def flush_prefill_batches_impl(
                         tracking.bridge_token_count = 0
                         tracking.bridge_token_positions = []
                         tracking.bridge_last_counted_epoch = -1
-                        tracking.producer_job_epoch = int(job_typed.producer_job_epoch)
                         tracking.producer_launch_step = -1
-                        tracking.building_compact_epoch = int(
-                            job_typed.building_compact_epoch
-                        )
-                        tracking.ready_compact_epoch = -1
-                        tracking.active_compact_epoch = -1
-                        tracking.bridge_graph_policy = str(bridge_graph_policy)
                         if slot_i in finalize_slot_set and bool(is_last_layer):
                             tracking.prefill_capture_ready = False
                             tracking.prefill_capture_last_n = 0
@@ -2055,7 +2067,7 @@ def flush_prefill_batches_impl(
                     if producer_attrib_mode == "normal":
                         producer_attrib_mode = ""
                 if producer_attrib_mode == "none":
-                    _mark_attribution_bootstrap_ready(mode="none")
+                    _mark_attribution_bootstrap_ready()
                     producer_group_end_ns = time.perf_counter_ns()
                     _append_prefill_producer_timeline(
                         phase="producer_attrib_none",
@@ -2273,7 +2285,7 @@ def flush_prefill_batches_impl(
                     time.perf_counter_ns() if do_profile and prof is not None else None
                 )
                 if producer_attrib_mode == "selector_only":
-                    _mark_attribution_bootstrap_ready(mode="selector_only")
+                    _mark_attribution_bootstrap_ready()
                     producer_group_end_ns = time.perf_counter_ns()
                     _record_prefill_group_profile_end(group_evt_pair)
                     _append_prefill_producer_timeline(
@@ -4457,7 +4469,9 @@ def flush_prefill_batches_impl(
     if not is_last_layer:
         return
 
-    # prefill/refresh 已在 chunk 边界完成（支持 refresh_stream 异步），这里不再做 last-layer finalize。
+    # 关闭本 handle 的 producer 侧精确 layer set。物理收据可能已同步到达，
+    # 也可能后续由 async wait 提交；两种顺序均由 sealed+同一 mask 终局处理。
+    self._seal_step_refresh_publish()
 
     # 清理本 step 的队列/状态（ring layout 保留以便复用，避免频繁分配）
     for buf_id in range(len(self.step_prefill_chunk_payloads)):
