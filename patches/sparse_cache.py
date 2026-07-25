@@ -11,19 +11,9 @@ import torch
 
 __all__ = [
     "_get_cached_empty_tensor",
-    "_ROW_INDEX_TENSOR_CACHE_GLOBAL",
-    "_LOGITS_PATCH_STEPWISE_CACHE_GLOBAL",
 ]
 
 _EMPTY_TENSORS_BY_KEY: Dict[Tuple[str, str, str], torch.Tensor] = {}
-
-# 备用 row_index cache（controller=None 时使用）。正常 sparse 路径 controller 总是存在；
-# 该 cache 仅用于保证非常规路径也不额外引入 per-layer small alloc。
-_ROW_INDEX_TENSOR_CACHE_GLOBAL: Dict[Tuple[str, int, Tuple[int, ...]], torch.Tensor] = {}
-_LOGITS_PATCH_STEPWISE_CACHE_GLOBAL: Dict[
-    Tuple[int, str, int, int, int, int, int, int, Tuple[object, ...], Tuple[int, ...]],
-    Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-] = {}
 
 
 def _get_cached_empty_tensor(

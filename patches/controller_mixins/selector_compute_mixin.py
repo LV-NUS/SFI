@@ -466,6 +466,100 @@ class SelectorComputeMixin:
         self._step_context_slot_row_map_key: Tuple[int, ...] = tuple()
         self._step_context_slot_row_map: Optional[Dict[int, int]] = None
 
+    def _reset_selector_graph_engine_state(self) -> None:
+        """Drop graph/persistent-selector state whose proof belongs to one engine."""
+        self._selector_topk_graph_state = None
+        self._selector_topk_graph_stream = None
+        self._selector_topk_graph_replay_count = 0
+        self._selector_topk_graph_scope_replacement_count = 0
+        self._selector_topk_graph_candidate_by_scope.clear()
+        self._selector_topk_graph_admission_deferred_count = 0
+        self._selector_base_proof_cache.clear()
+        self._selector_base_proof_scope_keys.clear()
+        self._selector_key_norms_all = None
+        self._selector_key_norms_shape = None
+        self._selector_key_norms_all_reallocated = False
+        self._selector_key_norms_all_cache.clear()
+        self._selector_key_norms_all_active_cache_key = None
+        self._selector_key_norms_all_valid_cache_keys.clear()
+        self._selector_key_norms_all_cache_override = None
+        self._selector_key_norms_all_valid_cache_keys_override = None
+        self._selector_key_norms_delta_carrier_pools.clear()
+        self._selector_key_norms_delta_active_carrier = None
+        self._selector_key_norms_delta_buffer_override = None
+        self._selector_key_norms_target_cpu = None
+        self._selector_capture_scores_all = None
+        self._selector_log_f_denoms_all = None
+        self._selector_kv_lengths_all = None
+        self._selector_decode_bounds_key = None
+        self._selector_decode_bounds_buffers = None
+        self._selector_decode_bounds_buffers_override = None
+        self._selector_selected_indices_out_key = None
+        self._selector_selected_indices_out = None
+        self._selector_selected_indices_out_override = None
+        self._selected_out_ring = None
+        self._selector_writer_row_tensor_all_key = None
+        self._selector_writer_row_tensor_all = None
+        self._selector_writer_seq_lens_all_key = None
+        self._selector_writer_seq_lens_all = None
+        self._selector_writer_slot_tensor_all_key = None
+        self._selector_writer_slot_tensor_all = None
+        self._selector_writer_selected_all_key = None
+        self._selector_writer_selected_all = None
+        self._selector_writer_input_ready_event = None
+        self._log_f_workspace_key = None
+        self._log_f_scratch_workspace = None
+        self._log_f_scratch_workspace_override = None
+        self._selector_pipeline_workspace_key = None
+        self._selector_pipeline_workspace_a = None
+        self._selector_pipeline_workspace_b = None
+        self._selector_pipeline_workspace_override = None
+        self._selector_layer_index_cache_key = None
+        self._selector_layer_index_cache_device = None
+        self._selector_layer_index_cache_tensor = None
+        self._positions_i32_cache_device = None
+        self._positions_i32_cache_cap = 0
+        self._positions_i32_cache = None
+        self._positions_i64_cache_device = None
+        self._positions_i64_cache_cap = 0
+        self._positions_i64_cache = None
+        self._window_idx_cache_device = None
+        self._window_idx_cache_cap = 0
+        self._window_idx_cache = None
+        self._tail_offsets_cache_device = None
+        self._tail_offsets_cache_cap = 0
+        self._tail_offsets_cache = None
+        self._logits_patch_cache_key = None
+        self._logits_patch_row_index = None
+        self._logits_patch_last_n_i32 = None
+        self._logits_patch_row_offsets_i32 = None
+        self._logits_patch_caps_i32 = None
+        self._logits_patch_rows_gt1 = None
+        self._decode_log_f_mask_i32 = None
+        self._decode_q_lens_i32 = None
+        self._decode_logits_cap_i64 = None
+        self._decode_logits_last_n_i64 = None
+        self._decode_logits_last_n_stage_cpu_i64 = None
+        self._decode_logits_cap_stage_cpu_i64 = None
+        self._step_logits_ready_token = -1
+        self._step_logits_ready_input_signature = None
+        self._step_logits_ready_bound_signature = None
+        self._decode_row_is_compact_i32 = None
+        self._decode_seqused_k_i32 = None
+        self._decode_cu_seqlens_q_i32 = None
+        self.step_prefill_plan_epoch = -1
+        self.step_prefill_plan_handle_id = -1
+        self.step_prefill_plan_handle_generation = -1
+        self.step_prefill_capture_plan_by_req = {}
+        self.step_prefill_finalize_req_ids = tuple()
+        self.step_prefill_capture_last_n_by_row = None
+        self.step_prefill_capture_last_n_epoch = -1
+        self.step_prefill_capture_last_n_handle_id = -1
+        self.step_prefill_capture_last_n_handle_generation = -1
+        self._step_context_slot_row_map_token = -1
+        self._step_context_slot_row_map_key = tuple()
+        self._step_context_slot_row_map = None
+
     @staticmethod
     def _tensor_bytes(tensor: Optional[torch.Tensor]) -> int:
         if tensor is None or not isinstance(tensor, torch.Tensor):

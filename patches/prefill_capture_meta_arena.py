@@ -264,6 +264,31 @@ class SparseCaptureMetaArena:
             ),
         )
 
+    def reset_engine_lifecycle(self) -> None:
+        """Retire request/step proofs while retaining generic large buffers."""
+        self.reservations_by_identity.clear()
+        for layout in self.layouts_by_key.values():
+            if not isinstance(layout, StepCaptureLayout):
+                continue
+            layout.epoch = -1
+            layout.step_handle_id = -1
+            layout.step_handle_generation = -1
+            layout.step_memo_token = None
+            layout.prefill_step_layout_memo = None
+            layout.slot_row_map_key = None
+            layout.live_lengths_key = None
+            layout.refresh_payload_views_key = None
+            layout.refresh_payload_views_fast_ident = None
+            layout.refresh_scores_subviews.clear()
+            layout.slot_tensor_cpu = None
+            layout.seq_lens_tensor_cpu = None
+            layout.seq_lens_cpu = None
+            layout.kv_len_per_row_cpu = None
+            layout.active_capture_row_by_batch_row_i32 = None
+            layout.lease_generation = 0
+            layout.small_tensor_stage.clear()
+        self.reset_step_metrics()
+
     def missing_reservation(
         self,
         *,

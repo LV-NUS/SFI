@@ -92,6 +92,36 @@ class CaptureRingMixin:
         # (held ref + record_stream; freed when the buf_id chunk_done_evt fires).
         self._arena_retired_buckets: Deque[Tuple[object, object]] = deque()
 
+    def _reset_capture_ring_engine_state(self) -> None:
+        """Retire engine-owned pointer publications after device quiescence."""
+        self._capture_rows_cache.clear()
+        self._capture_rows_cache_step_identity = (-1, -1, -1)
+        self._step_refresh_cpu_cache_epoch = -1
+        self._step_refresh_cpu_cache_handle_id = -1
+        self._step_refresh_cpu_cache_handle_generation = -1
+        self._step_refresh_slot_tensor_cpu.clear()
+        self._step_refresh_seq_tensor_cpu.clear()
+        self._rebuild_ptrs_cpu.clear()
+        self._rebuild_ptrs_cpu_free.clear()
+        self._rebuild_ptrs_cpu_pending.clear()
+        self._rebuild_ptrs_gpu.clear()
+        self._rebuild_ptrs_signature.clear()
+        self._rebuild_ptrs_ready_events.clear()
+        self._rebuild_ptrs_capture_wait_satisfied_names.clear()
+        self._capture_ring_lease_registry = BufferLeaseRegistry(
+            num_slots=int(_CAPTURE_IN_FLIGHT)
+        )
+        self._capture_ring_active_lease_by_buf = [
+            None for _ in range(int(_CAPTURE_IN_FLIGHT))
+        ]
+        self._capture_ring_retired_events.clear()
+        self._arena_retired_buckets.clear()
+        self._lease_stats = {
+            "capture_ring_retired": 0,
+            "capture_ring_reclaimed": 0,
+            "pending": 0,
+        }
+
     # ------------------------------------------------------------------
     # Pointer-buffer helpers
     # ------------------------------------------------------------------

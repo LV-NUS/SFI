@@ -12,8 +12,6 @@ def dummy_context_cudagraph_is_full(ctx: object | None) -> bool:
     """True iff a dummy-run context reports a FULL-class cudagraph mode."""
     if not isinstance(ctx, dict):
         return False
-    if bool(ctx.get("is_graph_capturing", False)):
-        return True
     runtime_mode = ctx.get("cudagraph_runtime_mode", None)
     return str(getattr(runtime_mode, "name", runtime_mode)) in {
         "FULL",

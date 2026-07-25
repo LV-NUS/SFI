@@ -136,6 +136,10 @@ from patches.step_authority import StepAuthority
 from patches.fa_sparse_runtime.compact_recent_alignment import (
     compact_slot_offset_tokens,
 )
+from patches.fa_sparse_runtime.full_cudagraph_payload_binding import (
+    FullCudagraphReplayPayloadCapture,
+    FullCudagraphReplayPayloadRegistry,
+)
 from patches.layer_state import LayerState
 from patches.sparse_constants import (
     _CAPTURE_CHUNK,
@@ -878,6 +882,27 @@ def _build_layer_step_cache(
 # Controller keyed by cache pointer
 # -----------------------------------------------------------------------------
 
+
+def _retire_vllm_cudagraphs_for_engine_reset() -> None:
+    """Retire vLLM's graph owner before controller-side bindings are dropped."""
+    try:
+        from vllm.compilation.cuda_graph import CUDAGraphWrapper
+    except ModuleNotFoundError as exc:
+        if exc.name != "vllm":
+            raise
+        return
+    clear_all_graphs = getattr(
+        CUDAGraphWrapper,
+        "clear_all_graphs",
+        None,
+    )
+    if not callable(clear_all_graphs):
+        raise RuntimeError(
+            "engine graph reset requires CUDAGraphWrapper.clear_all_graphs"
+        )
+    clear_all_graphs()
+
+
 class VLLMSparseController(
     ProfileMixin,
     CaptureRingMixin,
@@ -1062,6 +1087,15 @@ class VLLMSparseController(
         self._resolved_row_ptr_replay_arena: Optional[object] = None
         self._resolved_row_ptr_source_arena: Optional[object] = None
         self._resolved_row_ptr_arena_key: Optional[Tuple[object, ...]] = None
+        # FULL-cudagraph replay refresh inputs are frozen by the graph-capture
+        # owner, keyed by the exact graph identity.  Keep this controller-owned
+        # so an idle LayerState reset cannot invalidate still-live graphs.
+        self._full_cudagraph_replay_payload_registry = (
+            FullCudagraphReplayPayloadRegistry()
+        )
+        self._full_cudagraph_replay_payload_capture: Optional[
+            FullCudagraphReplayPayloadCapture
+        ] = None
         # step 级调度计划（用于 per-layer 入口零逻辑）
         self.step_dispatch_plan: Optional[StepDispatchPlan] = None
         self._runtime_state: StepRuntimeState = StepRuntimeState()
@@ -2714,11 +2748,92 @@ class VLLMSparseController(
         self._should_refresh_cache_nonce = -1
         self._should_refresh_cache.clear()
 
+    def _reset_engine_graph_resources(self) -> None:
+        """Retire every graph-stable publication owned by the old engine."""
+        self._full_cudagraph_replay_payload_registry.clear()
+        self._full_cudagraph_replay_payload_capture = None
+        self._reset_capture_ring_engine_state()
+        self._reset_selector_graph_engine_state()
+        self._reset_writer_graph_engine_state()
+        self.prefill_capture_meta_arena.reset_engine_lifecycle()
+
+        self._resolved_row_ptr_replay_arena = None
+        self._resolved_row_ptr_source_arena = None
+        self._resolved_row_ptr_arena_key = None
+        self._resolved_row_ptr_replay_arena_by_key = {}
+        self._rrp_row_table_manager = None
+        self._rrp_row_table_manager_by_key = {}
+        self._resolved_row_ptr_replay_metadata_binding = None
+        self._resolved_row_ptr_replay_metadata_binding_by_key = {}
+        self._resolved_row_ptr_metadata_ready = False
+        self._resolved_row_ptr_graph_binding_state = None
+        self._resolved_row_ptr_ready_event_recorded = False
+        self._resolved_row_ptr_step_fast_identity = None
+        self._resolved_row_ptr_step_live_batch_size = -1
+        self._resolved_row_ptr_step_effective_batch_size = -1
+        self._resolved_row_ptr_full_cudagraph_graph_batch_size = -1
+        self._resolved_row_ptr_lease_snapshot_cache = None
+        self._rrp_replay_consumed_by_storage = {}
+        self._rrp_writer_waited_replay_by_storage = {}
+        self._prebound_rrp_ready_event_waited_key = None
+        self._prebound_rrp_observed_ready_state = None
+        self._prebound_rrp_static_stats_cache = {}
+        self._compact_arena_ready_evt = None
+        self._compact_arena_ready_gen = 0
+        self._compact_arena_ready_waited_gen_by_stream = {}
+        self._compact_recent_wait_stream_epoch = -1
+        self._compact_recent_wait_stream_chunks = set()
+        self._capture_plan_cap_tensor = None
+        self._capture_plan_cap_tensor_epoch = -1
+        self._capture_plan_cap_tensor_device = None
+        self._capture_plan_cap_tensor_signature = tuple()
+        self._decode_dummy_capture_row_by_batch_row_i32 = None
+        self._decode_dummy_capture_row_device = None
+        self._decode_dummy_capture_row_cap = 0
+        self._capture_postprocess_step_owner_binding = None
+        self._capture_cohort_coordinator = None
+        self._prefill_release_pending_epoch = -1
+        self._prefill_release_waited_mask = 0
+        self._prefill_last_enqueue_epoch = -1
+        self._prefill_release_done_epoch = -1
+        self._refresh_layer_group_event_idx = 0
+        self._refresh_layer_group_active = 0
+        self._refresh_layer_group_enabled = False
+        self._refresh_layer_group_epoch = -1
+        self._refresh_layer_group_any_refresh = False
+        self._sfi_mixed_page_last_actual_route_family = None
+        self._sfi_mixed_page_route_family_recapture_count_by_descriptor = {}
+        self._sfi_mixed_page_route_family_recapture_count = 0
+        self._mixed_page_full_cudagraph_graph_route_family_mismatch = None
+        self._mixed_page_direct_bound_refresh_stats_by_graph_key = {}
+        self._mixed_page_full_cudagraph_last_replay_stats = None
+        self._mixed_page_full_cudagraph_last_replay_refresh_stage_profile = None
+        self._mixed_page_full_cudagraph_last_selector_writer_submit_debug = None
+        self._mixed_page_full_cudagraph_last_selector_writer_submit_summary = None
+        self._sparse_attention_in_cudagraph = False
+        self._vllm_dummy_run_depth = 0
+        self._vllm_dummy_run_context = None
+
     def reset_for_new_engine(self) -> None:
         """重置与 engine/kv-cache 绑定的状态，避免跨 engine 污染。"""
+        if torch.cuda.is_available():
+            if bool(torch.cuda.is_current_stream_capturing()):
+                raise RuntimeError(
+                    "engine graph resources cannot reset during CUDA graph capture"
+                )
+            # Engine replacement is a cold lifecycle boundary.  Drain once
+            # before dropping graph objects, ready events, stable pointer
+            # arrays, and ring slots; no replay hot path pays this cost.
+            torch.cuda.synchronize()
+        # The graph object and its payload registry are one ownership unit.
+        # Retiring only the controller binding would leave vLLM free to replay
+        # a graph captured against the old KV cache.
+        _retire_vllm_cudagraphs_for_engine_reset()
         self._reset_deferred_bootstrap_launch_state(
             reason="engine reset retired deferred producer launch",
         )
+        if self._pending_refresh_grouped_async_records is not None:
+            self._abort_pending_refresh_grouped_async_envelope()
         self.layer_states.clear()
         self.layer_cache_keys.clear()
         self.layer_index_by_cache_key.clear()
@@ -2773,16 +2888,10 @@ class VLLMSparseController(
         self._fa3_live_route_has_selected_consume = False
         self._fa3_live_route_has_capture = False
         self._fa3_live_route = None
-        self._step_context_slot_row_map_token = -1
-        self._step_context_slot_row_map_key = tuple()
-        self._step_context_slot_row_map = None
         self._step_refresh_slot_req_ids_epoch = -1
         self._step_refresh_slot_req_ids_handle_id = -1
         self._step_refresh_slot_req_ids_handle_generation = -1
         self._step_refresh_slot_req_ids_cache.clear()
-        self._step_logits_ready_token = -1
-        self._step_logits_ready_input_signature = None
-        self._step_logits_ready_bound_signature = None
         self._decode_logf_stage_token = -1
         self._decode_logf_stage_signature = None
         self._decode_logf_stage_bound_signature = None
@@ -2812,8 +2921,15 @@ class VLLMSparseController(
         self._pending_refresh_rebuilds = deque()
         self._pending_refresh_rebuild_by_req.clear()
         self._pending_refresh_rebuild_id = 0
+        self._refresh_nonce = 0
+        self._step_refresh_commit_id = 0
         self._step_refresh_commit_handle_id = -1
         self._step_refresh_commit_handle_generation = -1
+        self._step_refresh_commit_planned_reqs = 0
+        self._step_refresh_commit_planned_rows = 0
+        self._step_refresh_commit_num_actual_tokens = 0
+        self._step_refresh_commit_payload_enqueues = 0
+        self._step_refresh_commit_replay_payload_claims = 0
         if hasattr(self, "_step_refresh_commit_written_req_ids"):
             self._step_refresh_commit_written_req_ids.clear()
         self._step_refresh_handle_ledger = []
@@ -2837,9 +2953,7 @@ class VLLMSparseController(
             self.step_prefill_capture_layout_ring[idx] = None
         for idx in range(len(self.step_refresh_capture_layout_ring)):
             self.step_refresh_capture_layout_ring[idx] = None
-        for idx in range(len(self._capture_ring_active_lease_by_buf)):
-            self._capture_ring_active_lease_by_buf[idx] = None
-        self._capture_ring_retired_events.clear()
+        self._reset_engine_graph_resources()
         # profile-time capture 发布物与本 engine 的 refresh stream 绑定。跨
         # engine/KV-cache 边界不能只重建 stream 而保留 tape/plan/seal，否则
         # 下一次 profile 会复用旧 stream identity 或跳过 prebuild。这里仅
@@ -2868,9 +2982,6 @@ class VLLMSparseController(
             self._main_wait_chunk_id_by_buf[i] = -1
         for i in range(len(self._step_wait_consumed_token_by_buf)):
             self._step_wait_consumed_token_by_buf[i] = 0
-        self.step_prefill_plan_epoch = -1
-        self.step_prefill_capture_plan_by_req = {}
-        self.step_prefill_finalize_req_ids = tuple()
         self.step_context_epoch = 0
         self.step_decode_req_meta_i32_all = None
         self.step_decode_req_meta_i64_all = None

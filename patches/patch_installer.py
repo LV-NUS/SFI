@@ -56,6 +56,10 @@ from patches.fa3_native.compact_recent_contract import (
     compute_recent_visible_kv_len_i32,
     validate_compact_recent_support_matrix,
 )
+from patches.fa_sparse_runtime.full_cudagraph_payload_binding import (
+    FullCudagraphReplayPayloadCapture,
+    FullCudagraphReplayPayloadRegistry,
+)
 from patches.vllm_compat import (
     import_fa_utils_module,
 )
@@ -1313,8 +1317,6 @@ def _profile_mixed_page_cudagraph_capture_enabled(controller: object | None) -> 
     dummy_context = getattr(controller, "_vllm_dummy_run_context", None)
     if not isinstance(dummy_context, dict):
         return False
-    if bool(dummy_context.get("is_graph_capturing", False)):
-        return True
     return _dummy_context_cudagraph_is_full(dummy_context)
 
 
@@ -2671,6 +2673,26 @@ def _run_profile_resolved_row_ptr_mixed_forward(
             resolver_kwargs.get("graph_replay_carriers", False)
         ),
     }
+    controller = _get_global_controller()
+    if controller is None:
+        raise RuntimeError(
+            "vLLM profile ResolvedRowPtr mixed forward requires a live sparse controller"
+        )
+    _register_full_cudagraph_replay_payload_layer(
+        controller=controller,
+        graph_batch_size=batch_size,
+        num_actual_tokens=num_actual_tokens,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        block_table=block_table,
+        q=q_arg,
+        cu_seqlens_q=cu_seqlens_q,
+        softmax_scale=common_kwargs["softmax_scale"],
+        softcap=common_kwargs["softcap"],
+        window_size=common_kwargs["window_size"],
+        alibi_slopes=alibi_slopes,
+        k_descale=common_kwargs["k_descale"],
+    )
     row_ptr = getattr(carriers, "resolved_page_table_row_ptr_u64", None)
     affine_i32 = getattr(carriers, "resolved_page_table_affine_i32", None)
     affine_base = getattr(carriers, "resolved_page_table_affine_base", None)
@@ -2860,13 +2882,6 @@ def _resolve_step_real_seqused_k(
     return canonical
 
 
-# [OVERLAY-GEOM-STEP-CACHE] 单槽步级缓存：几何解析输入全部步内不变（launch_plan
-# 由 prologue 每步构造一次、seq_lens/authority 步级快照），旧实现每 layer 重跑
-# per-row Python 循环（36 层逐位同结果）。key=身份比较五元组+step_identity_token，
-# 任一输入对象换新即 miss——不存在 stale 可能；持有强引用一步（下步覆盖释放）。
-_OVERLAY_GEOM_STEP_CACHE: tuple | None = None
-
-
 def _resolve_selected_overlay_cpu_geometry(
     *,
     launch_plan: object,
@@ -2876,21 +2891,23 @@ def _resolve_selected_overlay_cpu_geometry(
     page_size: int,
     batch_size: int,
 ) -> tuple[Tuple[int, ...], Tuple[int, ...], Tuple[int, ...], Tuple[int, ...]]:
-    global _OVERLAY_GEOM_STEP_CACHE
-    token = int(getattr(step_bound_meta, "step_identity_token", 0) or 0)
-    cache = _OVERLAY_GEOM_STEP_CACHE
+    # StepBoundMeta is the lifecycle owner.  launch_plan and the step token are
+    # already implied by that owner, so the hit proof only checks the remaining
+    # external identities/geometry.  No request data lives in process globals.
+    cache = getattr(
+        step_bound_meta,
+        "selected_overlay_cpu_geometry_cache",
+        None,
+    )
     if (
         cache is not None
-        and token > 0
-        and cache[0] == token
-        and cache[1] is launch_plan
-        and cache[2] is step_bound_meta
-        and cache[3] is step_authority
-        and cache[4] is original_seq_lens
-        and cache[5] == page_size
-        and cache[6] == batch_size
+        and cache[0] is launch_plan
+        and cache[1] is step_authority
+        and cache[2] is original_seq_lens
+        and cache[3] == page_size
+        and cache[4] == batch_size
     ):
-        return cache[7]
+        return cache[5]
     from patches.fa_sparse_runtime.compact_mixed_page_route import (
         resolve_compact_mixed_page_overlay_cpu_geometry,
     )
@@ -2903,17 +2920,18 @@ def _resolve_selected_overlay_cpu_geometry(
         page_size=page_size,
         batch_size=batch_size,
     )
-    if token > 0:
-        _OVERLAY_GEOM_STEP_CACHE = (
-            token,
+    setattr(
+        step_bound_meta,
+        "selected_overlay_cpu_geometry_cache",
+        (
             launch_plan,
-            step_bound_meta,
             step_authority,
             original_seq_lens,
             page_size,
             batch_size,
             result,
-        )
+        ),
+    )
     return result
 
 
@@ -4772,7 +4790,7 @@ def _run_dummy_after_profile_capture_prebuild(
     return run_original()
 
 
-_EXP4_PREFLIGHT_LATCHED = False
+_EXP4_PREFLIGHT_DONE_ATTR = "_sfi_exp4_capture_alloc_preflight_done"
 
 
 def _custom_allreduce_is_live(parallel_config: object) -> bool:
@@ -4830,37 +4848,43 @@ def _exp4_capture_alloc_preflight(runner: object) -> None:
     AR 缓冲 → TP>1 + custom AR + graph capture + expandable = "invalid
     argument"(远端 exp4 根因,2026-07-06 本地实证)。脚本层(发布仓
     run_speed.sh)已默认 TP>1 关 expandable;本预检是随 runtime 走的启动器
-    无关守卫:capture 前 fail-fast 出可操作信息。冷路径:进程内至多完整
-    评估一次(条件均为进程静态)。
+    无关守卫:capture 前 fail-fast 出可操作信息。完成标记归 runner/engine
+    所有，不能用进程全局 latch 让后创建的 engine 跳过自己的配置证明。
     """
-    global _EXP4_PREFLIGHT_LATCHED
-    if _EXP4_PREFLIGHT_LATCHED:
+    if bool(getattr(runner, _EXP4_PREFLIGHT_DONE_ATTR, False)):
         return
-    _EXP4_PREFLIGHT_LATCHED = True
     vllm_config = getattr(runner, "vllm_config", None)
     parallel_config = getattr(vllm_config, "parallel_config", None)
     if parallel_config is None:
         parallel_config = getattr(runner, "parallel_config", None)
+    if parallel_config is None:
+        raise RuntimeError(
+            "E_EXP4_CAPTURE_PREFLIGHT_CONFIG_MISSING: CUDA graph capture "
+            "cannot prove the custom-all-reduce allocator contract without "
+            "parallel_config"
+        )
     tp_size = int(getattr(parallel_config, "tensor_parallel_size", 1) or 1)
-    if tp_size <= 1:
-        return
-    if not _expandable_segments_enabled_from_env():
-        return
-    if not _custom_allreduce_is_live(parallel_config):
-        return
-    raise RuntimeError(
-        "E_EXP4_EXPANDABLE_CUSTOM_AR_CAPTURE: TP>1 + custom all-reduce + CUDA "
-        "graph capture with PYTORCH_(CUDA_)ALLOC_CONF expandable_segments:True. "
-        "cuMemMap-backed allocations expose no cudaIpc handles, so custom-AR "
-        "register_graph_buffers fails with 'invalid argument' at capture end "
-        "(remote exp4 root cause, locally reproduced 2026-07-06). Fix one of: "
-        "unset expandable_segments for TP>1 (release run_speed.sh default), "
-        "disable custom AR (--disable-custom-all-reduce or "
-        "VLLM_SPARSE_FORCE_DISABLE_CUSTOM_AR=1), or run with enforce_eager."
-    )
+    if (
+        tp_size > 1
+        and _expandable_segments_enabled_from_env()
+        and _custom_allreduce_is_live(parallel_config)
+    ):
+        raise RuntimeError(
+            "E_EXP4_EXPANDABLE_CUSTOM_AR_CAPTURE: TP>1 + custom all-reduce + CUDA "
+            "graph capture with PYTORCH_(CUDA_)ALLOC_CONF expandable_segments:True. "
+            "cuMemMap-backed allocations expose no cudaIpc handles, so custom-AR "
+            "register_graph_buffers fails with 'invalid argument' at capture end "
+            "(remote exp4 root cause, locally reproduced 2026-07-06). Fix one of: "
+            "unset expandable_segments for TP>1 (release run_speed.sh default), "
+            "disable custom AR (--disable-custom-all-reduce or "
+            "VLLM_SPARSE_FORCE_DISABLE_CUSTOM_AR=1), or run with enforce_eager."
+        )
+    setattr(runner, _EXP4_PREFLIGHT_DONE_ATTR, True)
 
 
-_SLOTS_CONCURRENCY_PREFLIGHT_LATCHED = False
+_SLOTS_CONCURRENCY_PREFLIGHT_DONE_ATTR = (
+    "_sfi_slots_concurrency_preflight_done"
+)
 
 
 def _sparse_slots_concurrency_preflight(runner: object, controller: object) -> None:
@@ -4875,51 +4899,214 @@ def _sparse_slots_concurrency_preflight(runner: object, controller: object) -> N
     scheduler_config.max_num_seqs requests into one forward
     (max_num_running_reqs = max_num_seqs, sched/scheduler.py:105 — same
     invariant the capture prebuild sizing relies on), so
-    slots >= max_num_seqs proves the allocator can never overflow. Enforce
-    that at the profile dummy_run (startup, runner config resolved), where a
-    raise aborts serve before it takes traffic.
+    slots >= max_num_seqs proves the allocator can never overflow. Check that
+    relationship at profile dummy_run (startup, runner config resolved) and
+    warn before traffic when the configured scheduler envelope is wider.
     """
-    global _SLOTS_CONCURRENCY_PREFLIGHT_LATCHED
-    if _SLOTS_CONCURRENCY_PREFLIGHT_LATCHED:
+    if bool(
+        getattr(
+            runner,
+            _SLOTS_CONCURRENCY_PREFLIGHT_DONE_ATTR,
+            False,
+        )
+    ):
         return
-    _SLOTS_CONCURRENCY_PREFLIGHT_LATCHED = True
     cfg = getattr(controller, "config", None)
-    if cfg is None or not bool(getattr(cfg, "compact_page_residency_enabled", False)):
+    if cfg is not None and bool(
+        getattr(cfg, "compact_page_residency_enabled", False)
+    ):
+        slots = int(getattr(cfg, "max_live_sparse_slots", 0) or 0)
+        sched = getattr(runner, "scheduler_config", None)
+        if sched is None:
+            vllm_config = getattr(runner, "vllm_config", None)
+            sched = getattr(vllm_config, "scheduler_config", None)
+        max_num_seqs = int(getattr(sched, "max_num_seqs", 0) or 0)
+        if max_num_seqs <= 0:
+            # Config shape unknown (exotic runner) — cannot prove either way;
+            # the allocator's own capacity raise remains the backstop.
+            _log.warning(
+                "slots-concurrency preflight: scheduler max_num_seqs unresolved; "
+                "skipping the startup capacity proof"
+            )
+            return
+        elif slots < max_num_seqs:
+            # LOUD warning, not a raise: slots < max_num_seqs only dies when the
+            # SUBMITTED concurrency actually exceeds slots (the bench harness
+            # legitimately runs batch_size==slots requests under vLLM's default
+            # max_num_seqs=256 — a raise here killed that healthy shape, wg3
+            # forensics). The true capacity contract stays at the allocator
+            # ("capacity exceeded" raise, whose message names this config root
+            # cause); this preflight makes the hazard visible BEFORE traffic.
+            _log.warning(
+                "W_SPARSE_SLOTS_LT_MAX_NUM_SEQS: max_live_sparse_slots=%d < "
+                "scheduler max_num_seqs=%d. If more than %d requests are ever "
+                "co-batched (serve/LongBench concurrency!), the sparse global "
+                "slot allocator hard-raises and kills the engine mid-workload. "
+                "For serve deployments set max_live_sparse_slots >= expected "
+                "concurrency (lease grows by slots x blocks x 16 x "
+                "KV-bytes/token x gen_count) or pass --max-num-seqs %d.",
+                slots,
+                max_num_seqs,
+                slots,
+                slots,
+            )
+    setattr(runner, _SLOTS_CONCURRENCY_PREFLIGHT_DONE_ATTR, True)
+
+
+_SPARSE_FULL_CUDAGRAPH_UBATCH_PREFLIGHT_DONE_ATTR = (
+    "_sfi_full_cudagraph_ubatch_preflight_done"
+)
+
+
+def _sparse_full_cudagraph_ubatch_preflight(
+    runner: object,
+    controller: object,
+) -> None:
+    """Reject an unowned multi-view graph contract before CUDA capture.
+
+    UBatchWrapper captures multiple microbatch attention views into one graph
+    and keys it only by total num_tokens.  Replay refresh currently requires
+    one exact, full-batch layer binding, so accepting UBatch would recreate the
+    old last-writer-wins pointer bug.  This is a cold startup proof and adds no
+    work to model-forward replay.
+    """
+    if bool(
+        getattr(
+            runner,
+            _SPARSE_FULL_CUDAGRAPH_UBATCH_PREFLIGHT_DONE_ATTR,
+            False,
+        )
+    ):
         return
-    slots = int(getattr(cfg, "max_live_sparse_slots", 0) or 0)
-    sched = getattr(runner, "scheduler_config", None)
-    if sched is None:
-        vllm_config = getattr(runner, "vllm_config", None)
-        sched = getattr(vllm_config, "scheduler_config", None)
-    max_num_seqs = int(getattr(sched, "max_num_seqs", 0) or 0)
-    if max_num_seqs <= 0:
-        # Config shape unknown (exotic runner) — cannot prove either way;
-        # the allocator's own capacity raise remains the backstop.
-        _log.warning(
-            "slots-concurrency preflight: scheduler max_num_seqs unresolved; "
-            "skipping the startup capacity proof"
+    vllm_config = getattr(runner, "vllm_config", None)
+    parallel_config = getattr(vllm_config, "parallel_config", None)
+    if parallel_config is None:
+        parallel_config = getattr(runner, "parallel_config", None)
+    if _mixed_page_cudagraph_config_enabled(controller):
+        if parallel_config is None:
+            raise RuntimeError(
+                "E_SFI_FULL_CUDAGRAPH_PARALLEL_CONFIG_MISSING: sparse FULL "
+                "cudagraph capture cannot prove the UBatch ownership contract "
+                "without parallel_config"
+            )
+        if bool(getattr(parallel_config, "use_ubatching", False)):
+            raise RuntimeError(
+                "E_SFI_FULL_CUDAGRAPH_UBATCH_UNSUPPORTED: sparse compact-residency "
+                "FULL cudagraph replay refresh requires one exact full-batch graph "
+                "binding per layer, but vLLM UBatchWrapper captures multiple "
+                "microbatch views under one num_tokens key. Disable DBO/ubatching or "
+                "FULL cudagraphs; refusing capture prevents last-writer pointer "
+                "corruption."
+            )
+    setattr(
+        runner,
+        _SPARSE_FULL_CUDAGRAPH_UBATCH_PREFLIGHT_DONE_ATTR,
+        True,
+    )
+
+
+_FULL_CUDAGRAPH_REPLAY_PAYLOAD_CAPTURE_ATTR = (
+    "_full_cudagraph_replay_payload_capture"
+)
+
+
+def _begin_full_cudagraph_replay_payload_capture(
+    *,
+    controller: object,
+    batch_descriptor: object,
+) -> FullCudagraphReplayPayloadCapture:
+    current = getattr(
+        controller,
+        _FULL_CUDAGRAPH_REPLAY_PAYLOAD_CAPTURE_ATTR,
+        None,
+    )
+    if current is not None:
+        raise RuntimeError(
+            "FULL cudagraph replay payload capture already has a graph owner"
+        )
+    replay_payload_registry = getattr(
+        controller,
+        "_full_cudagraph_replay_payload_registry",
+        None,
+    )
+    if not isinstance(
+        replay_payload_registry,
+        FullCudagraphReplayPayloadRegistry,
+    ):
+        raise RuntimeError(
+            "FULL cudagraph capture requires replay payload registry"
+        )
+    graph_key = _mixed_page_full_graph_key_for_entry(
+        None,
+        batch_descriptor,
+    )
+    capture = replay_payload_registry.begin_capture(graph_key=graph_key)
+    setattr(
+        controller,
+        _FULL_CUDAGRAPH_REPLAY_PAYLOAD_CAPTURE_ATTR,
+        capture,
+    )
+    return capture
+
+
+def _finalize_full_cudagraph_replay_payload_capture(
+    *,
+    controller: object,
+    capture: FullCudagraphReplayPayloadCapture,
+) -> None:
+    current = getattr(
+        controller,
+        _FULL_CUDAGRAPH_REPLAY_PAYLOAD_CAPTURE_ATTR,
+        None,
+    )
+    if current is not capture:
+        raise RuntimeError(
+            "FULL cudagraph replay payload capture owner changed before "
+            "finalization"
+        )
+    layer_keys = getattr(controller, "layer_cache_keys", None)
+    if not isinstance(layer_keys, (list, tuple)) or not layer_keys:
+        raise RuntimeError(
+            "FULL cudagraph replay payload capture completed without layer keys"
+        )
+    replay_payload_registry = getattr(
+        controller,
+        "_full_cudagraph_replay_payload_registry",
+        None,
+    )
+    if not isinstance(
+        replay_payload_registry,
+        FullCudagraphReplayPayloadRegistry,
+    ):
+        raise RuntimeError(
+            "FULL cudagraph replay payload capture requires replay payload registry"
+        )
+    replay_payload_registry.finalize_capture(
+        capture=capture,
+        layer_keys=layer_keys,
+    )
+
+
+def _clear_full_cudagraph_replay_payload_capture(
+    *,
+    controller: object,
+    capture: FullCudagraphReplayPayloadCapture,
+) -> None:
+    current = getattr(
+        controller,
+        _FULL_CUDAGRAPH_REPLAY_PAYLOAD_CAPTURE_ATTR,
+        None,
+    )
+    if current is capture:
+        setattr(
+            controller,
+            _FULL_CUDAGRAPH_REPLAY_PAYLOAD_CAPTURE_ATTR,
+            None,
         )
         return
-    if slots < max_num_seqs:
-        # LOUD warning, not a raise: slots < max_num_seqs only dies when the
-        # SUBMITTED concurrency actually exceeds slots (the bench harness
-        # legitimately runs batch_size==slots requests under vLLM's default
-        # max_num_seqs=256 — a raise here killed that healthy shape, wg3
-        # forensics). The true capacity contract stays at the allocator
-        # ("capacity exceeded" raise, whose message names this config root
-        # cause); this preflight makes the hazard visible BEFORE traffic.
-        _log.warning(
-            "W_SPARSE_SLOTS_LT_MAX_NUM_SEQS: max_live_sparse_slots=%d < "
-            "scheduler max_num_seqs=%d. If more than %d requests are ever "
-            "co-batched (serve/LongBench concurrency!), the sparse global "
-            "slot allocator hard-raises and kills the engine mid-workload. "
-            "For serve deployments set max_live_sparse_slots >= expected "
-            "concurrency (lease grows by slots x blocks x 16 x "
-            "KV-bytes/token x gen_count) or pass --max-num-seqs %d.",
-            slots,
-            max_num_seqs,
-            slots,
-            slots,
+    if current is not None:
+        raise RuntimeError(
+            "FULL cudagraph replay payload capture owner changed during capture"
         )
 
 
@@ -4942,48 +5129,51 @@ def _patch_dummy_run() -> None:
         if controller is None:
             return original_dummy_run(self, *args, **kwargs)
         previous_depth = int(getattr(controller, "_vllm_dummy_run_depth", 0) or 0)
-        setattr(controller, "_vllm_dummy_run_depth", previous_depth + 1)
+        previous_context = getattr(controller, "_vllm_dummy_run_context", None)
         _dummy_ctx = _dummy_run_context_from_call(args, kwargs)
+        if previous_depth > 0 and bool(
+            _dummy_ctx.get("is_graph_capturing", False)
+        ):
+            raise RuntimeError(
+                "nested CUDA graph dummy capture has no valid graph owner"
+            )
+        setattr(controller, "_vllm_dummy_run_depth", previous_depth + 1)
         setattr(controller, "_vllm_dummy_run_context", _dummy_ctx)
-        # [EXP4-RUNTIME-PREFLIGHT] capture 型 dummy_run 即将录图:在 capture
-        # 开始前拦下 expandable×custom-AR 致命组合(见 helper docstring)。
-        if bool(_dummy_ctx.get("is_graph_capturing")):
-            _exp4_capture_alloc_preflight(self)
-        # [SERVE-LIVENESS-PREFLIGHT] profile 型 dummy_run=启动必经且 runner
-        # 配置已解析:residency 槽容量 < 调度并发上限=运行中必炸(allocator
-        # capacity raise),启动期 fail-fast(见 helper docstring)。
-        if bool(_dummy_ctx.get("is_profile")):
-            _sparse_slots_concurrency_preflight(self, controller)
-        # PHASE-2B de-legacy: latch the real cudagraph mode so steady-state gates
-        # engage compact without VLLM_SPARSE_ATTENTION_IN_CUDAGRAPH. Run-level sticky
-        # (only ever set True, never cleared) so a later PIECEWISE prefill dummy-run
-        # cannot turn decode compact off.
         try:
-            if _dummy_context_cudagraph_is_full(
-                getattr(controller, "_vllm_dummy_run_context", None)
+            # [EXP4-RUNTIME-PREFLIGHT] capture 型 dummy_run 即将录图:在 capture
+            # 开始前拦下 expandable×custom-AR 致命组合(见 helper docstring)。
+            if bool(_dummy_ctx.get("is_graph_capturing")):
+                _exp4_capture_alloc_preflight(self)
+            # [SERVE-LIVENESS-PREFLIGHT] profile 型 dummy_run=启动必经且 runner
+            # 配置已解析:residency 槽容量 < 调度并发上限=运行中必炸(allocator
+            # capacity raise),启动期 fail-fast(见 helper docstring)。
+            if bool(_dummy_ctx.get("is_profile")):
+                _sparse_slots_concurrency_preflight(self, controller)
+            if (
+                bool(_dummy_ctx.get("is_graph_capturing"))
+                and _dummy_context_cudagraph_is_full(_dummy_ctx)
             ):
+                _sparse_full_cudagraph_ubatch_preflight(self, controller)
+            # PHASE-2B de-legacy: latch the real FULL runtime mode so steady-state
+            # gates engage compact without an environment shadow contract.
+            if _dummy_context_cudagraph_is_full(_dummy_ctx):
                 setattr(controller, "_sparse_attention_in_cudagraph", True)
-        except Exception:
-            _log.warning("PHASE-2B cudagraph latch set skipped", exc_info=True)
-        try:
             # The resident SFI capture arena/scratch must exist BEFORE vLLM's
             # profile forward reaches its activation peak.  Building it after
             # original_dummy_run records max(activation, SFI), while live execution
             # needs their sum and can OOM after startup when the auto-sized KV pool
             # consumes the missing overlap.  The helper keeps the old one-shot gates
             # and failure fallback, but fixes the lifetime ordering.
-            return _run_dummy_after_profile_capture_prebuild(
+            result = _run_dummy_after_profile_capture_prebuild(
                 runner=self,
                 controller=controller,
                 dummy_context=_dummy_ctx,
                 run_original=lambda: original_dummy_run(self, *args, **kwargs),
             )
+            return result
         finally:
-            if previous_depth <= 0:
-                setattr(controller, "_vllm_dummy_run_depth", 0)
-                setattr(controller, "_vllm_dummy_run_context", None)
-            else:
-                setattr(controller, "_vllm_dummy_run_depth", previous_depth)
+            setattr(controller, "_vllm_dummy_run_depth", previous_depth)
+            setattr(controller, "_vllm_dummy_run_context", previous_context)
 
     GPUModelRunner._dummy_run = _sparse_dummy_run  # type: ignore[assignment]
     _ORIGINAL_DUMMY_RUN = original_dummy_run
@@ -6379,6 +6569,83 @@ def _mixed_page_full_graph_key_for_entry(
         except Exception:
             pass
     return value
+
+
+def _register_full_cudagraph_replay_payload_layer(
+    *,
+    controller: object,
+    graph_batch_size: int,
+    num_actual_tokens: int | None,
+    key_cache: object,
+    value_cache: object,
+    block_table: object,
+    q: object,
+    cu_seqlens_q: object,
+    softmax_scale: object,
+    softcap: object,
+    window_size: object,
+    alibi_slopes: object,
+    k_descale: object,
+) -> None:
+    """Register one layer only while the graph owner is actively capturing."""
+    capture = getattr(
+        controller,
+        _FULL_CUDAGRAPH_REPLAY_PAYLOAD_CAPTURE_ATTR,
+        None,
+    )
+    if capture is None:
+        return
+    if not isinstance(capture, FullCudagraphReplayPayloadCapture):
+        raise RuntimeError(
+            "FULL cudagraph replay payload capture has invalid controller owner"
+        )
+    if not isinstance(key_cache, torch.Tensor):
+        raise RuntimeError(
+            "FULL cudagraph replay payload capture requires tensor key_cache"
+        )
+    if num_actual_tokens is None:
+        if not isinstance(q, torch.Tensor):
+            raise RuntimeError(
+                "FULL cudagraph replay payload capture requires tensor q"
+            )
+        num_actual_tokens = int(q.shape[0])
+    cache_key = int(key_cache.data_ptr())
+    layer_index = int(
+        getattr(controller, "layer_index_by_cache_key", {}).get(
+            cache_key,
+            -1,
+        )
+    )
+    replay_payload_registry = getattr(
+        controller,
+        "_full_cudagraph_replay_payload_registry",
+        None,
+    )
+    if not isinstance(
+        replay_payload_registry,
+        FullCudagraphReplayPayloadRegistry,
+    ):
+        raise RuntimeError(
+            "FULL cudagraph replay payload capture requires replay payload registry"
+        )
+    replay_payload_registry.register_layer(
+        capture=capture,
+        cache_key=cache_key,
+        layer_index=layer_index,
+        graph_batch_size=graph_batch_size,
+        num_actual_tokens=int(num_actual_tokens),
+        key_cache=key_cache,
+        value_cache=value_cache,
+        block_table=block_table,
+        q=q,
+        cu_seqlens_q=cu_seqlens_q,
+        softmax_scale=softmax_scale,
+        softcap=softcap,
+        window_size=window_size,
+        alibi_slopes=alibi_slopes,
+        k_descale=k_descale,
+    )
+
 
 def _mixed_page_full_cudagraph_route_family_and_metadata_items(
     forward_context: object,
@@ -8316,35 +8583,6 @@ def _mixed_page_full_cudagraph_bind_identity_payload(
     }
 
 
-def _cache_full_cudagraph_replay_payload_refs(
-    *,
-    state: object,
-    key_cache: object,
-    value_cache: object,
-    block_table: object,
-    q: object,
-    cu_seqlens_q: object,
-    seqused_k: object,
-    softmax_scale: object,
-    softcap: object,
-    window_size: object,
-    alibi_slopes: object,
-    k_descale: object,
-) -> None:
-    """Cache stable layer inputs needed to build refresh payloads after graph replay."""
-    setattr(state, "_sfi_replay_key_cache", key_cache)
-    setattr(state, "_sfi_replay_value_cache", value_cache)
-    setattr(state, "_sfi_replay_block_table", block_table)
-    setattr(state, "_sfi_replay_q", q)
-    setattr(state, "_sfi_replay_cu_seqlens_q", cu_seqlens_q)
-    setattr(state, "_sfi_replay_seqused_k", seqused_k)
-    setattr(state, "_sfi_replay_softmax_scale", float(softmax_scale or 0.0))
-    setattr(state, "_sfi_replay_softcap", float(softcap or 0.0))
-    setattr(state, "_sfi_replay_window_size", window_size)
-    setattr(state, "_sfi_replay_alibi_slopes", alibi_slopes)
-    setattr(state, "_sfi_replay_k_descale", k_descale)
-
-
 def _full_cudagraph_replay_refresh_batched_flush_enabled(controller: object) -> bool:
     return bool(_FULL_CUDAGRAPH_REPLAY_REFRESH_BATCHED_FLUSH_CACHED)
 
@@ -8395,17 +8633,22 @@ def _drain_full_cudagraph_pending_refresh_before_replay_profiled(
 
 
 def _full_cudagraph_replay_step_has_refresh_row(controller: object) -> bool:
-    step_ctx = getattr(controller, "step_context", None)
-    step_authority = getattr(step_ctx, "step_authority", None)
-    if step_authority is None:
-        step_authority = getattr(controller, "step_authority", None)
-    if step_ctx is None or step_authority is None:
+    # This predicate is called on steady FULL replay. Use the one published
+    # StepContext owner directly: no controller mirror fallback and no dynamic
+    # field-name lookups after the nullable context boundary.
+    step_ctx = controller.step_context
+    if step_ctx is None:
         return False
-    if int(getattr(step_ctx, "epoch", -1)) != int(getattr(step_authority, "epoch", -2)):
+    step_authority = step_ctx.step_authority
+    if step_authority is None:
+        raise RuntimeError(
+            "full cudagraph replay refresh requires step-context-owned authority"
+        )
+    if int(step_ctx.epoch) != int(step_authority.epoch):
         raise RuntimeError(
             "full cudagraph replay refresh payload enqueue requires matching step authority"
         )
-    return bool(getattr(step_authority, "has_refresh_row", False))
+    return bool(step_authority.has_refresh_row)
 
 
 def _flush_full_cudagraph_refresh_payloads_batched_after_replay(
@@ -8992,6 +9235,12 @@ def _enqueue_full_cudagraph_refresh_payloads_after_replay(
     controller: object,
     graph_key: str = "",
 ) -> int:
+    # The overwhelmingly common replay step has no refresh row.  Keep the
+    # guard before profile-path lookup, timer reads, closure creation, imports,
+    # registry lookup, and layer-key materialization.
+    if not _full_cudagraph_replay_step_has_refresh_row(controller):
+        return 0
+
     stage_profile_enabled = bool(_full_cudagraph_hook_profile_log(True))
     stage_profile: Optional[dict[str, object]] = None
     stage_total_start_ns = time.perf_counter_ns() if stage_profile_enabled else 0
@@ -9040,13 +9289,16 @@ def _enqueue_full_cudagraph_refresh_payloads_after_replay(
         stage_profile[key] = int(stage_profile.get(key, 0) or 0) + int(amount)
 
     step_ctx = getattr(controller, "step_context", None)
+    if step_ctx is None:
+        raise RuntimeError(
+            "full cudagraph replay refresh payload enqueue requires step context"
+        )
     step_authority = getattr(step_ctx, "step_authority", None)
     if step_authority is None:
-        step_authority = getattr(controller, "step_authority", None)
-    if step_ctx is None or step_authority is None:
-        return 0
-    if not _full_cudagraph_replay_step_has_refresh_row(controller):
-        return 0
+        raise RuntimeError(
+            "full cudagraph replay refresh payload enqueue requires "
+            "step-context-owned authority"
+        )
     refresh_slot_list = getattr(step_authority, "refresh_capture_slot_list", None)
     if not isinstance(refresh_slot_list, tuple) or not refresh_slot_list:
         raise RuntimeError(
@@ -9061,15 +9313,35 @@ def _enqueue_full_cudagraph_refresh_payloads_after_replay(
     from patches.vllm_sparse_patch import _prepare_refresh_capture_payload
 
     step_meta = getattr(controller, "step_meta", None)
-    seqused_k = getattr(step_meta, "seqused_k_gpu", None)
+    seqused_k = getattr(step_meta, "canonical_real_kv_len_i32_gpu", None)
     if not isinstance(seqused_k, torch.Tensor):
-        seqused_k = getattr(step_meta, "canonical_real_kv_len_i32_gpu", None)
-    layer_keys = tuple(getattr(controller, "layer_cache_keys", tuple()) or tuple())
-    if not layer_keys:
+        raise RuntimeError(
+            "full cudagraph replay refresh payload enqueue requires canonical "
+            "step sequence lengths"
+        )
+    layer_keys = getattr(controller, "layer_cache_keys", None)
+    if not isinstance(layer_keys, (list, tuple)) or not layer_keys:
         raise RuntimeError("full cudagraph replay refresh payload enqueue requires layer_cache_keys")
     layer_states = getattr(controller, "layer_states", None)
     if not isinstance(layer_states, dict):
         raise RuntimeError("full cudagraph replay refresh payload enqueue requires layer_states")
+    replay_payload_registry = getattr(
+        controller,
+        "_full_cudagraph_replay_payload_registry",
+        None,
+    )
+    if not isinstance(
+        replay_payload_registry,
+        FullCudagraphReplayPayloadRegistry,
+    ):
+        raise RuntimeError(
+            "full cudagraph replay refresh payload enqueue requires registry"
+        )
+    replay_payload_bindings = replay_payload_registry.require_graph(
+        graph_key=str(graph_key),
+        layer_keys=layer_keys,
+        live_batch_size=int(getattr(step_authority, "batch_size", 0)),
+    )
 
     handle_id = int(getattr(step_ctx, "step_handle_id", -1))
     handle_generation = int(getattr(step_ctx, "step_handle_generation", -1))
@@ -9096,13 +9368,11 @@ def _enqueue_full_cudagraph_refresh_payloads_after_replay(
     ):
         return 0
     step_envelope = getattr(step_ctx, "step_envelope_v2", None)
-    refresh_reason = str(
-        getattr(
-            step_envelope,
-            "refresh_reason",
-            getattr(controller, "_step_profile_refresh_reason", ""),
+    if step_envelope is None:
+        raise RuntimeError(
+            "full cudagraph replay refresh payload enqueue requires step envelope"
         )
-    )
+    refresh_reason = str(getattr(step_envelope, "refresh_reason", ""))
     refresh_intent_req_ids = tuple(
         str(req_id)
         for req_id in (getattr(step_envelope, "refresh_reqs", ()) or ())
@@ -9294,7 +9564,8 @@ def _enqueue_full_cudagraph_refresh_payloads_after_replay(
     # [HOOK-PERLAYER-DIET 2026-07-09] 世代内层不变量上提（取证 residual 662µs/世代主项）：
     # layout ring 同步校验/step 级标量/authority 字段在同一世代内逐层重算为纯冗余。
     # layout 判定按 buf_id 记忆（同 buf 同世代同判定）；capture slot 映射走
-    # _register_layer 已维护的 state 缓存（layer_index_epoch 门失效即回退全量调用）。
+    # _register_layer 已维护的 state 缓存；epoch 失效时按 graph 的冻结 ordinal
+    # 重新计算，不读取可漂移的 cache-key->layer fallback。
     _step_epoch_hoisted = int(getattr(step_ctx, "epoch", -1))
     _refresh_slot_tuple_hoisted = tuple(int(v) for v in refresh_slot_list)
     _target_scope_key_hoisted = getattr(step_authority, "target_selected_scope_key", None)
@@ -9306,25 +9577,35 @@ def _enqueue_full_cudagraph_refresh_payloads_after_replay(
         raise RuntimeError(
             "full cudagraph replay refresh payload enqueue missing refresh layout ring"
         )
-    for ordinal, cache_key_raw in enumerate(layer_keys):
+    ordered_replay_payload_bindings = (
+        replay_payload_bindings.ordered_layer_bindings
+    )
+    for ordinal, replay_payload_binding in enumerate(
+        ordered_replay_payload_bindings
+    ):
         _stage_inc("layer_count")
-        cache_key = int(cache_key_raw)
+        cache_key = int(replay_payload_binding.cache_key)
         state = layer_states.get(cache_key)
         if state is None:
             raise RuntimeError(
                 "full cudagraph replay refresh payload enqueue missing layer state"
             )
-        layer_index = int(getattr(state, "layer_index", -1))
-        if layer_index < 0:
-            layer_index = int(getattr(controller, "layer_index_by_cache_key", {}).get(cache_key, ordinal))
-        if layer_index < 0:
+        layer_index = int(ordinal)
+        state_layer_index = int(getattr(state, "layer_index", -1))
+        state_layer_index_epoch = int(
+            getattr(state, "layer_index_epoch", -2)
+        )
+        if (
+            state_layer_index_epoch == _layer_index_cache_epoch
+            and state_layer_index != layer_index
+        ):
             raise RuntimeError(
-                "full cudagraph replay refresh payload enqueue missing layer index"
+                "full cudagraph replay refresh payload layer-state order drift"
             )
         if (
-            int(getattr(state, "layer_index_epoch", -2)) == _layer_index_cache_epoch
+            state_layer_index_epoch == _layer_index_cache_epoch
             and int(getattr(state, "capture_chunk_id", -1)) >= 0
-            and int(getattr(state, "layer_index", -1)) == layer_index
+            and state_layer_index == layer_index
         ):
             chunk_id = int(state.capture_chunk_id)
             buf_id = int(state.capture_buf_id)
@@ -9353,37 +9634,23 @@ def _enqueue_full_cudagraph_refresh_payloads_after_replay(
                 else:
                     _layout_verdict_by_buf[int(buf_id)] = layout
 
-        key_cache = getattr(state, "_sfi_replay_key_cache", None)
-        value_cache = getattr(state, "_sfi_replay_value_cache", None)
-        block_table = getattr(state, "_sfi_replay_block_table", None)
-        if not isinstance(block_table, torch.Tensor):
-            block_table = getattr(controller, "_worker_block_table", None)
-        if isinstance(block_table, torch.Tensor):
-            # [ROW-SNAPSHOT-CARRIER] 世代级快照(循环外 dict,per 源表一次)。
-            _bt_key = int(block_table.data_ptr())
-            _bt_snap = _btable_snapshot_by_ptr.get(_bt_key)
-            if _bt_snap is None:
-                _bt_snap = block_table.clone()
-                _btable_snapshot_by_ptr[_bt_key] = _bt_snap
-            block_table = _bt_snap
-        q = getattr(state, "_sfi_replay_q", None)
-        cu_seqlens_q = getattr(state, "_sfi_replay_cu_seqlens_q", None)
-        layer_seqused_k = seqused_k if isinstance(seqused_k, torch.Tensor) else getattr(
-            state,
-            "_sfi_replay_seqused_k",
-            None,
-        )
-        if (
-            not isinstance(key_cache, torch.Tensor)
-            or not isinstance(value_cache, torch.Tensor)
-            or not isinstance(block_table, torch.Tensor)
-            or not isinstance(q, torch.Tensor)
-            or not isinstance(cu_seqlens_q, torch.Tensor)
-            or not isinstance(layer_seqused_k, torch.Tensor)
-        ):
+        if int(replay_payload_binding.layer_index) != layer_index:
             raise RuntimeError(
-                "full cudagraph replay refresh payload enqueue missing cached layer tensors"
+                "full cudagraph replay refresh payload graph/layer binding mismatch"
             )
+        key_cache = replay_payload_binding.key_cache
+        value_cache = replay_payload_binding.value_cache
+        block_table = replay_payload_binding.block_table
+        # [ROW-SNAPSHOT-CARRIER] 世代级快照(循环外 dict,per 源表一次)。
+        _bt_key = int(block_table.data_ptr())
+        _bt_snap = _btable_snapshot_by_ptr.get(_bt_key)
+        if _bt_snap is None:
+            _bt_snap = block_table.clone()
+            _btable_snapshot_by_ptr[_bt_key] = _bt_snap
+        block_table = _bt_snap
+        q = replay_payload_binding.q
+        cu_seqlens_q = replay_payload_binding.cu_seqlens_q
+        layer_seqused_k = seqused_k
 
         if not replay_logits_buffers_ready:
             prepare_logits_buffers = getattr(controller, "prepare_step_logits_buffers", None)
@@ -9503,11 +9770,11 @@ def _enqueue_full_cudagraph_refresh_payloads_after_replay(
             q=q,
             q_is_sub=False,
             cu_seqlens_q=cu_seqlens_q,
-            softmax_scale=float(getattr(state, "_sfi_replay_softmax_scale", 0.0) or 0.0),
-            softcap=float(getattr(state, "_sfi_replay_softcap", 0.0) or 0.0),
-            window_size=getattr(state, "_sfi_replay_window_size", None),
-            alibi_slopes=getattr(state, "_sfi_replay_alibi_slopes", None),
-            k_descale=getattr(state, "_sfi_replay_k_descale", None),
+            softmax_scale=replay_payload_binding.softmax_scale,
+            softcap=replay_payload_binding.softcap,
+            window_size=replay_payload_binding.window_size,
+            alibi_slopes=replay_payload_binding.alibi_slopes,
+            k_descale=replay_payload_binding.k_descale,
             layer_index=int(layer_index_in_chunk),
             seq_lens_cpu=seq_lens_cpu if seq_lens_cpu is not None else tuple(),
             seq_lens_tensor_cpu=seq_lens_tensor_cpu,
@@ -10677,6 +10944,18 @@ def _patch_cuda_graph_wrapper_for_sparse_cudagraph() -> None:
                     controller=controller,
                     forward_context_available=forward_context_available,
                 )
+        replay_payload_capture = None
+        if (
+            not pre_call_had_cudagraph
+            and pre_call_batch_descriptor is not None
+        ):
+            replay_payload_capture = (
+                _begin_full_cudagraph_replay_payload_capture(
+                    controller=controller,
+                    batch_descriptor=pre_call_batch_descriptor,
+                )
+            )
+            profile_graph_key = str(replay_payload_capture.graph_key)
         profile_entry_for_payload = locals().get("entry")
         profile_original_start_ns = time.perf_counter_ns() if profile_enabled else 0
         profile_cuda_event_sample = (
@@ -10695,11 +10974,47 @@ def _patch_cuda_graph_wrapper_for_sparse_cudagraph() -> None:
         )
         try:
             result = original_call(self, *args, **kwargs)
+            if replay_payload_capture is not None:
+                entries_after_capture = getattr(
+                    self,
+                    "concrete_cudagraph_entries",
+                    {},
+                )
+                entry_after_capture = (
+                    entries_after_capture.get(pre_call_batch_descriptor)
+                    if hasattr(entries_after_capture, "get")
+                    else None
+                )
+                if (
+                    entry_after_capture is None
+                    or getattr(entry_after_capture, "cudagraph", None) is None
+                ):
+                    raise RuntimeError(
+                        "FULL cudagraph owner returned without publishing the "
+                        "captured graph"
+                    )
+                _finalize_full_cudagraph_replay_payload_capture(
+                    controller=controller,
+                    capture=replay_payload_capture,
+                )
         finally:
-            profile_original_end_ns = time.perf_counter_ns() if profile_enabled else 0
-            _end_full_cudagraph_replay_cuda_event(profile_cuda_event_sample)
-            if refresh_enabled or release_pending:
-                _release_refresh_producer_after_decode_if_pending(controller)
+            try:
+                if replay_payload_capture is not None:
+                    _clear_full_cudagraph_replay_payload_capture(
+                        controller=controller,
+                        capture=replay_payload_capture,
+                    )
+            finally:
+                profile_original_end_ns = (
+                    time.perf_counter_ns() if profile_enabled else 0
+                )
+                _end_full_cudagraph_replay_cuda_event(
+                    profile_cuda_event_sample
+                )
+                if refresh_enabled or release_pending:
+                    _release_refresh_producer_after_decode_if_pending(
+                        controller
+                    )
         _evt_bisect_mark("post_replay", controller)
         if profile_reason == "prebound_rrp_graph_state":
             _record_prebound_rrp_replay_consumed_generation(
@@ -12375,6 +12690,22 @@ def _run_selected_no_capture_mixed_forward(
             _raise_selected_compact_recent_launch_rejected(
                 compact_decode_launch_support_error
             )
+        if controller._full_cudagraph_replay_payload_capture is not None:
+            _register_full_cudagraph_replay_payload_layer(
+                controller=controller,
+                graph_batch_size=batch_size,
+                num_actual_tokens=None,
+                key_cache=key_arg,
+                value_cache=value_arg,
+                block_table=block_table_arg,
+                q=q_arg,
+                cu_seqlens_q=kwargs.get("cu_seqlens_q", cu_seqlens_q),
+                softmax_scale=kwargs.get("softmax_scale"),
+                softcap=softcap,
+                window_size=window_tuple,
+                alibi_slopes=kwargs.get("alibi_slopes"),
+                k_descale=kwargs.get("k_descale"),
+            )
         # Prologue runs after tensor validation and compact decode rail support
         # checks. Full-batch max_seqlen_q is intentionally not rejected here:
         # mixed chunk dispatch launches prefill through mixed_page and decode
@@ -13319,20 +13650,6 @@ def _run_capture_only_mixed_forward(
         raise RuntimeError(
             "native FA3 capture mixed route requires full-batch real seqused_k truth"
         )
-    _cache_full_cudagraph_replay_payload_refs(
-        state=state,
-        key_cache=key_cache,
-        value_cache=value_cache,
-        block_table=block_table,
-        q=query,
-        cu_seqlens_q=cu_seqlens_q,
-        seqused_k=real_seqused_k,
-        softmax_scale=float(getattr(self, "scale", 1.0)),
-        softcap=float(getattr(self, "logits_soft_cap", 0.0) or 0.0),
-        window_size=getattr(self, "sliding_window", None),
-        alibi_slopes=getattr(self, "alibi_slopes", None),
-        k_descale=None,
-    )
     def _capture_wrapper(*args, **kwargs):
         _ctrl = _get_global_controller()
         if _ctrl is None or getattr(getattr(_ctrl, "config", None), "attn_mode", "compact_recent") != "compact_recent":
@@ -13374,6 +13691,27 @@ def _run_capture_only_mixed_forward(
         kwargs.pop("scheduler_metadata", None)
         if alibi_slopes is not None:
             raise RuntimeError("native FA3 capture mixed route does not support ALiBi yet")
+        q_arg = kwargs.get("q", query)
+        key_arg = kwargs.get("k", key)
+        value_arg = kwargs.get("v", value)
+        cu_seqlens_q_arg = kwargs.get("cu_seqlens_q", cu_seqlens_q)
+        block_table_arg = kwargs.get("block_table", block_table)
+        if controller._full_cudagraph_replay_payload_capture is not None:
+            _register_full_cudagraph_replay_payload_layer(
+                controller=controller,
+                graph_batch_size=batch_size,
+                num_actual_tokens=None,
+                key_cache=key_arg,
+                value_cache=value_arg,
+                block_table=block_table_arg,
+                q=q_arg,
+                cu_seqlens_q=cu_seqlens_q_arg,
+                softmax_scale=kwargs.get("softmax_scale"),
+                softcap=kwargs.get("softcap", 0.0),
+                window_size=(-1, -1),
+                alibi_slopes=None,
+                k_descale=kwargs.get("k_descale"),
+            )
 
         from patches.fa_sparse_runtime.mixed_prefill_decode_dispatch import (
             dispatch_capture_mixed_owner,
@@ -13393,18 +13731,18 @@ def _run_capture_only_mixed_forward(
             "resolved_row_ptr" if resolver_kwargs else "native_or_capture",
         )
         return dispatch_capture_mixed_owner(
-            q=kwargs.get("q", query),
-            k=kwargs.get("k", key),
-            v=kwargs.get("v", value),
+            q=q_arg,
+            k=key_arg,
+            v=value_arg,
             out=out_tensor,
-            cu_seqlens_q=kwargs.get("cu_seqlens_q", cu_seqlens_q),
+            cu_seqlens_q=cu_seqlens_q_arg,
             max_seqlen_q=int(kwargs.get("max_seqlen_q") or 1),
             max_seqlen_k=int(original_max_seq_len or kwargs.get("max_seqlen_q") or 1),
             seqused_k=real_seqused_k,
             softmax_scale=kwargs.get("softmax_scale"),
             window_size=(-1, -1),
             softcap=float(kwargs.get("softcap", 0.0) or 0.0),
-            block_table=kwargs.get("block_table", block_table),
+            block_table=block_table_arg,
             owner_plan=owner_plan,
             side_outputs=side_outputs,
             bridge=bridge,

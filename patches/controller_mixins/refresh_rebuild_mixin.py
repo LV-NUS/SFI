@@ -224,7 +224,6 @@ class RefreshRebuildMixin:
         self._deadline_producer_work_target_layer_end: int = -1
         self._deadline_producer_work_decode_step_min: int = -1
         self._deadline_producer_work_decode_step_max: int = -1
-        self._deadline_producer_work_ready_epoch: int = -1
         self._deadline_producer_work_deadline_epoch: int = -1
         self._deadline_producer_work_deadline_handle_id: int = -1
         self._deadline_producer_work_deadline_slack_steps: int = -1
@@ -317,15 +316,30 @@ class RefreshRebuildMixin:
             List[Dict[str, Any]]
         ] = None
         self._pending_refresh_empty_tensor_cache: Dict[Tuple[str, str], torch.Tensor] = {}
-        self._refresh_producer_executor: Any = None
-        self._refresh_producer_release_condition: Any = None
-        self._refresh_producer_released_handle_id: int = -1
         self._refresh_producer_stream_release_events: List[Tuple[int, Any, Any]] = []
         self._refresh_producer_stream_release_pending: bool = False
         self._refresh_producer_stream_release_generation: int = 0
         self._refresh_producer_stream_release_checked_generation: int = -1
         self._refresh_producer_stream_release_checked_handle_id: int = -1
         self._refresh_producer_split_release_counts_by_handle: Dict[int, int] = {}
+
+    def _reset_writer_graph_engine_state(self) -> None:
+        """Drop writer graphs and their capture-stream owner at engine reset."""
+        if self._pending_refresh_grouped_async_records is not None:
+            raise RuntimeError(
+                "engine graph reset requires grouped async records to be aborted"
+            )
+        self._writer_graph_state = None
+        self._writer_graph_recapture_count = 0
+        self._writer_graph_capture_stream_obj = None
+        self._writer_graph_capture_stream_device = None
+        self._pending_refresh_empty_tensor_cache.clear()
+        self._refresh_producer_stream_release_events = []
+        self._refresh_producer_stream_release_pending = False
+        self._refresh_producer_stream_release_generation = 0
+        self._refresh_producer_stream_release_checked_generation = -1
+        self._refresh_producer_stream_release_checked_handle_id = -1
+        self._refresh_producer_split_release_counts_by_handle.clear()
 
     # ------------------------------------------------------------------
     # Config helpers

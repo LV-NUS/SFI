@@ -1151,6 +1151,9 @@ class StepBoundMeta:
     # full-KV rows inside the same mixed-page/RRP carrier family.
     prologue_full_kv_handoff: bool = False
     compact_recent_launch_plan: Optional["CompactRecentLaunchPlan"] = None
+    # One step owns one overlay-geometry memo. Keeping it on the real runtime
+    # owner prevents request data from escaping into process-global state.
+    selected_overlay_cpu_geometry_cache: Optional[Tuple[object, ...]] = None
     compact_mixed_page_overlay_by_layer: Dict[int, object] = field(default_factory=dict)
     resolved_row_ptr_arena_by_layer: Dict[int, object] = field(default_factory=dict)
     resolved_row_ptr_arena_key_by_layer: Dict[int, object] = field(default_factory=dict)
