@@ -4,6 +4,7 @@ import ast
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+import runpy
 import struct
 import subprocess
 import sys
@@ -96,6 +97,28 @@ def test_step_core_contains_no_trace_or_counter_observer() -> None:
     )
 
 
+def test_live_route_resolver_contains_no_trace_observer() -> None:
+    source = (
+        REPO_ROOT / "patches" / "patch_installer.py"
+    ).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    resolver = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "resolve_live_fa3_launch_route"
+    )
+    referenced_names = {
+        node.id for node in ast.walk(resolver) if isinstance(node, ast.Name)
+    }
+    assert referenced_names.isdisjoint(
+        {
+            "append_fa3_route_trace",
+            "fa3_route_trace_enabled",
+        }
+    )
+
+
 def test_observer_free_specialization_is_exact_core_identity(monkeypatch) -> None:
     from patches.decode_runtime.step_context_observer import (
         build_observed_prepare_step_context_impl,
@@ -139,6 +162,36 @@ def test_observer_free_specialization_is_exact_core_identity(monkeypatch) -> Non
     assert observed(SimpleNamespace()) == "context"
     assert compact_rows == [2]
     assert trace_events == [{"source": "prepare_step_context"}]
+
+
+def test_step_trace_uses_canonical_row_policy_readiness_schema() -> None:
+    from patches.fa3_native.install import build_fa3_step_trace_event
+
+    authority = SimpleNamespace(
+        req_ids=("request-1", "request-2"),
+        is_prefill_by_row=(False, False),
+        row_policy_ready_by_row=(True, False),
+        use_compact_by_row=(True, False),
+        dispatch_logf_producer_by_row=(0, 0),
+        logits_last_n_by_row=(0, 0),
+        row_mode_by_row=(1, 0),
+        layer_effective_refresh_by_row=(False, False),
+        batch_size=2,
+        epoch=7,
+        step_handle_id=11,
+        step_handle_generation=3,
+    )
+
+    event = build_fa3_step_trace_event(
+        step_authority=authority,
+        step_context=SimpleNamespace(step_identity_token=7011),
+        source="test",
+    )
+
+    assert event["row_policy_ready_by_row"] == [True, False]
+    assert event["row_policy_ready_row_count"] == 1
+    assert "bootstrap_done_by_row" not in event
+    assert "bootstrap_done_row_count" not in event
 
 
 def test_timed_and_diagnostic_children_are_statically_separated() -> None:
@@ -499,6 +552,7 @@ def test_liveness_rejects_snapshot_without_replay_generation(
         ("--refresh-profile-log", str(profile)),
         ("--refresh-profile-offset", "0"),
         ("--route-counter-mmap", str(counter)),
+        ("--require-mature-decode-compact", "1"),
     )
     for flag, value in retired_arguments:
         retired = subprocess.run(
@@ -548,11 +602,52 @@ def _replay_route_event(*, pid: int, step_id: int = 309) -> dict[str, object]:
     }
 
 
+def _step_state_event(
+    *,
+    pid: int,
+    step_token: int,
+    phase: str,
+) -> dict[str, object]:
+    phase_contracts = {
+        "prefill": (True, False, False, False, 0),
+        "unready_dense": (False, False, False, False, 0),
+        "dense": (False, True, False, False, 0),
+        "refresh": (False, True, False, True, 3),
+        "compact": (False, True, True, False, 1),
+    }
+    try:
+        is_prefill, row_policy_ready, use_compact, layer_refresh, row_mode = (
+            phase_contracts[phase]
+        )
+    except KeyError as exc:
+        raise ValueError(f"unknown test phase: {phase}") from exc
+    return {
+        "event": "fa3_step_state",
+        "pid": pid,
+        "epoch": step_token,
+        "step_handle_id": step_token,
+        "step_handle_generation": 0,
+        "step_identity_token": step_token,
+        "batch_size": 1,
+        "rows_traced": 1,
+        "req_ids": ["request-1"],
+        "is_prefill_by_row": [is_prefill],
+        "row_policy_ready_by_row": [row_policy_ready],
+        "use_compact_by_row": [use_compact],
+        "dispatch_logf_producer_by_row": [False],
+        "logits_last_n_by_row": [1],
+        "row_mode_by_row": [row_mode],
+        "layer_effective_refresh_by_row": [layer_refresh],
+    }
+
+
 def _run_replay_liveness(
     tmp_path: Path,
     *,
     route_events: list[dict[str, object]],
+    step_events: list[dict[str, object]] | None = None,
     rank_count: int = 2,
+    counter_rank_values: list[int] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     route = tmp_path / "route.jsonl"
     route.write_text(
@@ -560,28 +655,53 @@ def _run_replay_liveness(
         encoding="utf-8",
     )
     counter = tmp_path / "route_counter_snapshot.bin"
-    rank_values = [48, 0, 0, 48, 0, 0, 0, 0, 76, 76]
+    rank_values = counter_rank_values or [
+        48,
+        0,
+        0,
+        48,
+        0,
+        0,
+        0,
+        0,
+        76,
+        76,
+    ]
     counter.write_bytes(
         b"".join(struct.pack("10q", *rank_values) for _ in range(rank_count))
     )
+    command = [
+        sys.executable,
+        "-I",
+        str(REPO_ROOT / "scripts" / "check_sparse_liveness.py"),
+        "--route-trace",
+        str(route),
+        "--route-counter-snapshot",
+        str(counter),
+        "--baseline-compact-row-steps",
+        "0",
+        "--min-compact-row-step-delta",
+        "1",
+        "--expected-route-counter-ranks",
+        str(rank_count),
+        "--phase",
+        "full-replay-test",
+    ]
+    if step_events is not None:
+        step = tmp_path / "step.jsonl"
+        step.write_text(
+            "".join(json.dumps(event) + "\n" for event in step_events),
+            encoding="utf-8",
+        )
+        command.extend(
+            [
+                "--step-trace",
+                str(step),
+                "--reject-request-fallback",
+            ]
+        )
     return subprocess.run(
-        [
-            sys.executable,
-            "-I",
-            str(REPO_ROOT / "scripts" / "check_sparse_liveness.py"),
-            "--route-trace",
-            str(route),
-            "--route-counter-snapshot",
-            str(counter),
-            "--baseline-compact-row-steps",
-            "0",
-            "--min-compact-row-step-delta",
-            "1",
-            "--expected-route-counter-ranks",
-            str(rank_count),
-            "--phase",
-            "full-replay-test",
-        ],
+        command,
         check=False,
         capture_output=True,
         text=True,
@@ -605,6 +725,251 @@ def test_liveness_accepts_tp_complete_full_replay_without_profile(
     assert "generation_count=1" in result.stdout
     assert "source=replay_batched_route" in result.stdout
     assert "FULL replay route authority" in result.stdout
+
+
+def test_json_record_reader_uses_byte_offsets_and_rejects_invalid_utf8(
+    tmp_path: Path,
+) -> None:
+    checker = runpy.run_path(
+        str(REPO_ROOT / "scripts" / "check_sparse_liveness.py")
+    )
+    iter_records = checker["_iter_json_records"]
+    stale = (
+        json.dumps(
+            {"event": "stale", "note": "旧证据"},
+            ensure_ascii=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+    fresh_event = {"event": "fresh", "pid": 101}
+    fresh = (json.dumps(fresh_event) + "\n").encode("utf-8")
+    invalid = b'{"event":"corrupt",\xff"pid":202}\n'
+    route = tmp_path / "route.jsonl"
+    route.write_bytes(stale + fresh + invalid)
+    parse_errors: list[str] = []
+
+    records = list(
+        iter_records(
+            str(route),
+            offset=len(stale),
+            parse_errors=parse_errors,
+        )
+    )
+
+    assert records == [fresh_event]
+    assert len(parse_errors) == 1
+    assert "UTF-8 损坏" in parse_errors[0]
+
+
+def test_liveness_rejects_direct_route_as_full_replay_authority(
+    tmp_path: Path,
+) -> None:
+    result = _run_replay_liveness(
+        tmp_path,
+        route_events=[
+            _replay_enqueue_event(pid=101),
+            _replay_enqueue_event(pid=202),
+            {"event": "mixed_page_call", "mode": "resolved_row_ptr"},
+        ],
+        counter_rank_values=[48, 1, 1, 0, 0, 0, 0, 1, 76, 76],
+    )
+
+    assert result.returncode != 0
+    assert "缺少唯一的 TP-complete" in result.stdout
+
+
+def test_liveness_rejects_boundary_incomplete_replay_hook(
+    tmp_path: Path,
+) -> None:
+    result = _run_replay_liveness(
+        tmp_path,
+        route_events=[
+            _replay_enqueue_event(pid=101),
+            _replay_enqueue_event(pid=202),
+            _replay_route_event(pid=101, step_id=309),
+            _replay_route_event(pid=202, step_id=309),
+            _replay_route_event(pid=101, step_id=310),
+        ],
+    )
+
+    assert result.returncode != 0
+    assert "TP-incomplete=1" in result.stdout
+    assert "replay_incomplete=1" in result.stdout
+
+
+def _tp_step_events(phases: list[str]) -> list[dict[str, object]]:
+    return [
+        _step_state_event(
+            pid=pid,
+            step_token=step_token,
+            phase=phase,
+        )
+        for step_token, phase in enumerate(phases, start=1)
+        for pid in (101, 202)
+    ]
+
+
+def test_liveness_accepts_threshold_dense_before_first_compact(
+    tmp_path: Path,
+) -> None:
+    result = _run_replay_liveness(
+        tmp_path,
+        route_events=[
+            _replay_enqueue_event(pid=101),
+            _replay_enqueue_event(pid=202),
+            _replay_route_event(pid=101),
+            _replay_route_event(pid=202),
+        ],
+        step_events=_tp_step_events(
+            [
+                "prefill",
+                "dense",
+                "dense",
+                "refresh",
+                "dense",
+                "compact",
+                "compact",
+            ]
+        ),
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "precompact_or_short_dense=6" in result.stdout
+    assert "fallback=0" in result.stdout
+    assert "SPARSE LIVENESS: PASS" in result.stdout
+
+
+def test_liveness_accepts_policy_unready_before_first_compact(
+    tmp_path: Path,
+) -> None:
+    result = _run_replay_liveness(
+        tmp_path,
+        route_events=[
+            _replay_enqueue_event(pid=101),
+            _replay_enqueue_event(pid=202),
+            _replay_route_event(pid=101),
+            _replay_route_event(pid=202),
+        ],
+        step_events=_tp_step_events(
+            ["prefill", "unready_dense", "refresh", "compact"]
+        ),
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "policy_unready_dense=2" in result.stdout
+    assert "fallback=0" in result.stdout
+    assert "SPARSE LIVENESS: PASS" in result.stdout
+
+
+def test_liveness_resets_sticky_state_at_reused_request_prefill(
+    tmp_path: Path,
+) -> None:
+    result = _run_replay_liveness(
+        tmp_path,
+        route_events=[
+            _replay_enqueue_event(pid=101),
+            _replay_enqueue_event(pid=202),
+            _replay_route_event(pid=101),
+            _replay_route_event(pid=202),
+        ],
+        step_events=_tp_step_events(
+            [
+                "prefill",
+                "dense",
+                "compact",
+                "prefill",
+                "dense",
+                "compact",
+            ]
+        ),
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "precompact_or_short_dense=4" in result.stdout
+    assert "fallback=0" in result.stdout
+    assert "SPARSE LIVENESS: PASS" in result.stdout
+
+
+def test_liveness_rejects_dense_after_compact(
+    tmp_path: Path,
+) -> None:
+    result = _run_replay_liveness(
+        tmp_path,
+        route_events=[
+            _replay_enqueue_event(pid=101),
+            _replay_enqueue_event(pid=202),
+            _replay_route_event(pid=101),
+            _replay_route_event(pid=202),
+        ],
+        step_events=_tp_step_events(
+            ["prefill", "dense", "refresh", "compact", "dense"]
+        ),
+    )
+
+    assert result.returncode != 0
+    assert "fallback=2" in result.stdout
+    assert "post-compact mature decode" in result.stdout
+
+
+def test_liveness_rejects_policy_readiness_regression_after_compact(
+    tmp_path: Path,
+) -> None:
+    result = _run_replay_liveness(
+        tmp_path,
+        route_events=[
+            _replay_enqueue_event(pid=101),
+            _replay_enqueue_event(pid=202),
+            _replay_route_event(pid=101),
+            _replay_route_event(pid=202),
+        ],
+        step_events=_tp_step_events(
+            ["prefill", "refresh", "compact", "unready_dense"]
+        ),
+    )
+
+    assert result.returncode != 0
+    assert "fallback=2" in result.stdout
+    assert "reason=policy_unready" in result.stdout
+
+
+def test_liveness_rejects_boundary_incomplete_tp_step_group(
+    tmp_path: Path,
+) -> None:
+    step_events = _tp_step_events(
+        ["prefill", "dense", "refresh", "compact"]
+    )
+    result = _run_replay_liveness(
+        tmp_path,
+        route_events=[
+            _replay_enqueue_event(pid=101),
+            _replay_enqueue_event(pid=202),
+            _replay_route_event(pid=101),
+            _replay_route_event(pid=202),
+        ],
+        step_events=step_events[:-1],
+    )
+
+    assert result.returncode != 0
+    assert "incomplete=1" in result.stdout
+    assert "TP step trace 缺 rank 事件" in result.stdout
+
+
+def test_liveness_rejects_step_window_starting_mid_request(
+    tmp_path: Path,
+) -> None:
+    result = _run_replay_liveness(
+        tmp_path,
+        route_events=[
+            _replay_enqueue_event(pid=101),
+            _replay_enqueue_event(pid=202),
+            _replay_route_event(pid=101),
+            _replay_route_event(pid=202),
+        ],
+        step_events=_tp_step_events(["dense", "compact"]),
+    )
+
+    assert result.returncode != 0
+    assert "缺少 prefill 生命周期边界" in result.stdout
 
 
 @pytest.mark.parametrize(
@@ -706,10 +1071,10 @@ def test_liveness_route_judge_uses_only_fresh_offset_window(
     )
 
     assert result.returncode != 0
-    assert "fresh route window 无 sparse read authority" in result.stdout
+    assert "缺少唯一的 TP-complete" in result.stdout
 
 
-def test_full_replay_serve_retires_refresh_profile_authority() -> None:
+def test_full_replay_serve_retirement_contract() -> None:
     serve_source = (
         REPO_ROOT / "scripts" / "serve_sparse.sh"
     ).read_text(encoding="utf-8")
@@ -721,6 +1086,9 @@ def test_full_replay_serve_retires_refresh_profile_authority() -> None:
     ).read_text(encoding="utf-8")
     installer_source = (
         REPO_ROOT / "patches" / "patch_installer.py"
+    ).read_text(encoding="utf-8")
+    fa3_install_source = (
+        REPO_ROOT / "patches" / "fa3_native" / "install.py"
     ).read_text(encoding="utf-8")
 
     retired_profile_env = (
@@ -741,4 +1109,18 @@ def test_full_replay_serve_retires_refresh_profile_authority() -> None:
     assert 'data["schema"] != 7' in longbench_source
     assert "--refresh-profile-log" not in checker_source
     assert "--refresh-profile-offset" not in checker_source
+    assert "--require-mature-decode-compact" not in checker_source
+    assert "strict-long" not in longbench_source
+    assert "request_policy" not in longbench_source
+    assert 'open(path, "r", errors="ignore")' not in checker_source
+    assert "boundary_groups" not in checker_source
+    assert "boundary_tokens" not in checker_source
+    assert "row_is_compact" not in checker_source
+    assert "from collections import Counter" not in checker_source
+    assert "bootstrap_done_by_row" not in checker_source
+    assert "row_policy_ready_by_row" in checker_source
+    assert "fa3_live_route_decision" not in installer_source
+    assert "bootstrap_done_by_row" not in fa3_install_source
+    assert "bootstrap_done_row_count" not in fa3_install_source
+    assert '"row_policy_ready_by_row"' in fa3_install_source
     assert "_refresh_profile_batched_hint_emitted" not in installer_source

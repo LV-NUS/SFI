@@ -864,7 +864,6 @@ run_liveness_delta() {
   local compact_baseline="$2"
   local step_trace_offset="$3"
   local route_trace_offset="$4"
-  local request_policy="$5"
   local -a liveness_args=(
     --route-counter-snapshot "${ROUTE_COUNTER_SNAPSHOT}" \
     --run-since "${SERVER_STARTED_EPOCH}" \
@@ -874,9 +873,6 @@ run_liveness_delta() {
     --expected-route-counter-ranks "${TP_SIZE}" \
     --phase "${phase}"
   )
-  if [[ "${request_policy}" != "strict-long" && "${request_policy}" != "sticky" ]]; then
-    die "unknown liveness request policy: ${request_policy}"
-  fi
   [[ "${TRACE_ENABLED}" == "True" ]] || \
     die "same-run liveness requires the diagnostic trace/proof server mode"
   liveness_args+=(
@@ -884,11 +880,10 @@ run_liveness_delta() {
     --route-trace-offset "${route_trace_offset}"
     --step-trace "${STEP_TRACE_LOG}"
     --step-trace-offset "${step_trace_offset}"
+    # R1/R3 prove fresh generation and compact activation. R4 only rejects a
+    # request that regresses to dense after its first compact decode.
     --reject-request-fallback
   )
-  if [[ "${request_policy}" == "strict-long" ]]; then
-    liveness_args+=(--require-mature-decode-compact)
-  fi
   "${PYTHON}" -I "${SFI_ROOT}/scripts/check_sparse_liveness.py" \
     "${liveness_args[@]}" \
     2>&1 | tee "${EVAL_DIR}/${phase}_liveness.log"
@@ -992,7 +987,7 @@ if (( LIVENESS_ENABLED == 1 )); then
   route_counter_rpc "snapshot" "${SMOKE_SNAPSHOT_JSON}" "${SMOKE_RESET_JSON}"
   run_liveness_delta "smoke" \
     "${SMOKE_BASELINE[0]}" "${SMOKE_BASELINE[1]}" \
-    "${SMOKE_BASELINE[2]}" "strict-long"
+    "${SMOKE_BASELINE[2]}"
 else
   echo "INFO: smoke R0-R6 NOT_RUN; server is the hot-path observer-free specialization"
 fi
@@ -1031,7 +1026,7 @@ if (( LIVENESS_ENABLED == 1 )); then
   route_counter_rpc "snapshot" "${EVAL_SNAPSHOT_JSON}" "${EVAL_RESET_JSON}"
   run_liveness_delta "posteval" \
     "${EVAL_BASELINE[0]}" "${EVAL_BASELINE[1]}" \
-    "${EVAL_BASELINE[2]}" "sticky"
+    "${EVAL_BASELINE[2]}"
 else
   echo "INFO: posteval R0-R6 NOT_RUN; quality/scoring ran without hot-path observers"
 fi

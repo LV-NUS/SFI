@@ -3299,7 +3299,6 @@ def resolve_live_fa3_launch_route(
     ):
         live_has_selected = True
     live_has_capture = bool(row_plan.has_capture)
-    is_prefill_by_row = step_authority.is_prefill_by_row
     live_has_compact_recent = False
     live_route = route_attention_launch(
         has_selected_consume=live_has_selected,
@@ -3313,42 +3312,6 @@ def resolve_live_fa3_launch_route(
         and not live_has_compact_recent
     ):
         live_route = _MIXED_PAGE_ROUTE
-    from patches.fa3_native.install import append_fa3_route_trace, fa3_route_trace_enabled
-
-    if fa3_route_trace_enabled():
-        append_fa3_route_trace(
-            {
-                "event": "fa3_live_route_decision",
-                "epoch": int(getattr(step_authority, "epoch", -1)),
-                "step_identity_token": int(step_token),
-                "batch_size": int(total_rows),
-                "route": str(live_route),
-                "has_selected_consume": bool(live_has_selected),
-                "has_capture": bool(live_has_capture),
-                "has_compact_recent": bool(live_has_compact_recent),
-                "vllm_profile_step": bool(is_profile_step),
-                "is_prefill_by_row": [
-                    bool(v)
-                    for v in is_prefill_by_row
-                ],
-                "bootstrap_done_by_row": [
-                    bool(v)
-                    for v in step_authority.row_policy_ready_by_row
-                ],
-                "use_compact_by_row": [
-                    bool(v)
-                    for v in step_authority.use_compact_by_row
-                ],
-                "row_mode_by_row": [
-                    int(v)
-                    for v in step_authority.row_mode_by_row
-                ],
-                "logits_last_n_by_row": [
-                    int(v)
-                    for v in step_authority.logits_last_n_by_row
-                ],
-            }
-        )
     setattr(controller, "_fa3_live_route_token", step_token)
     setattr(controller, "_fa3_live_route_batch_size", int(batch_size if batch_size is not None else -1))
     setattr(controller, "_fa3_live_route_has_selected_consume", live_has_selected)
@@ -8128,8 +8091,6 @@ def _append_prebound_rrp_full_cudagraph_replay_trace(
     forward_context: object,
     stats: object,
 ) -> None:
-    if not _fa3_route_trace_enabled():
-        return
     try:
         from patches.fa3_native.install import append_fa3_route_trace
         from patches.fa_sparse_runtime.mixed_page_cudagraph_replay import (
@@ -8203,8 +8164,6 @@ def _append_mixed_page_full_cudagraph_hook_trace(
     route_family_mismatch: bool | None = None,
     bridge_graph_policy: str | None = None,
 ) -> None:
-    if not _fa3_route_trace_enabled():
-        return
     try:
         from patches.fa3_native.install import append_fa3_route_trace
     except Exception:

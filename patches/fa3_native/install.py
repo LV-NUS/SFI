@@ -377,9 +377,7 @@ def build_fa3_step_trace_event(
         "rows_traced": int(rows),
         "req_ids": list(req_ids[:rows]),
         "is_prefill_by_row": [bool(v) for v in is_prefill_by_row[:rows]],
-        # Wire key retained for release-checker compatibility. Runtime state
-        # ownership uses the unambiguous row_policy_ready_by_row name.
-        "bootstrap_done_by_row": [
+        "row_policy_ready_by_row": [
             bool(v) for v in row_policy_ready_by_row[:rows]
         ],
         "use_compact_by_row": [bool(v) for v in use_compact_by_row[:rows]],
@@ -389,7 +387,7 @@ def build_fa3_step_trace_event(
         "layer_effective_refresh_by_row": [bool(v) for v in layer_effective_refresh_by_row[:rows]],
         "prefill_row_count": sum(1 for v in is_prefill_by_row[:rows] if bool(v)),
         "decode_row_count": sum(1 for v in is_prefill_by_row[:rows] if not bool(v)),
-        "bootstrap_done_row_count": sum(
+        "row_policy_ready_row_count": sum(
             1 for v in row_policy_ready_by_row[:rows] if bool(v)
         ),
         "selected_row_count": sum(1 for v in use_compact_by_row[:rows] if bool(v)),

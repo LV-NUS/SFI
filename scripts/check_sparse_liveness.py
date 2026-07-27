@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""[SPARSE-LIVENESS-JUDGE 2026-07-27 v6] serve/LongBench 场 sparse 活性判官。
+"""[SPARSE-LIVENESS-JUDGE 2026-07-27 v8] serve/LongBench 场 sparse 活性判官。
 
 bench 场有 producer gate 兜活性;serve 注入场(LongBench 等)此前裸奔——
 sparse 若静默退化成 dense(触发为零/patch 未装/路由回落),精度数字看着
@@ -23,22 +23,19 @@ sparse 若静默退化成 dense(触发为零/patch 未装/路由回落),精度�
      旧 profile authority 已退休，缺 route enqueue 必须 fail-closed。
   R2 触发活性: sentence 触发意图>0；interval-only 配置由 R1 的世代活性
      覆盖，replay-batched 路径也读取 route 事件中的 refresh_reason。
-  R3 路由活性(两源,冻结 RPC 快照优先):
+  R3 路由活性(冻结 RPC + FULL replay hook 联合判定):
      a) --route-counter-snapshot: blocking worker RPC 后按 TP rank 冻结的
         10×int64 记录
         (total/kind4/has_rrp/kind0..4/compact_steps/compact_rows)，聚合前
         先要求各 rank 完全一致；kind4>0=Python 可见前向真走 resolver；
         FULL replay 下 kind4 不可见，改由 TP-complete graph hook 与
         replay-aware compact step counter 联合定谳；
-     b) --route-trace: 仅在 fresh offset 窗内逐事件解析 mode、FULL replay
-        graph hook 与 row_is_compact 聚合
-        (长请求 sparse 化率;短请求低于阈值恒 dense 是设计内,聚合占比
-        才有判读价值)。
+     b) --route-trace: 仅在 fresh offset 窗内解析 TP-complete FULL replay
+        graph hook。旧 direct-route/mode/逐行 compact 旁路权威已退休。
   R4 请求级 fallback: --step-trace 提供 fa3_step_state 时按 PID/request
-     重建相位。prefill、bootstrap 未完成的 dense 行与显式 refresh（包括
-     bootstrap refresh）允许 dense/native；已进入 compact 的请求若回到
-     mature decode dense 则判红。已知长请求可用
-     --require-mature-decode-compact 收紧为所有 mature decode 都必须 compact。
+     重建相位。prefill、row policy 未就绪的 dense 行与显式 refresh 允许
+     dense/native；已进入 compact 的请求若回到 dense 或 policy 未就绪
+     则判红。compact threshold 前的 mature dense 是设计内相位，不得误报。
   配置组合防护(启动期,非本判官):dual-gen×residency 缺失/FORCE_DENSE
      冲突=安装事务 fail-fast;residency slots<max_num_seqs=profile
      dummy_run 预检 fail-fast([SERVE-LIVENESS-PREFLIGHT])。本判官管
@@ -53,7 +50,6 @@ import json
 import os
 import struct
 import sys
-from collections import Counter
 
 
 def _iter_json_records(
@@ -62,10 +58,21 @@ def _iter_json_records(
     offset: int = 0,
     parse_errors: list[str] | None = None,
 ):
-    with open(path, "r", errors="ignore") as fh:
+    # Offsets come from os.path.getsize(), so consume the trace as bytes.
+    # Text-mode cookies and errors="ignore" can respectively mis-seek or hide
+    # corruption, allowing stale/malformed evidence to enter a fresh window.
+    with open(path, "rb") as fh:
         fh.seek(offset)
-        for line_number, line in enumerate(fh, start=1):
-            if not line.strip():
+        for line_number, raw_line in enumerate(fh, start=1):
+            if not raw_line.strip():
+                continue
+            try:
+                line = raw_line.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                if parse_errors is not None:
+                    parse_errors.append(
+                        f"offset 后第 {line_number} 行 UTF-8 损坏: {exc.reason}"
+                    )
                 continue
             try:
                 value = json.loads(line)
@@ -255,12 +262,9 @@ def main() -> int:
     ap.add_argument(
         "--reject-request-fallback",
         action="store_true",
-        help="请求进入 compact 后若回到 mature decode dense/native 则判红",
-    )
-    ap.add_argument(
-        "--require-mature-decode-compact",
-        action="store_true",
-        help="已知长请求中所有非 refresh 的 mature decode 行都必须 compact",
+        help=(
+            "请求进入 compact 后若回到 dense/native 或 policy-unready 则判红"
+        ),
     )
     ap.add_argument(
         "--require-mixed-prefill-decode",
@@ -344,7 +348,6 @@ def main() -> int:
     )
     require_step_trace = bool(
         args.reject_request_fallback
-        or args.require_mature_decode_compact
         or args.require_mixed_prefill_decode
     )
     step_trace_ok = _r0_check(
@@ -505,12 +508,9 @@ def main() -> int:
             "R3c: frozen route counter snapshot 不含 replay-aware compact 读计数"
         )
 
-    # ---- R3b fresh route authority: direct route 或 TP-complete replay hook ----
+    # ---- R3b fresh FULL replay authority: TP-complete replay hook only ----
     replay_route_authority = False
     if trace_ok:
-        mode_counts = Counter()
-        compact_rows = 0
-        total_rows = 0
         events = 0
         route_parse_errors: list[str] = []
         replay_hook_groups: dict[tuple[int, str], set[int]] = {}
@@ -523,12 +523,6 @@ def main() -> int:
             parse_errors=route_parse_errors,
         ):
             events += 1
-            mode = str(evt.get("mode", evt.get("probe", "?")))
-            mode_counts[mode] += 1
-            rows = evt.get("row_is_compact")
-            if isinstance(rows, (list, tuple)):
-                total_rows += len(rows)
-                compact_rows += sum(1 for value in rows if value)
             if evt.get("event") != (
                 "mixed_page_full_cudagraph_replay_hook_check"
             ):
@@ -570,33 +564,30 @@ def main() -> int:
                 continue
             seen_pids.add(pid)
 
-        rrp = mode_counts.get("resolved_row_ptr", 0)
         replay_hook_complete = 0
-        replay_hook_interior_incomplete = 0
+        replay_hook_incomplete = 0
         if replay_hook_groups and expected_replay_ranks > 0:
-            boundary_groups = {
-                min(replay_hook_groups),
-                max(replay_hook_groups),
-            }
             for group_key, seen_pids in replay_hook_groups.items():
                 if group_key in replay_hook_bad_groups:
                     continue
                 if len(seen_pids) == expected_replay_ranks:
                     replay_hook_complete += 1
-                elif group_key not in boundary_groups:
-                    replay_hook_interior_incomplete += 1
+                else:
+                    replay_hook_incomplete += 1
         elif replay_hook_groups:
-            replay_hook_interior_incomplete = len(replay_hook_groups)
+            replay_hook_incomplete = len(replay_hook_groups)
 
         replay_route_authority = bool(
             replay_hook_complete > 0 and compact_row_steps > 0
+            and replay_hook_incomplete == 0
+            and replay_hook_mismatches == 0
+            and replay_hook_duplicates == 0
+            and not route_parse_errors
         )
-        row_ratio = (compact_rows / total_rows) if total_rows else 0.0
         print(
-            f"R3b 路由活性(trace): events={events} modes={dict(mode_counts)} "
-            f"compact_rows={compact_rows}/{total_rows} ({row_ratio:.1%}) "
+            f"R3b FULL replay hook(trace): events={events} "
             f"replay_complete={replay_hook_complete} "
-            f"replay_interior_incomplete={replay_hook_interior_incomplete} "
+            f"replay_incomplete={replay_hook_incomplete} "
             f"replay_mismatch={replay_hook_mismatches} "
             f"replay_duplicates={replay_hook_duplicates}"
         )
@@ -609,35 +600,24 @@ def main() -> int:
         if (
             replay_hook_mismatches
             or replay_hook_duplicates
-            or replay_hook_interior_incomplete
+            or replay_hook_incomplete
         ):
             fails.append(
                 "R3b: FULL replay route 证据不完整: "
                 f"mismatch={replay_hook_mismatches} "
                 f"duplicates={replay_hook_duplicates} "
-                f"TP-incomplete={replay_hook_interior_incomplete}"
+                f"TP-incomplete={replay_hook_incomplete}"
             )
-        if events > 0 and rrp == 0 and not replay_route_authority:
-            fails.append("R3b: fresh route window 无 sparse read authority")
+        if generation_count > 0 and not replay_route_authority:
+            fails.append(
+                "R3b: replay generation 缺少唯一的 TP-complete "
+                "resolved_row_ptr hook + compact-step read authority"
+            )
         if replay_route_authority:
             print(
                 "[INFO] R3b: FULL replay route authority=TP-complete "
                 "resolved_row_ptr hook + replay-aware compact step counter"
             )
-        # row_is_compact 只覆盖 Python 可见步；FULL replay 的读侧以 R3c
-        # 为准。没有 R3c 的旧产物继续 fail-closed。
-        if total_rows > 0 and compact_rows == 0:
-            if compact_row_steps >= 0:
-                print(
-                    "[INFO] R3b: trace 可见步(capture/eager/prefill 窗)全 "
-                    "dense=FULL-graph 常态,读侧真值以 R3c 为准"
-                )
-            else:
-                fails.append(
-                    "R3b: row_is_compact 全 False 且无 R3c 计数(旧运行时)"
-                    "——所有可见行 dense(请求全短于阈值?FORCE_* env?"
-                    "bootstrap 未完成即结束?)"
-                )
     if counter_kind4_missing:
         if replay_route_authority:
             print(
@@ -654,19 +634,22 @@ def main() -> int:
         )
 
     # ---- R4 请求级 fallback：只把 mature decode 的不期望 dense 判死。 ----
-    # prefill / bootstrap / refresh 是显式相位，不属于 fallback；短请求可以一直
-    # dense。full eval 用 compact_seen 后的 sticky 规则，已知长 smoke 额外要求
-    # 每个 mature decode 行从一开始就 compact。
+    # prefill / policy-unready / refresh 与 threshold 前 mature dense 都是
+    # 显式合法相位。唯一 fallback 定义是同一 request incarnation 已进入
+    # compact 后又回到 dense/native 或 policy-unready。
     if step_trace_ok:
         compact_seen: set[tuple[int, str]] = set()
+        request_lifecycle_seen: set[tuple[int, str]] = set()
         step_events = 0
         traced_rows = 0
         compact_rows = 0
         prefill_dense_rows = 0
-        bootstrap_dense_rows = 0
+        policy_unready_dense_rows = 0
         refresh_rows = 0
         precompact_dense_rows = 0
-        fallback_rows: list[str] = []
+        post_compact_fallback_rows: list[str] = []
+        lifecycle_missing_count = 0
+        lifecycle_missing_samples: list[str] = []
         step_trace_parse_errors: list[str] = []
         tp_step_pids: set[int] = set()
         tp_step_groups: dict[int, tuple[str, int, set[int]]] = {}
@@ -683,7 +666,7 @@ def main() -> int:
         vector_fields = (
             "req_ids",
             "is_prefill_by_row",
-            "bootstrap_done_by_row",
+            "row_policy_ready_by_row",
             "use_compact_by_row",
             "row_mode_by_row",
             "layer_effective_refresh_by_row",
@@ -697,7 +680,7 @@ def main() -> int:
             "rows_traced",
             "req_ids",
             "is_prefill_by_row",
-            "bootstrap_done_by_row",
+            "row_policy_ready_by_row",
             "use_compact_by_row",
             "dispatch_logf_producer_by_row",
             "logits_last_n_by_row",
@@ -836,7 +819,7 @@ def main() -> int:
                 req_id = vectors["req_ids"][row]
                 boolean_values = (
                     vectors["is_prefill_by_row"][row],
-                    vectors["bootstrap_done_by_row"][row],
+                    vectors["row_policy_ready_by_row"][row],
                     vectors["use_compact_by_row"][row],
                     vectors["layer_effective_refresh_by_row"][row],
                 )
@@ -854,7 +837,7 @@ def main() -> int:
                 if type(row_mode) is not int:
                     fails.append("R4: row_mode_by_row 含非整数值")
                     continue
-                is_prefill, bootstrap_done, use_compact, layer_refresh = (
+                is_prefill, row_policy_ready, use_compact, layer_refresh = (
                     boolean_values
                 )
                 if use_compact != (row_mode == 1):
@@ -869,6 +852,7 @@ def main() -> int:
                     # lifecycle boundary carried by this trace, so discard
                     # sticky state from the previous incarnation first.
                     compact_seen.discard(key)
+                    request_lifecycle_seen.discard(key)
                     if row_mode not in (0, 2) or layer_refresh:
                         fails.append(
                             f"R4: req={req_id!r} prefill 相位非法 "
@@ -876,11 +860,19 @@ def main() -> int:
                         )
                         continue
                     prefill_dense_rows += 1
+                    request_lifecycle_seen.add(key)
+                    continue
+                if key not in request_lifecycle_seen:
+                    lifecycle_missing_count += 1
+                    if len(lifecycle_missing_samples) < 8:
+                        lifecycle_missing_samples.append(
+                            f"pid={pid},req={req_id}"
+                        )
                     continue
                 # Keep the judge's phase precedence identical to
                 # resolve_decode_row_policy(): an explicit decode refresh is
-                # legal before bootstrap_done because that refresh is what
-                # materializes the first compact generation.
+                # legal before row-policy readiness because that refresh is
+                # what materializes the first compact generation.
                 if row_mode == 3:
                     if not layer_refresh:
                         fails.append(
@@ -894,14 +886,19 @@ def main() -> int:
                         f"R4: req={req_id!r} 显式 refresh 行未使用 row_mode=3"
                     )
                     continue
-                if not bootstrap_done:
+                if not row_policy_ready:
                     if row_mode != 0:
                         fails.append(
-                            f"R4: req={req_id!r} bootstrap 相位非法 "
+                            f"R4: req={req_id!r} policy-unready 相位非法 "
                             f"row_mode={row_mode} refresh={layer_refresh}"
                         )
                         continue
-                    bootstrap_dense_rows += 1
+                    if args.reject_request_fallback and key in compact_seen:
+                        post_compact_fallback_rows.append(
+                            f"pid={pid},req={req_id},reason=policy_unready"
+                        )
+                    else:
+                        policy_unready_dense_rows += 1
                     continue
                 if row_mode == 1:
                     compact_seen.add(key)
@@ -913,12 +910,10 @@ def main() -> int:
                     )
                     continue
 
-                strict_failure = bool(args.require_mature_decode_compact)
-                sticky_failure = bool(
-                    args.reject_request_fallback and key in compact_seen
-                )
-                if strict_failure or sticky_failure:
-                    fallback_rows.append(f"pid={pid},req={req_id}")
+                if args.reject_request_fallback and key in compact_seen:
+                    post_compact_fallback_rows.append(
+                        f"pid={pid},req={req_id}"
+                    )
                 else:
                     precompact_dense_rows += 1
 
@@ -928,31 +923,35 @@ def main() -> int:
                 "R4: request-level step trace 含损坏记录: "
                 f"count={len(step_trace_parse_errors)} sample=[{sample}]"
             )
+        if lifecycle_missing_count:
+            fails.append(
+                "R4: fresh step window 从请求中途开始，缺少 prefill 生命周期边界: "
+                f"count={lifecycle_missing_count} "
+                f"sample={lifecycle_missing_samples}"
+            )
 
         print(
             f"R4 请求级相位({args.phase}): events={step_events} rows={traced_rows} "
             f"compact={compact_rows} prefill_dense={prefill_dense_rows} "
-            f"bootstrap_dense={bootstrap_dense_rows} refresh={refresh_rows} "
+            f"policy_unready_dense={policy_unready_dense_rows} "
+            f"refresh={refresh_rows} "
             f"precompact_or_short_dense={precompact_dense_rows} "
-            f"fallback={len(fallback_rows)}"
+            f"fallback={len(post_compact_fallback_rows)}"
         )
         if require_step_trace and step_events == 0:
             fails.append("R4: 没有 fa3_step_state 请求级记录")
-        if args.require_mature_decode_compact and compact_rows == 0:
-            fails.append("R4: 已知长请求没有任何 mature compact decode 行")
-        if fallback_rows:
-            sample = ", ".join(fallback_rows[:8])
+        if post_compact_fallback_rows:
+            sample = ", ".join(post_compact_fallback_rows[:8])
             fails.append(
-                "R4: 检出非预期 mature decode dense/native fallback: "
-                f"count={len(fallback_rows)} sample=[{sample}]"
+                "R4: 检出 post-compact mature decode dense/native fallback: "
+                f"count={len(post_compact_fallback_rows)} sample=[{sample}]"
             )
 
         # ---- R5 TP step semantics: aggregate counters can prove a final
         # mismatch but cannot identify a transient compact/native split.  The
         # step identity is scheduler-derived and must carry byte-identical row
-        # policy on every rank.  Only a possibly split first/last JSONL group
-        # is tolerated because offset snapshots and a live writer may cut at a
-        # rank boundary; any interior incompleteness is terminal.
+        # policy on every rank.  Runner offsets are captured before a request
+        # and checked after its response, so every fresh group must be complete.
         expected_tp_ranks = (
             route_rank_slots if route_rank_slots > 0 else len(tp_step_pids)
         )
@@ -960,14 +959,10 @@ def main() -> int:
             incomplete_tokens: list[str] = []
             incomplete_token_count = 0
             if tp_step_groups:
-                boundary_tokens = {
-                    min(tp_step_groups),
-                    max(tp_step_groups),
-                }
                 for token, (_digest, _reference_pid, seen_pids) in (
                     tp_step_groups.items()
                 ):
-                    if len(seen_pids) != expected_tp_ranks and token not in boundary_tokens:
+                    if len(seen_pids) != expected_tp_ranks:
                         incomplete_token_count += 1
                         if len(incomplete_tokens) < 8:
                             incomplete_tokens.append(
@@ -984,7 +979,7 @@ def main() -> int:
                 f"observed_pids={sorted(tp_step_pids)} "
                 f"groups={len(tp_step_groups)} complete={complete_groups} "
                 f"mismatch={tp_parity_mismatch_count} "
-                f"interior_incomplete={incomplete_token_count}"
+                f"incomplete={incomplete_token_count}"
             )
             if len(tp_step_pids) != expected_tp_ranks:
                 fails.append(
@@ -1008,7 +1003,7 @@ def main() -> int:
                 )
             if incomplete_token_count:
                 fails.append(
-                    "R5: TP step trace 中段缺 rank 事件: "
+                    "R5: TP step trace 缺 rank 事件: "
                     f"count={incomplete_token_count} sample={incomplete_tokens}"
                 )
             if not tp_step_groups:
