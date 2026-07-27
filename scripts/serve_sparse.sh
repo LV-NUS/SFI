@@ -292,7 +292,6 @@ mkdir "${ARTIFACT_DIR}"
 RUN_SINCE="$(date +%s)"
 
 SITE_LOG="${ARTIFACT_DIR}/site.log"
-REFRESH_PROFILE_LOG="${ARTIFACT_DIR}/refresh_profile.log"
 ROUTE_TRACE_LOG="${ARTIFACT_DIR}/route.jsonl"
 STEP_TRACE_LOG="${ARTIFACT_DIR}/step.jsonl"
 ROUTE_COUNTER_SNAPSHOT="${ARTIFACT_DIR}/route_counter_snapshot.bin"
@@ -372,9 +371,15 @@ export VLLM_SPARSE_DEFERRED_PRODUCER_GROUPS_PER_STEP=-1
 export VLLM_SPARSE_FULL_CUDAGRAPH_REPLAY_REFRESH_BATCHED_FLUSH=1
 export VLLM_SPARSE_FULL_CUDAGRAPH_REPLAY_REFRESH_DEFER_TO_DEADLINE=1
 export VLLM_SPARSE_REFRESH_ENQUEUE_STAGGER=1
+# FULL replay commits refresh generations through the TP-complete enqueue
+# trace.  Retire the eager per-chunk profile observer from serve even if a
+# caller shell exported its diagnostic knobs.
+unset VLLM_SPARSE_REFRESH_PROFILE
+unset VLLM_SPARSE_REFRESH_PROFILE_DETAIL
+unset VLLM_SPARSE_REFRESH_PROFILE_CALL_MIN
+unset VLLM_SPARSE_REFRESH_PROFILE_EVERY
+unset VLLM_SPARSE_REFRESH_PROFILE_LOG
 if [[ "${SFI_TRACE}" == "1" ]]; then
-  export VLLM_SPARSE_REFRESH_PROFILE=1
-  export VLLM_SPARSE_REFRESH_PROFILE_LOG="${REFRESH_PROFILE_LOG}"
   export VLLM_SPARSE_FA3_ROUTE_TRACE_LOG="${ROUTE_TRACE_LOG}"
   export VLLM_SPARSE_FA3_STEP_TRACE_LOG="${STEP_TRACE_LOG}"
 else
@@ -577,7 +582,7 @@ PY
   "${MANIFEST}" "${MANIFEST_POINTER}" "$$" "${HOST}" "${PORT}" \
   "${API_KEY_SOURCE}" "${MODEL}" "${SERVED_MODEL_ID}" "${MML}" "${RUN_NONCE}" \
   "${KVB:-}" "${RUN_SINCE}" "${PYTHON}" "${ARTIFACT_DIR}" "${SITE_LOG}" \
-  "${REFRESH_PROFILE_LOG}" "${ROUTE_TRACE_LOG}" "${STEP_TRACE_LOG}" \
+  "${ROUTE_TRACE_LOG}" "${STEP_TRACE_LOG}" \
   "${ROUTE_COUNTER_SNAPSHOT}" "${SFI_TRACE}" "${SFI_RUNTIME_PROOF}" \
   "${TP_SIZE}" "${SLOTS}" "${CAPTURE_SIZES_JSON}" "${SELECTOR_SEMANTIC}" \
   "${TORCH_EXTENSIONS_DIR}" "${GPU_DEVICES}" "${CUDA_ARCH}" "${CUDA_CAPABILITIES}" \
@@ -604,7 +609,6 @@ import sys
     python,
     run_dir,
     site_log,
-    profile_log,
     route_trace,
     step_trace,
     route_counter_snapshot,
@@ -626,7 +630,7 @@ import sys
 controller_config = json.loads(os.environ["VLLM_SPARSE_CONTROLLER_JSON"])
 alpha_fair_config = controller_config["alpha_fair"]
 payload = {
-    "schema": 6,
+    "schema": 7,
     "server_pid": int(server_pid),
     "host": host,
     "port": int(port),
@@ -642,7 +646,6 @@ payload = {
     "python": os.path.realpath(python),
     "run_dir": run_dir,
     "site_log": site_log,
-    "refresh_profile_log": profile_log,
     "route_trace_log": route_trace,
     "step_trace_log": step_trace,
     "route_counter_snapshot": route_counter_snapshot,

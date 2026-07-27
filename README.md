@@ -596,6 +596,12 @@ PYTHON="${PYTHON}" HOST=127.0.0.1 MML=32768 SLOTS=8 \
 
 The launcher verifies homogeneous GPU capability across ranks, binds the matching FA3/FA4 kernel, and sizes `--max-num-seqs` to the sparse slots (that size is included in CUDA-graph capture). Each run writes a PID-bound manifest and fresh route/liveness artifacts under `tmp/serve_runs/`. If the port is already occupied it refuses to start rather than kill an unrelated process.
 
+FULL CUDA-graph replay serving intentionally neither creates nor accepts
+`refresh_profile.log`; that per-chunk profiler belongs only to explicit eager
+benchmark diagnostics. Serving liveness is fail-closed on fresh, TP-complete
+replay enqueue/hook events plus the frozen route counter and request-step
+trace.
+
 Check reachability from another shell:
 
 ```bash
@@ -710,7 +716,7 @@ PYTHON="${PYTHON}" HOST=127.0.0.1 MML=131072 SLOTS=1 \
   bash scripts/serve_sparse.sh "0" "${MODEL}" 8000
 ```
 
-This mode installs no route/step/profile observer or worker proof extension;
+This mode installs no route/step observer or worker proof extension;
 R0&ndash;R6 are reported as `NOT_RUN`, while output completeness and official
 scoring remain hard gates. Same-run liveness uses the default trace/proof mode
 above and is restricted to a loopback bind. `SFI_TRACE=0` rejects

@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""[SPARSE-LIVENESS-JUDGE 2026-07-19 v5] serve/LongBench 场 sparse 活性判官。
+"""[SPARSE-LIVENESS-JUDGE 2026-07-27 v6] serve/LongBench 场 sparse 活性判官。
 
 bench 场有 producer gate 兜活性;serve 注入场(LongBench 等)此前裸奔——
 sparse 若静默退化成 dense(触发为零/patch 未装/路由回落),精度数字看着
@@ -7,33 +7,31 @@ sparse 若静默退化成 dense(触发为零/patch 未装/路由回落),精度�
 
 用法(serve 侧起服务时带 env,产物即判据源;路径带时间戳防残留假 PASS):
   RUN_TS=$(date +%s)
-  VLLM_SPARSE_REFRESH_PROFILE=1 \
-  VLLM_SPARSE_REFRESH_PROFILE_LOG=/tmp/lb_refresh_profile.${RUN_TS}.log \
   VLLM_SPARSE_FA3_ROUTE_TRACE_LOG=/tmp/lb_route.${RUN_TS}.jsonl \
   <启动 serve;跑完 LongBench 后:>
   python scripts/check_sparse_liveness.py \
-      --refresh-profile-log /tmp/lb_refresh_profile.${RUN_TS}.log \
       --route-trace /tmp/lb_route.${RUN_TS}.jsonl \
       --route-counter-snapshot /tmp/lb_route_counter.${RUN_TS}.bin \
       --run-since ${RUN_TS} [--min-world-publish 1]
 
 判定(全过=exit 0,任一红=exit 1 并逐条点名):
-  R0 产物新鲜/存在: profile log 必须存在且非空(缺失/空=patch 未装或
-     env 未设,与"装了但零活性"是不同的病,分开点名);--run-since 给出
-     run 起点 epoch 时,产物 mtime 早于它=残留文件(append 模式的假 PASS
-     陷阱),判红。
-  R1 世代活性: refresh flush 记录中 refresh_payloads>0 的世代发布次数，或
-     replay-batched 路径的正 refresh-payload-enqueue route 事件，二者之一
-     ≥ --min-world-publish。后者是当前 runtime 明确不写 per-chunk profile
-     时的同源提交证据，不能把健康 replay 误判为 decode 恒 dense。
+  R0 产物新鲜/存在: FULL replay 的 route trace、冻结 counter 与按需 step
+     trace 必须来自当前 fresh offset 窗；--run-since 给出 run 起点 epoch
+     时，判据 mtime 早于它=残留文件，判红。
+  R1 世代活性: TP-complete replay refresh-payload-enqueue world generation
+     ≥ --min-world-publish。FULL replay 不产出 per-chunk refresh profile，
+     旧 profile authority 已退休，缺 route enqueue 必须 fail-closed。
   R2 触发活性: sentence 触发意图>0；interval-only 配置由 R1 的世代活性
      覆盖，replay-batched 路径也读取 route 事件中的 refresh_reason。
   R3 路由活性(两源,冻结 RPC 快照优先):
      a) --route-counter-snapshot: blocking worker RPC 后按 TP rank 冻结的
         10×int64 记录
         (total/kind4/has_rrp/kind0..4/compact_steps/compact_rows)，聚合前
-        先要求各 rank 完全一致；kind4>0=前向真走 sparse resolver；
-     b) --route-trace: 逐事件 JSON 解析 mode 分布+row_is_compact 聚合
+        先要求各 rank 完全一致；kind4>0=Python 可见前向真走 resolver；
+        FULL replay 下 kind4 不可见，改由 TP-complete graph hook 与
+        replay-aware compact step counter 联合定谳；
+     b) --route-trace: 仅在 fresh offset 窗内逐事件解析 mode、FULL replay
+        graph hook 与 row_is_compact 聚合
         (长请求 sparse 化率;短请求低于阈值恒 dense 是设计内,聚合占比
         才有判读价值)。
   R4 请求级 fallback: --step-trace 提供 fa3_step_state 时按 PID/request
@@ -56,19 +54,6 @@ import os
 import struct
 import sys
 from collections import Counter
-
-
-def _iter_profile_records(path: str, *, offset: int = 0):
-    with open(path, "r", errors="ignore") as fh:
-        fh.seek(offset)
-        for line in fh:
-            parts = line.split("\t", 2)
-            if len(parts) != 3:
-                continue
-            try:
-                yield parts[0], parts[1], json.loads(parts[2])
-            except json.JSONDecodeError:
-                continue
 
 
 def _iter_json_records(
@@ -127,18 +112,21 @@ def _read_route_counter_snapshot(path: str):
 
 
 def _read_replay_batched_refresh_evidence(
-    path: str, *, offset: int = 0
+    path: str,
+    *,
+    offset: int = 0,
+    expected_ranks: int = 0,
 ) -> dict[str, int]:
     """Read fresh generation evidence emitted before replay-batched deferral.
 
-    The normal profile path records ``refresh_payloads`` at this same enqueue
-    boundary.  Replay-batched flush intentionally omits per-chunk profile
-    records, so this route event is its equivalent producer-commit evidence.
+    Replay-batched flush intentionally has no per-chunk profile carrier.  The
+    TP-complete enqueue group is the producer-commit authority for this mode.
     """
-    publishes = 0
-    payloads = 0
-    sentence_intents = 0
+    groups: dict[tuple[int, str, str, tuple[str, ...]], dict[int, int]] = {}
+    invalid_groups: set[tuple[int, str, str, tuple[str, ...]]] = set()
+    enqueue_events = 0
     malformed = 0
+    duplicates = 0
     parse_errors: list[str] = []
     for event in _iter_json_records(
         path,
@@ -149,26 +137,77 @@ def _read_replay_batched_refresh_evidence(
             "mixed_page_full_cudagraph_replay_refresh_payload_enqueue"
         ):
             continue
+        enqueue_events += 1
+        pid = event.get("pid")
+        step_id = event.get("step_id")
+        graph_key = event.get("graph_key")
+        refresh_reason = event.get("refresh_reason")
+        req_ids = event.get("refresh_intent_req_ids")
         payload_count = event.get("payload_count")
-        if type(payload_count) is not int or payload_count <= 0:
+        if (
+            type(pid) is not int
+            or type(step_id) is not int
+            or not isinstance(graph_key, str)
+            or not graph_key
+            or not isinstance(refresh_reason, str)
+            or not refresh_reason
+            or not isinstance(req_ids, list)
+            or not req_ids
+            or any(not isinstance(req_id, str) or not req_id for req_id in req_ids)
+            or type(payload_count) is not int
+            or payload_count <= 0
+        ):
             malformed += 1
             continue
+        group_key = (
+            step_id,
+            graph_key,
+            refresh_reason,
+            tuple(req_ids),
+        )
+        by_pid = groups.setdefault(group_key, {})
+        if pid in by_pid:
+            duplicates += 1
+            invalid_groups.add(group_key)
+            continue
+        by_pid[pid] = payload_count
+
+    publishes = 0
+    payloads = 0
+    sentence_intents = 0
+    tp_incomplete = 0
+    payload_mismatch = 0
+    rank_contract_missing = int(bool(groups) and expected_ranks <= 0)
+    for group_key, by_pid in groups.items():
+        if group_key in invalid_groups:
+            continue
+        if expected_ranks <= 0 or len(by_pid) != expected_ranks:
+            tp_incomplete += 1
+            continue
+        payload_counts = set(by_pid.values())
+        if len(payload_counts) != 1:
+            payload_mismatch += 1
+            continue
         publishes += 1
-        payloads += payload_count
-        if str(event.get("refresh_reason", "")) == "sentence":
+        payloads += next(iter(payload_counts))
+        if group_key[2] == "sentence":
             sentence_intents += 1
     return {
         "publishes": publishes,
         "payloads": payloads,
         "sentence_intents": sentence_intents,
+        "enqueue_events": enqueue_events,
         "malformed": malformed,
+        "duplicates": duplicates,
+        "tp_incomplete": tp_incomplete,
+        "payload_mismatch": payload_mismatch,
+        "rank_contract_missing": rank_contract_missing,
         "parse_errors": len(parse_errors),
     }
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--refresh-profile-log", required=True)
     ap.add_argument("--route-trace", default="")
     ap.add_argument(
         "--route-counter-snapshot",
@@ -177,12 +216,6 @@ def main() -> int:
     )
     ap.add_argument("--step-trace", default="")
     ap.add_argument("--min-world-publish", type=int, default=1)
-    ap.add_argument(
-        "--refresh-profile-offset",
-        type=int,
-        default=0,
-        help="只判定该字节偏移之后的新 refresh 记录",
-    )
     ap.add_argument(
         "--route-trace-offset",
         type=int,
@@ -242,9 +275,6 @@ def main() -> int:
 
     fails = []
     warns = []
-    profile_offset = max(0, args.refresh_profile_offset)
-    if args.refresh_profile_offset < 0:
-        fails.append("R0: --refresh-profile-offset 必须非负")
     route_trace_offset = max(0, args.route_trace_offset)
     if args.route_trace_offset < 0:
         fails.append("R0: --route-trace-offset 必须非负")
@@ -293,19 +323,14 @@ def main() -> int:
             (fails if required else warns).append(msg)
             return False
         if args.run_since > 0 and os.path.getmtime(path) < args.run_since:
-            fails.append(
-                f"R0: {label} mtime 早于 --run-since(残留产物;append 模式下"
-                "旧 run 记录会假 PASS)。给产物路径带时间戳重跑。"
+            (fails if required else warns).append(
+                f"R0: {label} mtime 早于 --run-since"
+                "(残留产物;append 模式下旧 run 记录会假 PASS)。"
+                "给产物路径带时间戳重跑。"
             )
             return False
         return True
 
-    profile_ok = _r0_check(
-        args.refresh_profile_log,
-        "refresh profile log",
-        True,
-        minimum_size=profile_offset,
-    )
     trace_ok = _r0_check(
         args.route_trace,
         "route trace",
@@ -328,97 +353,88 @@ def main() -> int:
         require_step_trace,
         minimum_size=step_trace_offset,
     )
+    snapshot_counters = (
+        _read_route_counter_snapshot(args.route_counter_snapshot)
+        if snapshot_ok
+        else None
+    )
+    expected_replay_ranks = args.expected_route_counter_ranks
+    if expected_replay_ranks <= 0 and snapshot_counters is not None:
+        expected_replay_ranks = int(snapshot_counters["rank_slots"])
 
-    # ---- R1/R2 世代与触发活性 ----
-    # ``refresh_payloads`` is the physical profile source.  On the documented
-    # replay-batched path no per-chunk profile record exists, while the same
-    # logical producer generation emits a positive route enqueue event.
-    profile_world_publishes = 0
-    profile_payloads_total = 0
-    reasons = Counter()
-    pids = set()
-    if profile_ok:
-        for pid, tag, rec in _iter_profile_records(
-            args.refresh_profile_log,
-            offset=profile_offset,
-        ):
-            pids.add(pid)
-            rp = int(rec.get("refresh_payloads", 0) or 0)
-            if rp > 0:
-                profile_world_publishes += 1
-                profile_payloads_total += rp
-            reasons["sentence"] += int(rec.get("sentence_trigger_intents", 0) or 0)
-
+    # ---- R1/R2 FULL replay 世代与触发活性 ----
     replay_evidence = {
         "publishes": 0,
         "payloads": 0,
         "sentence_intents": 0,
+        "enqueue_events": 0,
         "malformed": 0,
+        "duplicates": 0,
+        "tp_incomplete": 0,
+        "payload_mismatch": 0,
+        "rank_contract_missing": 0,
         "parse_errors": 0,
     }
     if trace_ok:
         replay_evidence = _read_replay_batched_refresh_evidence(
             args.route_trace,
             offset=route_trace_offset,
+            expected_ranks=expected_replay_ranks,
         )
+    generation_count = int(replay_evidence["publishes"])
+    payloads_total = int(replay_evidence["payloads"])
+    sentence_intents = int(replay_evidence["sentence_intents"])
 
-    # Profile remains authoritative whenever it observed a physical publish.
-    # Otherwise the replay enqueue is the only observable logical generation;
-    # do not double-count a generation visible through both sources.
-    if profile_world_publishes > 0:
-        generation_count = profile_world_publishes
-        payloads_total = profile_payloads_total
-        generation_source = "refresh_profile"
-    elif replay_evidence["publishes"] > 0:
-        generation_count = replay_evidence["publishes"]
-        payloads_total = replay_evidence["payloads"]
-        generation_source = "replay_batched_route"
-    else:
-        generation_count = 0
-        payloads_total = 0
-        generation_source = "none"
-    sentence_intents = max(
-        int(reasons.get("sentence", 0)),
-        int(replay_evidence["sentence_intents"]),
+    replay_defect_count = sum(
+        int(replay_evidence[field])
+        for field in (
+            "malformed",
+            "duplicates",
+            "tp_incomplete",
+            "payload_mismatch",
+            "rank_contract_missing",
+            "parse_errors",
+        )
     )
-
-    if profile_ok:
-        print(
-            f"R1 世代活性: generation_count={generation_count} "
-            f"payloads_total={payloads_total} pids={len(pids)} "
-            f"source={generation_source} profile_world_publish="
-            f"{profile_world_publishes} replay_enqueue_events="
-            f"{replay_evidence['publishes']} replay_payloads_total="
-            f"{replay_evidence['payloads']}"
+    print(
+        f"R1 世代活性: generation_count={generation_count} "
+        f"payloads_total={payloads_total} "
+        "source=replay_batched_route replay_enqueue_events="
+        f"{replay_evidence['enqueue_events']} replay_world_generations="
+        f"{replay_evidence['publishes']} replay_expected_ranks="
+        f"{expected_replay_ranks}"
+    )
+    if replay_evidence["enqueue_events"] > 0 and replay_defect_count > 0:
+        fails.append(
+            "R1: replay route 证据不完整: "
+            f"malformed={replay_evidence['malformed']} "
+            f"duplicates={replay_evidence['duplicates']} "
+            f"TP-incomplete={replay_evidence['tp_incomplete']} "
+            f"payload-mismatch={replay_evidence['payload_mismatch']} "
+            f"rank-contract-missing={replay_evidence['rank_contract_missing']} "
+            f"json-parse-errors={replay_evidence['parse_errors']}"
         )
-        if (
-            generation_source == "replay_batched_route"
-            and (
-                replay_evidence["malformed"] > 0
-                or replay_evidence["parse_errors"] > 0
-            )
-        ):
-            fails.append(
-                "R1: replay route 证据不完整: "
-                f"invalid_payload_count={replay_evidence['malformed']} "
-                f"json_parse_errors={replay_evidence['parse_errors']}"
-            )
-        if generation_count < args.min_world_publish:
-            fails.append(
-                f"R1: logical refresh 世代 {generation_count} < "
-                f"{args.min_world_publish} —— 本相位没有新的 selector refresh "
-                "generation；sparse 读侧是否工作由 R3c/R4 独立判定"
-            )
-        if sentence_intents <= 0 and generation_count <= 0:
-            fails.append("R2: 触发意图为零(sentence=0 且无逻辑世代)")
-        else:
-            print(f"R2 触发活性: sentence_intents={sentence_intents}")
+    if generation_count < args.min_world_publish:
+        fails.append(
+            f"R1: logical refresh 世代 {generation_count} < "
+            f"{args.min_world_publish} —— 本相位没有新的 selector refresh "
+            "generation；sparse 读侧是否工作由 R3c/R4 独立判定"
+        )
+    if sentence_intents <= 0 and generation_count <= 0:
+        fails.append("R2: 触发意图为零(sentence=0 且无逻辑世代)")
+    else:
+        print(f"R2 触发活性: sentence_intents={sentence_intents}")
 
     # ---- R3a 路由活性(冻结 RPC 结构化计数,主判据) ----
     compact_row_steps = -1
-    route_rank_slots = 0
+    route_rank_slots = (
+        int(snapshot_counters["rank_slots"])
+        if snapshot_counters is not None
+        else 0
+    )
+    counter_kind4_missing = False
     if snapshot_ok:
-        counters = _read_route_counter_snapshot(args.route_counter_snapshot)
+        counters = snapshot_counters
         if counters is None:
             fails.append(
                 "R3a: frozen route counter snapshot 不是非空的 "
@@ -450,17 +466,10 @@ def main() -> int:
                     f"observed={route_rank_slots} "
                     f"expected={args.expected_route_counter_ranks}"
                 )
-            if total > 0 and kind4 == 0:
-                fails.append(
-                    "R3a: frozen RPC 计数 kind4=0 —— 前向从未走 sparse resolver"
-                )
+            counter_kind4_missing = bool(total > 0 and kind4 == 0)
             # ---- R3c 读侧活性(step build 侧计数,replay-aware 主判据) ----
-            # [JUDGE-REPLAY-AWARE 2026-07-09] FULL-graph serve 下 python 侧
-            # 路由计数/trace 只在 capture/eager/prefill 步发射,replay 步不可
-            # 见——旧 R3b 在健康引擎上恒 FAIL(eager 定谳:18576/18684 步
-            # compact 健康,dense 事件全是 bootstrap/prefill 窗)。本判据由
-            # proof specialization 每步 bump,graph 无关,是 replay 覆盖的读侧
-            # 真值。纯 runtime 不装 observer；旧版 8q/共享槽在 R3a fail closed。
+            # FULL replay 对 Python route counter 不可见；proof specialization
+            # 的 step counter 是 graph-independent 读侧真值。
             if compact_row_steps >= 0:
                 print(
                     f"R3c 读侧活性(step 计数): compact_row_steps="
@@ -496,44 +505,127 @@ def main() -> int:
             "R3c: frozen route counter snapshot 不含 replay-aware compact 读计数"
         )
 
-    # ---- R3b 路由活性(trace 结构化解析;字符串 grep 已废:旧匹配串
-    #      '"dense_native"' 全仓无源=恒 0 假安静) ----
+    # ---- R3b fresh route authority: direct route 或 TP-complete replay hook ----
+    replay_route_authority = False
     if trace_ok:
         mode_counts = Counter()
         compact_rows = 0
         total_rows = 0
         events = 0
-        with open(args.route_trace, "r", errors="ignore") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    evt = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                events += 1
-                mode = str(evt.get("mode", evt.get("probe", "?")))
-                mode_counts[mode] += 1
-                rows = evt.get("row_is_compact")
-                if isinstance(rows, (list, tuple)):
-                    total_rows += len(rows)
-                    compact_rows += sum(1 for v in rows if v)
+        route_parse_errors: list[str] = []
+        replay_hook_groups: dict[tuple[int, str], set[int]] = {}
+        replay_hook_bad_groups: set[tuple[int, str]] = set()
+        replay_hook_mismatches = 0
+        replay_hook_duplicates = 0
+        for evt in _iter_json_records(
+            args.route_trace,
+            offset=route_trace_offset,
+            parse_errors=route_parse_errors,
+        ):
+            events += 1
+            mode = str(evt.get("mode", evt.get("probe", "?")))
+            mode_counts[mode] += 1
+            rows = evt.get("row_is_compact")
+            if isinstance(rows, (list, tuple)):
+                total_rows += len(rows)
+                compact_rows += sum(1 for value in rows if value)
+            if evt.get("event") != (
+                "mixed_page_full_cudagraph_replay_hook_check"
+            ):
+                continue
+            captured_family = evt.get("captured_route_family")
+            current_family = evt.get("current_route_family")
+            family_mismatch = evt.get("route_family_mismatch")
+            if (
+                captured_family is None
+                and current_family is None
+                and family_mismatch is None
+            ):
+                # Bootstrap/runtime-mode probes have no bound graph yet.
+                continue
+            pid = evt.get("pid")
+            step_id = evt.get("step_id")
+            batch_descriptor = evt.get("batch_descriptor")
+            if (
+                type(pid) is not int
+                or type(step_id) is not int
+                or not isinstance(batch_descriptor, str)
+                or not batch_descriptor
+            ):
+                replay_hook_mismatches += 1
+                continue
+            group_key = (step_id, batch_descriptor)
+            if (
+                captured_family != "resolved_row_ptr"
+                or current_family != "resolved_row_ptr"
+                or family_mismatch is not False
+            ):
+                replay_hook_mismatches += 1
+                replay_hook_bad_groups.add(group_key)
+                continue
+            seen_pids = replay_hook_groups.setdefault(group_key, set())
+            if pid in seen_pids:
+                replay_hook_duplicates += 1
+                replay_hook_bad_groups.add(group_key)
+                continue
+            seen_pids.add(pid)
+
         rrp = mode_counts.get("resolved_row_ptr", 0)
+        replay_hook_complete = 0
+        replay_hook_interior_incomplete = 0
+        if replay_hook_groups and expected_replay_ranks > 0:
+            boundary_groups = {
+                min(replay_hook_groups),
+                max(replay_hook_groups),
+            }
+            for group_key, seen_pids in replay_hook_groups.items():
+                if group_key in replay_hook_bad_groups:
+                    continue
+                if len(seen_pids) == expected_replay_ranks:
+                    replay_hook_complete += 1
+                elif group_key not in boundary_groups:
+                    replay_hook_interior_incomplete += 1
+        elif replay_hook_groups:
+            replay_hook_interior_incomplete = len(replay_hook_groups)
+
+        replay_route_authority = bool(
+            replay_hook_complete > 0 and compact_row_steps > 0
+        )
         row_ratio = (compact_rows / total_rows) if total_rows else 0.0
         print(
             f"R3b 路由活性(trace): events={events} modes={dict(mode_counts)} "
-            f"compact_rows={compact_rows}/{total_rows} ({row_ratio:.1%})"
+            f"compact_rows={compact_rows}/{total_rows} ({row_ratio:.1%}) "
+            f"replay_complete={replay_hook_complete} "
+            f"replay_interior_incomplete={replay_hook_interior_incomplete} "
+            f"replay_mismatch={replay_hook_mismatches} "
+            f"replay_duplicates={replay_hook_duplicates}"
         )
-        if events > 0 and rrp == 0:
+        if route_parse_errors:
             fails.append(
-                "R3b: route trace 无 resolved_row_ptr 事件=前向从未走 sparse"
+                "R3b: fresh route window 含损坏 JSON: "
+                f"count={len(route_parse_errors)} "
+                f"sample={route_parse_errors[:4]}"
             )
-        # [JUDGE-REPLAY-AWARE 2026-07-09] trace 的 row_is_compact 只覆盖
-        # python 可见步(capture/eager/prefill)——FULL-graph 下 replay 步不发
-        # 事件,"全 False"在健康引擎上是常态(那些步 dense 本合法)。降档:
-        # 仅当 R3c(step 计数)不可用(旧运行时)时才以此判死;R3c 可用时给
-        # 信息行,以 R3c 为准。
+        if (
+            replay_hook_mismatches
+            or replay_hook_duplicates
+            or replay_hook_interior_incomplete
+        ):
+            fails.append(
+                "R3b: FULL replay route 证据不完整: "
+                f"mismatch={replay_hook_mismatches} "
+                f"duplicates={replay_hook_duplicates} "
+                f"TP-incomplete={replay_hook_interior_incomplete}"
+            )
+        if events > 0 and rrp == 0 and not replay_route_authority:
+            fails.append("R3b: fresh route window 无 sparse read authority")
+        if replay_route_authority:
+            print(
+                "[INFO] R3b: FULL replay route authority=TP-complete "
+                "resolved_row_ptr hook + replay-aware compact step counter"
+            )
+        # row_is_compact 只覆盖 Python 可见步；FULL replay 的读侧以 R3c
+        # 为准。没有 R3c 的旧产物继续 fail-closed。
         if total_rows > 0 and compact_rows == 0:
             if compact_row_steps >= 0:
                 print(
@@ -546,6 +638,16 @@ def main() -> int:
                     "——所有可见行 dense(请求全短于阈值?FORCE_* env?"
                     "bootstrap 未完成即结束?)"
                 )
+    if counter_kind4_missing:
+        if replay_route_authority:
+            print(
+                "[INFO] R3a: kind4 对 FULL replay 不可见；"
+                "读侧以 R3b hook + R3c step counter 联合定谳"
+            )
+        else:
+            fails.append(
+                "R3a: frozen RPC kind4=0 且无 FULL replay read authority"
+            )
     if not (snapshot_ok or trace_ok):
         warns.append(
             "R3 未判(--route-trace / --route-counter-snapshot 均不可用)"

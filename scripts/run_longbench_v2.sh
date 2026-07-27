@@ -150,7 +150,6 @@ required = {
     "python",
     "run_dir",
     "site_log",
-    "refresh_profile_log",
     "route_trace_log",
     "step_trace_log",
     "route_counter_snapshot",
@@ -175,7 +174,7 @@ required = {
 missing = sorted(required.difference(data))
 if missing:
     raise SystemExit(f"server manifest is incomplete: {missing}")
-if data["schema"] != 6 or data["port"] != requested_port:
+if data["schema"] != 7 or data["port"] != requested_port:
     raise SystemExit("server manifest schema/port mismatch")
 try:
     bind_address = ipaddress.IPv4Address(data["host"])
@@ -281,6 +280,22 @@ try:
 except OSError as exc:
     raise SystemExit(f"cannot inspect server PID {pid}: {exc}") from exc
 
+retired_refresh_profile_env = {
+    "VLLM_SPARSE_REFRESH_PROFILE",
+    "VLLM_SPARSE_REFRESH_PROFILE_DETAIL",
+    "VLLM_SPARSE_REFRESH_PROFILE_CALL_MIN",
+    "VLLM_SPARSE_REFRESH_PROFILE_EVERY",
+    "VLLM_SPARSE_REFRESH_PROFILE_LOG",
+}
+leaked_refresh_profile_env = sorted(
+    retired_refresh_profile_env.intersection(environ)
+)
+if leaked_refresh_profile_env:
+    raise SystemExit(
+        "live server retains retired refresh-profile environment: "
+        f"{leaked_refresh_profile_env}"
+    )
+
 expected_env = {
     "SFI_RUN_NONCE": str(data["run_nonce"]),
     "SFI_SERVE_RUN_DIR": str(data["run_dir"]),
@@ -301,7 +316,6 @@ expected_env = {
 if proof_mode:
     expected_env.update(
         {
-            "VLLM_SPARSE_REFRESH_PROFILE_LOG": str(data["refresh_profile_log"]),
             "VLLM_SPARSE_FA3_ROUTE_TRACE_LOG": str(data["route_trace_log"]),
             "VLLM_SPARSE_FA3_STEP_TRACE_LOG": str(data["step_trace_log"]),
             "VLLM_SPARSE_FA3_ROUTE_COUNTER_ENABLED": "1",
@@ -400,7 +414,6 @@ for key in (
     "run_nonce",
     "started_epoch",
     "run_dir",
-    "refresh_profile_log",
     "route_trace_log",
     "step_trace_log",
     "route_counter_snapshot",
@@ -421,28 +434,27 @@ for key in (
     print(data[key])
 PY
 )
-(( ${#SERVER_META[@]} == 21 )) || die "failed to parse live server manifest"
+(( ${#SERVER_META[@]} == 20 )) || die "failed to parse live server manifest"
 SERVER_PID="${SERVER_META[0]}"
 SERVER_NONCE="${SERVER_META[1]}"
 SERVER_STARTED_EPOCH="${SERVER_META[2]}"
 SERVER_RUN_DIR="${SERVER_META[3]}"
-REFRESH_PROFILE_LOG="${SERVER_META[4]}"
-ROUTE_TRACE_LOG="${SERVER_META[5]}"
-STEP_TRACE_LOG="${SERVER_META[6]}"
-ROUTE_COUNTER_SNAPSHOT="${SERVER_META[7]}"
-SLOTS="${SERVER_META[8]}"
-CUDA_ARCH="${SERVER_META[9]}"
-ATTENTION_KERNEL="${SERVER_META[10]}"
-FLASH_ATTN_VERSION="${SERVER_META[11]}"
-SERVER_BIND_HOST="${SERVER_META[12]}"
-API_KEY_SOURCE="${SERVER_META[13]}"
-SERVER_MODEL_PATH="${SERVER_META[14]}"
-SERVED_MODEL_ID="${SERVER_META[15]}"
-SERVER_MAX_MODEL_LEN="${SERVER_META[16]}"
-TRACE_ENABLED="${SERVER_META[17]}"
-RUNTIME_PROOF_ENABLED="${SERVER_META[18]}"
-HOT_PATH_OBSERVER_FREE="${SERVER_META[19]}"
-TP_SIZE="${SERVER_META[20]}"
+ROUTE_TRACE_LOG="${SERVER_META[4]}"
+STEP_TRACE_LOG="${SERVER_META[5]}"
+ROUTE_COUNTER_SNAPSHOT="${SERVER_META[6]}"
+SLOTS="${SERVER_META[7]}"
+CUDA_ARCH="${SERVER_META[8]}"
+ATTENTION_KERNEL="${SERVER_META[9]}"
+FLASH_ATTN_VERSION="${SERVER_META[10]}"
+SERVER_BIND_HOST="${SERVER_META[11]}"
+API_KEY_SOURCE="${SERVER_META[12]}"
+SERVER_MODEL_PATH="${SERVER_META[13]}"
+SERVED_MODEL_ID="${SERVER_META[14]}"
+SERVER_MAX_MODEL_LEN="${SERVER_META[15]}"
+TRACE_ENABLED="${SERVER_META[16]}"
+RUNTIME_PROOF_ENABLED="${SERVER_META[17]}"
+HOT_PATH_OBSERVER_FREE="${SERVER_META[18]}"
+TP_SIZE="${SERVER_META[19]}"
 if [[ "${RUNTIME_PROOF_ENABLED}" == "True" ]]; then
   [[ "${TRACE_ENABLED}" == "True" && "${HOT_PATH_OBSERVER_FREE}" == "False" ]] || \
     die "runtime-proof LongBench mode has an inconsistent observer contract"
@@ -802,14 +814,13 @@ done
 
 snapshot_evidence() {
   "${PYTHON}" -I - \
-    "${REFRESH_PROFILE_LOG}" "${ROUTE_COUNTER_SNAPSHOT}" "${STEP_TRACE_LOG}" \
+    "${ROUTE_COUNTER_SNAPSHOT}" "${STEP_TRACE_LOG}" \
     "${ROUTE_TRACE_LOG}" <<'PY'
 import os
 import struct
 import sys
 
-profile, counter_snapshot, step_trace, route_trace = sys.argv[1:]
-print(os.path.getsize(profile) if os.path.isfile(profile) else 0)
+counter_snapshot, step_trace, route_trace = sys.argv[1:]
 compact_steps = 0
 if os.path.isfile(counter_snapshot):
     with open(counter_snapshot, "rb") as fh:
@@ -850,17 +861,14 @@ route_counter_rpc() {
 
 run_liveness_delta() {
   local phase="$1"
-  local profile_offset="$2"
-  local compact_baseline="$3"
-  local step_trace_offset="$4"
-  local route_trace_offset="$5"
-  local request_policy="$6"
+  local compact_baseline="$2"
+  local step_trace_offset="$3"
+  local route_trace_offset="$4"
+  local request_policy="$5"
   local -a liveness_args=(
-    --refresh-profile-log "${REFRESH_PROFILE_LOG}" \
     --route-counter-snapshot "${ROUTE_COUNTER_SNAPSHOT}" \
     --run-since "${SERVER_STARTED_EPOCH}" \
     --min-world-publish 1 \
-    --refresh-profile-offset "${profile_offset}" \
     --baseline-compact-row-steps "${compact_baseline}" \
     --min-compact-row-step-delta 1 \
     --expected-route-counter-ranks "${TP_SIZE}" \
@@ -891,8 +899,8 @@ SMOKE_SNAPSHOT_JSON="${EVAL_DIR}/smoke_route_counter_snapshot.json"
 if (( LIVENESS_ENABLED == 1 )); then
   route_counter_rpc "reset" "${SMOKE_RESET_JSON}"
   mapfile -t SMOKE_BASELINE < <(snapshot_evidence)
-  (( ${#SMOKE_BASELINE[@]} == 4 )) || die "cannot snapshot sparse evidence"
-  (( SMOKE_BASELINE[1] == 0 )) || die "smoke route-counter reset is not zero"
+  (( ${#SMOKE_BASELINE[@]} == 3 )) || die "cannot snapshot sparse evidence"
+  (( SMOKE_BASELINE[0] == 0 )) || die "smoke route-counter reset is not zero"
 fi
 
 # One long request must create fresh producer and replay-aware read evidence.
@@ -984,7 +992,7 @@ if (( LIVENESS_ENABLED == 1 )); then
   route_counter_rpc "snapshot" "${SMOKE_SNAPSHOT_JSON}" "${SMOKE_RESET_JSON}"
   run_liveness_delta "smoke" \
     "${SMOKE_BASELINE[0]}" "${SMOKE_BASELINE[1]}" \
-    "${SMOKE_BASELINE[2]}" "${SMOKE_BASELINE[3]}" "strict-long"
+    "${SMOKE_BASELINE[2]}" "strict-long"
 else
   echo "INFO: smoke R0-R6 NOT_RUN; server is the hot-path observer-free specialization"
 fi
@@ -994,8 +1002,8 @@ EVAL_SNAPSHOT_JSON="${EVAL_DIR}/eval_route_counter_snapshot.json"
 if (( LIVENESS_ENABLED == 1 )); then
   route_counter_rpc "reset" "${EVAL_RESET_JSON}"
   mapfile -t EVAL_BASELINE < <(snapshot_evidence)
-  (( ${#EVAL_BASELINE[@]} == 4 )) || die "cannot snapshot pre-eval sparse evidence"
-  (( EVAL_BASELINE[1] == 0 )) || die "eval route-counter reset is not zero"
+  (( ${#EVAL_BASELINE[@]} == 3 )) || die "cannot snapshot pre-eval sparse evidence"
+  (( EVAL_BASELINE[0] == 0 )) || die "eval route-counter reset is not zero"
 fi
 
 echo "==> LongBench v2: alias=${MODEL_NAME} served_model=${SERVED_MODEL_ID} n_proc=${N_PROC} server_pid=${SERVER_PID}"
@@ -1023,7 +1031,7 @@ if (( LIVENESS_ENABLED == 1 )); then
   route_counter_rpc "snapshot" "${EVAL_SNAPSHOT_JSON}" "${EVAL_RESET_JSON}"
   run_liveness_delta "posteval" \
     "${EVAL_BASELINE[0]}" "${EVAL_BASELINE[1]}" \
-    "${EVAL_BASELINE[2]}" "${EVAL_BASELINE[3]}" "sticky"
+    "${EVAL_BASELINE[2]}" "sticky"
 else
   echo "INFO: posteval R0-R6 NOT_RUN; quality/scoring ran without hot-path observers"
 fi

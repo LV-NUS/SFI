@@ -10058,20 +10058,6 @@ def _enqueue_full_cudagraph_refresh_payloads_after_replay(
                 _stage_max("flush_us_max", _flush_us)
                 _stage_inc("flush_call_count", amount=len(payload_groups))
             stage_profile["batched_flush"] = True
-            # [PROFILE-CARRIER-HINT 2026-07-06] REFRESH_PROFILE 的 per-chunk
-            # 载体只挂 eager flush 路径；本 replay-batched 路径下 refresh
-            # profile log 恒无 per-chunk 行（只有 marker），事件级分解应看
-            # hook_profile 的 refresh_stage_profile。曾三次误导跑批取证——
-            # 开着旋钮走到这里就提示一次。
-            if os.environ.get("VLLM_SPARSE_REFRESH_PROFILE", "0") == "1" and not getattr(
-                controller, "_refresh_profile_batched_hint_emitted", False
-            ):
-                controller._refresh_profile_batched_hint_emitted = True
-                _log.info(
-                    "VLLM_SPARSE_REFRESH_PROFILE per-chunk records are inactive on "
-                    "the replay-batched flush path; use the hook_profile "
-                    "refresh_stage_profile fields instead"
-                )
             stage_profile["batched_flush_group_count"] = int(
                 submit_group_count_for_profile
             )

@@ -459,7 +459,9 @@ def test_speed_summary_reads_route_proof_only_from_diagnostic_child(
     assert reasons == []
 
 
-def test_liveness_accepts_frozen_snapshot_without_json_trace(tmp_path: Path) -> None:
+def test_liveness_rejects_snapshot_without_replay_generation(
+    tmp_path: Path,
+) -> None:
     profile = tmp_path / "refresh.log"
     profile.write_text(
         "101\tstep\t"
@@ -475,8 +477,6 @@ def test_liveness_accepts_frozen_snapshot_without_json_trace(tmp_path: Path) -> 
             sys.executable,
             "-I",
             str(REPO_ROOT / "scripts" / "check_sparse_liveness.py"),
-            "--refresh-profile-log",
-            str(profile),
             "--route-counter-snapshot",
             str(counter),
             "--baseline-compact-row-steps",
@@ -492,23 +492,253 @@ def test_liveness_accepts_frozen_snapshot_without_json_trace(tmp_path: Path) -> 
         capture_output=True,
         text=True,
     )
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert "SPARSE LIVENESS: PASS" in result.stdout
-    assert "R4 请求级" not in result.stdout
+    assert result.returncode != 0
+    assert "logical refresh 世代 0 < 1" in result.stdout
 
-    retired = subprocess.run(
+    retired_arguments = (
+        ("--refresh-profile-log", str(profile)),
+        ("--refresh-profile-offset", "0"),
+        ("--route-counter-mmap", str(counter)),
+    )
+    for flag, value in retired_arguments:
+        retired = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                str(REPO_ROOT / "scripts" / "check_sparse_liveness.py"),
+                flag,
+                value,
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert retired.returncode != 0
+        assert f"unrecognized arguments: {flag}" in retired.stderr
+
+
+def _replay_enqueue_event(
+    *,
+    pid: int,
+    payload_count: int = 48,
+    step_id: int = 306,
+) -> dict[str, object]:
+    return {
+        "event": (
+            "mixed_page_full_cudagraph_replay_refresh_payload_enqueue"
+        ),
+        "pid": pid,
+        "step_id": step_id,
+        "graph_key": "full:BatchDescriptor(num_tokens=1,num_reqs=1)",
+        "refresh_reason": "compact_threshold_crossed",
+        "refresh_intent_req_ids": ["request-1"],
+        "payload_count": payload_count,
+    }
+
+
+def _replay_route_event(*, pid: int, step_id: int = 309) -> dict[str, object]:
+    return {
+        "event": "mixed_page_full_cudagraph_replay_hook_check",
+        "pid": pid,
+        "step_id": step_id,
+        "batch_descriptor": "BatchDescriptor(num_tokens=1,num_reqs=1)",
+        "captured_route_family": "resolved_row_ptr",
+        "current_route_family": "resolved_row_ptr",
+        "route_family_mismatch": False,
+    }
+
+
+def _run_replay_liveness(
+    tmp_path: Path,
+    *,
+    route_events: list[dict[str, object]],
+    rank_count: int = 2,
+) -> subprocess.CompletedProcess[str]:
+    route = tmp_path / "route.jsonl"
+    route.write_text(
+        "".join(json.dumps(event) + "\n" for event in route_events),
+        encoding="utf-8",
+    )
+    counter = tmp_path / "route_counter_snapshot.bin"
+    rank_values = [48, 0, 0, 48, 0, 0, 0, 0, 76, 76]
+    counter.write_bytes(
+        b"".join(struct.pack("10q", *rank_values) for _ in range(rank_count))
+    )
+    return subprocess.run(
         [
             sys.executable,
             "-I",
             str(REPO_ROOT / "scripts" / "check_sparse_liveness.py"),
-            "--refresh-profile-log",
-            str(profile),
-            "--route-counter-mmap",
+            "--route-trace",
+            str(route),
+            "--route-counter-snapshot",
             str(counter),
+            "--baseline-compact-row-steps",
+            "0",
+            "--min-compact-row-step-delta",
+            "1",
+            "--expected-route-counter-ranks",
+            str(rank_count),
+            "--phase",
+            "full-replay-test",
         ],
         check=False,
         capture_output=True,
         text=True,
     )
-    assert retired.returncode != 0
-    assert "unrecognized arguments: --route-counter-mmap" in retired.stderr
+
+
+def test_liveness_accepts_tp_complete_full_replay_without_profile(
+    tmp_path: Path,
+) -> None:
+    result = _run_replay_liveness(
+        tmp_path,
+        route_events=[
+            _replay_enqueue_event(pid=101),
+            _replay_enqueue_event(pid=202),
+            _replay_route_event(pid=101),
+            _replay_route_event(pid=202),
+        ],
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "generation_count=1" in result.stdout
+    assert "source=replay_batched_route" in result.stdout
+    assert "FULL replay route authority" in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("enqueue_events", "failure"),
+    [
+        (
+            [],
+            "logical refresh 世代 0 < 1",
+        ),
+        (
+            [_replay_enqueue_event(pid=101)],
+            "TP-incomplete=1",
+        ),
+        (
+            [
+                _replay_enqueue_event(pid=101, payload_count=48),
+                _replay_enqueue_event(pid=202, payload_count=47),
+            ],
+            "payload-mismatch=1",
+        ),
+    ],
+)
+def test_liveness_rejects_incomplete_replay_generation_evidence(
+    tmp_path: Path,
+    enqueue_events: list[dict[str, object]],
+    failure: str,
+) -> None:
+    result = _run_replay_liveness(
+        tmp_path,
+        route_events=[
+            *enqueue_events,
+            _replay_route_event(pid=101),
+            _replay_route_event(pid=202),
+        ],
+    )
+
+    assert result.returncode != 0
+    assert failure in result.stdout
+
+
+def test_liveness_rejects_full_replay_route_family_mismatch(
+    tmp_path: Path,
+) -> None:
+    mismatched_route = _replay_route_event(pid=202)
+    mismatched_route["current_route_family"] = "native"
+    mismatched_route["route_family_mismatch"] = True
+    result = _run_replay_liveness(
+        tmp_path,
+        route_events=[
+            _replay_enqueue_event(pid=101),
+            _replay_enqueue_event(pid=202),
+            _replay_route_event(pid=101),
+            mismatched_route,
+        ],
+    )
+
+    assert result.returncode != 0
+    assert "FULL replay route 证据不完整" in result.stdout
+    assert "mismatch=1" in result.stdout
+
+
+def test_liveness_route_judge_uses_only_fresh_offset_window(
+    tmp_path: Path,
+) -> None:
+    stale = json.dumps(
+        {"event": "mixed_page_call", "mode": "resolved_row_ptr"}
+    ) + "\n"
+    fresh = "".join(
+        json.dumps(event) + "\n"
+        for event in (
+            _replay_enqueue_event(pid=101),
+            {"event": "mixed_page_call", "mode": "native"},
+        )
+    )
+    route = tmp_path / "route.jsonl"
+    route.write_text(stale + fresh, encoding="utf-8")
+    counter = tmp_path / "route_counter_snapshot.bin"
+    counter.write_bytes(struct.pack("10q", 1, 1, 1, 0, 0, 0, 0, 1, 1, 1))
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            str(REPO_ROOT / "scripts" / "check_sparse_liveness.py"),
+            "--route-trace",
+            str(route),
+            "--route-trace-offset",
+            str(len(stale.encode("utf-8"))),
+            "--route-counter-snapshot",
+            str(counter),
+            "--expected-route-counter-ranks",
+            "1",
+            "--phase",
+            "fresh-window-test",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "fresh route window 无 sparse read authority" in result.stdout
+
+
+def test_full_replay_serve_retires_refresh_profile_authority() -> None:
+    serve_source = (
+        REPO_ROOT / "scripts" / "serve_sparse.sh"
+    ).read_text(encoding="utf-8")
+    longbench_source = (
+        REPO_ROOT / "scripts" / "run_longbench_v2.sh"
+    ).read_text(encoding="utf-8")
+    checker_source = (
+        REPO_ROOT / "scripts" / "check_sparse_liveness.py"
+    ).read_text(encoding="utf-8")
+    installer_source = (
+        REPO_ROOT / "patches" / "patch_installer.py"
+    ).read_text(encoding="utf-8")
+
+    retired_profile_env = (
+        "VLLM_SPARSE_REFRESH_PROFILE",
+        "VLLM_SPARSE_REFRESH_PROFILE_DETAIL",
+        "VLLM_SPARSE_REFRESH_PROFILE_CALL_MIN",
+        "VLLM_SPARSE_REFRESH_PROFILE_EVERY",
+        "VLLM_SPARSE_REFRESH_PROFILE_LOG",
+    )
+    assert "REFRESH_PROFILE_LOG=" not in serve_source
+    assert "export VLLM_SPARSE_REFRESH_PROFILE=" not in serve_source
+    assert '"refresh_profile_log"' not in serve_source
+    for name in retired_profile_env:
+        assert f"unset {name}" in serve_source
+        assert f'"{name}"' in longbench_source
+    assert '"schema": 7' in serve_source
+    assert '"refresh_profile_log"' not in longbench_source
+    assert 'data["schema"] != 7' in longbench_source
+    assert "--refresh-profile-log" not in checker_source
+    assert "--refresh-profile-offset" not in checker_source
+    assert "_refresh_profile_batched_hint_emitted" not in installer_source
