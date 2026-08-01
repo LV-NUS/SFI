@@ -151,7 +151,6 @@ def _prefill_step_layout_memo_keys(
         int(getattr(layout, "step_handle_id", -1)),
         int(getattr(layout, "step_handle_generation", -1)),
         int(getattr(layout, "kv_max", -1)),
-        int(getattr(layout, "lease_generation", -1)),
         tuple(int(v) for v in getattr(layout, "slot_list", tuple())),
         tuple(
             int(v) for v in (getattr(layout, "row_list_cpu", None) or tuple())
@@ -473,10 +472,8 @@ def get_step_capture_layout_impl(
     chunk_id, buf_id, _ = self._map_global_layer_to_capture_slot(global_layer_index)
     ring = self.step_prefill_capture_layout_ring if phase == "prefill" else self.step_refresh_capture_layout_ring
     layout = ring[buf_id]
-    self._reclaim_retired_buffers()
-    _mark_phase("reclaim_retired")
     # [LAYOUT-STEP-MEMO 2026-07-06] refresh 布局在同 step 同 chunk 内逐层重建
-    # 是纯冗余（rows/cap tensor/live lengths/cpu tensors/lease 全同值重做，
+    # 是纯冗余（rows/cap tensor/live lengths/cpu tensors 全同值重做，
     # 实测 X 账单单点 ~100-250µs/层）：chunk 首层走完整 reuse_same_step 路径
     # 后置 memo，同 chunk 2..N 层直接返回。
     layout_step_memo_token = None
@@ -590,12 +587,6 @@ def get_step_capture_layout_impl(
             slot_list_for_rows=prepared_slot_list,
         )
         if not prepared_miss_reason:
-            lease = self._ensure_capture_ring_active_lease(
-                buf_id=buf_id,
-                epoch=int(step_context.epoch),
-                min_capacity=int(prepared_layout.capture_scores.numel()),
-            )
-            prepared_layout.lease_generation = int(lease.generation)
             _mark_phase("prepared_fast_ready")
             if not skip_live_lengths and prefill_slot_by_row is not None:
                 prepared_layout.prefill_step_layout_memo = (
@@ -776,13 +767,6 @@ def get_step_capture_layout_impl(
                 layout.slot_row_map_key = row_key
             self._ensure_capture_layout_cpu_tensors(layout=layout, phase=phase)
             _mark_phase("reuse_same_step_cpu_tensors")
-            lease = self._ensure_capture_ring_active_lease(
-                buf_id=buf_id,
-                epoch=int(step_context.epoch),
-                min_capacity=int(layout.capture_scores.numel()),
-            )
-            layout.lease_generation = int(lease.generation)
-            _mark_phase("reuse_same_step_lease")
             _emit(
                 "prepared_bind" if prepared_bound else "reuse_same_step",
                 buf_id=int(buf_id),
@@ -960,13 +944,6 @@ def get_step_capture_layout_impl(
             layout.chunk_lengths = None
         self._ensure_capture_layout_cpu_tensors(layout=layout, phase=phase)
         _mark_phase("reuse_cpu_tensors")
-        lease = self._ensure_capture_ring_active_lease(
-            buf_id=buf_id,
-            epoch=int(step_context.epoch),
-            min_capacity=int(layout.capture_scores.numel()),
-        )
-        layout.lease_generation = int(lease.generation)
-        _mark_phase("reuse_lease")
         _emit(
             "prepared_bind" if prepared_bound else "reuse_cross_step",
             buf_id=int(buf_id),
@@ -996,7 +973,7 @@ def get_step_capture_layout_impl(
         )
         return None
     if layout is not None:
-        self._retire_capture_layout(buf_id=buf_id, layout=layout, device=device)
+        self._retire_capture_layout(layout=layout, device=device)
         _mark_phase("retire_old_layout")
     slots_cap = _align_up_int(slots_needed, 8)
     small_tensor_stage: dict[str, object] = {}
@@ -1174,13 +1151,6 @@ def get_step_capture_layout_impl(
         stage_cache=small_tensor_stage,
     )
     _mark_phase("new_capture_row")
-    lease = self._ensure_capture_ring_active_lease(
-        buf_id=buf_id,
-        epoch=int(step_context.epoch),
-        min_capacity=int(_CAPTURE_CHUNK * slots_cap * num_heads * window * kv_max),
-    )
-    _mark_phase("new_lease")
-
     layout = StepCaptureLayout(
         epoch=step_context.epoch,
         step_handle_id=int(getattr(step_context, "step_handle_id", -1)),
@@ -1208,7 +1178,6 @@ def get_step_capture_layout_impl(
         active_capture_row_by_batch_row_i32=capture_row_by_batch_row_i32[: int(step_context.num_reqs)],
         slot_row_map_key=tuple(int(r) for r in row_list_cpu),
         buf_id=buf_id,  # P0-2 FIX: 包含 buf_id 用于缓存区分
-        lease_generation=int(lease.generation),
         small_tensor_stage=small_tensor_stage,
     )
 

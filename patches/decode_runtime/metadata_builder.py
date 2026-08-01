@@ -7687,7 +7687,7 @@ def maybe_build_step_decode_data_from_metadata_impl(
 
         if need_decode_out_ptr:
             # 关键：maybe_build_step_decode_data_from_metadata 在 layer 前置阶段运行，
-            # 此时 slot_batch_rows 可能仍停留在上一 step（多 request / 早结束 / 调度重排会触发）。
+            # 此时 slot_batch_rows_cpu 可能仍停留在上一 step（多 request / 早结束 / 调度重排会触发）。
             # 在构建 capture layout 前先更新 slot->row 映射，避免 row 越界导致硬崩溃。
             try:
                 slot_row_map: Dict[int, int] = {}
@@ -8644,13 +8644,6 @@ def maybe_build_step_prefill_global_meta_from_metadata_impl(
             last_n = int(last_n_raw or 0)
             if last_n > 0:
                 capture_plan_active_by_req[str(rid)] = int(last_n)
-    if step_ctx is not None:
-        self._ensure_step_prefill_capture_last_n_by_row(
-            step_context=step_ctx,
-            capture_plan_active_by_req=(
-                capture_plan_active_by_req if capture_plan_active_by_req else None
-            ),
-        )
     if not capture_plan_active_by_req:
         _invalidate_prefill_global_meta()
         _append_detail_event(
@@ -8870,10 +8863,6 @@ def maybe_build_step_prefill_global_meta_from_metadata_impl(
     kv_bucket = max(256, int(kv_bucket))
     kv_max = _align_up_int(int(kv_needed_cpu), kv_bucket) if int(kv_needed_cpu) > 0 else 0
     self._prefill_log_f_stride_head = int(kv_max)
-    self._prefill_log_f_stride_epoch = step_authority.epoch
-    self._prefill_log_f_stride_handle_id = int(step_authority.step_handle_id)
-    self._prefill_log_f_stride_handle_generation = int(step_authority.step_handle_generation)
-
     # 预分配跨层 req_meta buffer
     def _ensure_prefill_buf(
         name: str,

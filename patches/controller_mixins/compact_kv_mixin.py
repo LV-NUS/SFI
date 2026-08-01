@@ -9,7 +9,6 @@ OWNS:
   - _ensure_compact_capacity(): grow-or-allocate compact KV storage
 
 DEPENDS_ON:
-  - patches.buffer_lease_protocol (LeaseKind)
   - config, _allocator_backend, refresh_stream, step_context_epoch (cross-mixin state)
 
 ENTRY_POINTS:
@@ -19,7 +18,6 @@ from __future__ import annotations
 
 import logging
 import os
-import time
 from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
@@ -27,7 +25,6 @@ import torch
 _log = logging.getLogger(__name__)
 _COMPACT_GROW_DEBUG = os.environ.get("VLLM_SPARSE_COMPACT_GROW_DEBUG", "0") == "1"
 
-from patches.buffer_lease_protocol import LeaseKind
 from patches.fa_sparse_runtime.compact_recent_alignment import (
     compact_recent_effective_k_head,
     compact_slot_offset_tokens,
@@ -311,24 +308,10 @@ class CompactKVMixin:
                 new_arena_k[:copy_tokens].copy_(state.compact_arena_k[:copy_tokens])
                 new_arena_v[:copy_tokens].copy_(state.compact_arena_v[:copy_tokens])
                 new_arena_pos[:, :copy_tokens].copy_(state.compact_arena_pos[:, :copy_tokens])
-            # 先 retire 旧 lease（失败时 arena 不变，状态完全一致）
-            old_lease = state._compact_active_lease
-            if old_lease is not None:
-                retire_id = f"compact-retire-{old_lease.generation}-{time.time_ns()}"
-                state._compact_lease_registry.retire(lease=old_lease, event_id=retire_id)
-            # retire 成功后替换 arena
             state.compact_arena_k = new_arena_k
             state.compact_arena_v = new_arena_v
             state.compact_arena_pos = new_arena_pos
             state.compact_arena_capacity_tokens = total_tokens
-            new_lease = state._compact_lease_registry.acquire(
-                kind=LeaseKind.COMPACT,
-                slot=0,
-                min_capacity=int(total_tokens * max(1, num_kv_heads) * max(1, head_dim)),
-                epoch=int(getattr(self, "step_context_epoch", -1)),
-            )
-            state._compact_active_lease = new_lease
-            state.compact_generation = int(new_lease.generation)
             state.bump_compact_meta_epoch()
             arena_reallocated = True
 
@@ -672,6 +655,3 @@ class CompactKVMixin:
         if hasattr(tensor, "untyped_storage"):
             return int(tensor.untyped_storage().data_ptr())
         return int(tensor.storage().data_ptr())
-
-
-

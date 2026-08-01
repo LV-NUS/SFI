@@ -55,6 +55,12 @@ class GlobalSlotAllocator:
         self._next_slot: int = 0
         self._slot_generation: Dict[int, int] = {}
 
+    @property
+    def capacity(self) -> Optional[int]:
+        """Return the immutable live-slot bound owned by this allocator."""
+
+        return self._capacity
+
     def _allocate_slot(self) -> int:
         if self._free_slots:
             return int(heapq.heappop(self._free_slots))

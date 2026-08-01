@@ -28,30 +28,29 @@ def validate_capture_inflight(value: int) -> int:
     return v
 
 
-_SUPPORTED_CAPTURE_REDUCE_GROUPS: Tuple[int, ...] = (0, 1, 2, 4)
+_SUPPORTED_CAPTURE_REDUCE_GROUPS: Tuple[int, ...] = (1, 2, 4)
 
 
 def validate_reduce_group(reduce_group: int, capture_chunk: int) -> int:
-    """[REDUCE-GROUP-SINGLE-SOURCE 2026-07-11 EXT审计·随手批] 域校验唯一真源。
+    """Validate the sole supported raw-ring geometry contract.
 
-    此前该域有两份实现：生产走 sparse_constants 内联判定（[REDUCE-GROUP-DOMAIN
-    收窄 2026-07-11] 已改 raise），测试走 fa3_native/ring_capture.py 的副本
-    （仍是旧的静默 return 0 = fallback 形态）——语义已漂移，测试测的不是生产
-    路径。收敛为本纯合同函数（raise 语义，与生产逐位同判）；ring_capture 与
-    sparse_constants 均消费此处。
+    G=0 had no cross-request WAR owner and is intentionally absent.  Production
+    configuration and pure tests both consume this function, so invalid values
+    cannot select a hidden execution mode.
     """
     g = int(reduce_group)
     chunk = int(capture_chunk)
+    if chunk <= 0:
+        raise ValueError(f"capture_chunk must be positive, got {chunk}")
     if g not in _SUPPORTED_CAPTURE_REDUCE_GROUPS:
         raise ValueError(
             f"capture reduce_group={g} unsupported; "
             f"allowed={_SUPPORTED_CAPTURE_REDUCE_GROUPS}"
         )
-    if g > 0 and chunk % g != 0:
+    if chunk % g != 0:
         raise ValueError(
             f"capture reduce_group={g} does not divide capture_chunk={chunk}; "
-            "the per-G raw ring requires capture_chunk % G == 0 (set a "
-            "dividing G, or G=0 for the explicit chunk-deep diagnostic mode)"
+            "the raw ring requires capture_chunk % G == 0"
         )
     return g
 

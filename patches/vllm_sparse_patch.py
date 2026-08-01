@@ -565,7 +565,6 @@ def _cleanup_inactive_slots(state: LayerState, controller: Optional['VLLMSparseC
                 state.prefill_kv_len_per_row_i32[slot] = 0
             if state.prefill_kv_lengths is not None and slot < state.prefill_kv_lengths.shape[0]:
                 state.prefill_kv_lengths[slot].zero_()
-            state.slot_batch_rows = None
             if state.slot_batch_rows_cpu is not None and slot < len(state.slot_batch_rows_cpu):
                 state.slot_batch_rows_cpu[slot] = -1
             steps_cpu = state.last_refresh_step_per_slot_cpu
@@ -638,10 +637,6 @@ def _cleanup_inactive_slots(state: LayerState, controller: Optional['VLLMSparseC
             # Task 10: cleanup 之后，旧请求的 selected/launch truth 不能继续参与后续 decode route。
             _invalidate_page_sparse_step_cache_truth(state)
             state.bump_compact_meta_epoch()
-            # finished slot 会把 CPU slot->row mirror 置为 -1；必须失效缓存键，
-            # 否则同 key 复用时 _maybe_update_slot_rows 可能跳过重建，遗留旧行号。
-            state._slot_row_map_key = None
-            state._slot_row_map_epoch = -1
             prev_active = state.last_active_request_ids
             if prev_active is not None:
                 active_ids = tuple(rid for rid in prev_active if rid in state.request_id_to_slot)
@@ -958,7 +953,7 @@ class VLLMSparseController(
         self.base_cache_key: Optional[int] = None
         self.base_last_seq_len: int = -1
         self._global_slot_allocator: GlobalSlotAllocator = GlobalSlotAllocator(
-            capacity=self._global_slot_allocator_capacity()
+            capacity=self._configured_global_slot_capacity()
         )
         self._pending_global_slot_releases: Set[str] = set()
         self._step_global_slot_map_epoch: int = -1
@@ -977,26 +972,11 @@ class VLLMSparseController(
         self.step_context_epoch: int = 0
         self._current_decode_step_by_req_epoch: int = -1
         self._current_decode_step_by_req: Dict[str, int] = {}
-        # kernel_dispatch step-local caches（避免热路径重复构建）
-        self._step_dispatcher_slot_row_map_token: int = -1
-        self._step_dispatcher_slot_row_map_key: Tuple[int, ...] = tuple()
-        self._step_dispatcher_slot_row_map: Optional[Dict[int, int]] = None
-        self._step_dispatcher_refresh_dirty_token: int = -1
-        self._step_dispatcher_refresh_dirty_slot_key: Tuple[int, ...] = tuple()
-        self._step_dispatcher_refresh_dirty_payload_slots: Tuple[int, ...] = tuple()
-        self._step_dispatcher_refresh_dirty_any_decode: bool = False
         self._fa3_live_route_token: int = -1
         self._fa3_live_route_batch_size: int = -1
         self._fa3_live_route_has_selected_consume: bool = False
         self._fa3_live_route_has_capture: bool = False
         self._fa3_live_route: Optional[str] = None
-        # step-local local-pack compact 缓存（按 step identity token + layer + compact meta 绑定）
-        self._step_local_pack_compact_token: int = -1
-        self._step_local_pack_compact_layer_index: int = -1
-        self._step_local_pack_compact_meta_epoch: int = -1
-        self._step_local_pack_compact_kv_len_by_row: Tuple[int, ...] = tuple()
-        self._step_local_pack_compact_offsets_by_row: Tuple[int, ...] = tuple()
-        self._step_local_pack_compact_kv_len_max: int = 0
         self._step_handle_ring_size: int = int(self.STEP_HANDLE_RING_SIZE)
         self._step_handle_next_id: int = 0
         self._step_handle_by_slot: List[Optional[StepHandle]] = [
@@ -1155,14 +1135,9 @@ class VLLMSparseController(
         # decode log_f / logits stage cache: 必须绑定 step identity，避免同 epoch 重入误复用。
         self._step_logits_ready_token: int = -1
         self._step_logits_ready_input_signature: Optional[Tuple[object, ...]] = None
-        self._step_logits_ready_bound_signature: Optional[Tuple[object, ...]] = None
         self._decode_logf_stage_token: int = -1
         self._decode_logf_stage_signature: Optional[Tuple[object, ...]] = None
         self._decode_logf_stage_bound_signature: Optional[Tuple[object, ...]] = None
-        self._step_cql_epoch: int = -1
-        self._step_cql_handle_id: int = -1
-        self._step_cql_handle_generation: int = -1
-        self._step_cql_tensor: Optional[torch.Tensor] = None
         # selector 复用缓冲（避免每步大分配）
         # key_norms delta 复用缓冲（减少 per-layer 小分配与 HtoD 抖动）
         # log_f(last_n>1) workspace（scratch + denom，step-wise 复用以避免频繁分配）
@@ -1231,9 +1206,6 @@ class VLLMSparseController(
         self._prefill_i32_handle_id: int = -1
         self._prefill_i32_handle_generation: int = -1
         self._prefill_log_f_stride_head: int = 0
-        self._prefill_log_f_stride_epoch: int = -1
-        self._prefill_log_f_stride_handle_id: int = -1
-        self._prefill_log_f_stride_handle_generation: int = -1
         # 262k OOM fix: cap the arena kv_max at the model bound and raise the
         # default budget so the profile-time prebuild (_prebuild_capture_buffers)
         # can reserve the max_model_len(262144)-bucket window=1 arena past the
@@ -1500,10 +1472,9 @@ class VLLMSparseController(
         self._request_intent_tickets.clear()
         self._bootstrap_pending_request_ids.clear()
         self._bootstrap_submission_boundary_pending_epoch_by_id.clear()
-        # idle 周期边界：重置 global slot 相关状态，避免 slot 跨 idle 滞留。
-        self._global_slot_allocator = GlobalSlotAllocator(
-            capacity=self._global_slot_allocator_capacity()
-        )
+        # idle 周期边界：tape row 与 global slot 是同一个 request ownership
+        # 单元，必须在同一冷侧事务中重置，不能留下跨 allocator 的旧 lease。
+        self._reset_request_slot_owners_after_idle()
         self._pending_global_slot_releases = set()
         self._step_global_slot_map_epoch = -1
         self._step_global_slot_map_req_ids = tuple()
@@ -1518,13 +1489,6 @@ class VLLMSparseController(
         self._should_refresh_cache_step = -1
         self._should_refresh_cache_nonce = -1
         self._should_refresh_cache.clear()
-        self._step_dispatcher_slot_row_map_token = -1
-        self._step_dispatcher_slot_row_map_key = tuple()
-        self._step_dispatcher_slot_row_map = None
-        self._step_dispatcher_refresh_dirty_token = -1
-        self._step_dispatcher_refresh_dirty_slot_key = tuple()
-        self._step_dispatcher_refresh_dirty_payload_slots = tuple()
-        self._step_dispatcher_refresh_dirty_any_decode = False
         self._fa3_live_route_token = -1
         self._fa3_live_route_batch_size = -1
         self._fa3_live_route_has_selected_consume = False
@@ -1533,26 +1497,15 @@ class VLLMSparseController(
         self._step_context_slot_row_map_token = -1
         self._step_context_slot_row_map_key = tuple()
         self._step_context_slot_row_map = None
-        self._step_local_pack_compact_token = -1
-        self._step_local_pack_compact_layer_index = -1
-        self._step_local_pack_compact_meta_epoch = -1
-        self._step_local_pack_compact_kv_len_by_row = tuple()
-        self._step_local_pack_compact_offsets_by_row = tuple()
-        self._step_local_pack_compact_kv_len_max = 0
         self._step_refresh_slot_req_ids_epoch = -1
         self._step_refresh_slot_req_ids_handle_id = -1
         self._step_refresh_slot_req_ids_handle_generation = -1
         self._step_refresh_slot_req_ids_cache.clear()
         self._step_logits_ready_token = -1
         self._step_logits_ready_input_signature = None
-        self._step_logits_ready_bound_signature = None
         self._decode_logf_stage_token = -1
         self._decode_logf_stage_signature = None
         self._decode_logf_stage_bound_signature = None
-        self._step_cql_epoch = -1
-        self._step_cql_handle_id = -1
-        self._step_cql_handle_generation = -1
-        self._step_cql_tensor = None
         self._step_refresh_commit_handle_id = -1
         self._step_refresh_commit_handle_generation = -1
         if hasattr(self, "_step_refresh_commit_written_req_ids"):
@@ -1579,10 +1532,6 @@ class VLLMSparseController(
             self.step_prefill_capture_layout_ring[idx] = None
         for idx in range(len(self.step_refresh_capture_layout_ring)):
             self.step_refresh_capture_layout_ring[idx] = None
-        for idx in range(len(self._capture_ring_active_lease_by_buf)):
-            self._capture_ring_active_lease_by_buf[idx] = None
-        self._capture_ring_retired_events.clear()
-        self._lease_stats["pending"] = 0
 
         # [TOPK-GRAPH-IDLE-RESET 2026-07-11] idle 清环使 capture arena ptr
         # 换代——selector topk graph 与 recurrence candidate 的旧 pointer key
@@ -2353,7 +2302,6 @@ class VLLMSparseController(
                 steps_decode_cpu[slot] = -1
             _revoke_slot_selected_truth(state, slot=int(slot))
             _invalidate_page_sparse_step_cache_truth(state)
-            state._slot_row_map_key = None
         tracking.bootstrap_done = False
         # resume 重新进入 bootstrap 生命周期；旧 short-dense 的决策锁存和
         # 读侧保护都不属于新世代。短 prompt 完成时会按几何重新置位。
@@ -2544,10 +2492,42 @@ class VLLMSparseController(
         self._ensure_request(rid)
         return int(self._global_slot_allocator.acquire(rid))
 
-    def _global_slot_allocator_capacity(self) -> Optional[int]:
+    def _configured_global_slot_capacity(self) -> Optional[int]:
+        """Resolve the immutable allocator capacity at controller construction."""
+
         if not bool(getattr(self.config, "compact_page_residency_enabled", False)):
             return None
         return int(getattr(self.config, "max_live_sparse_slots"))
+
+    def _reset_request_slot_owners_after_idle(self) -> None:
+        """Reset allocator and persistent tape leases after idle quiescence."""
+
+        allocator = self._global_slot_allocator
+        if not isinstance(allocator, GlobalSlotAllocator):
+            raise RuntimeError("E_SFI_GLOBAL_SLOT_ALLOCATOR_OWNER_DRIFT")
+        capacity = allocator.capacity
+        tape_state = getattr(self, "_capture_cohort_tape_state", None)
+        tape_tracker = getattr(self, "_capture_cohort_tape_lease_tracker", None)
+        if (tape_state is None) != (tape_tracker is None):
+            raise RuntimeError("E_SFI_CAPTURE_COHORT_TAPE_IDLE_OWNER_DRIFT")
+        if tape_state is not None:
+            from patches.fa3_native.capture_cohort_tape import (
+                CaptureCohortTapeState,
+                quiesce_and_reset_capture_cohort_tape_leases,
+            )
+
+            if not isinstance(tape_state, CaptureCohortTapeState):
+                raise RuntimeError("E_SFI_CAPTURE_COHORT_TAPE_IDLE_OWNER_DRIFT")
+            if capacity != int(tape_state.report.slot_capacity):
+                raise RuntimeError("E_SFI_CAPTURE_COHORT_TAPE_IDLE_CAPACITY_DRIFT")
+            refresh_stream = getattr(self, "refresh_stream", None)
+            if refresh_stream is None:
+                raise RuntimeError("E_SFI_CAPTURE_COHORT_TAPE_IDLE_STREAM_MISSING")
+            quiesce_and_reset_capture_cohort_tape_leases(
+                controller=self,
+                consumer_stream=refresh_stream,
+            )
+        self._global_slot_allocator = GlobalSlotAllocator(capacity=capacity)
 
     def release_global_slot(self, request_id: str) -> Optional[int]:
         if not isinstance(request_id, str):
@@ -2648,9 +2628,6 @@ class VLLMSparseController(
             self.step_prefill_capture_layout_ring[idx] = None
         for idx in range(len(self.step_refresh_capture_layout_ring)):
             self.step_refresh_capture_layout_ring[idx] = None
-        for idx in range(len(self._capture_ring_active_lease_by_buf)):
-            self._capture_ring_active_lease_by_buf[idx] = None
-        self._capture_ring_retired_events.clear()
         self._pending_work_reset()
         self._main_wait_epoch = -1
         for idx in range(len(self._main_wait_chunk_id_by_buf)):
@@ -2735,10 +2712,6 @@ class VLLMSparseController(
         self._step_refresh_slot_req_ids_handle_id = -1
         self._step_refresh_slot_req_ids_handle_generation = -1
         self._step_refresh_slot_req_ids_cache.clear()
-        self._step_dispatcher_refresh_dirty_token = -1
-        self._step_dispatcher_refresh_dirty_slot_key = tuple()
-        self._step_dispatcher_refresh_dirty_payload_slots = tuple()
-        self._step_dispatcher_refresh_dirty_any_decode = False
         self._fa3_live_route_token = -1
         self._fa3_live_route_batch_size = -1
         self._fa3_live_route_has_selected_consume = False
@@ -2869,20 +2842,16 @@ class VLLMSparseController(
         self.layer_dispatch_layer_count = 0
         self.base_cache_key = None
         self.base_last_seq_len = -1
+        allocator = self._global_slot_allocator
+        if not isinstance(allocator, GlobalSlotAllocator):
+            raise RuntimeError("E_SFI_GLOBAL_SLOT_ALLOCATOR_OWNER_DRIFT")
         self._global_slot_allocator = GlobalSlotAllocator(
-            capacity=self._global_slot_allocator_capacity()
+            capacity=allocator.capacity
         )
         self._pending_global_slot_releases = set()
         self._step_global_slot_map_epoch = -1
         self._step_global_slot_map_req_ids = tuple()
         self._step_global_slot_map = {}
-        self._step_dispatcher_slot_row_map_token = -1
-        self._step_dispatcher_slot_row_map_key = tuple()
-        self._step_dispatcher_slot_row_map = None
-        self._step_dispatcher_refresh_dirty_token = -1
-        self._step_dispatcher_refresh_dirty_slot_key = tuple()
-        self._step_dispatcher_refresh_dirty_payload_slots = tuple()
-        self._step_dispatcher_refresh_dirty_any_decode = False
         self._fa3_live_route_token = -1
         self._fa3_live_route_batch_size = -1
         self._fa3_live_route_has_selected_consume = False
@@ -2895,11 +2864,6 @@ class VLLMSparseController(
         self._decode_logf_stage_token = -1
         self._decode_logf_stage_signature = None
         self._decode_logf_stage_bound_signature = None
-        self._step_cql_epoch = -1
-        self._step_cql_handle_id = -1
-        self._step_cql_handle_generation = -1
-        self._step_cql_tensor = None
-
         self.request_states.clear()
         self._request_intent_tickets.clear()
         self._bootstrap_pending_request_ids.clear()
@@ -2928,15 +2892,11 @@ class VLLMSparseController(
         self._step_refresh_commit_planned_reqs = 0
         self._step_refresh_commit_planned_rows = 0
         self._step_refresh_commit_num_actual_tokens = 0
-        self._step_refresh_commit_payload_enqueues = 0
-        self._step_refresh_commit_replay_payload_claims = 0
         if hasattr(self, "_step_refresh_commit_written_req_ids"):
             self._step_refresh_commit_written_req_ids.clear()
         self._step_refresh_handle_ledger = []
         self._step_refresh_handle_ledger_size = 0
         self._step_refresh_handle_checked_through = 0
-        self._refresh_rebuild_delay_max = 0
-        self._refresh_rebuild_delay_max_epoch = -1
         self.step_prefill_epoch = -1
         for buf_id in range(len(self.step_prefill_chunk_payloads)):
             _buf = self.step_prefill_chunk_payloads[buf_id]
@@ -2959,17 +2919,15 @@ class VLLMSparseController(
         # 下一次 profile 会复用旧 stream identity 或跳过 prebuild。这里仅
         # 失效发布状态；已分配的通用 scratch/arena 仍由 profile 按新几何复用。
         self._capture_cohort_tape_state = None
-        self._capture_cohort_tape_report = None
         self._capture_cohort_tape_lease_tracker = None
-        self._selector_log_f_r2_tiled_resources = {}
+        self._capture_postprocess_meta_staging_seal = None
         self._selector_log_f_r2_tiled_resource_seal = None
-        self._selector_log_f_r2_tiled_resource_prebuild_key = None
         self._capture_kv_max_bucket = 0
         self._capture_last_n_bucket = 0
         self._capture_rows_bucket = 0
-        self._capture_tiled_postprocess_resource_report = None
         self._capture_prebuilt = False
         self._capture_ownership_plan = None
+        self._ring_war_fence = None
         self.refresh_stream = None
         self._refresh_stream_device = None
         self.chunk_ready_evt = []
@@ -3004,9 +2962,6 @@ class VLLMSparseController(
         self._prefill_i32_handle_id = -1
         self._prefill_i32_handle_generation = -1
         self._prefill_log_f_stride_head = 0
-        self._prefill_log_f_stride_epoch = -1
-        self._prefill_log_f_stride_handle_id = -1
-        self._prefill_log_f_stride_handle_generation = -1
         self._set_unified_attention_mode("default")
 
     def _maybe_build_step_prefill_global_meta_from_metadata(
@@ -3411,7 +3366,42 @@ class VLLMSparseController(
         for state in self.layer_states.values():
             _cleanup_inactive_slots(state, self)
 
-        for rid in list(self._pending_global_slot_releases):
+        pending_slot_releases = tuple(sorted(self._pending_global_slot_releases))
+        tape_tracker = getattr(self, "_capture_cohort_tape_lease_tracker", None)
+        if tape_tracker is not None:
+            from patches.fa3_native.capture_cohort_tape import (
+                CaptureCohortTapeLeaseTracker,
+                capture_cohort_stream_identity,
+            )
+
+            if not isinstance(tape_tracker, CaptureCohortTapeLeaseTracker):
+                raise RuntimeError("E_SFI_CAPTURE_COHORT_TAPE_TRACKER_DRIFT")
+            tape_retirements = tuple(
+                (rid, int(slot))
+                for rid in pending_slot_releases
+                if (slot := self._global_slot_allocator.slot_of(rid)) is not None
+                and tape_tracker.request_requires_retirement(
+                    slot=int(slot),
+                    request_id=rid,
+                )
+            )
+            if tape_retirements:
+                retire_stream = getattr(self, "refresh_stream", None)
+                if retire_stream is None:
+                    raise RuntimeError(
+                        "E_SFI_CAPTURE_COHORT_TAPE_RETIRE_STREAM_MISSING"
+                    )
+                retire_stream_identity = capture_cohort_stream_identity(
+                    retire_stream
+                )
+                for rid, slot in tape_retirements:
+                    tape_tracker.retire_request(
+                        slot=slot,
+                        request_id=rid,
+                        consumer_stream_identity=retire_stream_identity,
+                    )
+
+        for rid in pending_slot_releases:
             self.release_global_slot(rid)
             self._pending_global_slot_releases.discard(rid)
 

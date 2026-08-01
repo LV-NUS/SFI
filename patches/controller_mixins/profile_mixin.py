@@ -920,9 +920,6 @@ class ProfileMixin:
             ),
             "lastn1_direct_count": int(pending.lastn1_direct_count or 0),
             "gt1_reduce_count": int(pending.gt1_reduce_count or 0),
-            "gt1_scalar_fallback_count": int(
-                pending.gt1_scalar_fallback_count or 0
-            ),
             "refresh_rebuild_budget_before": int(
                 pending.refresh_rebuild_budget_before
             ),
@@ -1155,9 +1152,6 @@ class ProfileMixin:
             ),
             "deadline_async_producer_result_precomputed_count": int(
                 pending.deadline_async_producer_result_precomputed_count or 0
-            ),
-            "refresh_rebuild_delay_max": int(
-                pending.refresh_rebuild_delay_max or 0
             ),
             "producer_work_target_layer_start": int(
                 pending.producer_work_target_layer_start

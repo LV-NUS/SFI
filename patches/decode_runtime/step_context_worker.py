@@ -456,8 +456,6 @@ def prepare_step_context_impl(
         stage="prepare_step_context",
     )
 
-    self._reclaim_retired_buffers()
-
     req_ids_tuple = tuple(req_ids)
     num_reqs = len(req_ids_tuple)
     step_token = int(step_ticket.target_epoch)
@@ -1318,10 +1316,6 @@ def prepare_step_context_impl(
     self.step_prefill_plan_handle_generation = -1
     self.step_prefill_capture_plan_by_req = {}
     self.step_prefill_finalize_req_ids = tuple()
-    self.step_prefill_capture_last_n_by_row = None
-    self.step_prefill_capture_last_n_epoch = -1
-    self.step_prefill_capture_last_n_handle_id = -1
-    self.step_prefill_capture_last_n_handle_generation = -1
 
     # ============ 构建 StepMeta（两阶段缓存的第一阶段）============
     # 收集跨层共享的信息，供 per-layer cache 使用

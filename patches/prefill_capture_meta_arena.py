@@ -285,7 +285,6 @@ class SparseCaptureMetaArena:
             layout.seq_lens_cpu = None
             layout.kv_len_per_row_cpu = None
             layout.active_capture_row_by_batch_row_i32 = None
-            layout.lease_generation = 0
             layout.small_tensor_stage.clear()
         self.reset_step_metrics()
 

@@ -1,5 +1,5 @@
 """
-patches/controller_mixins/capture_ring_mixin.py — Capture layout, ring-buffer lease, and pointer-array management.
+patches/controller_mixins/capture_ring_mixin.py — Capture layout and pointer-array management.
 
 OWNS:
   - _init_capture_ring_state(): capture ring state initialization
@@ -7,11 +7,9 @@ OWNS:
   - _ensure_capture_layout_cpu_tensors(): CPU-side slot/seq tensor materialization
   - _capture_scores_ptrs_for_rows / _log_f_denoms_ptrs_for_rows(): pointer-array builders
   - _map_global_layer_to_capture_slot(): global-layer to ring-slot mapping
-  - _ensure_capture_ring_active_lease / _retire_capture_layout(): lease lifecycle
-  - _reclaim_capture_ring_leases / _reclaim_retired_buffers(): GPU event-driven reclaim
+  - _retire_capture_layout(): allocator stream-lifetime publication
 
 DEPENDS_ON:
-  - patches.buffer_lease_protocol (BufferLease, BufferLeaseRegistry, LeaseKind)
   - patches.sparse_constants (_CAPTURE_CHUNK, _CAPTURE_IN_FLIGHT)
   - step_context_epoch, refresh_stream, chunk_done_evt (cross-mixin state)
 
@@ -22,25 +20,26 @@ from __future__ import annotations
 
 import logging
 import os
-import time
 from collections import deque
 from typing import TYPE_CHECKING, Deque, Dict, List, Optional, Set, Tuple
 
 import torch
 
-from patches.buffer_lease_protocol import BufferLease, BufferLeaseRegistry, LeaseKind
 from patches.sparse_constants import _CAPTURE_CHUNK, _CAPTURE_IN_FLIGHT
 from patches.sparse_utils import _is_stream_capturing_or_raise
 
 _log = logging.getLogger(__name__)
-_REBUILD_PTRS_CPU_FREE_MAX_PER_NAME = max(2, 2 * int(_CAPTURE_IN_FLIGHT))
+# A free pointer carrier is only a cold reuse cache; outstanding H2D lifetime
+# remains represented by the pending event queue.  Retain one steady-state
+# carrier per name instead of coupling cache population to scratch overlap.
+_REBUILD_PTRS_CPU_FREE_MAX_PER_NAME = 1
 
 if TYPE_CHECKING:
     from patches.sparse_types import StepCaptureLayout, StepContext
 
 
 class CaptureRingMixin:
-    """Capture layout buffer management and ring-buffer lease lifecycle.
+    """Capture layout, storage lifetime, and ring-overwrite management.
 
     All capture-ring state is initialised via ``_init_capture_ring_state()``
     which must be called from the controller's ``__init__``.
@@ -75,19 +74,6 @@ class CaptureRingMixin:
         self._writer_cached_pointer_op_count_total: int = 0
         self._writer_vector_fallback_count_total: int = 0
         self._source_ready_recorded_after_pointer_publish_total: int = 0
-        # ring-buffer lease management
-        self._capture_ring_lease_registry: BufferLeaseRegistry = BufferLeaseRegistry(
-            num_slots=int(_CAPTURE_IN_FLIGHT)
-        )
-        self._capture_ring_active_lease_by_buf: List[Optional[BufferLease]] = [
-            None for _ in range(int(_CAPTURE_IN_FLIGHT))
-        ]
-        self._capture_ring_retired_events: Deque[Tuple[str, torch.cuda.Event]] = deque()
-        self._lease_stats: Dict[str, int] = {
-            "capture_ring_retired": 0,
-            "capture_ring_reclaimed": 0,
-            "pending": 0,
-        }
         # grow-to-fit arena: superseded prefill-capture buffers awaiting async-safe free
         # (held ref + record_stream; freed when the buf_id chunk_done_evt fires).
         self._arena_retired_buckets: Deque[Tuple[object, object]] = deque()
@@ -108,19 +94,7 @@ class CaptureRingMixin:
         self._rebuild_ptrs_signature.clear()
         self._rebuild_ptrs_ready_events.clear()
         self._rebuild_ptrs_capture_wait_satisfied_names.clear()
-        self._capture_ring_lease_registry = BufferLeaseRegistry(
-            num_slots=int(_CAPTURE_IN_FLIGHT)
-        )
-        self._capture_ring_active_lease_by_buf = [
-            None for _ in range(int(_CAPTURE_IN_FLIGHT))
-        ]
-        self._capture_ring_retired_events.clear()
         self._arena_retired_buckets.clear()
-        self._lease_stats = {
-            "capture_ring_retired": 0,
-            "capture_ring_reclaimed": 0,
-            "pending": 0,
-        }
 
     # ------------------------------------------------------------------
     # Pointer-buffer helpers
@@ -626,56 +600,8 @@ class CaptureRingMixin:
         return chunk_id, buf_id, slot_in_chunk
 
     # ------------------------------------------------------------------
-    # Ring-buffer lease lifecycle
+    # Ring-buffer storage lifecycle
     # ------------------------------------------------------------------
-
-    def _reclaim_capture_ring_leases(self) -> int:
-        if not self._capture_ring_retired_events:
-            return 0
-        ready_ids: Set[str] = set()
-        pending: Deque[Tuple[str, torch.cuda.Event]] = deque()
-        while self._capture_ring_retired_events:
-            retire_id, done_evt = self._capture_ring_retired_events.popleft()
-            try:
-                done = bool(done_evt.query())
-            except Exception:
-                _log.warning("done_evt.query() failed for retire_id=%s", retire_id, exc_info=True)
-                raise
-            if done:
-                ready_ids.add(str(retire_id))
-            else:
-                pending.append((str(retire_id), done_evt))
-        self._capture_ring_retired_events = pending
-        reclaimed = 0
-        if ready_ids:
-            reclaimed = int(self._capture_ring_lease_registry.reclaim(ready_event_ids=ready_ids))
-        return reclaimed
-
-    def _reclaim_retired_buffers(self) -> None:
-        reclaimed = self._reclaim_capture_ring_leases()
-        if reclaimed > 0:
-            self._lease_stats["capture_ring_reclaimed"] += int(reclaimed)
-        self._lease_stats["pending"] = int(self._capture_ring_lease_registry.pending_retired())
-
-    def _ensure_capture_ring_active_lease(
-        self,
-        *,
-        buf_id: int,
-        epoch: int,
-        min_capacity: int,
-    ) -> BufferLease:
-        buf = int(buf_id) % int(_CAPTURE_IN_FLIGHT)
-        cur = self._capture_ring_active_lease_by_buf[buf]
-        if cur is not None:
-            return cur
-        lease = self._capture_ring_lease_registry.acquire(
-            kind=LeaseKind.CAPTURE_RING,
-            slot=buf,
-            min_capacity=max(1, int(min_capacity)),
-            epoch=int(epoch),
-        )
-        self._capture_ring_active_lease_by_buf[buf] = lease
-        return lease
 
     def _record_streams_for_release(
         self,
@@ -686,7 +612,7 @@ class CaptureRingMixin:
     ) -> None:
         """Bind a to-be-dropped capture buffer's storage lifetime to the compute
         AND refresh (async selector-writer) streams so the caching allocator defers
-        the free past both readers. Same async-UAF contract as _retire_capture_layout."""
+        the free past both readers."""
         if capture_scores.device.type != "cuda":
             return
         cur = torch.cuda.current_stream(device=device)
@@ -699,8 +625,8 @@ class CaptureRingMixin:
 
     def _reclaim_retired_arena_buckets(self) -> int:
         """Drop held refs to pruned capture buffers whose buf_id chunk_done_evt has
-        fired (async producer done) -> storage actually freed. Mirrors the ring's
-        _reclaim_retired_buffers deferral; runs at step-prep (off hot path)."""
+        fired (async producer done), allowing storage to be freed. Runs only at
+        grow/release boundaries, never in the steady attention path."""
         q = getattr(self, "_arena_retired_buckets", None)
         if not q:
             return 0
@@ -800,49 +726,14 @@ class CaptureRingMixin:
     def _retire_capture_layout(
         self,
         *,
-        buf_id: int,
         layout: "StepCaptureLayout",
         device: torch.device,
     ) -> None:
-        self._reclaim_retired_buffers()
-        buf = int(buf_id) % int(_CAPTURE_IN_FLIGHT)
-        # 在替换 ring layout 前绑定旧 storage 生命周期，避免异步路径 UAF。
-        if layout.capture_scores.device.type == "cuda":
-            try:
-                cur = torch.cuda.current_stream(device=device)
-                layout.capture_scores.record_stream(cur)
-                layout.log_f_denoms.record_stream(cur)
-            except Exception:
-                _log.warning("record_stream(current_stream) failed for buf_id=%s", buf_id, exc_info=True)
-                raise
-            rs = self.refresh_stream
-            if rs is not None:
-                try:
-                    layout.capture_scores.record_stream(rs)
-                    layout.log_f_denoms.record_stream(rs)
-                except Exception:
-                    _log.warning("record_stream(refresh_stream) failed for buf_id=%s", buf_id, exc_info=True)
-                    raise
-
-        active = self._capture_ring_active_lease_by_buf[buf]
-        if active is None:
-            return
-        retire_id = f"capture-ring-retire-{buf}-{active.generation}-{time.time_ns()}"
-        try:
-            self._capture_ring_lease_registry.retire(lease=active, event_id=retire_id)
-        except Exception:
-            _log.warning("lease_registry.retire() failed for buf=%d retire_id=%s", buf, retire_id, exc_info=True)
-            raise
-        self._lease_stats["capture_ring_retired"] += 1
-        self._capture_ring_active_lease_by_buf[buf] = None
-
-        if device.type != "cuda":
-            self._capture_ring_lease_registry.reclaim(ready_event_ids={retire_id})
-            return
-
-        if 0 <= buf < len(self.chunk_done_evt):
-            done_evt = self.chunk_done_evt[buf]
-            if done_evt is not None:
-                self._capture_ring_retired_events.append((retire_id, done_evt))
-                return
-        self._capture_ring_lease_registry.reclaim(ready_event_ids={retire_id})
+        # The caching allocator is the storage-lifetime authority.  Bind the old
+        # allocation to both streams before dropping the layout reference; ring
+        # overwrite ordering remains owned by chunk_done_evt/RingWarFence.
+        self._record_streams_for_release(
+            capture_scores=layout.capture_scores,
+            log_f_denoms=layout.log_f_denoms,
+            device=device,
+        )

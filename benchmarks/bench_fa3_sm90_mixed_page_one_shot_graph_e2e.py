@@ -205,7 +205,6 @@ def _unsupported_fallback_count(summary: dict[str, object]) -> int:
         "vector_fallback_rows",
         "full_fallback_rows",
         "writer_vector_fallback_count",
-        "gt1_scalar_fallback_count",
     )
     return sum(_require_fallback_counter(summary, key) for key in keys)
 

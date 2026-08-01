@@ -196,8 +196,6 @@ class RefreshRebuildMixin:
         self._step_refresh_commit_planned_reqs: int = 0
         self._step_refresh_commit_planned_rows: int = 0
         self._step_refresh_commit_num_actual_tokens: int = 0
-        self._step_refresh_commit_payload_enqueues: int = 0
-        self._step_refresh_commit_replay_payload_claims: int = 0
         # commit-path single writer（exactly-once per request within one step-handle）
         self._step_refresh_commit_written_req_ids: Set[str] = set()
         # handle-ledger ring（slot = handle_id % ring_size）：
@@ -211,8 +209,6 @@ class RefreshRebuildMixin:
         self._pending_refresh_rebuilds: Deque[PendingRefreshRebuild] = deque()
         self._pending_refresh_rebuild_id: int = 0
         self._pending_refresh_rebuild_by_req: Dict[Tuple[str, int, int], int] = {}
-        self._refresh_rebuild_delay_max: int = 0
-        self._refresh_rebuild_delay_max_epoch: int = -1
         self._deadline_rebuild_drop_finished_count: int = 0
         self._deadline_rebuild_drain_finish_count: int = 0
         self._deadline_rebuild_partial_finish_count: int = 0
@@ -4655,8 +4651,6 @@ class RefreshRebuildMixin:
         self._step_refresh_commit_planned_reqs = max(0, planned_reqs)
         self._step_refresh_commit_planned_rows = max(0, planned_rows)
         self._step_refresh_commit_num_actual_tokens = max(0, num_actual_tokens)
-        self._step_refresh_commit_payload_enqueues = 0
-        self._step_refresh_commit_replay_payload_claims = 0
         self._step_refresh_commit_written_req_ids.clear()
         self._step_refresh_handle_ledger_ensure()
         ring_size = self._step_refresh_handle_ledger_size
@@ -4704,11 +4698,6 @@ class RefreshRebuildMixin:
                 f"next_count={next_count} expected={expected_replay_payloads}"
             )
         entry[6] = next_count
-        if (
-            self._step_refresh_commit_handle_id == commit_handle_id
-            and self._step_refresh_commit_handle_generation == commit_handle_generation
-        ):
-            self._step_refresh_commit_payload_enqueues += count_i
 
     def _step_refresh_commit_claim_replay_payload_generation(
         self,
@@ -4762,12 +4751,6 @@ class RefreshRebuildMixin:
                 )
             entry[5] = 1
             entry[7] = expected_payload_count
-            if (
-                self._step_refresh_commit_handle_id == commit_handle_id
-                and self._step_refresh_commit_handle_generation
-                == commit_handle_generation
-            ):
-                self._step_refresh_commit_replay_payload_claims = 1
             return True
         if claims != 1 or recorded_expected != expected_payload_count:
             raise RuntimeError(

@@ -697,17 +697,12 @@ def run_deferred_bootstrap_producer_job(
             )
 
             # Only the prebuilt tape owns a cross-step lease.  The ring path has
-            # no such lifetime to retire, so do not inject a CUDA event into its
-            # steady state.
+            # no such lifetime to retire.  All tape reads and subsequent writes
+            # use this same producer stream, so FIFO order is the reuse fence.
             if resolve_capture_cohort_tape_group(group_payloads) is not None:
-                tape_consumer_done_event = torch.cuda.Event(enable_timing=False)
-                tape_consumer_done_event.record(
-                    torch.cuda.current_stream(device=device)
-                )
                 release_capture_cohort_payload_group(
                     controller=controller,
                     payloads=group_payloads,
-                    completion_event=tape_consumer_done_event,
                     consumer_stream=producer_stream,
                 )
             group_end_ns = time.perf_counter_ns()

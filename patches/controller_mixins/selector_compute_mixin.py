@@ -446,7 +446,6 @@ class SelectorComputeMixin:
         self._decode_logits_cap_stage_cpu_i64: Optional[torch.Tensor] = None
         self._step_logits_ready_token: int = -1
         self._step_logits_ready_input_signature: Optional[Tuple[object, ...]] = None
-        self._step_logits_ready_bound_signature: Optional[Tuple[object, ...]] = None
         self._decode_row_is_compact_i32: Optional[torch.Tensor] = None  # [max_batch], int32
         # [ARM-WAR-R1-PINNED-INDEPENDENT 2026-07-12] _decode_compact_staging_cpu
         # 常驻单例已退休:xlayer staging 改每次 fill 独立 fresh pinned 分配
@@ -458,10 +457,6 @@ class SelectorComputeMixin:
         self.step_prefill_plan_handle_generation: int = -1
         self.step_prefill_capture_plan_by_req: Dict[str, int] = {}
         self.step_prefill_finalize_req_ids: Tuple[str, ...] = tuple()
-        self.step_prefill_capture_last_n_by_row: Optional[Tuple[int, ...]] = None
-        self.step_prefill_capture_last_n_epoch: int = -1
-        self.step_prefill_capture_last_n_handle_id: int = -1
-        self.step_prefill_capture_last_n_handle_generation: int = -1
         self._step_context_slot_row_map_token: int = -1
         self._step_context_slot_row_map_key: Tuple[int, ...] = tuple()
         self._step_context_slot_row_map: Optional[Dict[int, int]] = None
@@ -543,7 +538,6 @@ class SelectorComputeMixin:
         self._decode_logits_cap_stage_cpu_i64 = None
         self._step_logits_ready_token = -1
         self._step_logits_ready_input_signature = None
-        self._step_logits_ready_bound_signature = None
         self._decode_row_is_compact_i32 = None
         self._decode_seqused_k_i32 = None
         self._decode_cu_seqlens_q_i32 = None
@@ -552,10 +546,6 @@ class SelectorComputeMixin:
         self.step_prefill_plan_handle_generation = -1
         self.step_prefill_capture_plan_by_req = {}
         self.step_prefill_finalize_req_ids = tuple()
-        self.step_prefill_capture_last_n_by_row = None
-        self.step_prefill_capture_last_n_epoch = -1
-        self.step_prefill_capture_last_n_handle_id = -1
-        self.step_prefill_capture_last_n_handle_generation = -1
         self._step_context_slot_row_map_token = -1
         self._step_context_slot_row_map_key = tuple()
         self._step_context_slot_row_map = None
@@ -2803,11 +2793,6 @@ class SelectorComputeMixin:
             self._step_capture_accum_token = int(step_context.epoch)
             self._step_logits_ready_token = _sit
             self._step_logits_ready_input_signature = ready_input_signature
-            self._step_logits_ready_bound_signature = (
-                tuple(self.step_bound_meta.bound_meta_signature)
-                if self.step_bound_meta is not None
-                else tuple()
-            )
             return
 
         tensor_cap = max(int(getattr(self, "max_batch_size", 0) or 0), int(num_reqs))
@@ -2907,11 +2892,6 @@ class SelectorComputeMixin:
         self._step_capture_accum_token = int(step_context.epoch)
         self._step_logits_ready_token = _sit
         self._step_logits_ready_input_signature = ready_input_signature
-        self._step_logits_ready_bound_signature = (
-            tuple(self.step_bound_meta.bound_meta_signature)
-            if self.step_bound_meta is not None
-            else tuple()
-        )
 
     def _update_prefill_capture_state_by_req(
         self,
@@ -3096,51 +3076,6 @@ class SelectorComputeMixin:
         self.step_prefill_capture_plan_by_req = capture_plan_by_req
         self.step_prefill_finalize_req_ids = finalize_req_ids
         return capture_plan_by_req, finalize_req_ids
-
-    def _ensure_step_prefill_capture_last_n_by_row(
-        self,
-        *,
-        step_context: StepContext,
-        capture_plan_active_by_req: Optional[Dict[str, int]],
-    ) -> None:
-        """构建并缓存 step 级 per-row last_n（仅针对 active capture 计划）。"""
-        epoch = self.step_context_epoch
-        handle_id = int(getattr(step_context, "step_handle_id", -1))
-        handle_generation = int(getattr(step_context, "step_handle_generation", -1))
-        if (
-            self.step_prefill_capture_last_n_epoch == epoch
-            and int(getattr(self, "step_prefill_capture_last_n_handle_id", -1))
-            == handle_id
-            and int(getattr(self, "step_prefill_capture_last_n_handle_generation", -1))
-            == handle_generation
-        ):
-            return
-        num_reqs = int(getattr(step_context, "num_reqs", 0) or 0)
-        if num_reqs <= 0:
-            self.step_prefill_capture_last_n_by_row = None
-            self.step_prefill_capture_last_n_epoch = epoch
-            self.step_prefill_capture_last_n_handle_id = handle_id
-            self.step_prefill_capture_last_n_handle_generation = handle_generation
-            return
-        if not capture_plan_active_by_req:
-            self.step_prefill_capture_last_n_by_row = tuple(0 for _ in range(num_reqs))
-            self.step_prefill_capture_last_n_epoch = epoch
-            self.step_prefill_capture_last_n_handle_id = handle_id
-            self.step_prefill_capture_last_n_handle_generation = handle_generation
-            return
-        req_ids = step_context.req_ids
-        last_n_by_row: List[int] = [0 for _ in range(num_reqs)]
-        for row in range(num_reqs):
-            if row >= len(req_ids):
-                break
-            rid = req_ids[row]
-            ln = int(capture_plan_active_by_req.get(str(rid), 0) or 0)
-            if ln > 0:
-                last_n_by_row[row] = int(ln)
-        self.step_prefill_capture_last_n_by_row = tuple(last_n_by_row)
-        self.step_prefill_capture_last_n_epoch = epoch
-        self.step_prefill_capture_last_n_handle_id = handle_id
-        self.step_prefill_capture_last_n_handle_generation = handle_generation
 
     def _create_profile_events_batch(
         self,

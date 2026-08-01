@@ -229,7 +229,6 @@ class Phase2OneShotGraphRecord:
     capture_postprocess_or_reduce_ms: float = -1.0
     lastn1_direct_count: int = -1
     gt1_reduce_count: int = -1
-    gt1_scalar_fallback_count: int = -1
     selector_gpu_ms: float = -1.0
     selector_launch_count: int = -1
     pack_rebuild_gpu_ms: float = -1.0
@@ -633,9 +632,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=-1,
         help=(
             "Diagnostic only: when deferred bootstrap producer is enabled, "
-            "submit at most this many producer payload groups per step. "
-            "-1 lets the runtime adapt to bridge slack and remaining producer "
-            "groups, 0 forces submit-all behavior."
+            "a positive value caps total producer payload groups per step. "
+            "-1 derives each request's budget from its own bridge slack and "
+            "remaining groups; 0 forces submit-all behavior."
         ),
     )
     parser.add_argument(
@@ -5258,13 +5257,6 @@ def _gate_d_payload(
         {},
         "gt1_reduce_count",
     )
-    gt1_scalar_fallback_count = _counter_int_from_all_sources(
-        metrics,
-        refresh_profile,
-        {},
-        {},
-        "gt1_scalar_fallback_count",
-    )
     refresh_rebuild_enqueued_count = _sum_int(
         refresh_profile,
         "refresh_rebuild_enqueued_count",
@@ -5306,10 +5298,6 @@ def _gate_d_payload(
         refresh_profile,
         "deadline_rebuild_drain_submit_decode_steps",
     )
-    refresh_rebuild_delay_max = _max_int_from_records(
-        refresh_profile,
-        "refresh_rebuild_delay_max",
-    )
     async_refresh_enabled_for_gate = _env_flag_enabled(
         speed_env,
         "VLLM_SPARSE_ASYNC_REFRESH",
@@ -5348,8 +5336,6 @@ def _gate_d_payload(
         if _producer_mode_requires_gt1(producer_mode):
             if max(0, int(getattr(args, "prefill_last_n", 16))) <= 1:
                 producer_gate_reasons.append("prefill_last_n_not_gt1")
-            if gt1_scalar_fallback_count > 0:
-                producer_gate_reasons.append("gt1_scalar_fallback_count_nonzero")
     producer_gate_passed = not producer_gate_reasons
     semantic_output_health = str(
         _sparse_output_content_health(output_records)
@@ -5497,7 +5483,6 @@ def _gate_d_payload(
             _producer_mode_requires_observed_sentence_trigger(producer_mode)
         ),
         "gt1_reduce_count": int(gt1_reduce_count),
-        "gt1_scalar_fallback_count": int(gt1_scalar_fallback_count),
         "gt1_gate_scope": "prefill_last_n_bootstrap",
         "prefill_last_n_gt1_requested": bool(
             max(0, int(getattr(args, "prefill_last_n", 16))) > 1
@@ -5526,7 +5511,6 @@ def _gate_d_payload(
         "deadline_rebuild_drain_submit_decode_steps": list(
             deadline_rebuild_drain_submit_decode_steps
         ),
-        "refresh_rebuild_delay_max": int(refresh_rebuild_delay_max),
         "async_producer_writer_count_for_gate": int(
             async_producer_writer_count_for_gate
         ),
@@ -9935,7 +9919,6 @@ def _timeline_budget_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
     int_max_fields = {
         "lastn1_direct_count": -1,
         "gt1_reduce_count": -1,
-        "gt1_scalar_fallback_count": -1,
         "bridge_token_count": -1,
         "producer_launch_step": -1,
         "producer_ready_step": -1,
@@ -10861,13 +10844,6 @@ def _record_from_result(
         {},
         "gt1_reduce_count",
     )
-    gt1_scalar_fallback_count = _counter_int_from_all_sources(
-        metrics,
-        refresh_profile,
-        timeline_summary,
-        {},
-        "gt1_scalar_fallback_count",
-    )
     page_resolver_kind0_count = _counter_int_from_all_sources(
         metrics,
         refresh_profile,
@@ -11279,7 +11255,6 @@ def _record_from_result(
     )
     gt1_requirement_ok = (
         max(0, int(getattr(args, "prefill_last_n", 16))) > 1
-        and gt1_scalar_fallback_count <= 0
         if _producer_mode_requires_gt1(producer_mode)
         else True
     )
@@ -11407,7 +11382,6 @@ def _record_from_result(
         capture_postprocess_or_reduce_ms=capture_postprocess_or_reduce_ms,
         lastn1_direct_count=lastn1_direct_count,
         gt1_reduce_count=gt1_reduce_count,
-        gt1_scalar_fallback_count=gt1_scalar_fallback_count,
         selector_gpu_ms=selector_gpu_ms,
         selector_launch_count=selector_launch_count,
         pack_rebuild_gpu_ms=pack_rebuild_gpu_ms,
@@ -11582,8 +11556,6 @@ def _classify_phase2_failure(
             return "prefill_last_n_not_gt1"
         if record.gt1_gate_scope != "prefill_last_n_bootstrap":
             return "gt1_gate_scope_unset"
-        if record.gt1_scalar_fallback_count > 0:
-            return "gt1_scalar_fallback_count_nonzero"
     if int(record.row_mode_distribution.get("compact", 0) or 0) <= 0:
         return "compact_row_distribution_missing"
     if record.source_counter_schema_version < 0 or record.source_counter_missing_fields:

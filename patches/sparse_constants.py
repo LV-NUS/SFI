@@ -224,61 +224,70 @@ _CAPTURE_CHUNK_DEFAULT = 18
 
 
 def resolve_capture_chunk(environ: Mapping[str, str] | None = None) -> int:
-    """Resolve capture chunk, falling back for malformed/non-positive values."""
+    """Resolve one positive capture chunk or reject configuration drift."""
     source = os.environ if environ is None else environ
+    raw_value = source.get(
+        "VLLM_SPARSE_CAPTURE_CHUNK",
+        str(_CAPTURE_CHUNK_DEFAULT),
+    )
     try:
-        value = int(
-            source.get(
-                "VLLM_SPARSE_CAPTURE_CHUNK",
-                str(_CAPTURE_CHUNK_DEFAULT),
-            )
-            or str(_CAPTURE_CHUNK_DEFAULT)
+        value = int(raw_value or str(_CAPTURE_CHUNK_DEFAULT))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "VLLM_SPARSE_CAPTURE_CHUNK must be a positive integer; "
+            f"got {raw_value!r}"
+        ) from exc
+    if value <= 0:
+        raise ValueError(
+            "VLLM_SPARSE_CAPTURE_CHUNK must be positive; "
+            f"got {value}"
         )
-    except (TypeError, ValueError):
-        return _CAPTURE_CHUNK_DEFAULT
-    return value if value > 0 else _CAPTURE_CHUNK_DEFAULT
+    return value
 
 
 _CAPTURE_CHUNK: int = resolve_capture_chunk()
 
 try:
     _CAPTURE_KV_BUCKET_CACHED: int = int(os.environ.get("VLLM_SPARSE_CAPTURE_KV_BUCKET", "2048") or "2048")
-except ValueError:
-    _CAPTURE_KV_BUCKET_CACHED = 2048
+except ValueError as _kv_bucket_exc:
+    raise ValueError(
+        "VLLM_SPARSE_CAPTURE_KV_BUCKET must be a positive integer; "
+        f"got {os.environ.get('VLLM_SPARSE_CAPTURE_KV_BUCKET')!r}"
+    ) from _kv_bucket_exc
+if _CAPTURE_KV_BUCKET_CACHED <= 0:
+    raise ValueError(
+        "VLLM_SPARSE_CAPTURE_KV_BUCKET must be positive; "
+        f"got {_CAPTURE_KV_BUCKET_CACHED}"
+    )
 
 try:
     _CAPTURE_IN_FLIGHT: int = int(os.environ.get("VLLM_SPARSE_CAPTURE_IN_FLIGHT", "2") or "2")
-except ValueError:
-    _CAPTURE_IN_FLIGHT = 2
+except ValueError as _in_flight_exc:
+    raise ValueError(
+        "VLLM_SPARSE_CAPTURE_IN_FLIGHT must be an integer in (1, 2); "
+        f"got {os.environ.get('VLLM_SPARSE_CAPTURE_IN_FLIGHT')!r}"
+    ) from _in_flight_exc
 _CAPTURE_IN_FLIGHT = validate_capture_inflight(_CAPTURE_IN_FLIGHT)
 
 # ---------------------------------------------------------------------------
 # Per-G-layer capture reduce group (memory-bounded raw ring; bit-identical).
-# G==0 => scheme OFF: legacy per-chunk reduce over a _CAPTURE_CHUNK-deep raw slab.
 # G in {1,2,4} => reduce every G layers into a (G*_CAPTURE_IN_FLIGHT)-slot raw RING,
-#   draining last_n=16 -> window=1 into the (unchanged) chunk-deep p_f tape. Raw staging
-#   becomes chunk-INDEPENDENT (bounded by G*_CAPTURE_IN_FLIGHT slots). Requires
+#   draining reduced scores into the active capture-layout owner. Raw staging is
+#   chunk-independent and bounded by G*_CAPTURE_IN_FLIGHT slots. Requires
 #   _CAPTURE_CHUNK % G == 0.
-# [REDUCE-GROUP-DOMAIN 收窄 2026-07-11] 三个静默降 0 口子全部改 raise(域扫描
-# A2):打错字/超域/CHUNK 不整除原先静默落 G=0——而 G=0 的 chunk-deep scratch
-# 路径在 patch_installer [RING-AUDIT 2026-07-03] 注释里自认"串行调度假设
-# load-bearing"(deferred producer 并发 prefill 无事件护栏),静默切入=无人知晓
-# 地踩进有前提的路径;且 CHUNK=18 实验(新方向 #11)配 G=4 时 18%4!=0 恰会中招。
-# 与同文件 SPLIT_* env 的 raise 风格对齐(fail-fast,坏值不再产生);G=0 仍可
-# 显式配置(诊断档)。
+# The legacy G=0 chunk-deep path relied on serialized requests and had no
+# cross-request WAR owner.  It is not a safe diagnostic mode: reject it at the
+# single configuration boundary instead of retaining an unguarded live branch.
 # ---------------------------------------------------------------------------
 try:
     _CAPTURE_REDUCE_GROUP: int = int(os.environ.get("VLLM_SPARSE_CAPTURE_REDUCE_GROUP", "1") or "1")
 except ValueError as _rg_exc:
     raise ValueError(
-        "VLLM_SPARSE_CAPTURE_REDUCE_GROUP must be an integer in (0, 1, 2, 4); "
+        "VLLM_SPARSE_CAPTURE_REDUCE_GROUP must be an integer in (1, 2, 4); "
         f"got {os.environ.get('VLLM_SPARSE_CAPTURE_REDUCE_GROUP')!r}"
     ) from _rg_exc
-# [REDUCE-GROUP-SINGLE-SOURCE 2026-07-11 EXT审计·随手批] 域判定唯一真源
-# = runtime_contracts.validate_reduce_group（与 validate_capture_inflight 同居
-# 的纯合同件）。此前 fa3_native/ring_capture.py 携带第二份实现且语义已漂移
-# （静默 return 0 vs 此处 raise）= 测试测的不是生产路径。判定逻辑与
-# [REDUCE-GROUP-DOMAIN 收窄 2026-07-11] 逐位同判；此处仅补 env 语境后上抛。
+# Runtime contracts are the sole geometry validator; this boundary adds only
+# the environment-variable context to its fail-closed error.
 try:
     _CAPTURE_REDUCE_GROUP = validate_reduce_group(_CAPTURE_REDUCE_GROUP, _CAPTURE_CHUNK)
 except ValueError as _rg_domain_exc:

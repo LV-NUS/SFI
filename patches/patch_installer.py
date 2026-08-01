@@ -4306,7 +4306,9 @@ def _prebuild_capture_buffers(runner, controller) -> None:
         prepare_capture_cohort_tape,
     )
     from patches.fa3_native.postprocess import (
+        plan_capture_postprocess_meta_staging_resources,
         plan_tiled_capture_postprocess_resources,
+        prepare_capture_postprocess_meta_staging_resources,
         prepare_tiled_capture_postprocess_resources,
     )
     from patches.sparse_utils import _align_up_int, _selector_fixed_k_enabled
@@ -4340,24 +4342,9 @@ def _prebuild_capture_buffers(runner, controller) -> None:
     kv_min = max(256, int(_CAPTURE_KV_BUCKET_CACHED))
     kv_max_bucket = max(kv_min, _align_up_int(int(max_model_len), kv_min))
 
-    # producer_rows_worst = the live scratch dim-1 (= len(producer_rows_cpu), the number
-    # of prefill-capture rows in one forward) that the prebuilt slab must byte-match.
-    # The legacy auto-early DEFER path is prefill-only. A stamped chunk cohort
-    # activates later at the semantic-work boundary and may own mixed layouts;
-    # max_num_seqs therefore remains the real worst-case row concurrency cap.
-    # Size against max_num_seqs -- the REAL forward-batch
-    # concurrency cap: vLLM v1 0.19 sets max_num_running_reqs = max_num_seqs
-    # (sched/scheduler.py:105) and does NOT consult max_num_partial_prefills in the
-    # scheduling loop, so up to max_num_seqs prefills can share ONE forward -> live
-    # dim-1 can reach max_num_seqs. Reserving that many rows (paired with the live dim-1
-    # bucket -- forward_capture.py rounds the keyed dim-1 UP to the stamped
-    # _capture_rows_bucket) makes concurrent prefill HIT the prebuilt slab instead of
-    # re-OOMing. Cost: only the DEFER per-chunk slabs scale with dim-1 (~3.5 GiB/row *
-    # num_chunks); the window=1 arena buffer is FIXED (slots_cap rounds 1 and 2 both to
-    # 8), so the total reserve goes ~14.0 -> ~24.5 GiB at max_num_seqs=2 (~1.75x, KV
-    # pool shrinks ~10.5 GiB), NOT a clean 2x. A KNOWN-sequential deployment can reclaim it with
-    # VLLM_SPARSE_CAPTURE_PREBUILD_ROWS=1 (now COMPLETE: the same int drives BOTH the
-    # prebuilt slab dim-1 AND the live dim-1 bucket via _capture_rows_bucket).
+    # producer_rows_worst is the live scratch row dimension.  It must cover the
+    # scheduler's real forward concurrency, and the same value is stamped as the
+    # live row bucket so every sealed owner resolves the exact prebuilt key.
     sched = getattr(runner, "scheduler_config", None)
     # Residual-hazard clamp (audit w1hrqiqrk): the env override may only WIDEN the
     # reserve, never SHRINK it below max_num_seqs (the real forward concurrency cap;
@@ -4377,13 +4364,9 @@ def _prebuild_capture_buffers(runner, controller) -> None:
         int(os.environ.get("VLLM_SPARSE_CAPTURE_PREBUILD_ROWS", "0") or "0"),
     )
 
-    # num_chunks = ceil(num_capture_layers / _CAPTURE_CHUNK). The DEFER scratch is keyed by
-    # chunk_id (sync_fa4_capture_scratch_chunkid_reuse), so the live cache holds one slab per
-    # chunk_id; prebuild ALL of them so the 262k capture HITS every chunk_id (a MISS would
-    # hot-path torch.empty into a pool already sized for the prebuilt set). get_num_layers(
-    # parallel_config) is the per-rank count (== total for PP=1, the launch config); fall back
-    # through total_num_hidden_layers / hf_config. Fail-safe: if the layer count is unknown,
-    # skip the prebuild (the live path reallocs, still bounded by chunk_id, no per-step churn).
+    # The ownership plan still needs the exact per-rank layer count.  Scratch is
+    # now one fixed owner slab, so layer count sizes its depth rather than a
+    # collection of per-chunk cache entries.
     mc = getattr(runner, "model_config", None)
     pc = getattr(runner, "parallel_config", None)
     num_layers = 0
@@ -4405,7 +4388,6 @@ def _prebuild_capture_buffers(runner, controller) -> None:
             "E_SFI_CAPTURE_PREBUILD_GEOMETRY: capture prebuild could not "
             "prove the per-rank model layer count"
         )
-    num_chunks = max(1, (num_layers + int(_CAPTURE_CHUNK) - 1) // int(_CAPTURE_CHUNK))
 
     device_properties = _capture_profile_device_properties(dev)
     capability = (
@@ -4428,34 +4410,67 @@ def _prebuild_capture_buffers(runner, controller) -> None:
         refresh_stream = getattr(controller, "refresh_stream", None)
     async_owner_available = bool(refresh_stream is not None)
 
-    # Both owners may use the dynamic tiled selector kernel.  Budget the exact
-    # structural GPU-owner concurrency before profile work: ring_early owns one
-    # workspace per scratch lane; chunk_cohort owns one per configured in-flight
-    # bank.  The sealed live path never grows this GPU footprint.  Pinned H2D
-    # metadata sources are a separate small FIFO and therefore cannot duplicate
-    # a giant tiled workspace merely because a prior host source is still busy.
-    ring_structural_slots = (
-        int(_CAPTURE_REDUCE_GROUP) * int(_CAPTURE_IN_FLIGHT)
-        if int(_CAPTURE_REDUCE_GROUP) > 0
-        else int(_CAPTURE_CHUNK) * int(_CAPTURE_IN_FLIGHT)
+    # Both owners submit tiled work through one controller-owned refresh stream.
+    # GPU workspace lifetime is therefore one synchronous host reservation, not
+    # the raw-scratch reuse window.  Pinned H2D sources do outlive submission;
+    # prebuild exactly one carrier per scratch generation and keep that distinct
+    # from the single large workspace.
+    ring_meta_carriers = int(_CAPTURE_REDUCE_GROUP) * int(_CAPTURE_IN_FLIGHT)
+    # A scratch generation may submit one last-n=1 copy plus one gt1 reduce.
+    # Pair i32/i64 metadata and prebuild two carriers per generation instead
+    # of retaining four shape-growing live pools.
+    ring_meta_staging_resources = (
+        plan_capture_postprocess_meta_staging_resources(
+            meta_carrier_count=2 * int(ring_meta_carriers),
+            num_rows_capacity=int(producer_rows_worst),
+        )
+    )
+    cohort_meta_staging_resources = (
+        plan_capture_postprocess_meta_staging_resources(
+            meta_carrier_count=(
+                2 * int(_CAPTURE_CHUNK) * int(_CAPTURE_IN_FLIGHT)
+            ),
+            num_rows_capacity=int(producer_rows_worst),
+        )
     )
     ring_tiled_resources = plan_tiled_capture_postprocess_resources(
-        slot_count=max(1, ring_structural_slots),
+        meta_carrier_count=int(ring_meta_carriers),
         num_rows_capacity=int(producer_rows_worst),
         num_query_heads=int(num_heads),
         logical_k_capacity=int(kv_max_bucket),
     )
     cohort_tiled_resources = plan_tiled_capture_postprocess_resources(
-        slot_count=int(_CAPTURE_IN_FLIGHT),
+        # Mixed cohorts may split tiled work into as many as one submission per
+        # layer.  Size pinned lifetime by scratch generations, not by cohort
+        # lane count; compatible runs still coalesce onto one GPU workspace.
+        meta_carrier_count=(
+            int(_CAPTURE_CHUNK) * int(_CAPTURE_IN_FLIGHT)
+        ),
         num_rows_capacity=int(producer_rows_worst) * int(_CAPTURE_CHUNK),
         num_query_heads=int(num_heads),
         logical_k_capacity=int(kv_max_bucket),
     )
     selector_fixed_k = bool(_selector_fixed_k_enabled())
+    # The live global request-slot allocator is the sole concurrency authority
+    # for deferred tape rows.  Reading the already-constructed owner avoids a
+    # second interpretation of mutable config between controller init and
+    # profile prebuild.
+    from patches.global_slot_allocator import GlobalSlotAllocator
+
+    slot_allocator = getattr(controller, "_global_slot_allocator", None)
+    if not isinstance(slot_allocator, GlobalSlotAllocator):
+        raise RuntimeError(
+            "E_SFI_CAPTURE_COHORT_TAPE_SLOT_AUTHORITY_MISSING"
+        )
+    allocator_slot_capacity = slot_allocator.capacity
+    tape_slot_capacity = (
+        int(allocator_slot_capacity)
+        if allocator_slot_capacity is not None
+        else 0
+    )
     cohort_tape_report = plan_capture_cohort_tape(
-        bank_capacity=int(_CAPTURE_IN_FLIGHT),
+        slot_capacity=int(tape_slot_capacity),
         layer_capacity=int(num_layers),
-        rows_capacity=int(producer_rows_worst),
         num_query_heads=int(num_heads),
         logical_k_capacity=int(kv_max_bucket),
         cohort_size=int(_CAPTURE_CHUNK),
@@ -4475,12 +4490,18 @@ def _prebuild_capture_buffers(runner, controller) -> None:
         chunk=int(_CAPTURE_CHUNK),
         in_flight=int(_CAPTURE_IN_FLIGHT),
         layer_count=int(num_layers),
-        tape_bank_count=int(cohort_tape_report.bank_capacity),
+        tape_slot_count=int(cohort_tape_report.slot_capacity),
         baseline_reduce_group=int(_CAPTURE_REDUCE_GROUP),
-        baseline_postprocess_device_bytes=int(
+        baseline_meta_staging_device_bytes=int(
+            ring_meta_staging_resources.device_bytes
+        ),
+        target_meta_staging_device_bytes=int(
+            cohort_meta_staging_resources.device_bytes
+        ),
+        baseline_tiled_postprocess_device_bytes=int(
             ring_tiled_resources.total_device_bytes
         ),
-        target_postprocess_device_bytes=int(
+        target_tiled_postprocess_device_bytes=int(
             cohort_tiled_resources.total_device_bytes
         ),
         baseline_tape_device_bytes=0,
@@ -4488,64 +4509,91 @@ def _prebuild_capture_buffers(runner, controller) -> None:
         configured_device_bytes=int(configured_device_bytes),
     )
     if (
-        int(ring_tiled_resources.structural_slot_count)
+        int(ring_tiled_resources.submission_slot_count) != 1
+        or int(cohort_tiled_resources.submission_slot_count) != 1
+        or int(ring_tiled_resources.meta_carrier_count)
         != int(ownership_plan.baseline_depth)
-        or int(cohort_tiled_resources.structural_slot_count)
-        != int(ownership_plan.in_flight)
+        or int(cohort_tiled_resources.meta_carrier_count)
+        != int(ownership_plan.target_depth)
+        or int(ring_meta_staging_resources.meta_carrier_count)
+        != 2 * int(ownership_plan.baseline_depth)
+        or int(cohort_meta_staging_resources.meta_carrier_count)
+        != 2 * int(ownership_plan.target_depth)
     ):
         raise RuntimeError(
-            "E_SFI_CAPTURE_TILED_OWNERSHIP: structural workspace slots "
-            "disagree with the immutable scratch-owner concurrency"
+            "E_SFI_CAPTURE_POSTPROCESS_OWNERSHIP: workspace or metadata "
+            "capacity disagrees with the immutable owner plan"
         )
 
     # (finding-5 fail-safe) The live buckets (kv / last_n / rows) are stamped LAST,
-    # only after the arena reserve + every per-chunk scratch slab is resident (see the
-    # end of this function). EDIT-1 / EDIT-7 / the live dim-1 bucket force-form the
+    # only after the arena reserve + fixed scratch owner is resident (see the end
+    # of this function). EDIT-1 / EDIT-7 / the live dim-1 bucket force-form the
     # large bucketed shape, which is correct ONLY if the matching prebuilt slab exists;
     # a partial prebuild RAISES before the stamps -> NO bucket stamped -> the live path
-    # uses the raw per-forward shape == exact HEAD behaviour (still bounded by
-    # chunk_id), instead of force-forming a large shape with no slab to HIT (re-OOM).
+    # uses the raw per-forward shape instead of force-forming a large shape with
+    # no resident owner.
 
-    # (2) Seal the selector workspace against the stream and maximum live
-    # geometry selected above.  Live acquisition may use any smaller N/K within
-    # this capacity but may never create another slot or cache key after profile.
-    # This allocation must precede the dummy forward for honest KV budgeting.
-    selected_tiled_resources = None
-    if int(ownership_plan.selected_postprocess_device_bytes) > 0:
-        if ownership_plan.mode == CHUNK_COHORT:
-            if refresh_stream is None:
-                raise RuntimeError(
-                    "E_SFI_CAPTURE_TILED_PREBUILD: chunk cohort has no refresh stream"
-                )
-            tiled_stream = refresh_stream
-            selected_tiled_resources = cohort_tiled_resources
-        else:
-            tiled_stream = (
-                refresh_stream
-                if refresh_stream is not None
-                else torch.cuda.current_stream(device=dev)
+    # (2) Seal all postprocess metadata and the optional tiled workspace against
+    # one controller-owned stream.  Live submission may consume smaller shapes
+    # but cannot allocate, grow a cache key, or switch streams after profile.
+    if ownership_plan.mode == CHUNK_COHORT:
+        if refresh_stream is None:
+            raise RuntimeError(
+                "E_SFI_CAPTURE_POSTPROCESS_PREBUILD: chunk cohort has no "
+                "refresh stream"
             )
-            selected_tiled_resources = ring_tiled_resources
+        postprocess_stream = refresh_stream
+        selected_meta_staging_resources = cohort_meta_staging_resources
+        selected_tiled_resources = cohort_tiled_resources
+    else:
+        postprocess_stream = (
+            refresh_stream
+            if refresh_stream is not None
+            else torch.cuda.current_stream(device=dev)
+        )
+        selected_meta_staging_resources = ring_meta_staging_resources
+        selected_tiled_resources = ring_tiled_resources
+
+    prepared_meta_staging_resources = (
+        prepare_capture_postprocess_meta_staging_resources(
+            controller,
+            dev,
+            postprocess_stream,
+            int(selected_meta_staging_resources.meta_carrier_count),
+            int(selected_meta_staging_resources.num_rows_capacity),
+        )
+    )
+    if (
+        prepared_meta_staging_resources != selected_meta_staging_resources
+        or int(prepared_meta_staging_resources.device_bytes)
+        != int(ownership_plan.selected_meta_staging_device_bytes)
+    ):
+        raise RuntimeError(
+            "E_SFI_CAPTURE_META_STAGING_PREBUILD: prepared resources disagree "
+            "with the immutable ownership budget"
+        )
+
+    if int(ownership_plan.selected_tiled_postprocess_device_bytes) > 0:
         prepared_tiled_resources = prepare_tiled_capture_postprocess_resources(
             controller,
             dev,
-            tiled_stream,
-            int(selected_tiled_resources.slot_count),
+            postprocess_stream,
+            int(selected_tiled_resources.meta_carrier_count),
             int(selected_tiled_resources.num_rows_capacity),
             int(selected_tiled_resources.num_query_heads_capacity),
             int(selected_tiled_resources.logical_k_capacity),
         )
         if prepared_tiled_resources != selected_tiled_resources or int(
             prepared_tiled_resources.total_device_bytes
-        ) != int(ownership_plan.selected_postprocess_device_bytes):
+        ) != int(ownership_plan.selected_tiled_postprocess_device_bytes):
             raise RuntimeError(
                 "E_SFI_CAPTURE_TILED_PREBUILD: prepared resources disagree "
                 "with the immutable ownership budget"
             )
 
-    # (2b) The chunk owner publishes request-major full-layer generation banks.
-    # Their complete footprint participated in the policy gate above; allocate
-    # exactly that report before the ownership signature becomes visible.
+    # (2b) The chunk owner publishes one full-layer row per stable global
+    # request slot.  Its complete footprint participated in the policy gate
+    # above; allocate exactly that report before the signature becomes visible.
     if ownership_plan.mode == CHUNK_COHORT:
         if refresh_stream is None:
             raise RuntimeError(
@@ -4554,13 +4602,14 @@ def _prebuild_capture_buffers(runner, controller) -> None:
         if (
             not bool(ownership_plan.selector_fixed_k)
             or int(ownership_plan.layer_count) != int(cohort_tape_report.layer_capacity)
-            or int(ownership_plan.tape_bank_count) != int(cohort_tape_report.bank_capacity)
+            or int(ownership_plan.tape_slot_count)
+            != int(cohort_tape_report.slot_capacity)
             or int(ownership_plan.selected_tape_device_bytes)
             != int(cohort_tape_report.total_device_bytes)
         ):
             raise RuntimeError(
                 "E_SFI_CAPTURE_COHORT_TAPE_PREBUILD: immutable ownership plan "
-                "disagrees with the precomputed bank report"
+                "disagrees with the precomputed slot report"
             )
         prepare_capture_cohort_tape(
             controller=controller,
@@ -4611,11 +4660,9 @@ def _prebuild_capture_buffers(runner, controller) -> None:
                 f"kv_max_bucket={kv_max_bucket}, rows={producer_rows_worst})"
             )
 
-    # (4) Prebuild the exact DEFER scratch ownership selected above. ring_early keeps
-    # the existing G-ring / per-chunk keys byte-for-byte. chunk_cohort owns one
-    # C*in_flight-deep slab; its lane mapping and RingWarFence provide bounded overlap
-    # without retaining one allocation per model chunk. The published plan is stamped
-    # only after this exact key and shape are resident.
+    # (4) Prebuild the exact scratch ownership selected above.  ring_early owns
+    # one G*in_flight slab; chunk_cohort owns one C*in_flight slab.  Both use a
+    # canonical owner key and the RingWarFence, independent of execution mode.
     scratch_storage_shape = (
         int(_CAPTURE_CHUNK),
         int(producer_rows_worst),
@@ -4629,7 +4676,7 @@ def _prebuild_capture_buffers(runner, controller) -> None:
         cache_map = {}
         setattr(controller, "_fa3_capture_scratch_cache_by_key", cache_map)
     _reduce_group = int(_CAPTURE_REDUCE_GROUP)
-    _ring_slabs = int(_reduce_group) * int(_CAPTURE_IN_FLIGHT) if _reduce_group > 0 else 0
+    _ring_slabs = int(_reduce_group) * int(_CAPTURE_IN_FLIGHT)
     if ownership_plan.mode == CHUNK_COHORT:
         scratch_storage_shape = (
             int(ownership_plan.selected_depth),
@@ -4638,11 +4685,8 @@ def _prebuild_capture_buffers(runner, controller) -> None:
             int(last_n),
             int(kv_max_bucket),
         )
-    elif _reduce_group > 0:
-        # Per-G ring: ONE [G*in_flight]-deep slab (constant key) instead of num_chunks
-        # chunk-deep slabs -> raw staging num_layers-deep => ring_slabs-deep (the 8.4x cut).
-        # NOT yet safe to ENABLE: the live key/slot + per-G reduce + refresh->main WAR event
-        # must also land before G>0 can run without corrupting reused ring slots.
+    else:
+        # Per-G ring: one [G*in_flight]-deep slab under one canonical key.
         scratch_storage_shape = (
             int(_ring_slabs),
             int(producer_rows_worst),
@@ -4650,80 +4694,77 @@ def _prebuild_capture_buffers(runner, controller) -> None:
             int(last_n),
             int(kv_max_bucket),
         )
-    _prebuild_iter = (
-        1
-        if ownership_plan.mode == CHUNK_COHORT or _reduce_group > 0
-        else int(num_chunks)
+    if ownership_plan.mode == CHUNK_COHORT:
+        extra_key = (
+            "capture_postprocess_cohort",
+            int(ownership_plan.cohort_size),
+            int(ownership_plan.selected_depth),
+        )
+    else:
+        extra_key = ("capture_postprocess_ring", 0, int(_ring_slabs))
+    scratch_key = (
+        str(dev.type),
+        -1 if dev.index is None else int(dev.index),
+        scratch_dtype,
+        scratch_storage_shape,
+        extra_key,
     )
-    for chunk_id in range(int(_prebuild_iter)):
-        if ownership_plan.mode == CHUNK_COHORT:
-            extra_key = (
-                "defer_postprocess_chunk",
-                int(ownership_plan.cohort_size),
-                int(ownership_plan.selected_depth),
-            )
-        elif _reduce_group > 0:
-            extra_key = ("defer_postprocess_chunk", 0, int(_ring_slabs))
-        else:
-            extra_key = (
-                "defer_postprocess_chunk",
-                int(chunk_id),
-                int(_CAPTURE_CHUNK),
-            )
-        scratch_key = (
-            str(dev.type),
-            -1 if dev.index is None else int(dev.index),
-            scratch_dtype,
-            scratch_storage_shape,
-            extra_key,
+    scratch_storage = cache_map.get(scratch_key)
+    scratch_cache_hit = scratch_storage is not None
+    if scratch_storage is None:
+        scratch_storage = torch.empty(
+            scratch_storage_shape, device=dev, dtype=scratch_dtype
         )
-        scratch_cache_hit = cache_map.get(scratch_key) is not None
-        if not scratch_cache_hit:
-            from patches.fa3_native.forward_capture import (
-                _store_capture_scratch_cache_entry,
-            )
+    from patches.fa3_native.forward_capture import (
+        _store_capture_scratch_cache_entry,
+        log_capture_scratch_probe,
+    )
 
-            _store_capture_scratch_cache_entry(
-                cache_owner=controller,
-                cache_map=cache_map,
-                scratch_key=scratch_key,
-                scratch_storage=torch.empty(
-                    scratch_storage_shape, device=dev, dtype=scratch_dtype
-                ),
-            )
-        from patches.fa3_native.forward_capture import log_capture_scratch_probe
+    # Re-publish even an exact tensor hit so the single-owner scope index is
+    # rebuilt transactionally after an engine/profile boundary.
+    _store_capture_scratch_cache_entry(
+        cache_owner=controller,
+        cache_map=cache_map,
+        scratch_key=scratch_key,
+        scratch_storage=scratch_storage,
+    )
+    from patches.fa3_native.ring_capture import RingWarFence
 
-        log_capture_scratch_probe(
-            source="prebuild",
-            cache_key=scratch_key,
-            cache_hit=bool(scratch_cache_hit),
-            scratch_storage_shape=scratch_storage_shape,
-            scratch_dtype=scratch_dtype,
-            element_size_bytes=int(torch.finfo(scratch_dtype).bits // 8),
-            actual_rows=None,
-            bucket_rows=int(producer_rows_worst),
-            heads=int(num_heads),
-            last_n=int(last_n),
-            capture_k=int(kv_max_bucket),
-            reduce_group=int(_reduce_group),
-            in_flight=int(_CAPTURE_IN_FLIGHT),
-            key_kind=str(extra_key[0]),
-        )
+    # Scratch storage and its reuse fence are one publication unit.  Replacing
+    # the fence here prevents an old engine/geometry event from escaping into
+    # the newly sealed owner.
+    setattr(
+        controller,
+        "_ring_war_fence",
+        RingWarFence(int(ownership_plan.selected_depth)),
+    )
 
-    # (5) Stamp the live buckets now that the selector resources, arena reserve,
-    # and all num_chunks scratch
-    # slabs are resident (finding-5 fail-safe; see (1) above). _capture_rows_bucket is
+    log_capture_scratch_probe(
+        source="prebuild",
+        cache_key=scratch_key,
+        cache_hit=bool(scratch_cache_hit),
+        scratch_storage_shape=scratch_storage_shape,
+        scratch_dtype=scratch_dtype,
+        element_size_bytes=int(torch.finfo(scratch_dtype).bits // 8),
+        actual_rows=None,
+        bucket_rows=int(producer_rows_worst),
+        heads=int(num_heads),
+        last_n=int(last_n),
+        capture_k=int(kv_max_bucket),
+        reduce_group=int(_reduce_group),
+        in_flight=int(_CAPTURE_IN_FLIGHT),
+        key_kind=str(extra_key[0]),
+    )
+
+    # (5) Stamp the live buckets only after selector resources, arena reserve,
+    # and the fixed scratch owner are resident (finding-5 fail-safe; see (1)
+    # above). _capture_rows_bucket is
     # the dim-1 (concurrent-prefill row) bucket the live path rounds the keyed scratch
     # dim-1 UP to (forward_capture.py), closing the dim-1 re-OOM hazard symmetrically
     # with the kv / last_n buckets.
     setattr(controller, "_capture_kv_max_bucket", int(kv_max_bucket))
     setattr(controller, "_capture_last_n_bucket", int(last_n))
     setattr(controller, "_capture_rows_bucket", int(producer_rows_worst))
-    setattr(
-        controller,
-        "_capture_tiled_postprocess_resource_report",
-        selected_tiled_resources,
-    )
     setattr(controller, "_capture_prebuilt", True)
     # The immutable plan is the publication latch: all capacities, resources,
     # streams and cache entries above must already be resident before it exists.
@@ -13316,8 +13357,8 @@ def _run_capture_only_mixed_forward(
     _rg = int(_CAPTURE_REDUCE_GROUP)
     _ring_slabs = ring_depth(_rg, int(_CAPTURE_IN_FLIGHT))
     _ring_slot = ring_scratch_slot(int(global_layer_index), _rg, int(_CAPTURE_IN_FLIGHT))
-    _ek_chunk_id = 0 if _rg > 0 else (int(global_layer_index) // max(1, int(_CAPTURE_CHUNK)))
-    _ek_depth = int(_ring_slabs) if _rg > 0 else int(_CAPTURE_CHUNK)
+    _ek_chunk_id = 0
+    _ek_depth = int(_ring_slabs)
     if _capture_ownership_mode_value == CHUNK_COHORT:
         _ring_slot, _ek_chunk_id, _ek_depth = (
             _chunk_cohort_runtime_scratch_binding(
@@ -13347,29 +13388,25 @@ def _run_capture_only_mixed_forward(
         if _capture_ownership_mode_value == CHUNK_COHORT
         else int(_CAPTURE_CHUNK)
     )
-    _capture_ring_fence_active = bool(
-        _rg > 0 or _capture_ownership_mode_value == CHUNK_COHORT
+    _fence = getattr(controller, "_ring_war_fence", None)
+    if _fence is None:
+        _fence = RingWarFence(int(_effective_capture_scratch_depth))
+        setattr(controller, "_ring_war_fence", _fence)
+    _prev_evt = _fence.war_event_before_capture(
+        int(_effective_capture_ring_slot)
     )
-    if _capture_ring_fence_active:
-        _fence = getattr(controller, "_ring_war_fence", None)
-        if _fence is None:
-            _fence = RingWarFence()
-            setattr(controller, "_ring_war_fence", _fence)
-        _prev_evt = _fence.war_event_before_capture(
-            int(_effective_capture_ring_slot)
-        )
-        if _prev_evt is not None:
-            # [RING-GUARD 2026-07-03] a residual fence event while the current stream
-            # is capturing would bake an external-event wait into the graph (capture
-            # failure or a stale WAR edge on every replay). Init-time captures always
-            # see a drained fence; anything else is a program error - fail fast.
-            if torch.cuda.is_current_stream_capturing():
-                raise RuntimeError(
-                    "ring WAR fence holds a residual event while the current stream is "
-                    "capturing; graph capture must start with a drained fence"
-                )
-            # WAR: order this layer's ring-slot capture AFTER the prior occupant's reduce read.
-            torch.cuda.current_stream(device=torch.device(query.device)).wait_event(_prev_evt)
+    if _prev_evt is not None:
+        # [RING-GUARD 2026-07-03] a residual fence event while the current stream
+        # is capturing would bake an external-event wait into the graph (capture
+        # failure or a stale WAR edge on every replay). Init-time captures always
+        # see a drained fence; anything else is a program error - fail fast.
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "ring WAR fence holds a residual event while the current stream is "
+                "capturing; graph capture must start with a drained fence"
+            )
+        # WAR: order this layer's ring-slot capture AFTER the prior occupant's reduce read.
+        torch.cuda.current_stream(device=torch.device(query.device)).wait_event(_prev_evt)
     defer_capture_postprocess_requested = (
         os.environ.get("VLLM_SPARSE_DEFER_CAPTURE_POSTPROCESS", "0") == "1"
     )
@@ -13470,48 +13507,26 @@ def _run_capture_only_mixed_forward(
         scratch_cache_owner=controller,
         scratch_cache_extra_key=(
             (
-                "defer_postprocess_chunk",
+                "capture_postprocess_cohort",
                 _effective_capture_cohort_size,
                 _effective_capture_scratch_depth,
             )
             if _capture_ownership_mode_value == CHUNK_COHORT
-            else
-            (
-                "defer_postprocess_chunk",
-                # 262k OOM fix: drop the per-step nonce (step_handle_id/generation) from
-                # the deferred capture scratch key, keeping ONLY the chunk_id
-                # (global_layer_index // _CAPTURE_CHUNK). The nonce forced a NEW ~3.14GB
-                # slab per step on the lazy torch.empty (forward_capture.py:459) -> 262k
-                # prefill OOM. chunk_id keying bounds live slabs to num_chunks
-                # (= ceil(num_layers / _CAPTURE_CHUNK)), reused across steps, and KEEPS the
-                # original per-chunk buffer DISJOINTNESS: distinct chunk_id -> distinct
-                # slab, so layers sharing a buf_id (chunk_id % _CAPTURE_IN_FLIGHT) within
-                # one forward (e.g. layer 0 chunk0 and layer 28 chunk2) never alias the
-                # same scratch slot -> NO intra-forward write-after-read race against the
-                # auto-early refresh_stream reduce, with ZERO added sync (a buf_id key
-                # WOULD alias them; chunk_id does not). Cross-step reuse of a chunk_id slab
-                # is ordered by data dependency (the prior request consumes its reduce +
-                # decodes before the next sequential n_proc=1 / max_num_partial_prefills=1
-                # prefill). [RING-AUDIT 2026-07-03] that serial assumption is load-bearing:
-                # under G=0 (env override; default G=1 ring) + deferred producer, a
-                # scheduler that co-runs a NEW prefill before the prior step's flush
-                # consumed this chunk_id slab would overwrite unread scratch with no
-                # event guard. If G=0 ever becomes a served mode, add a per-(state,
-                # chunk_id) flush-completion event (record after the flush tape stack,
-                # wait before the next step's first slab write) before enabling it.
-                # The profile prebuild (_prebuild_capture_buffers) pre-reserves
-                # one slab per chunk_id so the 262k capture HITS (forward_capture.py:444)
-                # and :459 never fires on the hot path.
-                _ek_chunk_id,
-                _ek_depth,
-            )
-            if defer_capture_postprocess_requested
             else (
-                "async_postprocess_chunk",
-                _ek_chunk_id,
+                "capture_postprocess_ring",
+                0,
+                _effective_capture_scratch_depth,
+            )
+            if _capture_ownership_plan is not None
+            else (
+                "capture_postprocess_ring",
+                0,
                 _ek_depth,
             )
-            if async_capture_postprocess_requested
+            if (
+                defer_capture_postprocess_requested
+                or async_capture_postprocess_requested
+            )
             else None
         ),
     )
@@ -13562,8 +13577,7 @@ def _run_capture_only_mixed_forward(
         # layer_stride=0 fail-fast)。
         _phase = str(capture_postprocess_state.get("direct_capture_phase", ""))
         return bool(
-            _capture_ring_fence_active
-            and (refresh_layout is None or _phase == "")
+            (refresh_layout is None or _phase == "")
             and _phase != "prefill"
         )
 
@@ -13990,7 +14004,7 @@ def _run_capture_only_mixed_forward(
         # Every reusable scratch owner publishes reduce completion through the
         # RingWarFence. Validate only live scratch work: no-work/direct steps
         # must not be rejected by a structural plan they do not execute.
-        if _capture_ring_fence_active and (
+        if (
             (defer_capture_postprocess_requested and not early_capture_postprocess_requested)
             or async_capture_postprocess_requested
         ):
@@ -14176,18 +14190,17 @@ def _run_capture_only_mixed_forward(
                                 "E_SFI_CAPTURE_POSTPROCESS_EVENT: completed job "
                                 "has no completion event"
                             )
-                        if _capture_ring_fence_active:
-                            fence = getattr(controller, "_ring_war_fence", None)
-                            if fence is None:
-                                raise RuntimeError(
-                                    "E_SFI_CAPTURE_POSTPROCESS_FENCE: reusable "
-                                    "scratch has no WAR fence owner"
-                                )
-                            fence.on_reduce(
-                                int(_effective_capture_ring_slot),
-                                completion_event,
-                                postprocess_ran,
+                        fence = getattr(controller, "_ring_war_fence", None)
+                        if fence is None:
+                            raise RuntimeError(
+                                "E_SFI_CAPTURE_POSTPROCESS_FENCE: reusable "
+                                "scratch has no WAR fence owner"
                             )
+                        fence.on_reduce(
+                            int(_effective_capture_ring_slot),
+                            completion_event,
+                            postprocess_ran,
+                        )
     elif capture_postprocess_execution_owner == _POSTPROCESS_OWNER_ASYNC:
         refresh_stream = getattr(controller, "refresh_stream", None)
         if refresh_stream is None:
@@ -14345,8 +14358,8 @@ def _run_capture_only_mixed_forward(
         ) = payload
         # [RING-LASTN1-DRAIN 2026-07-03] under the ring the postprocess run drains
         # last_n==1 rows into the phase out tensors (fenced), so the payload must
-        # not carry a raw ring-scratch view -- the flush falls back to the tape
-        # (lastn1_capture_scores=None -> p.capture_scores in the !use_denoms group).
+        # not carry a raw ring-scratch view. The flush consumes the finalized
+        # phase output directly (lastn1_capture_scores=None -> p.capture_scores).
         lastn1_capture_scores = (
             None
             if _ring_lastn1_drain_active()
@@ -14442,7 +14455,7 @@ def _run_capture_only_mixed_forward(
         # 冲、每层复写,chunk 批量 deferred 消费必读脏(4B bs8 错峰实证);现由
         # _ring_lastn1_drain_active 在混合步激活 lastn1 drain,把 refresh 行的
         # B1 logits 逐层拷回 layout base,payload 恒携带 base 视图(与纯 refresh
-        # 步 direct-capture 直写 base 后的消费形态一致,selector 的 chunk-deep
+        # 步 direct-capture 直写 base 后的消费形态一致,selector 的 stable-slot
         # 5 维 tape 证明天然成立)。
         controller._enqueue_refresh_capture(
             SelectorBatchPayload(

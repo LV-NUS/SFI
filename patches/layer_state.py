@@ -10,13 +10,11 @@ import heapq
 import json
 import logging
 import os
-import time
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 import torch
 
 from patches.buffer_allocator_backends import AllocatorBackend, resolve_allocator_backend
-from patches.buffer_lease_protocol import BufferLease, BufferLeaseRegistry, LeaseKind
 from patches.global_slot_allocator import stable_request_id_hash64
 from patches.page_kv_residency import CompactMetadataBuffers, CompactPageResidency
 from patches.sparse_cache import _get_cached_empty_tensor
@@ -129,9 +127,6 @@ class LayerState:
         self.compact_arena_v: torch.Tensor = torch.empty(0, device=device)
         self.compact_arena_pos: torch.Tensor = torch.empty(0, device=device, dtype=torch.int32)
         self.compact_arena_capacity_tokens: int = 0
-        self.compact_generation: int = 0
-        self._compact_lease_registry: BufferLeaseRegistry = BufferLeaseRegistry(num_slots=1)
-        self._compact_active_lease: Optional[BufferLease] = None
         # 固定 stride（按 slot 切片）布局：token/block 数一旦确定即保持稳定
         self.compact_stride_tokens: int = 0
         self.compact_stride_blocks: int = 0
@@ -156,8 +151,6 @@ class LayerState:
         self.compact_layout_is_compact_i32: Optional[torch.Tensor] = None
         self.compact_layout_kv_len_i32: Optional[torch.Tensor] = None
         self.compact_layout_offset_tokens_i64: Optional[torch.Tensor] = None
-        # compact layout cache（尽量让后续 step 可被 CUDA Graph 捕获）
-        self.compact_layout_cache_key: Optional[Tuple[object, ...]] = None
         # 复用 arena view，避免每层每步创建新 Tensor view 导致 launcher stride cache 失效
         self.compact_layout_key_view: Optional[torch.Tensor] = None
         self.compact_layout_value_view: Optional[torch.Tensor] = None
@@ -191,7 +184,6 @@ class LayerState:
         self.prefill_total_chunks: Optional[torch.Tensor] = None
         self.prefill_chunks_seen: Optional[torch.Tensor] = None
         # slot->row 仅供 Python 控制逻辑读取；保持 CPU-only，避免 graph 热路径 GPU 标量写。
-        self.slot_batch_rows: Optional[torch.Tensor] = None
         self.slot_batch_rows_cpu: Optional[List[int]] = None
         # Rebuild writer 的 row 映射 staging 由真实 layer 生命周期持有。每层只
         # 保留当前权威值；同值 layer 在 fused rebuild 内共享同一 CUDA tensor。
@@ -199,11 +191,7 @@ class LayerState:
         # 值换代不会触发 graph rebind/capture。
         self._rebuild_row_tensor_cache_key: Optional[Tuple[int, ...]] = None
         self._rebuild_row_tensor_cache: Optional[torch.Tensor] = None
-        # slot->row 映射缓存（按 step_context_epoch 去重，避免每层重复清空/填充）
-        self._slot_row_map_epoch: int = -1
-        self._slot_row_map_key: Optional[Tuple[int, ...]] = None
         # decode 刷新计数（基于 decode_step）
-        self.last_refresh_decode_per_slot: Optional[torch.Tensor] = None
         self.last_refresh_decode_per_slot_cpu: Optional[List[int]] = None
         # key_norms 缓存：避免在 refresh/selector 阶段从 paged KV 反复 gather 全量 key 再求范数。
         # - 每个 slot 维护 [num_kv_heads, capacity_tokens] 的 L2 norms（float32）
@@ -221,9 +209,6 @@ class LayerState:
         self.key_norms_capacity: List[int] = []
         self.key_norms_arena: torch.Tensor = torch.empty(0, device=device, dtype=torch.float16)  # [S,H,T]
         self.key_norms_stride_tokens: int = 0
-        self.key_norms_generation: int = 0
-        self._key_norms_lease_registry: BufferLeaseRegistry = BufferLeaseRegistry(num_slots=1)
-        self._key_norms_active_lease: Optional[BufferLease] = None
 
         # ============ FA sparse runtime: per-slot selected middle logical pages ============
         self.sparse_selected_middle_pages: List[torch.Tensor] = []
@@ -584,8 +569,8 @@ class LayerState:
         old_heads = int(old.shape[1]) if old.dim() == 3 else 0
         old_stride = int(old.shape[2]) if old.dim() == 3 else 0
 
-        # 关键约束：扩容时不能通过全局同步硬挡。改为 record_stream + generation lease：
-        # 旧 arena 的 storage 生命周期绑定到当前流与 refresh_stream，避免跨流 UAF。
+        # 关键约束：扩容时不能通过全局同步硬挡。record_stream 直接把旧
+        # arena 的 storage 生命周期绑定到当前流与 refresh_stream，避免跨流 UAF。
         if old.numel() > 0 and old.device.type == "cuda":
             old.record_stream(torch.cuda.current_stream(device=self.device))
             if refresh_stream is not None:
@@ -605,18 +590,6 @@ class LayerState:
             new_arena[:copy_slots, :, :copy_stride].copy_(old[:copy_slots, :, :copy_stride])
         self.key_norms_arena = new_arena
         self.key_norms_stride_tokens = int(new_stride)
-        old_lease = self._key_norms_active_lease
-        if old_lease is not None:
-            retire_id = f"key_norms-retire-{old_lease.generation}-{time.time_ns()}"
-            self._key_norms_lease_registry.retire(lease=old_lease, event_id=retire_id)
-        new_lease = self._key_norms_lease_registry.acquire(
-            kind=LeaseKind.KEY_NORMS,
-            slot=0,
-            min_capacity=int(new_slots * int(num_kv_heads) * new_stride),
-            epoch=int(time.time_ns() & 0x7FFFFFFF),
-        )
-        self._key_norms_active_lease = new_lease
-        self.key_norms_generation = int(new_lease.generation)
         # 同步更新 per-slot capacity（避免旧逻辑误判容量不足走慢路径）
         if len(self.key_norms_capacity) < new_slots:
             self.key_norms_capacity.extend([0 for _ in range(new_slots - len(self.key_norms_capacity))])
@@ -631,7 +604,6 @@ class LayerState:
             self.compact_layout_is_compact_i32 = None
             self.compact_layout_kv_len_i32 = None
             self.compact_layout_offset_tokens_i64 = None
-            self.compact_layout_cache_key = None
             self.compact_layout_key_view = None
             self.compact_layout_value_view = None
             self.compact_layout_token_positions_view = None
@@ -837,7 +809,6 @@ class LayerState:
     def bump_compact_meta_epoch(self) -> None:
         """标记 compact 元数据已变更，失效 compact layout cache。"""
         self.compact_meta_epoch += 1
-        self.compact_layout_cache_key = None
         # arena 发生变化时，相关 view 也必须重建，否则 stride cache 会错配/失效
         self.compact_layout_key_view = None
         self.compact_layout_value_view = None
@@ -1017,18 +988,12 @@ class LayerState:
             self.prefill_active_mask = None
             self.prefill_done_mask = None
             self.prefill_fifo_counts_cpu = None
-            self.slot_batch_rows = None
             self.slot_batch_rows_cpu = None
-            # slot->row 映射缓存（按 step_context_epoch 去重，避免每层重复清空/填充）
-            self._slot_row_map_epoch = -1
-            self._slot_row_map_key = None
-            self.last_refresh_decode_per_slot = None
             self.last_refresh_step_per_slot_cpu = None
             self.last_refresh_decode_per_slot_cpu = None
             self.compact_layout_is_compact_i32 = None
             self.compact_layout_kv_len_i32 = None
             self.compact_layout_offset_tokens_i64 = None
-            self.compact_layout_cache_key = None
             self.compact_layout_key_view = None
             self.compact_layout_value_view = None
             self.compact_layout_token_positions_view = None
@@ -1226,14 +1191,12 @@ class LayerState:
                 self.prefill_fifo_counts_cpu.extend([0 for _ in range(size - len(self.prefill_fifo_counts_cpu))])
             else:
                 self.prefill_fifo_counts_cpu = self.prefill_fifo_counts_cpu[:size]
-        self.slot_batch_rows = None
 
     def _resize_refresh_steps(self) -> None:
         """Resize per-slot refresh step tracker to current slot capacity."""
 
         size = self.batch_size
         if size <= 0:
-            self.last_refresh_decode_per_slot = None
             self.last_refresh_step_per_slot_cpu = None
             self.last_refresh_decode_per_slot_cpu = None
             return
@@ -1259,12 +1222,8 @@ class LayerState:
                 steps_decode = steps_decode[:size]
         self.last_refresh_decode_per_slot_cpu = steps_decode
 
-        # 保守：清空 GPU tensor 版本，避免后续路径误写入导致性能回退。
-        self.last_refresh_decode_per_slot = None
-
     def update_slot_rows(self, slot_to_row: Dict[int, int]) -> None:
         if self.batch_size <= 0:
-            self.slot_batch_rows = None
             self.slot_batch_rows_cpu = None
             return
         rows_cpu = [-1 for _ in range(self.batch_size)]
@@ -1273,5 +1232,4 @@ class LayerState:
                 continue
             row_idx = max(-1, int(row))
             rows_cpu[slot] = row_idx
-        self.slot_batch_rows = None
         self.slot_batch_rows_cpu = rows_cpu

@@ -15,7 +15,7 @@ DEPENDS_ON:
   - patches.runtime_contracts.ExecutionBackendLedger
   - patches.sparse_constants (_CAPTURE_CHUNK, _CAPTURE_IN_FLIGHT, _DYNAMIC_ENV)
   - patches.sparse_utils._is_stream_capturing_or_raise
-  - CaptureRingMixin._reclaim_retired_buffers, ProfileMixin._refresh_profile_try_flush_pending
+  - ProfileMixin._refresh_profile_try_flush_pending
 
 ENTRY_POINTS:
   - _init_wait_decider_state(): called from VLLMSparseController.__init__
@@ -139,7 +139,6 @@ class WaitDeciderMixin:
             Tuple[int, int],
             int,
         ] = {}
-        self._one_shot_group_ready_wait_epoch_by_group: Dict[int, int] = {}
         self._one_shot_group_ready_wait_epoch_by_group_slot: Dict[
             Tuple[int, int],
             int,
@@ -148,7 +147,6 @@ class WaitDeciderMixin:
             Tuple[int, int],
             int,
         ] = {}
-        self._one_shot_group_ready_full_graph_wait_required: bool = False
         self._one_shot_group_ready_compact_slots_cache_key: (
             Tuple[int, int, int, int] | None
         ) = None
@@ -411,41 +409,6 @@ class WaitDeciderMixin:
                 // int(remaining_bridge_steps),
             ),
         )
-
-    def _adaptive_deferred_producer_groups_per_step(
-        self,
-        *,
-        bridge_token_count_by_request: Optional[Dict[str, int]] = None,
-    ) -> int:
-        budget = 0
-        for rid, tracking in list(self.request_states.items()):
-            if (
-                bridge_token_count_by_request is not None
-                and str(rid) not in bridge_token_count_by_request
-            ):
-                continue
-            job = getattr(tracking, "deferred_producer_job", None)
-            if job is None or bool(getattr(job, "completed", False)):
-                continue
-            if bool(getattr(job, "cancelled", False)) or str(
-                getattr(job, "failure_reason", "") or ""
-            ):
-                continue
-            budget = max(
-                int(budget),
-                int(
-                    self._adaptive_deferred_producer_group_budget(
-                        tracking=tracking,
-                        job=job,
-                        used_bridge_tokens=(
-                            bridge_token_count_by_request.get(str(rid))
-                            if bridge_token_count_by_request is not None
-                            else None
-                        ),
-                    )
-                ),
-            )
-        return int(budget)
 
     @staticmethod
     def _bridge_safe_deferred_producer_group_budget(
@@ -741,15 +704,9 @@ class WaitDeciderMixin:
         )
         groups_per_step = self._deferred_producer_groups_per_step()
         adaptive_budget = int(groups_per_step) < 0
-        remaining_group_budget = (
-            self._adaptive_deferred_producer_groups_per_step(
-                bridge_token_count_by_request=bridge_token_count_by_request,
-            )
-            if adaptive_budget
-            else int(groups_per_step)
-        )
+        remaining_fixed_budget = max(0, int(groups_per_step))
         for rid, tracking in list(self.request_states.items()):
-            if (adaptive_budget or groups_per_step > 0) and remaining_group_budget <= 0:
+            if groups_per_step > 0 and remaining_fixed_budget <= 0:
                 break
             if only_ids and str(rid) not in only_ids:
                 continue
@@ -797,9 +754,21 @@ class WaitDeciderMixin:
             payload_groups = tuple(getattr(job, "payload_groups", tuple()) or tuple())
             remaining_groups = max(0, len(payload_groups) - int(before_group_index))
             requested_group_budget = (
-                int(remaining_group_budget)
-                if adaptive_budget or groups_per_step > 0
-                else int(remaining_groups)
+                self._adaptive_deferred_producer_group_budget(
+                    tracking=tracking,
+                    job=job,
+                    used_bridge_tokens=(
+                        bridge_token_count_by_request.get(str(rid))
+                        if bridge_token_count_by_request is not None
+                        else None
+                    ),
+                )
+                if adaptive_budget
+                else (
+                    int(remaining_fixed_budget)
+                    if groups_per_step > 0
+                    else int(remaining_groups)
+                )
             )
             safe_group_budget = self._bridge_safe_deferred_producer_group_budget(
                 tracking=tracking,
@@ -830,9 +799,12 @@ class WaitDeciderMixin:
                 max_groups_per_call=int(launch_group_budget),
             )
             after_group_index = int(getattr(job, "next_payload_group_index", 0) or 0)
-            if adaptive_budget or groups_per_step > 0:
-                submitted_groups = max(0, int(after_group_index) - int(before_group_index))
-                remaining_group_budget -= int(submitted_groups)
+            if groups_per_step > 0:
+                submitted_groups = max(
+                    0,
+                    int(after_group_index) - int(before_group_index),
+                )
+                remaining_fixed_budget -= int(submitted_groups)
             if after_group_index > before_group_index or bool(
                 getattr(job, "completed", False)
             ):
@@ -1398,16 +1370,12 @@ class WaitDeciderMixin:
     ) -> int:
         """Order all ready groups before a full CUDA graph replay consumes them."""
         if not self._one_shot_group_ready_graph_wait_enabled():
-            self._one_shot_group_ready_full_graph_wait_required = False
             return 0
         if device.type != "cuda":
-            self._one_shot_group_ready_full_graph_wait_required = False
             return 0
         if not self._step_has_decode_consumer():
-            self._one_shot_group_ready_full_graph_wait_required = False
             return 0
         if not self._step_has_compact_consumer():
-            self._one_shot_group_ready_full_graph_wait_required = False
             return 0
 
         from patches.refresh_runtime.producer_ready import resolve_one_shot_ready_chunk
@@ -1441,7 +1409,6 @@ class WaitDeciderMixin:
                     device=device,
                 )
             )
-        self._one_shot_group_ready_full_graph_wait_required = False
         return int(waited)
 
     def _wait_one_shot_group_ready_for_group(
@@ -1758,7 +1725,6 @@ class WaitDeciderMixin:
                         "failed to append group-ready publish timeline",
                         exc_info=True,
                     )
-            self._one_shot_group_ready_full_graph_wait_required = True
             self._mark_bootstrap_request_ready(
                 rid=str(rid),
                 tracking=tracking,
@@ -1962,7 +1928,6 @@ class WaitDeciderMixin:
             return
         if _is_stream_capturing_or_raise(stage="_main_stream_wait_for_chunk_done"):
             return
-        self._reclaim_retired_buffers()
         buf = int(buf_id) % int(_CAPTURE_IN_FLIGHT)
         if epoch is not None and int(epoch) != int(self._main_wait_epoch):
             self._main_wait_epoch = int(epoch)
@@ -2034,7 +1999,6 @@ class WaitDeciderMixin:
                       else "main_chunk"),
             )
         torch.cuda.current_stream(device=device).wait_event(evt)
-        self._reclaim_retired_buffers()
         commit_flush_compact_meta = getattr(
             self, "_commit_flush_compact_meta_for_buf", None
         )

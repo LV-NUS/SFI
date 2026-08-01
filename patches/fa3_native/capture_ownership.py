@@ -8,7 +8,7 @@ from numbers import Real
 from typing import Any, Literal, Mapping
 
 
-CAPTURE_OWNERSHIP_POLICY_SCHEMA = "sfi.fa3_capture_ownership_policy.v6"
+CAPTURE_OWNERSHIP_POLICY_SCHEMA = "sfi.fa3_capture_ownership_policy.v8"
 
 RING_EARLY = "ring_early"
 CHUNK_COHORT = "chunk_cohort"
@@ -53,7 +53,7 @@ class CaptureOwnershipPlan:
     chunk: int
     in_flight: int
     layer_count: int
-    tape_bank_count: int
+    tape_slot_count: int
     baseline_reduce_group: int
     cohort_size: int
     elements_per_slot: int
@@ -67,6 +67,12 @@ class CaptureOwnershipPlan:
     baseline_bytes: int
     target_bytes: int
     selected_bytes: int
+    baseline_meta_staging_device_bytes: int
+    target_meta_staging_device_bytes: int
+    selected_meta_staging_device_bytes: int
+    baseline_tiled_postprocess_device_bytes: int
+    target_tiled_postprocess_device_bytes: int
+    selected_tiled_postprocess_device_bytes: int
     baseline_postprocess_device_bytes: int
     target_postprocess_device_bytes: int
     selected_postprocess_device_bytes: int
@@ -109,7 +115,7 @@ class CaptureOwnershipPlan:
             "chunk": self.chunk,
             "in_flight": self.in_flight,
             "layer_count": self.layer_count,
-            "tape_bank_count": self.tape_bank_count,
+            "tape_slot_count": self.tape_slot_count,
             "baseline_reduce_group": self.baseline_reduce_group,
             "cohort_size": self.cohort_size,
             "elements_per_slot": self.elements_per_slot,
@@ -123,6 +129,24 @@ class CaptureOwnershipPlan:
             "baseline_bytes": self.baseline_bytes,
             "target_bytes": self.target_bytes,
             "selected_bytes": self.selected_bytes,
+            "baseline_meta_staging_device_bytes": (
+                self.baseline_meta_staging_device_bytes
+            ),
+            "target_meta_staging_device_bytes": (
+                self.target_meta_staging_device_bytes
+            ),
+            "selected_meta_staging_device_bytes": (
+                self.selected_meta_staging_device_bytes
+            ),
+            "baseline_tiled_postprocess_device_bytes": (
+                self.baseline_tiled_postprocess_device_bytes
+            ),
+            "target_tiled_postprocess_device_bytes": (
+                self.target_tiled_postprocess_device_bytes
+            ),
+            "selected_tiled_postprocess_device_bytes": (
+                self.selected_tiled_postprocess_device_bytes
+            ),
             "baseline_postprocess_device_bytes": (
                 self.baseline_postprocess_device_bytes
             ),
@@ -264,10 +288,12 @@ def plan_capture_ownership(
     chunk: int,
     in_flight: int,
     layer_count: int,
-    tape_bank_count: int,
+    tape_slot_count: int,
     baseline_reduce_group: int,
-    baseline_postprocess_device_bytes: int,
-    target_postprocess_device_bytes: int,
+    baseline_meta_staging_device_bytes: int,
+    target_meta_staging_device_bytes: int,
+    baseline_tiled_postprocess_device_bytes: int,
+    target_tiled_postprocess_device_bytes: int,
     baseline_tape_device_bytes: int,
     target_tape_device_bytes: int,
     configured_device_bytes: int,
@@ -289,17 +315,27 @@ def plan_capture_ownership(
     chunk = _require_non_negative_int("chunk", chunk)
     in_flight = _require_non_negative_int("in_flight", in_flight)
     layer_count = _require_non_negative_int("layer_count", layer_count)
-    tape_bank_count = _require_non_negative_int(
-        "tape_bank_count", tape_bank_count
+    tape_slot_count = _require_non_negative_int(
+        "tape_slot_count", tape_slot_count
     )
-    baseline_reduce_group = _require_non_negative_int(
+    baseline_reduce_group = _require_positive_int(
         "baseline_reduce_group", baseline_reduce_group
     )
-    baseline_postprocess_device_bytes = _require_non_negative_int(
-        "baseline_postprocess_device_bytes", baseline_postprocess_device_bytes
+    baseline_meta_staging_device_bytes = _require_non_negative_int(
+        "baseline_meta_staging_device_bytes",
+        baseline_meta_staging_device_bytes,
     )
-    target_postprocess_device_bytes = _require_non_negative_int(
-        "target_postprocess_device_bytes", target_postprocess_device_bytes
+    target_meta_staging_device_bytes = _require_non_negative_int(
+        "target_meta_staging_device_bytes",
+        target_meta_staging_device_bytes,
+    )
+    baseline_tiled_postprocess_device_bytes = _require_non_negative_int(
+        "baseline_tiled_postprocess_device_bytes",
+        baseline_tiled_postprocess_device_bytes,
+    )
+    target_tiled_postprocess_device_bytes = _require_non_negative_int(
+        "target_tiled_postprocess_device_bytes",
+        target_tiled_postprocess_device_bytes,
     )
     baseline_tape_device_bytes = _require_non_negative_int(
         "baseline_tape_device_bytes", baseline_tape_device_bytes
@@ -313,12 +349,10 @@ def plan_capture_ownership(
 
     elements_per_slot = rows_cap * heads_per_rank * last_n * aligned_k
     bytes_per_slot = elements_per_slot * element_bytes
+    # in_flight sizes short-lived capture scratch only.  Deferred tape lifetime
+    # is request-owned and independently bounded by tape_slot_count.
     target_depth = chunk * in_flight
-    baseline_depth = (
-        baseline_reduce_group * in_flight
-        if baseline_reduce_group > 0
-        else target_depth
-    )
+    baseline_depth = baseline_reduce_group * in_flight
     baseline_capacity_elements = baseline_depth * elements_per_slot
     target_capacity_elements = target_depth * elements_per_slot
     baseline_bytes = baseline_depth * bytes_per_slot
@@ -347,9 +381,17 @@ def plan_capture_ownership(
     baseline_tiled_kernel_eligible = not baseline_tiled_kernel_reason
     tiled_kernel_eligible = not tiled_kernel_reason
     if not baseline_tiled_kernel_eligible:
-        baseline_postprocess_device_bytes = 0
+        baseline_tiled_postprocess_device_bytes = 0
     if not tiled_kernel_eligible:
-        target_postprocess_device_bytes = 0
+        target_tiled_postprocess_device_bytes = 0
+    baseline_postprocess_device_bytes = (
+        baseline_meta_staging_device_bytes
+        + baseline_tiled_postprocess_device_bytes
+    )
+    target_postprocess_device_bytes = (
+        target_meta_staging_device_bytes
+        + target_tiled_postprocess_device_bytes
+    )
 
     scratch_incremental_bytes = max(0, target_bytes - baseline_bytes)
     baseline_total_device_bytes = (
@@ -378,7 +420,7 @@ def plan_capture_ownership(
         chunk <= 0
         or in_flight <= 0
         or layer_count <= 0
-        or tape_bank_count != in_flight
+        or tape_slot_count <= 0
         or target_tape_device_bytes <= 0
     ):
         ineligibility_reason = "non_positive_shape"
@@ -401,6 +443,16 @@ def plan_capture_ownership(
         target_postprocess_device_bytes
         if mode == CHUNK_COHORT
         else baseline_postprocess_device_bytes
+    )
+    selected_meta_staging_device_bytes = (
+        target_meta_staging_device_bytes
+        if mode == CHUNK_COHORT
+        else baseline_meta_staging_device_bytes
+    )
+    selected_tiled_postprocess_device_bytes = (
+        target_tiled_postprocess_device_bytes
+        if mode == CHUNK_COHORT
+        else baseline_tiled_postprocess_device_bytes
     )
     selected_tape_device_bytes = (
         target_tape_device_bytes
@@ -436,7 +488,7 @@ def plan_capture_ownership(
         "chunk": chunk,
         "in_flight": in_flight,
         "layer_count": layer_count,
-        "tape_bank_count": tape_bank_count,
+        "tape_slot_count": tape_slot_count,
         "baseline_reduce_group": baseline_reduce_group,
         "cohort_size": chunk,
         "elements_per_slot": elements_per_slot,
@@ -450,6 +502,18 @@ def plan_capture_ownership(
         "baseline_bytes": baseline_bytes,
         "target_bytes": target_bytes,
         "selected_bytes": selected_bytes,
+        "baseline_meta_staging_device_bytes": baseline_meta_staging_device_bytes,
+        "target_meta_staging_device_bytes": target_meta_staging_device_bytes,
+        "selected_meta_staging_device_bytes": selected_meta_staging_device_bytes,
+        "baseline_tiled_postprocess_device_bytes": (
+            baseline_tiled_postprocess_device_bytes
+        ),
+        "target_tiled_postprocess_device_bytes": (
+            target_tiled_postprocess_device_bytes
+        ),
+        "selected_tiled_postprocess_device_bytes": (
+            selected_tiled_postprocess_device_bytes
+        ),
         "baseline_postprocess_device_bytes": baseline_postprocess_device_bytes,
         "target_postprocess_device_bytes": target_postprocess_device_bytes,
         "selected_postprocess_device_bytes": selected_postprocess_device_bytes,

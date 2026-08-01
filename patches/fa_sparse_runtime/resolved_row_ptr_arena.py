@@ -43,7 +43,7 @@ _ROW_SOURCE_KEYS = (
     "compact_full_native_fallback_rows",
 )
 SOURCE_COUNTER_SCHEMA_VERSION = 1
-LIVE_PAGES_PUBLISH_METRICS_SCHEMA_VERSION = 2
+LIVE_PAGES_PUBLISH_METRICS_SCHEMA_VERSION = 3
 _AFFINE_ROW_PTR_FALLBACK_SEGMENT_PAGES = -1
 # [ARENA-AFFINE-DEVICE-RETIRED 2026-07-03] The zero-consumer device tensors
 # affine_i32 / affine_row_consume_mode_i32 and everything that ONLY served
@@ -1252,19 +1252,13 @@ class ResolvedRowPtrArena:
     # ordered only when every publish is submitted by the same writer stream;
     # a stream change is therefore a contract violation, not a fallback case.
     _live_pages_writer_stream_id: int = field(default=-1, init=False, repr=False)
-    # Always-on integer evidence is intentionally allocation-free on the hot
-    # path.  Legacy wait/sync counters remain in schema v2 as compatibility
-    # zeros; busy candidates now grow the pool instead of blocking the host.
+    # Always-on integer evidence is allocation-free on the steady hot path.
     _live_pages_publish_call_count: int = field(default=0, init=False, repr=False)
     _live_pages_publish_complete_count: int = field(default=0, init=False, repr=False)
     _live_pages_dirty_rows_total: int = field(default=0, init=False, repr=False)
     _live_pages_h2d_bytes_total: int = field(default=0, init=False, repr=False)
     _live_pages_direct_full_hkv1_count: int = field(default=0, init=False, repr=False)
     _live_pages_slot_query_count: int = field(default=0, init=False, repr=False)
-    _live_pages_slot_wait_count: int = field(default=0, init=False, repr=False)
-    _live_pages_slot_wait_ns_total: int = field(default=0, init=False, repr=False)
-    _live_pages_cold_sync_count: int = field(default=0, init=False, repr=False)
-    _live_pages_cold_sync_ns_total: int = field(default=0, init=False, repr=False)
     _live_pages_slot_growth_count: int = field(default=0, init=False, repr=False)
     _live_pages_max_ring_slot_count: int = field(default=0, init=False, repr=False)
     _live_pages_buffer_retirement_count: int = field(
@@ -1279,7 +1273,6 @@ class ResolvedRowPtrArena:
     _live_pages_last_dirty_rows_mask: int = field(default=0, init=False, repr=False)
     _live_pages_last_page_count_signature: int = field(default=0, init=False, repr=False)
     _live_pages_last_h2d_bytes: int = field(default=0, init=False, repr=False)
-    _live_pages_last_slot_wait_ns: int = field(default=0, init=False, repr=False)
     _live_pages_last_direct_full_hkv1: bool = field(default=False, init=False, repr=False)
     # [ARENA-AFFINE-DEVICE-RETIRED 2026-07-03] The #12 v6 affine-clean
     # write-skip cache slot ``_affine_clean_last_key_by_row`` was removed with
@@ -1857,14 +1850,6 @@ class ResolvedRowPtrArena:
                 self._live_pages_direct_full_hkv1_count
             ),
             "rrp_live_pages_slot_query_count": self._live_pages_slot_query_count,
-            "rrp_live_pages_slot_wait_count": self._live_pages_slot_wait_count,
-            "rrp_live_pages_slot_wait_observed_ns_total": (
-                self._live_pages_slot_wait_ns_total
-            ),
-            "rrp_live_pages_cold_sync_count": self._live_pages_cold_sync_count,
-            "rrp_live_pages_cold_sync_observed_ns_total": (
-                self._live_pages_cold_sync_ns_total
-            ),
             "rrp_live_pages_slot_growth_count": (
                 self._live_pages_slot_growth_count
             ),
@@ -1898,13 +1883,9 @@ class ResolvedRowPtrArena:
                 self._live_pages_last_page_count_signature
             ),
             "rrp_live_pages_last_h2d_bytes": self._live_pages_last_h2d_bytes,
-            "rrp_live_pages_last_slot_wait_observed_ns": (
-                self._live_pages_last_slot_wait_ns
-            ),
             "rrp_live_pages_last_direct_full_hkv1": (
                 self._live_pages_last_direct_full_hkv1
             ),
-            "rrp_live_pages_slot_wait_is_backpressure_ceiling": False,
             "rrp_live_pages_grow_on_busy_enabled": True,
         }
 
@@ -1976,7 +1957,6 @@ class ResolvedRowPtrArena:
         self._live_pages_last_publish_epoch = int(publish_epoch)
         self._live_pages_last_dirty_rows_count = len(dirty)
         self._live_pages_last_dirty_rows_mask = dirty_rows_mask
-        self._live_pages_last_slot_wait_ns = 0
         self._live_pages_last_direct_full_hkv1 = False
         max_pages = int(self.max_pages_per_row)
         validated_pages: list[tuple[int, ...]] = []

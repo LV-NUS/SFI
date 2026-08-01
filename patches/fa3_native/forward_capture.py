@@ -52,16 +52,26 @@ _CAPTURE_SCRATCH_PROBE_LOCK = threading.Lock()
 def _capture_scratch_scope_key(scratch_key: tuple[object, ...]) -> tuple[object, ...]:
     """Return the runtime owner scope for one exact scratch allocation key.
 
-    Shape is intentionally excluded: a model chunk/cohort on one device owns one
-    current exact shape. Legitimate distinct chunks remain distinct scopes.
+    The sealed capture runtime has exactly one scratch owner per device.  Ring
+    and cohort are alternative policies, not simultaneous cache populations;
+    geometry or policy changes replace the prior slab at the cold boundary.
     """
     if len(scratch_key) != 5:
         raise RuntimeError("E_SFI_CAPTURE_SCRATCH_INVALID_KEY")
+    extra_key = scratch_key[4]
+    if (
+        isinstance(extra_key, tuple)
+        and extra_key
+        and isinstance(extra_key[0], str)
+        and extra_key[0]
+        in {"capture_postprocess_ring", "capture_postprocess_cohort"}
+    ):
+        extra_key = "capture_postprocess_owner"
     return (
         scratch_key[0],
         scratch_key[1],
         scratch_key[2],
-        scratch_key[4],
+        extra_key,
     )
 
 
@@ -853,7 +863,10 @@ def prepare_capture_forward_side_outputs(
     scratch_layer_slots = 0
     if isinstance(scratch_cache_extra_key, tuple) and scratch_cache_extra_key:
         key_kind = str(scratch_cache_extra_key[0])
-        if key_kind in {"async_postprocess_chunk", "defer_postprocess_chunk"}:
+        if key_kind in {
+            "capture_postprocess_ring",
+            "capture_postprocess_cohort",
+        }:
             try:
                 scratch_layer_slots = int(scratch_cache_extra_key[-1])
             except (TypeError, ValueError):
@@ -878,7 +891,7 @@ def prepare_capture_forward_side_outputs(
         scratch_storage_shape,
         scratch_cache_extra_key,
     )
-    chunk_cohort_cache_required = False
+    sealed_cache_required = False
     if scratch_cache_owner is not None:
         ownership_plan = getattr(
             scratch_cache_owner, "_capture_ownership_plan", None
@@ -892,28 +905,37 @@ def prepare_capture_forward_side_outputs(
                     "E_SFI_CAPTURE_OWNERSHIP_CACHE_MISS: invalid stamped "
                     "capture ownership plan"
                 )
-            if ownership_plan.mode == CHUNK_COHORT:
-                chunk_cohort_cache_required = True
-                expected_extra_key = (
-                    "defer_postprocess_chunk",
-                    int(ownership_plan.cohort_size),
-                    int(ownership_plan.selected_depth),
+            sealed_cache_required = True
+            key_kind = (
+                "capture_postprocess_cohort"
+                if ownership_plan.mode == CHUNK_COHORT
+                else "capture_postprocess_ring"
+            )
+            key_scope = (
+                int(ownership_plan.cohort_size)
+                if ownership_plan.mode == CHUNK_COHORT
+                else 0
+            )
+            expected_extra_key = (
+                key_kind,
+                key_scope,
+                int(ownership_plan.selected_depth),
+            )
+            expected_shape = (
+                int(ownership_plan.selected_depth),
+                int(ownership_plan.rows_cap),
+                int(ownership_plan.heads_per_rank),
+                int(ownership_plan.last_n),
+                int(ownership_plan.aligned_k),
+            )
+            if (
+                scratch_cache_extra_key != expected_extra_key
+                or scratch_storage_shape != expected_shape
+            ):
+                raise RuntimeError(
+                    "E_SFI_CAPTURE_OWNERSHIP_CACHE_MISS: live scratch "
+                    "key/shape does not match the stamped owner"
                 )
-                expected_shape = (
-                    int(ownership_plan.selected_depth),
-                    int(ownership_plan.rows_cap),
-                    int(ownership_plan.heads_per_rank),
-                    int(ownership_plan.last_n),
-                    int(ownership_plan.aligned_k),
-                )
-                if (
-                    scratch_cache_extra_key != expected_extra_key
-                    or scratch_storage_shape != expected_shape
-                ):
-                    raise RuntimeError(
-                        "E_SFI_CAPTURE_OWNERSHIP_CACHE_MISS: live scratch "
-                        "key/shape does not match the stamped chunk cohort"
-                    )
     scratch_storage = None
     if scratch_cache_owner is not None:
         cached_key = getattr(scratch_cache_owner, "_fa3_capture_scratch_cache_key", None)
@@ -933,10 +955,10 @@ def prepare_capture_forward_side_outputs(
             scratch_storage = cached_tensor
     scratch_cache_hit = scratch_storage is not None
     if scratch_storage is None:
-        if chunk_cohort_cache_required:
+        if sealed_cache_required:
             raise RuntimeError(
-                "E_SFI_CAPTURE_OWNERSHIP_CACHE_MISS: stamped chunk cohort "
-                "requires an exact prebuilt scratch cache hit"
+                "E_SFI_CAPTURE_OWNERSHIP_CACHE_MISS: stamped owner requires "
+                "an exact prebuilt scratch cache hit"
             )
         # The native capture store runs after FA masking and postprocess reads
         # only producer rows within [last_n, effective_kv_len]. Reusing an

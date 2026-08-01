@@ -26,7 +26,6 @@ class ProducerReadyState:
     completed_group_mask: int = 0
     failed_group_mask: int = 0
     final_event: Any | None = None
-    final_event_generation: int = 0
     manifests: dict[int, ProducerGroupManifest] = field(default_factory=dict)
     group_done_events: dict[int, Any] = field(default_factory=dict)
     graph_wait_event_used: bool = False
@@ -196,7 +195,6 @@ def publish_final_event(
             return
         raise RuntimeError("producer final event was already published")
     state.final_event = final_event
-    state.final_event_generation += 1
 
 
 def validate_producer_ready_for_publish(state: ProducerReadyState) -> None:

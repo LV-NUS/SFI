@@ -424,11 +424,12 @@ def flush_prefill_batches_impl(
 
         lastn1_direct_count = 0
         gt1_reduce_count = 0
-        gt1_scalar_fallback_count = 0
-        cohort_private_tape_used = False
+        cohort_slot_tape_used = False
         cohort_tape_deferred_producer_used = False
         cohort_snapshot_copy_event = None
         cohort_tape_tokens_by_slot: Dict[int, object] = {}
+        cohort_tape_scores_base: Optional[torch.Tensor] = None
+        cohort_tape_denoms_base: Optional[torch.Tensor] = None
 
         def _producer_work_int(name: str, default: int = -1) -> int:
             prof_value = (
@@ -1116,9 +1117,11 @@ def flush_prefill_batches_impl(
             slot_list_ref = slot_list_full
             pos_map = {int(s): idx for idx, s in enumerate(slot_list_ref)}
             if chunk_cohort_stamped:
-                nonlocal cohort_private_tape_used
+                nonlocal cohort_slot_tape_used
                 nonlocal cohort_snapshot_copy_event
                 nonlocal cohort_tape_tokens_by_slot
+                nonlocal cohort_tape_scores_base
+                nonlocal cohort_tape_denoms_base
                 if not bool(
                     getattr(
                         getattr(self, "config", None),
@@ -1166,9 +1169,8 @@ def flush_prefill_batches_impl(
                     tape_state, prefill_payloads
                 )
                 # Registering a request token without a corresponding deferred
-                # producer would poison the bounded generation bank until a
-                # later request reports BANKS_EXHAUSTED.  Prove the one-to-one
-                # consumer set before snapshot acquires any bank ownership.
+                # producer would pin its stable slot across future reuse. Prove
+                # the one-to-one consumer set before snapshot acquires ownership.
                 registered_consumer_slots = (
                     require_capture_cohort_consumer_coverage(
                         registered_slots=tuple(sorted(finalize_slot_set)),
@@ -1215,13 +1217,16 @@ def flush_prefill_batches_impl(
                     tracker=tape_tracker,
                     payloads=prefill_payloads,
                     consumer_tokens=tuple(cohort_tape_tokens_by_slot.values()),
+                    source_slots=slot_list_ref,
                     lastn1_row_positions=lastn1_row_positions,
-                    # The prebuilt tape owns a generation bank on the dedicated
+                    # The prebuilt tape owns stable request rows on the dedicated
                     # refresh stream.  CUDAGraph execution can make the ambient
                     # current stream differ even inside this flush, so submitting
                     # the snapshot there violates the tape lease contract.
                     stream=self.refresh_stream,
                 )
+                cohort_tape_scores_base = tape_state.scores
+                cohort_tape_denoms_base = tape_state.denoms
                 cohort_snapshot_copy_event = (
                     cohort_snapshot.copy_completion_event
                 )
@@ -1234,7 +1239,7 @@ def flush_prefill_batches_impl(
                     )
                 cohort_size = int(capture_ownership_plan.cohort_size)
                 in_flight = int(capture_ownership_plan.in_flight)
-                for global_layer in cohort_snapshot.group.layer_slots:
+                for global_layer in cohort_snapshot.layer_slots:
                     cohort_origin = (
                         int(global_layer) // cohort_size
                     ) * cohort_size
@@ -1250,11 +1255,10 @@ def flush_prefill_batches_impl(
                         cohort_snapshot_copy_event,
                         True,
                     )
-                cohort_private_tape_used = True
-            # [DETERMINISTIC-CAPTURE-SNAPSHOT 2026-07-02] one private tape per
-            # flush per source kind (True=capture+denoms, False=lastn1), shared
-            # by every subset of this flush so all per-slot payloads and the
-            # postprocess retarget agree on a single buffer.
+                cohort_slot_tape_used = True
+            # Ring ownership materializes at most one private stack per source
+            # kind. Chunk-cohort ownership instead memoizes direct stable-slot
+            # views; both keep all subsets on one immutable source per flush.
             subset_tape_cache: Dict[object, object] = {}
             retargeted_postprocess_job_ids: set = set()
 
@@ -1537,53 +1541,92 @@ def flush_prefill_batches_impl(
                         [max(0, int(s)) for s in seq_lens_cpu_sub], dtype=torch.long
                     )
 
-                # [DETERMINISTIC-CAPTURE-SNAPSHOT 2026-07-02] Third member of the
-                # producer live-read race family (with [DETERMINISTIC-AUTOLEN] and
-                # [DETERMINISTIC-SELECTOR-BOUNDS]). The payload capture views point
-                # into the per-(state,chunk) capture arena, which the decode main
-                # stream keeps rewriting every step (the rolling capture hook),
-                # while the deferred bootstrap selector reads them on refresh_stream
-                # at a floating time -> the topk input depended on WHEN the producer
-                # executed (run-to-run output drift). Fix: take the shared arena out
-                # of the deferred dataflow entirely via a private per-flush tape.
-                #   1. Baseline: one stacked D2D copy of the full per-layer views,
-                #      enqueued on the SUBMISSION stream (deterministic position,
-                #      serialized against decode's arena rewrites). Covers direct
-                #      capture / last_n==1 rows, whose arena content is final at
-                #      submission.
-                #   2. gt1 rows: the pending capture-postprocess jobs (stable
-                #      scratch input + ready_event) are retargeted to write the
-                #      tape instead of the arena -- the authoritative content lands
-                #      in the tape at deferred time with no arena involvement and
-                #      zero extra bandwidth (the postprocess write happens anyway).
-                #   3. All subset payloads view the tape; tape[i] views share one
-                #      5-dim base, satisfying the selector's direct-tape contract
-                #      (per-layer clones satisfy neither probe and trip its
-                #      require_base guard).
-                # Decode keeps exclusive ownership of the arena; the deferred
-                # producer keeps floating (async overlap preserved); bootstrap-only
-                # path, no steady-state cost.
+                # Deferred consumers must never retain the rolling capture arena.
+                # chunk_cohort already copied each live row into its stable global
+                # request slot above, so bind that zero-copy request view directly.
+                # The ring owner keeps its historical bootstrap-only private stack.
                 if chunk_cohort_stamped:
                     from patches.fa3_native.capture_cohort_tape import (
-                        resolve_capture_cohort_tape_group,
+                        payload_group_consumer_tokens,
                     )
 
-                    tape_group = resolve_capture_cohort_tape_group(payloads_in)
-                    if tape_group is None:
+                    if batch_sub != 1:
                         raise RuntimeError(
-                            "E_SFI_CAPTURE_COHORT_TAPE_PUBLICATION_MISSING: "
-                            "stamped chunk cohort cannot fall back to an arena stack"
+                            "E_SFI_CAPTURE_COHORT_TAPE_REQUEST_VIEW: stable-slot "
+                            "consumers must be request-local"
                         )
-                    tape_denoms = tape_group.denoms
-                    if use_denoms and tape_denoms is None:
+                    request_slot = int(slots_use_ordered[0])
+                    consumer_token = cohort_tape_tokens_by_slot.get(request_slot)
+                    if consumer_token is None:
                         raise RuntimeError(
-                            "E_SFI_CAPTURE_COHORT_TAPE_DENOM_MISSING"
+                            "E_SFI_CAPTURE_COHORT_CONSUMER: request slot has no "
+                            "registered tape token"
                         )
-                    subset_tape_cache[bool(use_denoms)] = (
-                        tape_group.scores,
-                        tape_denoms if use_denoms else None,
+                    published_tokens = payload_group_consumer_tokens(payloads_in)
+                    if consumer_token not in published_tokens:
+                        raise RuntimeError(
+                            "E_SFI_CAPTURE_COHORT_CONSUMER: request token is "
+                            "outside the published snapshot"
+                        )
+                    scores_base = cohort_tape_scores_base
+                    denoms_base = cohort_tape_denoms_base
+                    if (
+                        not isinstance(scores_base, torch.Tensor)
+                        or not isinstance(denoms_base, torch.Tensor)
+                    ):
+                        raise RuntimeError(
+                            "E_SFI_CAPTURE_COHORT_TAPE_PUBLICATION_MISSING"
+                        )
+                    layer_slots = tuple(
+                        int(
+                            getattr(
+                                getattr(payload, "state", None),
+                                "layer_index",
+                                -1,
+                            )
+                        )
+                        for payload in payloads_in
                     )
-                tape_entry = subset_tape_cache.get(bool(use_denoms))
+                    if layer_slots != tuple(
+                        range(layer_slots[0], layer_slots[0] + len(layer_slots))
+                    ):
+                        raise RuntimeError(
+                            "E_SFI_CAPTURE_COHORT_TAPE_NONCONTIGUOUS_GROUP"
+                        )
+                    if any(
+                        getattr(payload, "cohort_tape_scores_base", None)
+                        is not scores_base
+                        or getattr(payload, "cohort_tape_denoms_base", None)
+                        is not denoms_base
+                        or not isinstance(
+                            getattr(payload, "cohort_tape_owner_key", None),
+                            tuple,
+                        )
+                        or len(getattr(payload, "cohort_tape_owner_key", ())) != 5
+                        or getattr(payload, "cohort_tape_owner_key", None)[0]
+                        != str(tape_state.plan_signature)
+                        for payload in payloads_in
+                    ):
+                        raise RuntimeError(
+                            "E_SFI_CAPTURE_COHORT_TAPE_PUBLICATION_MISSING"
+                        )
+                    first_layer = layer_slots[0]
+                    capture_tape = scores_base[
+                        first_layer : first_layer + len(layer_slots),
+                        request_slot : request_slot + 1,
+                    ]
+                    denoms_tape = denoms_base[
+                        first_layer : first_layer + len(layer_slots),
+                        request_slot : request_slot + 1,
+                    ]
+                    tape_key: object = (bool(use_denoms), request_slot)
+                    subset_tape_cache[tape_key] = (
+                        capture_tape,
+                        denoms_tape if use_denoms else None,
+                    )
+                else:
+                    tape_key = bool(use_denoms)
+                tape_entry = subset_tape_cache.get(tape_key)
                 if tape_entry is None:
                     capture_views_all: List[torch.Tensor] = []
                     denoms_views_all: List[torch.Tensor] = []
@@ -1672,7 +1715,7 @@ def flush_prefill_batches_impl(
                                 if _lk is not None:
                                     _lk.release()
                     tape_entry = (capture_tape, denoms_tape)
-                    subset_tape_cache[bool(use_denoms)] = tape_entry
+                    subset_tape_cache[tape_key] = tape_entry
                 capture_tape, denoms_tape = tape_entry
                 cohort_consumer_tokens_sub = tuple()
                 if chunk_cohort_stamped:
@@ -1689,13 +1732,21 @@ def flush_prefill_batches_impl(
 
                 payloads_out = []
                 for layer_pos, p in enumerate(payloads_in):
-                    capture_view = capture_tape[layer_pos][
-                        start : start + batch_sub, :, :, :kv_len_total
-                    ]
+                    capture_view = (
+                        capture_tape[layer_pos][:, :, :, :kv_len_total]
+                        if chunk_cohort_stamped
+                        else capture_tape[layer_pos][
+                            start : start + batch_sub, :, :, :kv_len_total
+                        ]
+                    )
                     denoms_view = None
                     if use_denoms:
                         assert denoms_tape is not None
-                        denoms_view = denoms_tape[layer_pos][start : start + batch_sub]
+                        denoms_view = (
+                            denoms_tape[layer_pos]
+                            if chunk_cohort_stamped
+                            else denoms_tape[layer_pos][start : start + batch_sub]
+                        )
                     kv_lengths_src = p.kv_lengths
                     if isinstance(kv_lengths_src, torch.Tensor):
                         kv_lengths_src = kv_lengths_snap_by_ptr.get(
@@ -1766,28 +1817,30 @@ def flush_prefill_batches_impl(
                                 if chunk_cohort_stamped
                                 else p.cohort_tape_consumer_tokens
                             ),
-                            cohort_tape_row_start=(
-                                int(start)
-                                if chunk_cohort_stamped
-                                else p.cohort_tape_row_start
-                            ),
                         )
                     )
                 return payloads_out
 
             def _run_prefill_group(slots_use: List[int], *, use_denoms: bool) -> None:
-                nonlocal lastn1_direct_count, gt1_reduce_count, gt1_scalar_fallback_count
+                nonlocal lastn1_direct_count, gt1_reduce_count
                 nonlocal cohort_tape_deferred_producer_used
                 if not slots_use:
                     return
-                group_payloads = _subset_payloads_for_slots(prefill_payloads, slots_use, use_denoms=use_denoms)
+                group_payloads = (
+                    list(prefill_payloads)
+                    if chunk_cohort_stamped
+                    else _subset_payloads_for_slots(
+                        prefill_payloads,
+                        slots_use,
+                        use_denoms=use_denoms,
+                    )
+                )
                 if not group_payloads:
                     return
                 if use_denoms:
                     gt1_reduce_count += len(slots_use)
                 else:
                     lastn1_direct_count += len(slots_use)
-                gt1_scalar_fallback_count = 0
                 one_shot_bootstrap_only = bool(
                     getattr(getattr(self, "config", None), "one_shot_bootstrap_only", False)
                 )
@@ -2028,9 +2081,6 @@ def flush_prefill_batches_impl(
                             "layer_indices": list(layer_indices),
                             "lastn1_direct_count": int(lastn1_direct_count),
                             "gt1_reduce_count": int(gt1_reduce_count),
-                            "gt1_scalar_fallback_count": int(
-                                gt1_scalar_fallback_count
-                            ),
                             "bootstrap_full_kv_handoff": True,
                         },
                     )
@@ -2052,7 +2102,6 @@ def flush_prefill_batches_impl(
                         "layer_indices": list(layer_indices),
                         "lastn1_direct_count": int(lastn1_direct_count),
                         "gt1_reduce_count": int(gt1_reduce_count),
-                        "gt1_scalar_fallback_count": int(gt1_scalar_fallback_count),
                     },
                 )
                 producer_attrib_mode = ""
@@ -2082,7 +2131,6 @@ def flush_prefill_batches_impl(
                             "producer_attrib_mode": "none",
                             "lastn1_direct_count": int(lastn1_direct_count),
                             "gt1_reduce_count": int(gt1_reduce_count),
-                            "gt1_scalar_fallback_count": int(gt1_scalar_fallback_count),
                         },
                     )
                     return
@@ -2301,7 +2349,6 @@ def flush_prefill_batches_impl(
                             "producer_attrib_mode": "selector_only",
                             "lastn1_direct_count": int(lastn1_direct_count),
                             "gt1_reduce_count": int(gt1_reduce_count),
-                            "gt1_scalar_fallback_count": int(gt1_scalar_fallback_count),
                         },
                     )
                     return
@@ -2680,9 +2727,6 @@ def flush_prefill_batches_impl(
                                                 "gt1_reduce_count": int(
                                                     gt1_reduce_count
                                                 ),
-                                                "gt1_scalar_fallback_count": int(
-                                                    gt1_scalar_fallback_count
-                                                ),
                                                 "capture_tap_visible_ms_or_unavailable_reason": (
                                                     "unavailable:not_measured_in_hot_path"
                                                 ),
@@ -2705,7 +2749,6 @@ def flush_prefill_batches_impl(
                         "layer_indices": list(layer_indices),
                         "lastn1_direct_count": int(lastn1_direct_count),
                         "gt1_reduce_count": int(gt1_reduce_count),
-                        "gt1_scalar_fallback_count": int(gt1_scalar_fallback_count),
                     },
                 )
                 if finalize_slot_set and ((not one_shot_bootstrap_only) or bool(is_last_layer)):
@@ -2770,7 +2813,6 @@ def flush_prefill_batches_impl(
                             {
                                 "lastn1_direct_count": int(lastn1_direct_count),
                                 "gt1_reduce_count": int(gt1_reduce_count),
-                                "gt1_scalar_fallback_count": int(gt1_scalar_fallback_count),
                                 "capture_tap_visible_ms_or_unavailable_reason": (
                                     "unavailable:not_measured_in_hot_path"
                                 ),
@@ -2931,15 +2973,15 @@ def flush_prefill_batches_impl(
                     if prefill_payloads:
                         cohort_deferred_overlap_proven = bool(
                             chunk_cohort_stamped
-                            and cohort_private_tape_used
+                            and cohort_slot_tape_used
                             and cohort_tape_deferred_producer_used
                             and not refresh_payloads
                         )
                         if cohort_deferred_overlap_proven:
                             if cohort_snapshot_copy_event is None:
                                 raise RuntimeError(
-                                    "E_SFI_CAPTURE_COHORT_COPY_EVENT: private "
-                                    "tape publication has no arena-release event"
+                                    "E_SFI_CAPTURE_COHORT_COPY_EVENT: stable-slot "
+                                    "publication has no arena-release event"
                                 )
                             # The only main-stream dependency is source lifetime:
                             # once the R-stream snapshot copy completes, the arena
@@ -3229,7 +3271,6 @@ def flush_prefill_batches_impl(
                     ),
                     lastn1_direct_count=int(lastn1_direct_count),
                     gt1_reduce_count=int(gt1_reduce_count),
-                    gt1_scalar_fallback_count=int(gt1_scalar_fallback_count),
                     refresh_rebuild_budget_before=int(
                         prof.refresh_rebuild_budget_before
                     ),
@@ -3707,9 +3748,6 @@ def flush_prefill_batches_impl(
                             0,
                         )
                     ),
-                    refresh_rebuild_delay_max=int(
-                        getattr(self, "_refresh_rebuild_delay_max", 0)
-                    ),
                     producer_work_target_layer_start=int(
                         _producer_work_int("target_layer_start")
                     ),
@@ -4112,7 +4150,6 @@ def flush_prefill_batches_impl(
                     ),
                     "lastn1_direct_count": int(lastn1_direct_count),
                     "gt1_reduce_count": int(gt1_reduce_count),
-                    "gt1_scalar_fallback_count": int(gt1_scalar_fallback_count),
                     "refresh_rebuild_budget_before": int(
                         prof.refresh_rebuild_budget_before
                     ),
@@ -4392,9 +4429,6 @@ def flush_prefill_batches_impl(
                             "_deadline_async_producer_result_precomputed_count",
                             0,
                         )
-                    ),
-                    "refresh_rebuild_delay_max": int(
-                        getattr(self, "_refresh_rebuild_delay_max", 0)
                     ),
                     "producer_work_target_layer_start": int(
                         _producer_work_int("target_layer_start")

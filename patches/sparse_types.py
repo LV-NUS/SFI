@@ -284,7 +284,6 @@ class _RefreshProfilePending:
     source_ready_recorded_after_pointer_publish_count: int = 0
     lastn1_direct_count: int = 0
     gt1_reduce_count: int = 0
-    gt1_scalar_fallback_count: int = 0
     refresh_rebuild_budget_before: int = -1
     refresh_rebuild_budget_after: int = -1
     refresh_rebuild_enqueued_count: int = 0
@@ -365,7 +364,6 @@ class _RefreshProfilePending:
     deadline_async_producer_graph_capture_cpu_us_total: float = 0.0
     deadline_async_producer_graph_capture_cpu_us_max: float = 0.0
     deadline_async_producer_result_precomputed_count: int = 0
-    refresh_rebuild_delay_max: int = 0
     producer_work_target_layer_start: int = -1
     producer_work_target_layer_end: int = -1
     producer_work_decode_step_min: int = -1
@@ -572,7 +570,6 @@ class _FlushProfileAccum:
     source_ready_recorded_after_pointer_publish_count: int = 0
     lastn1_direct_count: int = 0
     gt1_reduce_count: int = 0
-    gt1_scalar_fallback_count: int = 0
     refresh_rebuild_budget_before: int = -1
     refresh_rebuild_budget_after: int = -1
     refresh_rebuild_enqueued_count: int = 0
@@ -586,7 +583,6 @@ class _FlushProfileAccum:
     deadline_rebuild_drain_submit_decode_step_min: int = -1
     deadline_rebuild_drain_submit_decode_step_max: int = -1
     deadline_rebuild_drain_submit_decode_steps: Tuple[int, ...] = ()
-    refresh_rebuild_delay_max: int = 0
     producer_work_target_layer_start: int = -1
     producer_work_target_layer_end: int = -1
     producer_work_decode_step_min: int = -1
@@ -902,7 +898,6 @@ class StepCaptureLayout:
     )
     # P0-2 FIX: buf_id 用于 cache key 区分不同 ring buffer 位置，防止内存复用时的缓存错误
     buf_id: int = -1
-    lease_generation: int = 0
     # Per-layout pinned CPU/GPU staging for tiny metadata carriers.
     small_tensor_stage: Dict[str, object] = field(default_factory=dict)
 
@@ -1565,8 +1560,6 @@ class CapturePostprocessJob:
     launched: bool = False
     completed: bool = False
     ran_postprocess: bool = False
-    waited_ready_event: bool = False
-    waited_completion_event: bool = False
     # [DETERMINISTIC-TAPE-WAW 2026-07-03] flush 把本 job 输出 retarget 到私有
     # tape 时挂上的"tape baseline stack 完成"事件:job 的写必须排在 stack 之后
     # (否则 stack 的 arena 旧值会覆盖 job 输出)。
@@ -1640,16 +1633,9 @@ class SelectorBatchPayload:
     q_is_sub: bool = False
     fast_signature: Optional[Tuple[object, ...]] = None
     capture_postprocess_job: Optional[CapturePostprocessJob] = None
-    # Explicit chunk-cohort tape provenance. Empty fields mean the legacy arena
-    # payload; a stamped chunk_cohort requires every payload in the layer group
-    # to carry one contiguous same-lane binding.
-    cohort_tape_plan_signature: str = ""
-    cohort_tape_bank: int = -1
-    cohort_tape_slot: int = -1
-    cohort_tape_lane: int = -1
+    # Explicit chunk-cohort tape provenance. Empty fields mean a ring-owned
+    # payload; a deferred request group binds one stable global request slot.
     cohort_tape_cohort_size: int = 0
-    cohort_tape_expected_group_size: int = 0
-    cohort_tape_row_start: int = -1
     cohort_tape_owner_key: object | None = None
     cohort_tape_scores_base: Optional[torch.Tensor] = None
     cohort_tape_denoms_base: Optional[torch.Tensor] = None
