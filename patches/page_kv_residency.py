@@ -91,8 +91,6 @@ class CompactMetadataBuffers:
 
 _RESERVED_IDS_ATTR = "_sfi_compact_reserved_block_ids"
 _LEASE_ATTR = "_sfi_compact_page_lease"
-_LEASE_MANIFEST_ATTR = "_sfi_compact_page_lease_manifest"
-_LEASE_MANIFEST_ENV = "VLLM_SPARSE_COMPACT_PAGE_LEASE_MANIFEST"
 _PATCHED_ATTR = "_sfi_compact_block_pool_patched"
 _ORIGINALS_ATTR = "_sfi_compact_block_pool_originals"
 _EMPTY_RESERVED_IDS: frozenset[int] = frozenset()
@@ -354,7 +352,7 @@ def _compact_lease_state(lease: Any) -> Optional[dict[str, Any]]:
 
 
 def snapshot_compact_page_block_pool_state(engine_core: Any) -> dict[str, Any]:
-    """Return actual scheduler BlockPool ownership, not a transported manifest."""
+    """Return actual scheduler BlockPool ownership, not an attached plan."""
     scheduler = getattr(engine_core, "scheduler", None)
     manager = getattr(scheduler, "kv_cache_manager", None)
     block_pool = getattr(manager, "block_pool", None)
@@ -522,62 +520,23 @@ def _same_lease(left: CompactPageLease, right: CompactPageLease) -> bool:
     return left == right
 
 
-def _lease_to_manifest(lease: CompactPageLease) -> dict[str, Any]:
-    return {
-        "kv_cache_group_id": lease.kv_cache_group_id,
-        "reserved_manager_block_ids": tuple(lease.reserved_manager_block_ids),
-        "reserve_epoch": lease.reserve_epoch,
-        "manager_block_size": lease.manager_block_size,
-        "kernel_page_size": lease.kernel_page_size,
-        "kv_cache_shape_signature": tuple(lease.kv_cache_shape_signature),
-        "compact_blocks_per_slot": lease.compact_blocks_per_slot,
-        "max_live_sparse_slots": lease.max_live_sparse_slots,
-    }
-
-
-def _lease_from_manifest(value: Mapping[str, Any]) -> CompactPageLease:
-    raw_signature = value["kv_cache_shape_signature"]
-    kv_cache_shape_signature = tuple(
-        tuple(item) if isinstance(item, (list, tuple)) else item
-        for item in raw_signature
-    )
-    return CompactPageLease(
-        kv_cache_group_id=int(value["kv_cache_group_id"]),
-        reserved_manager_block_ids=tuple(
-            int(block_id) for block_id in value["reserved_manager_block_ids"]
-        ),
-        reserve_epoch=int(value["reserve_epoch"]),
-        manager_block_size=int(value["manager_block_size"]),
-        kernel_page_size=int(value["kernel_page_size"]),
-        kv_cache_shape_signature=kv_cache_shape_signature,
-        compact_blocks_per_slot=int(value["compact_blocks_per_slot"]),
-        max_live_sparse_slots=int(value["max_live_sparse_slots"]),
-    )
-
-
 def attach_compact_page_lease(kv_cache_config: Any, lease: CompactPageLease) -> None:
     if not isinstance(lease, CompactPageLease):
         raise TypeError("lease must be CompactPageLease")
     _LEASE_BY_CONFIG_ID[id(kv_cache_config)] = (kv_cache_config, lease)
-    manifest = _lease_to_manifest(lease)
-    os.environ[_LEASE_MANIFEST_ENV] = json.dumps(manifest, sort_keys=True)
     try:
         setattr(kv_cache_config, _LEASE_ATTR, lease)
-        setattr(kv_cache_config, _LEASE_MANIFEST_ATTR, manifest)
     except AttributeError:
         pass
 
 
-def clear_compact_page_lease_transport() -> None:
+def clear_compact_page_lease_registry() -> None:
     _LEASE_BY_CONFIG_ID.clear()
-    os.environ.pop(_LEASE_MANIFEST_ENV, None)
 
 
-def _get_transported_lease(
+def _get_attached_compact_page_lease(
     kv_cache_config: Any,
     block_pool: Any = None,
-    *,
-    include_env: bool = True,
 ) -> Any:
     if kv_cache_config is not None:
         stored = _LEASE_BY_CONFIG_ID.get(id(kv_cache_config))
@@ -591,28 +550,16 @@ def _get_transported_lease(
         lease = getattr(source, _LEASE_ATTR, None)
         if lease is not None:
             return lease
-        manifest = getattr(source, _LEASE_MANIFEST_ATTR, None)
-        if manifest is not None:
-            return manifest
-    if include_env:
-        manifest_payload = os.environ.get(_LEASE_MANIFEST_ENV)
-        if manifest_payload:
-            try:
-                return json.loads(manifest_payload)
-            except json.JSONDecodeError as exc:
-                raise RuntimeError("compact page lease manifest env is not valid JSON") from exc
     return None
 
 
 def _coerce_compact_page_lease(value: Any) -> CompactPageLease:
     if isinstance(value, CompactPageLease):
         return value
-    if isinstance(value, Mapping):
-        return _lease_from_manifest(value)
-    raise TypeError("compact page lease must be CompactPageLease or manifest mapping")
+    raise TypeError("compact page lease must be CompactPageLease")
 
 
-def ensure_compact_page_lease_transport(
+def prepare_worker_compact_page_lease(
     kv_cache_config: Any,
     config: Any,
     *,
@@ -620,26 +567,35 @@ def ensure_compact_page_lease_transport(
     reserve_epoch: int = 0,
     kernel_page_size: Optional[int] = None,
 ) -> Optional[CompactPageLease]:
-    """Attach a deterministic lease manifest before BlockPool reservation exists."""
+    """Publish the deterministic worker plan before scheduler materialization.
+
+    vLLM initializes worker KV tensors before constructing the scheduler
+    BlockPool. Both sides therefore derive the same immutable tail plan from
+    their shared KV contract; this is an explicit two-phase protocol, not a
+    missing-lease fallback or a cross-process environment side channel.
+    """
     if not getattr(config, "compact_page_residency_enabled", False):
         return None
-    raw_lease = _get_transported_lease(kv_cache_config, include_env=False)
-    if raw_lease is not None:
-        return resolve_compact_page_lease(kv_cache_config, config)
-    lease = build_tail_compact_page_lease(
+    expected = build_tail_compact_page_lease(
         kv_cache_config,
         config,
         kv_cache_group_id=kv_cache_group_id,
         reserve_epoch=reserve_epoch,
         kernel_page_size=kernel_page_size,
     )
-    if lease is None:
+    if expected is None:
         return None
+    attached = _get_attached_compact_page_lease(kv_cache_config)
+    if attached is None:
+        lease = expected
+    else:
+        lease = _coerce_compact_page_lease(attached)
+        _validate_compact_page_lease_plan(lease, expected)
     attach_compact_page_lease(kv_cache_config, lease)
     return lease
 
 
-def _validate_transported_lease(
+def _validate_compact_page_lease_plan(
     lease: CompactPageLease,
     expected: CompactPageLease,
 ) -> None:
@@ -656,7 +612,7 @@ def _validate_transported_lease(
         if actual != required:
             raise RuntimeError(
                 f"compact page lease mismatch for {name}: "
-                f"transported={actual!r}, expected={required!r}"
+                f"planned={actual!r}, expected={required!r}"
             )
 
 
@@ -676,31 +632,31 @@ def _validate_lease_against_worker_kv_cache(
     kv_cache_config: Any,
     config: Any,
 ) -> None:
-    """Validate a scheduler-owned compact lease in a worker KV cache context.
+    """Validate the deterministic compact plan in a worker KV context.
 
     The scheduler BlockPool may use a bounded manager block count while the
-    worker KV tensor exposes a larger physical block capacity. The transported
-    lease is the ownership truth; the worker only verifies that it can map
-    those manager block ids into the current KV cache layout.
+    worker KV tensor exposes a larger physical block capacity. The worker
+    verifies that the shared plan maps into its layout; the scheduler later
+    materializes the same manager block ids as first-class ownership.
     """
     expected_blocks = validate_compact_page_residency_config(config)
     if expected_blocks is None:
-        raise RuntimeError("compact page lease was transported while config is disabled")
+        raise RuntimeError("compact page lease plan exists while config is disabled")
     if len(lease.reserved_manager_block_ids) != expected_blocks:
         raise RuntimeError(
             "compact page lease mismatch for reserved_manager_block_ids length: "
-            f"transported={len(lease.reserved_manager_block_ids)!r}, expected={expected_blocks!r}"
+            f"planned={len(lease.reserved_manager_block_ids)!r}, expected={expected_blocks!r}"
         )
     if int(lease.compact_blocks_per_slot) != int(getattr(config, "compact_blocks_per_slot")):
         raise RuntimeError(
             "compact page lease mismatch for compact_blocks_per_slot: "
-            f"transported={lease.compact_blocks_per_slot!r}, "
+            f"planned={lease.compact_blocks_per_slot!r}, "
             f"expected={getattr(config, 'compact_blocks_per_slot')!r}"
         )
     if int(lease.max_live_sparse_slots) != int(getattr(config, "max_live_sparse_slots")):
         raise RuntimeError(
             "compact page lease mismatch for max_live_sparse_slots: "
-            f"transported={lease.max_live_sparse_slots!r}, "
+            f"planned={lease.max_live_sparse_slots!r}, "
             f"expected={getattr(config, 'max_live_sparse_slots')!r}"
         )
 
@@ -721,12 +677,12 @@ def _validate_lease_against_worker_kv_cache(
     if int(lease.manager_block_size) != manager_block_size:
         raise RuntimeError(
             "compact page lease mismatch for manager_block_size: "
-            f"transported={lease.manager_block_size!r}, expected={manager_block_size!r}"
+            f"planned={lease.manager_block_size!r}, expected={manager_block_size!r}"
         )
     if int(lease.kernel_page_size) != manager_block_size:
         raise RuntimeError(
             "compact page lease mismatch for kernel_page_size: "
-            f"transported={lease.kernel_page_size!r}, expected={manager_block_size!r}"
+            f"planned={lease.kernel_page_size!r}, expected={manager_block_size!r}"
         )
 
     current_signature = _kv_cache_shape_signature(
@@ -747,12 +703,12 @@ def _validate_lease_against_worker_kv_cache(
         "head_size",
         "dtype",
     ):
-        transported = _signature_value(lease.kv_cache_shape_signature, key)
+        planned = _signature_value(lease.kv_cache_shape_signature, key)
         current = _signature_value(current_signature, key)
-        if transported != current:
+        if planned != current:
             raise RuntimeError(
                 f"compact page lease mismatch for kv_cache_shape_signature.{key}: "
-                f"transported={transported!r}, expected={current!r}"
+                f"planned={planned!r}, expected={current!r}"
             )
 
     num_blocks = _require_positive_int(getattr(kv_cache_config, "num_blocks"), "num_blocks")
@@ -772,11 +728,11 @@ def resolve_compact_page_lease(
     if not getattr(config, "compact_page_residency_enabled", False):
         return None
 
-    raw_lease = _get_transported_lease(kv_cache_config, block_pool)
+    raw_lease = _get_attached_compact_page_lease(kv_cache_config, block_pool)
     if raw_lease is None:
         raise RuntimeError(
             "compact page lease is missing from kv_cache_config/block_pool; "
-            "worker must not rebuild unchecked tail residency"
+            "prepare the worker plan before layer binding"
         )
     lease = _coerce_compact_page_lease(raw_lease)
     _validate_lease_against_worker_kv_cache(lease, kv_cache_config, config)
@@ -985,12 +941,12 @@ def reserve_compact_page_blocks(
     )
     if expected_lease is None:
         return None
-    transported = _get_transported_lease(kv_cache_config, include_env=False)
-    if transported is None:
+    attached = _get_attached_compact_page_lease(kv_cache_config)
+    if attached is None:
         lease = expected_lease
     else:
-        lease = _coerce_compact_page_lease(transported)
-        _validate_transported_lease(lease, expected_lease)
+        lease = _coerce_compact_page_lease(attached)
+        _validate_compact_page_lease_plan(lease, expected_lease)
 
     patch_compact_page_block_pool_methods(block_pool.__class__)
 

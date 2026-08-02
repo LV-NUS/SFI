@@ -1249,13 +1249,20 @@ def _is_vllm_dummy_run_active(controller: object | None) -> bool:
 
 
 def _mixed_page_cudagraph_config_enabled(controller: object | None) -> bool:
-    if controller is None:
-        return False
-    config = getattr(controller, "config", None)
+    config = (
+        getattr(controller, "config", None) if controller is not None else None
+    )
     return bool(
         getattr(config, "enabled", False)
         and getattr(config, "compact_page_residency_enabled", False)
     )
+
+
+def _sparse_controller_enabled(controller: object | None) -> bool:
+    config = (
+        getattr(controller, "config", None) if controller is not None else None
+    )
+    return bool(getattr(config, "enabled", False))
 
 
 def _mixed_page_full_cudagraph_replay_refresh_enabled(
@@ -1658,8 +1665,11 @@ _FLASH_METADATA_PATCHED: bool = False
 _ORIGINAL_FLASH_METADATA_BUILD = None
 _REQUEST_PATCHED: bool = False
 _ORIGINAL_APPEND_OUTPUT_TOKEN_IDS = None
-_KV_INIT_PATCHED: bool = False
+_KV_CACHE_LIFECYCLE_PATCHED: bool = False
 _ORIGINAL_INIT_KV_CACHE = None
+_INSTALLED_INIT_KV_CACHE_WRAPPER = None
+_ORIGINAL_PROFILE_CUDAGRAPH_MEMORY = None
+_INSTALLED_PROFILE_CUDAGRAPH_MEMORY_WRAPPER = None
 
 
 def load_fa3_native_contracts():
@@ -4276,7 +4286,19 @@ def _chunk_cohort_runtime_scratch_binding(
     return int(scratch_slot), int(cohort_size), int(selected_depth)
 
 
-def _prebuild_capture_buffers(runner, controller) -> None:
+def _kv_cache_generation(controller: object) -> int:
+    generation = getattr(controller, "_kv_cache_generation", None)
+    if type(generation) is not int or generation < 0:
+        raise RuntimeError("E_SFI_KV_CACHE_GENERATION_STATE")
+    return generation
+
+
+def _prebuild_capture_buffers(
+    runner,
+    controller,
+    *,
+    kv_cache_generation: int,
+) -> None:
     """Prebuild the bounded capture arena and DEFER scratch before profile work.
 
     The caller must run this before the profile ``_dummy_run``.  vLLM derives the
@@ -4289,6 +4311,14 @@ def _prebuild_capture_buffers(runner, controller) -> None:
     This remains profile-only, one-shot and fail-closed: it only fires for the
     gt1 one-shot capture config, and the live bucket stamps are written last.
     """
+    current_generation = _kv_cache_generation(controller)
+    if (
+        type(kv_cache_generation) is not int
+        or kv_cache_generation < 0
+        or kv_cache_generation != current_generation
+    ):
+        raise RuntimeError("E_SFI_CAPTURE_PREBUILD_GENERATION_DRIFT")
+
     import torch
 
     from patches.sparse_constants import (
@@ -4412,16 +4442,17 @@ def _prebuild_capture_buffers(runner, controller) -> None:
 
     # Both owners submit tiled work through one controller-owned refresh stream.
     # GPU workspace lifetime is therefore one synchronous host reservation, not
-    # the raw-scratch reuse window.  Pinned H2D sources do outlive submission;
-    # prebuild exactly one carrier per scratch generation and keep that distinct
-    # from the single large workspace.
-    ring_meta_carriers = int(_CAPTURE_REDUCE_GROUP) * int(_CAPTURE_IN_FLIGHT)
+    # the raw-scratch reuse window.  Pinned H2D sources live until their async
+    # copies complete on that stream, which may lag across a full capture chunk.
+    # Size this small host-only FIFO by chunk generations, independently of the
+    # shorter G-layer raw-scratch ring.  This is a cold-side allocation only.
+    postprocess_meta_carriers = int(_CAPTURE_CHUNK) * int(_CAPTURE_IN_FLIGHT)
     # A scratch generation may submit one last-n=1 copy plus one gt1 reduce.
     # Pair i32/i64 metadata and prebuild two carriers per generation instead
     # of retaining four shape-growing live pools.
     ring_meta_staging_resources = (
         plan_capture_postprocess_meta_staging_resources(
-            meta_carrier_count=2 * int(ring_meta_carriers),
+            meta_carrier_count=2 * int(postprocess_meta_carriers),
             num_rows_capacity=int(producer_rows_worst),
         )
     )
@@ -4434,7 +4465,7 @@ def _prebuild_capture_buffers(runner, controller) -> None:
         )
     )
     ring_tiled_resources = plan_tiled_capture_postprocess_resources(
-        meta_carrier_count=int(ring_meta_carriers),
+        meta_carrier_count=int(postprocess_meta_carriers),
         num_rows_capacity=int(producer_rows_worst),
         num_query_heads=int(num_heads),
         logical_k_capacity=int(kv_max_bucket),
@@ -4443,9 +4474,7 @@ def _prebuild_capture_buffers(runner, controller) -> None:
         # Mixed cohorts may split tiled work into as many as one submission per
         # layer.  Size pinned lifetime by scratch generations, not by cohort
         # lane count; compatible runs still coalesce onto one GPU workspace.
-        meta_carrier_count=(
-            int(_CAPTURE_CHUNK) * int(_CAPTURE_IN_FLIGHT)
-        ),
+        meta_carrier_count=int(postprocess_meta_carriers),
         num_rows_capacity=int(producer_rows_worst) * int(_CAPTURE_CHUNK),
         num_query_heads=int(num_heads),
         logical_k_capacity=int(kv_max_bucket),
@@ -4512,13 +4541,13 @@ def _prebuild_capture_buffers(runner, controller) -> None:
         int(ring_tiled_resources.submission_slot_count) != 1
         or int(cohort_tiled_resources.submission_slot_count) != 1
         or int(ring_tiled_resources.meta_carrier_count)
-        != int(ownership_plan.baseline_depth)
+        != int(postprocess_meta_carriers)
         or int(cohort_tiled_resources.meta_carrier_count)
-        != int(ownership_plan.target_depth)
+        != int(postprocess_meta_carriers)
         or int(ring_meta_staging_resources.meta_carrier_count)
-        != 2 * int(ownership_plan.baseline_depth)
+        != 2 * int(postprocess_meta_carriers)
         or int(cohort_meta_staging_resources.meta_carrier_count)
-        != 2 * int(ownership_plan.target_depth)
+        != 2 * int(postprocess_meta_carriers)
     ):
         raise RuntimeError(
             "E_SFI_CAPTURE_POSTPROCESS_OWNERSHIP: workspace or metadata "
@@ -4765,6 +4794,7 @@ def _prebuild_capture_buffers(runner, controller) -> None:
     setattr(controller, "_capture_kv_max_bucket", int(kv_max_bucket))
     setattr(controller, "_capture_last_n_bucket", int(last_n))
     setattr(controller, "_capture_rows_bucket", int(producer_rows_worst))
+    setattr(controller, "_capture_resource_generation", current_generation)
     setattr(controller, "_capture_prebuilt", True)
     # The immutable plan is the publication latch: all capacities, resources,
     # streams and cache entries above must already be resident before it exists.
@@ -4790,7 +4820,11 @@ def _run_dummy_after_profile_capture_prebuild(
         and not bool(dummy_context.get("is_graph_capturing"))
         and not bool(getattr(controller, "_capture_prebuilt", False))
     ):
-        _prebuild_capture_buffers(runner, controller)
+        _prebuild_capture_buffers(
+            runner,
+            controller,
+            kv_cache_generation=_kv_cache_generation(controller),
+        )
     return run_original()
 
 
@@ -5012,6 +5046,100 @@ def _sparse_full_cudagraph_ubatch_preflight(
 _FULL_CUDAGRAPH_REPLAY_PAYLOAD_CAPTURE_ATTR = (
     "_full_cudagraph_replay_payload_capture"
 )
+_CUDAGRAPH_MEMORY_PROFILE_OWNER_ATTR = (
+    "_sfi_cudagraph_memory_profile_owner"
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _CudagraphMemoryProfileOwner:
+    """Cold-scope token for vLLM graphs captured only to size memory."""
+
+    runner: object
+
+
+def _cudagraph_memory_profile_owner(
+    controller: object | None,
+) -> _CudagraphMemoryProfileOwner | None:
+    owner = getattr(controller, _CUDAGRAPH_MEMORY_PROFILE_OWNER_ATTR, None)
+    return owner if isinstance(owner, _CudagraphMemoryProfileOwner) else None
+
+
+def _cudagraph_memory_profile_active(controller: object | None) -> bool:
+    return _cudagraph_memory_profile_owner(controller) is not None
+
+
+def _begin_cudagraph_memory_profile(
+    *,
+    controller: object,
+    runner: object,
+) -> _CudagraphMemoryProfileOwner:
+    if getattr(controller, _CUDAGRAPH_MEMORY_PROFILE_OWNER_ATTR, None) is not None:
+        raise RuntimeError(
+            "E_SFI_CUDAGRAPH_MEMORY_PROFILE_OWNER: nested or foreign owner"
+        )
+    if getattr(
+        controller,
+        _FULL_CUDAGRAPH_REPLAY_PAYLOAD_CAPTURE_ATTR,
+        None,
+    ) is not None:
+        raise RuntimeError(
+            "E_SFI_CUDAGRAPH_MEMORY_PROFILE_OWNER: production payload capture "
+            "is already active"
+        )
+    owner = _CudagraphMemoryProfileOwner(runner=runner)
+    setattr(controller, _CUDAGRAPH_MEMORY_PROFILE_OWNER_ATTR, owner)
+    return owner
+
+
+def _end_cudagraph_memory_profile(
+    *,
+    controller: object,
+    owner: _CudagraphMemoryProfileOwner,
+) -> None:
+    current = getattr(controller, _CUDAGRAPH_MEMORY_PROFILE_OWNER_ATTR, None)
+    if current is not owner:
+        raise RuntimeError(
+            "E_SFI_CUDAGRAPH_MEMORY_PROFILE_OWNER: owner changed during profile"
+        )
+    setattr(controller, _CUDAGRAPH_MEMORY_PROFILE_OWNER_ATTR, None)
+    if getattr(
+        controller,
+        _FULL_CUDAGRAPH_REPLAY_PAYLOAD_CAPTURE_ATTR,
+        None,
+    ) is not None:
+        raise RuntimeError(
+            "E_SFI_CUDAGRAPH_MEMORY_PROFILE_OWNER: temporary profile leaked a "
+            "production payload capture"
+        )
+
+
+def _capture_resources_required(controller: object) -> bool:
+    config = getattr(controller, "config", None)
+    return bool(
+        getattr(config, "enabled", False)
+        and getattr(config, "one_shot_bootstrap_only", False)
+        and int(getattr(config, "prefill_last_n_query", 0) or 0) > 1
+        and getattr(controller, "_prefill_capture_meta_arena_enabled", False)
+    )
+
+
+def _validate_production_capture_resource_generation(controller: object) -> None:
+    """Prove the cold resource seal belongs to this production KV generation."""
+
+    if not _capture_resources_required(controller):
+        return
+    kv_generation = _kv_cache_generation(controller)
+    resource_generation = getattr(controller, "_capture_resource_generation", None)
+    if kv_generation <= 0:
+        raise RuntimeError("E_SFI_PRODUCTION_KV_GENERATION_REQUIRED")
+    if (
+        type(resource_generation) is not int
+        or resource_generation != kv_generation
+        or not bool(getattr(controller, "_capture_prebuilt", False))
+        or getattr(controller, "_capture_ownership_plan", None) is None
+    ):
+        raise RuntimeError("E_SFI_CAPTURE_RESOURCE_GENERATION_DRIFT")
 
 
 def _begin_full_cudagraph_replay_payload_capture(
@@ -5019,6 +5147,12 @@ def _begin_full_cudagraph_replay_payload_capture(
     controller: object,
     batch_descriptor: object,
 ) -> FullCudagraphReplayPayloadCapture:
+    if _cudagraph_memory_profile_active(controller):
+        raise RuntimeError(
+            "E_SFI_TEMPORARY_CUDAGRAPH_OWNER: memory-profile graphs cannot "
+            "publish production replay payloads"
+        )
+    _validate_production_capture_resource_generation(controller)
     current = getattr(
         controller,
         _FULL_CUDAGRAPH_REPLAY_PAYLOAD_CAPTURE_ATTR,
@@ -6599,6 +6733,11 @@ def _register_full_cudagraph_replay_payload_layer(
     )
     if capture is None:
         return
+    if _cudagraph_memory_profile_active(controller):
+        raise RuntimeError(
+            "E_SFI_TEMPORARY_CUDAGRAPH_OWNER: memory-profile graphs cannot "
+            "register production replay layers"
+        )
     if not isinstance(capture, FullCudagraphReplayPayloadCapture):
         raise RuntimeError(
             "FULL cudagraph replay payload capture has invalid controller owner"
@@ -10934,6 +11073,7 @@ def _patch_cuda_graph_wrapper_for_sparse_cudagraph() -> None:
         if (
             not pre_call_had_cudagraph
             and pre_call_batch_descriptor is not None
+            and not _cudagraph_memory_profile_active(controller)
         ):
             replay_payload_capture = (
                 _begin_full_cudagraph_replay_payload_capture(
@@ -11994,38 +12134,122 @@ def _patch_request_append() -> None:
 
 
 
-def _patch_initialize_kv_cache() -> None:
-    global _KV_INIT_PATCHED, _ORIGINAL_INIT_KV_CACHE
-    if _KV_INIT_PATCHED:
+def _preflight_kv_cache_lifecycle_hook_lease() -> None:
+    originals = (
+        _ORIGINAL_INIT_KV_CACHE,
+        _ORIGINAL_PROFILE_CUDAGRAPH_MEMORY,
+    )
+    wrappers = (
+        _INSTALLED_INIT_KV_CACHE_WRAPPER,
+        _INSTALLED_PROFILE_CUDAGRAPH_MEMORY_WRAPPER,
+    )
+    if not _KV_CACHE_LIFECYCLE_PATCHED:
+        if any(value is not None for value in (*originals, *wrappers)):
+            raise RuntimeError(
+                "E_SFI_KV_CACHE_LIFECYCLE_HOOK: inactive lease has state"
+            )
+        return
+    if any(value is None for value in (*originals, *wrappers)):
+        raise RuntimeError(
+            "E_SFI_KV_CACHE_LIFECYCLE_HOOK: active lease is incomplete"
+        )
+    try:
+        from vllm.v1.worker.gpu_model_runner import GPUModelRunner  # type: ignore[import]
+    except Exception as exc:
+        raise RuntimeError(
+            "E_SFI_KV_CACHE_LIFECYCLE_HOOK: vLLM interface unavailable"
+        ) from exc
+    if (
+        GPUModelRunner.initialize_kv_cache
+        is not _INSTALLED_INIT_KV_CACHE_WRAPPER
+        or GPUModelRunner.profile_cudagraph_memory
+        is not _INSTALLED_PROFILE_CUDAGRAPH_MEMORY_WRAPPER
+    ):
+        raise RuntimeError(
+            "E_SFI_KV_CACHE_LIFECYCLE_HOOK: patch lease lost"
+        )
+
+
+def _patch_kv_cache_lifecycle() -> None:
+    global _KV_CACHE_LIFECYCLE_PATCHED
+    global _ORIGINAL_INIT_KV_CACHE, _INSTALLED_INIT_KV_CACHE_WRAPPER
+    global _ORIGINAL_PROFILE_CUDAGRAPH_MEMORY
+    global _INSTALLED_PROFILE_CUDAGRAPH_MEMORY_WRAPPER
+    _preflight_kv_cache_lifecycle_hook_lease()
+    if _KV_CACHE_LIFECYCLE_PATCHED:
         return
     try:
         from vllm.v1.worker.gpu_model_runner import GPUModelRunner  # type: ignore[import]
-    except Exception:
-        _log.warning("Cannot import GPUModelRunner for initialize_kv_cache patch, skipping")
-        return
+    except Exception as exc:
+        raise RuntimeError(
+            "E_SFI_KV_CACHE_LIFECYCLE_HOOK: vLLM interface unavailable"
+        ) from exc
 
-    original_init = GPUModelRunner.initialize_kv_cache
-
-    def _is_minimal_profile_kv_cache(self, kv_cache_config) -> bool:
-        compilation_config = getattr(self, "compilation_config", None)
-        max_capture_size = int(
-            getattr(compilation_config, "max_cudagraph_capture_size", 0) or 0
+    original_init = getattr(GPUModelRunner, "initialize_kv_cache", None)
+    original_profile_cudagraph_memory = getattr(
+        GPUModelRunner,
+        "profile_cudagraph_memory",
+        None,
+    )
+    if not callable(original_init) or not callable(
+        original_profile_cudagraph_memory
+    ):
+        raise RuntimeError(
+            "E_SFI_KV_CACHE_LIFECYCLE_HOOK: required vLLM methods are missing"
         )
-        if max_capture_size <= 0:
-            return False
+
+    def _profile_cudagraph_memory_with_sparse_owner(
+        self,
+        *args,
+        **kwargs,
+    ):  # type: ignore[no-untyped-def]
+        controller = _GLOBAL_CONTROLLER or _ensure_controller()
+        if not _sparse_controller_enabled(controller):
+            return original_profile_cudagraph_memory(self, *args, **kwargs)
+        owner = _begin_cudagraph_memory_profile(
+            controller=controller,
+            runner=self,
+        )
         try:
-            return int(getattr(kv_cache_config, "num_blocks")) == max_capture_size
-        except Exception:
-            return False
+            return original_profile_cudagraph_memory(self, *args, **kwargs)
+        finally:
+            _end_cudagraph_memory_profile(
+                controller=controller,
+                owner=owner,
+            )
 
     def _patched_initialize_kv_cache(self, kv_cache_config):  # type: ignore[override]
-        result = original_init(self, kv_cache_config)
         controller = _GLOBAL_CONTROLLER or _ensure_controller()
         if controller is None:
+            return original_init(self, kv_cache_config)
+        profile_owner = _cudagraph_memory_profile_owner(controller)
+        if profile_owner is not None:
+            if profile_owner.runner is not self:
+                raise RuntimeError(
+                    "E_SFI_CUDAGRAPH_MEMORY_PROFILE_OWNER: KV cache initialized "
+                    "by a foreign runner"
+                )
+
+        # initialize_kv_cache is the authoritative KV-generation boundary.
+        # Retire the previous generation before vLLM replaces its tensors; do
+        # not infer ownership from incidental layer/request container contents.
+        # This is startup-only and deliberately keeps replay free of lifecycle
+        # probes, synchronization, allocation, or fallback.
+        kv_cache_generation = controller.begin_kv_cache_generation()
+        result = original_init(self, kv_cache_config)
+
+        if profile_owner is not None:
+            # vLLM owns this minimal KV cache only long enough to measure and
+            # then destroy disposable graphs.  It must not publish production
+            # layer, lease, or replay-payload identities.  Persistent SFI
+            # resources are rebuilt now so both the profile peak and temporary
+            # captures observe the exact production overlap.
+            _prebuild_capture_buffers(
+                self,
+                controller,
+                kv_cache_generation=kv_cache_generation,
+            )
             return result
-        # 初始化 KV cache 时，清理可能残留的跨 engine 状态，避免 slot/prefill 污染
-        if controller.layer_states or controller.request_states:
-            controller.reset_for_new_engine()
         try:
             from vllm.model_executor.models.utils import extract_layer_index  # type: ignore[import]
         except Exception as exc:
@@ -12034,25 +12258,13 @@ def _patch_initialize_kv_cache() -> None:
             ) from exc
         from patches.page_kv_residency import (
             bind_compact_page_residency_to_layer,
-            ensure_compact_page_lease_transport,
-            resolve_compact_page_lease,
+            prepare_worker_compact_page_lease,
         )
 
-        try:
-            lease = resolve_compact_page_lease(kv_cache_config, controller.config)
-        except RuntimeError as exc:
-            if (
-                getattr(controller.config, "compact_page_residency_enabled", False)
-                and _is_minimal_profile_kv_cache(self, kv_cache_config)
-            ):
-                return result
-            if "compact page lease is missing" in str(exc):
-                lease = ensure_compact_page_lease_transport(
-                    kv_cache_config,
-                    controller.config,
-                )
-            else:
-                raise
+        lease = prepare_worker_compact_page_lease(
+            kv_cache_config,
+            controller.config,
+        )
         try:
             forward_ctx = getattr(self.compilation_config, "static_forward_context", None)
             if not forward_ctx:
@@ -12060,9 +12272,19 @@ def _patch_initialize_kv_cache() -> None:
                     raise RuntimeError(
                         "compact page residency requires static_forward_context"
                     )
-                return result
+                forward_ctx = {}
             cache_key_to_layer_idx: Dict[int, int] = {}
-            layer_infos: List[Tuple[int, int, int, torch.device, Optional[int], torch.dtype, int, torch.Tensor]] = []
+            layer_info_by_cache_key: Dict[
+                int,
+                Tuple[
+                    int,
+                    int,
+                    torch.device,
+                    Optional[int],
+                    torch.dtype,
+                    torch.Tensor,
+                ],
+            ] = {}
             for layer_name, attn in forward_ctx.items():
                 kv_cache = _first_kv_cache_tensor(getattr(attn, "kv_cache", None))
                 if not isinstance(kv_cache, torch.Tensor):
@@ -12084,23 +12306,6 @@ def _patch_initialize_kv_cache() -> None:
                             "compact page residency requires attention head metadata"
                         )
                     continue
-                if cache_key not in controller.layer_states:
-                    state = controller._register_layer(
-                        cache_key,
-                        int(num_heads),
-                        int(num_kv_heads),
-                        key_cache.device,
-                        head_dim=int(head_dim) if head_dim is not None else None,
-                        kv_cache_dtype=key_cache.dtype,
-                    )
-                    state.kv_cache_dtype = key_cache.dtype
-                else:
-                    state = controller.layer_states.get(cache_key)
-                    if state is not None:
-                        if state.head_dim is None and head_dim is not None:
-                            state.head_dim = int(head_dim)
-                        if state.kv_cache_dtype is None:
-                            state.kv_cache_dtype = key_cache.dtype
                 try:
                     layer_idx = int(extract_layer_index(layer_name))
                 except Exception as exc:
@@ -12111,19 +12316,14 @@ def _patch_initialize_kv_cache() -> None:
                 prev = cache_key_to_layer_idx.get(cache_key)
                 if prev is None or layer_idx < prev:
                     cache_key_to_layer_idx[cache_key] = layer_idx
-
-                layer_infos.append(
-                    (
-                        cache_key,
+                    layer_info_by_cache_key[cache_key] = (
                         int(num_heads),
                         int(num_kv_heads),
                         key_cache.device,
                         int(head_dim) if head_dim is not None else None,
                         key_cache.dtype,
-                        int(layer_idx),
                         kv_cache,
                     )
-                )
 
             if lease is not None and not cache_key_to_layer_idx:
                 raise RuntimeError(
@@ -12132,32 +12332,25 @@ def _patch_initialize_kv_cache() -> None:
             if cache_key_to_layer_idx:
                 ordered = sorted(cache_key_to_layer_idx.items(), key=lambda x: x[1])
                 new_keys = [key for key, _ in ordered]
-                if controller.layer_cache_keys and set(new_keys) != set(controller.layer_cache_keys):
-                    controller.reset_for_new_engine()
-                for cache_key, num_heads, num_kv_heads, device, head_dim, dtype, _, kv_cache in layer_infos:
-                    if cache_key not in controller.layer_states:
-                        state = controller._register_layer(
-                            cache_key,
-                            num_heads,
-                            num_kv_heads,
-                            device,
-                            head_dim=head_dim,
-                            kv_cache_dtype=dtype,
-                        )
-                        state.kv_cache_dtype = dtype
-                    else:
-                        state = controller.layer_states.get(cache_key)
-                        if state is not None:
-                            if state.head_dim is None and head_dim is not None:
-                                state.head_dim = int(head_dim)
-                            if state.kv_cache_dtype is None:
-                                state.kv_cache_dtype = dtype
+                for cache_key in new_keys:
+                    (
+                        num_heads,
+                        num_kv_heads,
+                        device,
+                        head_dim,
+                        dtype,
+                        kv_cache,
+                    ) = layer_info_by_cache_key[cache_key]
+                    state = controller._register_layer(
+                        cache_key,
+                        num_heads,
+                        num_kv_heads,
+                        device,
+                        head_dim=head_dim,
+                        kv_cache_dtype=dtype,
+                    )
+                    state.kv_cache_dtype = dtype
                     if lease is not None:
-                        state = controller.layer_states.get(cache_key)
-                        if state is None:
-                            raise RuntimeError(
-                                "compact page residency layer state missing after registration"
-                            )
                         bind_compact_page_residency_to_layer(
                             state,
                             kv_cache,
@@ -12166,7 +12359,9 @@ def _patch_initialize_kv_cache() -> None:
                             lease=lease,
                         )
                 controller.layer_cache_keys = new_keys
-                controller.layer_index_by_cache_key = {key: idx for idx, key in enumerate(new_keys)}
+                controller.layer_index_by_cache_key = {
+                    key: idx for idx, key in enumerate(new_keys)
+                }
                 controller.step_decode_data = None
                 controller.step_decode_cache_key = None
                 controller._step_decode_spec_key = None
@@ -12176,11 +12371,28 @@ def _patch_initialize_kv_cache() -> None:
                 "initialize_kv_cache sparse layer discovery failed; "
                 f"refuse silent skip: {type(exc).__name__}: {exc}"
             ) from exc
+        # Publish every persistent capture resource only after the real KV
+        # layer identities are complete.  This is the cold production seal
+        # consumed allocation-free by capture and replay.  Keep prebuild errors
+        # precise instead of mislabeling them as layer-discovery failures.
+        _prebuild_capture_buffers(
+            self,
+            controller,
+            kv_cache_generation=kv_cache_generation,
+        )
         return result
 
     GPUModelRunner.initialize_kv_cache = _patched_initialize_kv_cache  # type: ignore[assignment]
+    GPUModelRunner.profile_cudagraph_memory = (  # type: ignore[assignment]
+        _profile_cudagraph_memory_with_sparse_owner
+    )
     _ORIGINAL_INIT_KV_CACHE = original_init
-    _KV_INIT_PATCHED = True
+    _INSTALLED_INIT_KV_CACHE_WRAPPER = _patched_initialize_kv_cache
+    _ORIGINAL_PROFILE_CUDAGRAPH_MEMORY = original_profile_cudagraph_memory
+    _INSTALLED_PROFILE_CUDAGRAPH_MEMORY_WRAPPER = (
+        _profile_cudagraph_memory_with_sparse_owner
+    )
+    _KV_CACHE_LIFECYCLE_PATCHED = True
 
 
 def _patch_compact_page_residency_core() -> None:
@@ -12260,12 +12472,9 @@ def _restore_compact_page_residency_core_patch() -> None:
     _ORIGINAL_BLOCK_POOL_METHODS = None
     _COMPACT_PAGE_BLOCK_POOL_CLS = None
     _COMPACT_PAGE_KV_CACHE_MANAGER_CLS = None
-    try:
-        from patches.page_kv_residency import clear_compact_page_lease_transport
+    from patches.page_kv_residency import clear_compact_page_lease_registry
 
-        clear_compact_page_lease_transport()
-    except Exception:
-        _log.error("Failed to clear compact page lease transport", exc_info=True)
+    clear_compact_page_lease_registry()
 
 
 def _preflight_controller_hook_leases() -> None:
@@ -12310,6 +12519,7 @@ def _preflight_controller_hook_leases() -> None:
     _preflight_update_states_hook_lease()
     _preflight_batch_execution_admission_hook_lease()
     _preflight_async_sampled_token_stash_hook_lease()
+    _preflight_kv_cache_lifecycle_hook_lease()
 
 
 def _set_controller(config: SparseControllerConfig) -> "VLLMSparseController":
@@ -12325,7 +12535,7 @@ def _set_controller(config: SparseControllerConfig) -> "VLLMSparseController":
     _patch_model_forward_refresh_owner()
     _patch_request_append()
     _install_async_sampled_token_stash()
-    _patch_initialize_kv_cache()
+    _patch_kv_cache_lifecycle()
     return controller
 
 def _ensure_controller() -> Optional["VLLMSparseController"]:
@@ -15121,7 +15331,10 @@ def disable_vllm_sparse_patch() -> None:
     global _DUMMY_RUN_PATCHED, _ORIGINAL_DUMMY_RUN
     global _FLASH_METADATA_PATCHED, _ORIGINAL_FLASH_METADATA_BUILD
     global _REQUEST_PATCHED, _ORIGINAL_APPEND_OUTPUT_TOKEN_IDS
-    global _KV_INIT_PATCHED, _ORIGINAL_INIT_KV_CACHE
+    global _KV_CACHE_LIFECYCLE_PATCHED
+    global _ORIGINAL_INIT_KV_CACHE, _INSTALLED_INIT_KV_CACHE_WRAPPER
+    global _ORIGINAL_PROFILE_CUDAGRAPH_MEMORY
+    global _INSTALLED_PROFILE_CUDAGRAPH_MEMORY_WRAPPER
     global _UBATCH_WRAPPER_PATCHED, _ORIGINAL_UBATCH_WRAPPER_CALL
     global _CUDAGRAPH_WRAPPER_PATCHED, _ORIGINAL_CUDAGRAPH_WRAPPER_CALL
     global _MODEL_FORWARD_REFRESH_OWNER_PATCHED
@@ -15323,13 +15536,22 @@ def disable_vllm_sparse_patch() -> None:
             raise
     _REQUEST_PATCHED = False
     _ORIGINAL_APPEND_OUTPUT_TOKEN_IDS = None
-    if _KV_INIT_PATCHED and _ORIGINAL_INIT_KV_CACHE is not None:
+    if _KV_CACHE_LIFECYCLE_PATCHED:
         try:
             from vllm.v1.worker.gpu_model_runner import GPUModelRunner  # type: ignore[import]
+
             GPUModelRunner.initialize_kv_cache = _ORIGINAL_INIT_KV_CACHE  # type: ignore[assignment]
+            GPUModelRunner.profile_cudagraph_memory = (  # type: ignore[assignment]
+                _ORIGINAL_PROFILE_CUDAGRAPH_MEMORY
+            )
         except Exception:
-            _log.error("Failed to restore initialize_kv_cache during patch uninstall")
+            _log.error(
+                "Failed to restore KV cache lifecycle during patch uninstall"
+            )
             raise
-    _KV_INIT_PATCHED = False
+    _KV_CACHE_LIFECYCLE_PATCHED = False
     _ORIGINAL_INIT_KV_CACHE = None
+    _INSTALLED_INIT_KV_CACHE_WRAPPER = None
+    _ORIGINAL_PROFILE_CUDAGRAPH_MEMORY = None
+    _INSTALLED_PROFILE_CUDAGRAPH_MEMORY_WRAPPER = None
     _restore_compact_page_residency_core_patch()

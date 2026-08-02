@@ -320,7 +320,7 @@ class RefreshRebuildMixin:
         self._refresh_producer_split_release_counts_by_handle: Dict[int, int] = {}
 
     def _reset_writer_graph_engine_state(self) -> None:
-        """Drop writer graphs and their capture-stream owner at engine reset."""
+        """Drop writer graphs and capture-stream owner at a KV generation boundary."""
         if self._pending_refresh_grouped_async_records is not None:
             raise RuntimeError(
                 "engine graph reset requires grouped async records to be aborted"
@@ -620,7 +620,8 @@ class RefreshRebuildMixin:
         """[SELECTED-OUT-RING] 释放 pending 占用的环槽(幂等:属性置 None 防
         重入双释放)。writer_done_event 作为消费序存入槽,下任 acquire 在其
         run 流上补 wait。调用面=终局漏斗 _pending_refresh_rebuild_clear+两个
-        绕过 clear 的整批丢弃点(release_idle_buffers / reset_for_new_engine)
+        绕过 clear 的整批丢弃点(release_idle_buffers /
+        begin_kv_cache_generation)
         +[RING-RELEASE-ON-WRITER-SUBMIT 2026-07-10] 三个 writer_done_event
         record 点的前移释放(默认档/grouped envelope/split writer):writer 已
         提交且事件已 record ⇒ 槽 buffer 的全部 GPU 消费序已凝固为事件(下任

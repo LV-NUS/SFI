@@ -206,16 +206,33 @@ class FullCudagraphReplayPayloadRegistry:
         layer_index_i = int(layer_index)
         graph_batch_size_i = int(graph_batch_size)
         num_actual_tokens_i = int(num_actual_tokens)
-        if (
-            capture_generation_i <= 0
-            or capture_generation_i != self._capture_generation
-            or cache_key_i <= 0
-            or layer_index_i < 0
-            or graph_batch_size_i <= 0
-            or num_actual_tokens_i <= 0
-        ):
+        if capture_generation_i <= 0:
             raise RuntimeError(
-                "FULL cudagraph replay payload capture has invalid identity"
+                "E_SFI_FULL_CUDAGRAPH_CAPTURE_GENERATION: generation must be "
+                "positive"
+            )
+        if capture_generation_i != self._capture_generation:
+            raise RuntimeError(
+                "E_SFI_FULL_CUDAGRAPH_CAPTURE_GENERATION: stale generation"
+            )
+        if cache_key_i <= 0:
+            raise RuntimeError(
+                "E_SFI_FULL_CUDAGRAPH_CACHE_IDENTITY: cache pointer must be "
+                "positive"
+            )
+        if layer_index_i < 0:
+            raise RuntimeError(
+                "E_SFI_FULL_CUDAGRAPH_LAYER_IDENTITY: layer index is missing"
+            )
+        if graph_batch_size_i <= 0:
+            raise RuntimeError(
+                "E_SFI_FULL_CUDAGRAPH_BATCH_IDENTITY: graph batch size must be "
+                "positive"
+            )
+        if num_actual_tokens_i <= 0:
+            raise RuntimeError(
+                "E_SFI_FULL_CUDAGRAPH_TOKEN_IDENTITY: actual token count must be "
+                "positive"
             )
 
         key_cache_t = _require_tensor(key_cache, name="key_cache", rank=4)

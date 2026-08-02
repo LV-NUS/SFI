@@ -878,8 +878,8 @@ def _build_layer_step_cache(
 # -----------------------------------------------------------------------------
 
 
-def _retire_vllm_cudagraphs_for_engine_reset() -> None:
-    """Retire vLLM's graph owner before controller-side bindings are dropped."""
+def _retire_vllm_cudagraphs_for_kv_generation() -> None:
+    """Retire vLLM graphs before their KV generation bindings are dropped."""
     try:
         from vllm.compilation.cuda_graph import CUDAGraphWrapper
     except ModuleNotFoundError as exc:
@@ -893,7 +893,7 @@ def _retire_vllm_cudagraphs_for_engine_reset() -> None:
     )
     if not callable(clear_all_graphs):
         raise RuntimeError(
-            "engine graph reset requires CUDAGraphWrapper.clear_all_graphs"
+            "KV generation transition requires CUDAGraphWrapper.clear_all_graphs"
         )
     clear_all_graphs()
 
@@ -1076,6 +1076,13 @@ class VLLMSparseController(
         self._full_cudagraph_replay_payload_capture: Optional[
             FullCudagraphReplayPayloadCapture
         ] = None
+        # Set only by vLLM's disposable CUDA-graph memory profiling scope.
+        # KV generation changes intentionally leave the outer cold owner intact.
+        self._sfi_cudagraph_memory_profile_owner: object | None = None
+        # initialize_kv_cache is the only publisher of positive generations.
+        # Generation 0 belongs to the pre-KV memory-profile dummy run.
+        self._kv_cache_generation: int = 0
+        self._capture_resource_generation: int = -1
         # step 级调度计划（用于 per-layer 入口零逻辑）
         self.step_dispatch_plan: Optional[StepDispatchPlan] = None
         self._runtime_state: StepRuntimeState = StepRuntimeState()
@@ -2787,23 +2794,27 @@ class VLLMSparseController(
         self._vllm_dummy_run_depth = 0
         self._vllm_dummy_run_context = None
 
-    def reset_for_new_engine(self) -> None:
-        """重置与 engine/kv-cache 绑定的状态，避免跨 engine 污染。"""
+    def begin_kv_cache_generation(self) -> int:
+        """Retire the prior KV owner and publish one new cold generation."""
+        current_generation = self._kv_cache_generation
+        if type(current_generation) is not int or current_generation < 0:
+            raise RuntimeError("E_SFI_KV_CACHE_GENERATION_STATE")
+        next_generation = current_generation + 1
         if torch.cuda.is_available():
             if bool(torch.cuda.is_current_stream_capturing()):
                 raise RuntimeError(
-                    "engine graph resources cannot reset during CUDA graph capture"
+                    "KV generation cannot change during CUDA graph capture"
                 )
-            # Engine replacement is a cold lifecycle boundary.  Drain once
+            # KV replacement is a cold lifecycle boundary.  Drain once
             # before dropping graph objects, ready events, stable pointer
             # arrays, and ring slots; no replay hot path pays this cost.
             torch.cuda.synchronize()
         # The graph object and its payload registry are one ownership unit.
         # Retiring only the controller binding would leave vLLM free to replay
         # a graph captured against the old KV cache.
-        _retire_vllm_cudagraphs_for_engine_reset()
+        _retire_vllm_cudagraphs_for_kv_generation()
         self._reset_deferred_bootstrap_launch_state(
-            reason="engine reset retired deferred producer launch",
+            reason="KV generation transition retired deferred producer launch",
         )
         if self._pending_refresh_grouped_async_records is not None:
             self._abort_pending_refresh_grouped_async_envelope()
@@ -2915,7 +2926,8 @@ class VLLMSparseController(
             self.step_refresh_capture_layout_ring[idx] = None
         self._reset_engine_graph_resources()
         # profile-time capture 发布物与本 engine 的 refresh stream 绑定。跨
-        # engine/KV-cache 边界不能只重建 stream 而保留 tape/plan/seal，否则
+        # KV-cache generation 边界不能只重建 stream 而保留
+        # tape/plan/seal，否则
         # 下一次 profile 会复用旧 stream identity 或跳过 prebuild。这里仅
         # 失效发布状态；已分配的通用 scratch/arena 仍由 profile 按新几何复用。
         self._capture_cohort_tape_state = None
@@ -2926,6 +2938,7 @@ class VLLMSparseController(
         self._capture_last_n_bucket = 0
         self._capture_rows_bucket = 0
         self._capture_prebuilt = False
+        self._capture_resource_generation = -1
         self._capture_ownership_plan = None
         self._ring_war_fence = None
         self.refresh_stream = None
@@ -2963,6 +2976,8 @@ class VLLMSparseController(
         self._prefill_i32_handle_generation = -1
         self._prefill_log_f_stride_head = 0
         self._set_unified_attention_mode("default")
+        self._kv_cache_generation = next_generation
+        return next_generation
 
     def _maybe_build_step_prefill_global_meta_from_metadata(
         self,
