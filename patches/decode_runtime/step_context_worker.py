@@ -773,16 +773,16 @@ def prepare_step_context_impl(
                 prefill_active = True
                 has_prefill_by_prompt = True
 
-            # [RESUME-STATE-RESET 2026-07-03] 已 bootstrap 的请求回到 prompt 中
-            # 段=preempt 后 RECOMPUTE 重算(抢占不进 finished_req_ids,清理链对
-            # 其 no-op,旧压缩状态原样留在同 slot)。在 boot 读取前重置:压缩状
-            # 态清零+bootstrap_done=False,重算即重新 bootstrap;判据自灭天然
-            # once,黄金档(无抢占)不可达零扰动。
+            # A request that already reached either bootstrap terminal state
+            # (ready) or physical-owner state (pending) and then returns to the
+            # prompt is a preempted RECOMPUTE resume.  ``bootstrap_done`` alone
+            # misses the deferred bridge window: its old producer can still own
+            # compact-slot writes while logical readiness is false.  Check
+            # prompt geometry first so steady decode adds no owner-state read.
             if (
-                tracking is not None
-                and bool(getattr(tracking, "bootstrap_done", False))
-                and prompt_len > 0
+                prompt_len > 0
                 and computed < prompt_len
+                and (tracking.bootstrap_done or tracking.bootstrap_pending)
             ):
                 self._reset_request_sparse_state_for_resume(rid, tracking)
 

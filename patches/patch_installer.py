@@ -47,7 +47,6 @@ from patches.sparse_types import SparseControllerConfig, StepContext, StepTicket
 from patches.step_authority import StepAuthority
 from patches.tp_contract import E_TP_INPUT_CONTRACT, ensure_tp_prompt_lengths, validate_tp_input_contract
 from patches.controller_mixins.refresh_rebuild_mixin import (
-    _mark_pending_selected_scope_terminal,
     _pending_refresh_rebuild_matches_current_target_scope,
 )
 from patches.fa3_native.compact_recent_contract import (
@@ -7696,6 +7695,15 @@ def _wait_replay_refresh_selectors_before_full_cudagraph_replay(
 
     compact_consume_req_ids: set[str] | None = None
 
+    def _require_pending_terminal_op(name: str):
+        operation = getattr(controller, str(name), None)
+        if not callable(operation):
+            raise RuntimeError(
+                "full cudagraph replay requires the unified pending terminal "
+                f"contract operation {name!r}"
+            )
+        return operation
+
     def _current_compact_consume_req_ids() -> set[str]:
         nonlocal compact_consume_req_ids
         if compact_consume_req_ids is not None:
@@ -7724,35 +7732,23 @@ def _wait_replay_refresh_selectors_before_full_cudagraph_replay(
         is_latest = getattr(controller, "_pending_refresh_rebuild_is_latest", None)
         if not callable(is_latest) or bool(is_latest(item)):
             return False
-        drop_pending = getattr(controller, "_drop_pending_refresh_rebuild", None)
-        if callable(drop_pending):
-            remaining_pending = tuple(
-                other
-                for other in controller._pending_refresh_rebuilds
-                if other is not item
+        drop_pending = _require_pending_terminal_op(
+            "_drop_pending_refresh_rebuild"
+        )
+        remaining_pending = tuple(
+            other
+            for other in tuple(
+                getattr(controller, "_pending_refresh_rebuilds", tuple())
             )
-            drop_pending(
-                item,
-                status="drop_non_latest",
-                lease_reason="pending_rebuild_drop_non_latest_full_cudagraph_replay",
-                remaining_pending=remaining_pending,
-                wait_recorded_work=False,
-            )
-        else:
-            _mark_pending_selected_scope_terminal(
-                item,  # type: ignore[arg-type]
-                status="drop_non_latest",
-            )
-            drop_req_ids = tuple(controller._pending_refresh_rebuild_drop_req_ids(item))
-            if drop_req_ids:
-                controller._resolve_refresh_lease(
-                    req_ids=drop_req_ids,
-                    reason="pending_rebuild_drop_non_latest_full_cudagraph_replay",
-                    publish_key=controller._pending_refresh_rebuild_publish_key(
-                        item
-                    ),
-                )
-            controller._pending_refresh_rebuild_clear(item)
+            if other is not item
+        )
+        drop_pending(
+            item,
+            status="drop_non_latest",
+            lease_reason="pending_rebuild_drop_non_latest_full_cudagraph_replay",
+            remaining_pending=remaining_pending,
+            wait_recorded_work=False,
+        )
         completed_item_ids.add(id(item))
         return True
 
@@ -7837,36 +7833,35 @@ def _wait_replay_refresh_selectors_before_full_cudagraph_replay(
         # wait-phase locals: writer_ready_items, completed_item_ids, pending,
         # writer_done_bufs, uncovered_bufs.
         if writer_ready_items:
-            publish_read_side = (
-                controller._publish_pending_refresh_rebuild_read_side
+            publish_read_side = _require_pending_terminal_op(
+                "_publish_pending_refresh_rebuild_read_side"
             )
-            mark_accepted = controller._mark_pending_refresh_rebuild_accepted
-            clear_pending = controller._pending_refresh_rebuild_clear
-            is_latest = controller._pending_refresh_rebuild_is_latest
-
-            def _resolve_writer_ready_drop(item: object, *, reason: str) -> None:
-                req_ids = tuple(controller._pending_refresh_rebuild_drop_req_ids(item))
-                if not req_ids:
-                    return
-                controller._resolve_refresh_lease(
-                    req_ids=req_ids,
-                    reason=str(reason),
-                    publish_key=controller._pending_refresh_rebuild_publish_key(
-                        item
-                    ),
-                )
+            mark_accepted = _require_pending_terminal_op(
+                "_mark_pending_refresh_rebuild_accepted"
+            )
+            clear_pending = _require_pending_terminal_op(
+                "_pending_refresh_rebuild_clear"
+            )
+            is_latest = _require_pending_terminal_op(
+                "_pending_refresh_rebuild_is_latest"
+            )
+            drop_pending = _require_pending_terminal_op(
+                "_drop_pending_refresh_rebuild"
+            )
 
             for item in writer_ready_items:
                 if not bool(is_latest(item)):
-                    _mark_pending_selected_scope_terminal(
-                        item,  # type: ignore[arg-type]
-                        status="drop_non_latest",
-                    )
-                    _resolve_writer_ready_drop(
+                    drop_pending(
                         item,
-                        reason="pending_rebuild_drop_non_latest_full_cudagraph_replay",
+                        status="drop_non_latest",
+                        lease_reason=(
+                            "pending_rebuild_drop_non_latest_full_cudagraph_replay"
+                        ),
+                        remaining_pending=tuple(
+                            other for other in pending if other is not item
+                        ),
+                        wait_recorded_work=False,
                     )
-                    clear_pending(item)
                     completed_item_ids.add(id(item))
                     continue
                 publish_read_side(item)
@@ -7874,8 +7869,15 @@ def _wait_replay_refresh_selectors_before_full_cudagraph_replay(
                 clear_pending(item)
                 completed_item_ids.add(id(item))
         if completed_item_ids:
-            controller._pending_refresh_rebuilds = deque(
-                item for item in pending if id(item) not in completed_item_ids
+            setattr(
+                controller,
+                "_pending_refresh_rebuilds",
+                deque(
+                    item for item in pending if id(item) not in completed_item_ids
+                ),
+            )
+            remaining_pending = tuple(
+                getattr(controller, "_pending_refresh_rebuilds", tuple())
             )
             clearable_writer_done_bufs: set[int] = set()
             for item in writer_ready_items:
@@ -7887,7 +7889,7 @@ def _wait_replay_refresh_selectors_before_full_cudagraph_replay(
                         clearable_writer_done_bufs.add(buf)
             clearable_writer_done_bufs.difference_update(uncovered_bufs)
             if clearable_writer_done_bufs:
-                for item in controller._pending_refresh_rebuilds:
+                for item in remaining_pending:
                     for raw_buf in pending_buf_ids(item):
                         buf = int(raw_buf)
                         if buf >= 0:
@@ -7960,20 +7962,34 @@ def _wait_pending_async_refresh_before_full_cudagraph_replay(
             "_mixed_page_full_cudagraph_last_selector_writer_submit_summary",
             None,
         )
-    if pending_queue and bool(controller._refresh_producer_stream_release_pending):
+    if pending_queue and bool(
+        getattr(controller, "_refresh_producer_stream_release_pending", False)
+    ):
         step_authority = _full_cudagraph_current_step_authority(controller)
         handle_id = int(getattr(step_authority, "step_handle_id", -1) or -1)
         if handle_id <= 0:
             step_context = getattr(controller, "step_context", None)
             handle_id = int(getattr(step_context, "step_handle_id", -1) or -1)
         if handle_id > 0:
-            force_req_ids = tuple(
+            force_consume_req_ids = tuple(
                 sorted(
                     _current_compact_consume_req_ids_for_full_cudagraph_replay(
                         controller
                     )
                 )
             )
+            force_consume_req_id_set = set(force_consume_req_ids)
+            force_pending_items = tuple(
+                item
+                for item in tuple(pending_queue)
+                if force_consume_req_id_set.intersection(
+                    str(req_id)
+                    for req_id in tuple(
+                        getattr(item, "req_ids", tuple()) or tuple()
+                    )
+                )
+            )
+            force_pending_object_ids = tuple(id(item) for item in force_pending_items)
             submit_debug: list[dict[str, object]] | None = (
                 [] if collect_submit_diagnostics else None
             )
@@ -7985,16 +8001,38 @@ def _wait_pending_async_refresh_before_full_cudagraph_replay(
             pending_before = (
                 int(len(pending_queue)) if collect_submit_diagnostics else 0
             )
-            submitted = int(controller._submit_due_selector_prepared_refresh_writers(
+            submit_due_writers = getattr(
+                controller,
+                "_submit_due_selector_prepared_refresh_writers",
+                None,
+            )
+            if not callable(submit_due_writers):
+                raise RuntimeError(
+                    "full cudagraph replay requires the selector-writer release owner"
+                )
+            submitted_result = submit_due_writers(
                 handle_id=handle_id,
-                force_req_ids=force_req_ids,
-            ))
-            pending_queue = controller._pending_refresh_rebuilds
+                force_pending_object_ids=force_pending_object_ids,
+            )
+            if type(submitted_result) is not int or submitted_result < 0:
+                raise RuntimeError(
+                    "selector-writer release owner returned an invalid submit count"
+                )
+            submitted = int(submitted_result)
+            pending_queue = getattr(
+                controller,
+                "_pending_refresh_rebuilds",
+                tuple(),
+            )
             submit_summary = None
             if collect_submit_diagnostics:
                 submit_summary = {
                     "handle_id": int(handle_id),
-                    "force_req_ids": list(force_req_ids),
+                    "force_consume_req_ids": list(force_consume_req_ids),
+                    "force_pending_ids": [
+                        int(getattr(item, "pending_id", -1))
+                        for item in force_pending_items
+                    ],
                     "pending_before": int(pending_before),
                     "pending_after": int(len(tuple(pending_queue))),
                     "submitted": int(submitted),
@@ -9606,6 +9644,13 @@ def _enqueue_full_cudagraph_refresh_payloads_after_replay(
                             0,
                         )
                     ).bit_count(),
+                    "refresh_publish_retired_layers": int(
+                        getattr(
+                            tracking,
+                            "refresh_publish_retired_layer_mask",
+                            0,
+                        )
+                    ).bit_count(),
                     "refresh_publish_sealed": bool(
                         getattr(tracking, "refresh_publish_sealed", False)
                     ),
@@ -10433,6 +10478,9 @@ def _patch_model_forward_refresh_owner() -> None:
                 "model-forward refresh owner does not support nested entry"
             )
         staged_intents = ()
+        take_staged_intents: Any = None
+        drain_staged_intents: Any = None
+        fail_staged_intents: Any = None
         if getattr(controller, "_deferred_bootstrap_launch_intents", None):
             take_staged_intents = getattr(
                 controller,
@@ -10463,86 +10511,105 @@ def _patch_model_forward_refresh_owner() -> None:
             staged_intents = tuple(take_staged_intents())
         setattr(controller, active_attr, True)
         try:
-            result = original_model_forward(self, *args, **kwargs)
-        except Exception as exc:
+            try:
+                result = original_model_forward(self, *args, **kwargs)
+            except Exception as exc:
+                setattr(controller, ready_attr, None)
+                if staged_intents:
+                    assert callable(fail_staged_intents)
+                    fail_staged_intents(
+                        staged_intents,
+                        reason=(
+                            "model forward failed before deferred producer "
+                            f"drain: {exc}"
+                        ),
+                    )
+                raise
+
+            ready = getattr(controller, ready_attr, None)
             setattr(controller, ready_attr, None)
-            setattr(controller, active_attr, False)
+            deferred_launch_count = 0
             if staged_intents:
-                assert callable(fail_staged_intents)
-                fail_staged_intents(
-                    staged_intents,
-                    reason=f"model forward failed before deferred producer drain: {exc}"
+                assert callable(drain_staged_intents)
+                deferred_launch_result = drain_staged_intents(
+                    intents=staged_intents
                 )
-            raise
-        setattr(controller, active_attr, False)
-        ready = getattr(controller, ready_attr, None)
-        setattr(controller, ready_attr, None)
-        deferred_launch_count = 0
-        if staged_intents:
-            assert callable(drain_staged_intents)
-            deferred_launch_count = int(
-                drain_staged_intents(intents=staged_intents)
-            )
-        if not isinstance(ready, dict):
-            return result
+                if (
+                    type(deferred_launch_result) is not int
+                    or deferred_launch_result < 0
+                ):
+                    raise RuntimeError(
+                        "deferred producer drain returned an invalid launch count"
+                    )
+                deferred_launch_count = deferred_launch_result
+            if not isinstance(ready, dict):
+                return result
 
-        current_identity = _current_model_forward_refresh_identity(
-            controller,
-            stage="model-forward refresh owner completion",
-        )
-        ready_identity = tuple(ready.get("identity", ()))
-        if ready_identity != current_identity:
-            raise RuntimeError(
-                "model-forward refresh owner identity mismatch: "
-                f"ready={ready_identity!r} current={current_identity!r}"
-            )
-
-        refresh_enabled = _mixed_page_full_cudagraph_replay_refresh_enabled(
-            controller
-        )
-        if not refresh_enabled:
-            raise RuntimeError(
-                "model-forward refresh generation was marked while refresh is disabled"
-            )
-        profile_path = _full_cudagraph_hook_profile_log(refresh_enabled)
-        start_ns = time.perf_counter_ns() if profile_path else 0
-        payload_count = _enqueue_full_cudagraph_refresh_payloads_after_replay(
-            controller=controller,
-            graph_key=str(ready.get("graph_key", "") or ""),
-        )
-        refresh_us = (
-            (time.perf_counter_ns() - start_ns) / 1000.0 if profile_path else 0.0
-        )
-        if profile_path:
-            stage_profile = getattr(
+            current_identity = _current_model_forward_refresh_identity(
                 controller,
-                "_mixed_page_full_cudagraph_last_replay_refresh_stage_profile",
-                None,
+                stage="model-forward refresh owner completion",
             )
-            _append_mixed_page_full_cudagraph_profile_event(
-                profile_path,
-                {
-                    "event": "mixed_page_full_cudagraph_model_forward_refresh",
-                    "hook": "model_forward_completion",
-                    "step_id": int(current_identity[0]),
-                    "step_handle_id": int(current_identity[1]),
-                    "step_handle_generation": int(current_identity[2]),
-                    "step_identity_token": int(current_identity[3]),
-                    "graph_key": str(ready.get("graph_key", "") or ""),
-                    "refresh_called": bool(payload_count > 0),
-                    "post_replay_refresh_payloads": int(payload_count),
-                    "post_forward_deferred_producer_launches": int(
-                        deferred_launch_count
-                    ),
-                    "refresh_us": float(refresh_us),
-                    "refresh_stage_profile": (
-                        dict(stage_profile)
-                        if isinstance(stage_profile, dict)
-                        else None
-                    ),
-                },
+            ready_identity = tuple(ready.get("identity", ()))
+            if ready_identity != current_identity:
+                raise RuntimeError(
+                    "model-forward refresh owner identity mismatch: "
+                    f"ready={ready_identity!r} current={current_identity!r}"
+                )
+
+            refresh_enabled = _mixed_page_full_cudagraph_replay_refresh_enabled(
+                controller
             )
-        return result
+            if not refresh_enabled:
+                raise RuntimeError(
+                    "model-forward refresh generation was marked while refresh is disabled"
+                )
+            profile_path = _full_cudagraph_hook_profile_log(refresh_enabled)
+            start_ns = time.perf_counter_ns() if profile_path else 0
+            payload_count = _enqueue_full_cudagraph_refresh_payloads_after_replay(
+                controller=controller,
+                graph_key=str(ready.get("graph_key", "") or ""),
+            )
+            refresh_us = (
+                (time.perf_counter_ns() - start_ns) / 1000.0
+                if profile_path
+                else 0.0
+            )
+            if profile_path:
+                stage_profile = getattr(
+                    controller,
+                    "_mixed_page_full_cudagraph_last_replay_refresh_stage_profile",
+                    None,
+                )
+                _append_mixed_page_full_cudagraph_profile_event(
+                    profile_path,
+                    {
+                        "event": "mixed_page_full_cudagraph_model_forward_refresh",
+                        "hook": "model_forward_completion",
+                        "step_id": int(current_identity[0]),
+                        "step_handle_id": int(current_identity[1]),
+                        "step_handle_generation": int(current_identity[2]),
+                        "step_identity_token": int(current_identity[3]),
+                        "graph_key": str(ready.get("graph_key", "") or ""),
+                        "refresh_called": bool(payload_count > 0),
+                        "post_replay_refresh_payloads": int(payload_count),
+                        "post_forward_deferred_producer_launches": int(
+                            deferred_launch_count
+                        ),
+                        "refresh_us": float(refresh_us),
+                        "refresh_stage_profile": (
+                            dict(stage_profile)
+                            if isinstance(stage_profile, dict)
+                            else None
+                        ),
+                    },
+                )
+            return result
+        finally:
+            # The private deferred-intent batch and post-forward refresh enqueue
+            # are part of the same physical owner.  Keep the owner active until
+            # both are terminal so a concurrent cold reset cannot clear state
+            # in the gap between model forward and producer drain.
+            setattr(controller, active_attr, False)
 
     _ORIGINAL_MODEL_FORWARD_FOR_REFRESH_OWNER = original_model_forward
     GPUModelRunner._model_forward = _sparse_model_forward  # type: ignore[assignment]

@@ -6806,8 +6806,6 @@ def _is_cumulative_refresh_profile_counter(key: str) -> bool:
     return key in {
         "sentence_trigger_admission_coalesced_total",
         "sentence_trigger_admission_coalesced_interval_pending_total",
-        "sentence_trigger_admission_coalesced_inflight_total",
-        "sentence_trigger_admission_coalesced_pending_rebuild_total",
         "sentence_trigger_admission_dropped_finished_total",
         "refresh_coalesce_skipped_existing_pending_total",
     }
@@ -9518,18 +9516,6 @@ def _deadline_v2_attribution_summary(
             default=0,
         )
     )
-    sentence_trigger_admission_coalesced_inflight_count = _max_int_from_records(
-        refresh_profile,
-        "sentence_trigger_admission_coalesced_inflight_total",
-        default=0,
-    )
-    sentence_trigger_admission_coalesced_pending_rebuild_count = (
-        _max_int_from_records(
-            refresh_profile,
-            "sentence_trigger_admission_coalesced_pending_rebuild_total",
-            default=0,
-        )
-    )
     sentence_trigger_admission_dropped_finished_count = _max_int_from_records(
         refresh_profile,
         "sentence_trigger_admission_dropped_finished_total",
@@ -9883,12 +9869,6 @@ def _deadline_v2_attribution_summary(
         ),
         "sentence_trigger_admission_coalesced_interval_pending_count": int(
             sentence_trigger_admission_coalesced_interval_pending_count
-        ),
-        "sentence_trigger_admission_coalesced_inflight_count": int(
-            sentence_trigger_admission_coalesced_inflight_count
-        ),
-        "sentence_trigger_admission_coalesced_pending_rebuild_count": int(
-            sentence_trigger_admission_coalesced_pending_rebuild_count
         ),
         "sentence_trigger_admission_dropped_finished_count": int(
             sentence_trigger_admission_dropped_finished_count

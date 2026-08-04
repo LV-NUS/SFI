@@ -1489,14 +1489,18 @@ class RequestTracking:
     # short-dense 首个 compact generation 发布前的读侧保护。该状态只在
     # compact metadata 全层原子发布后清除，不参与 TP trigger 决策。
     dense_until_compact_ready: bool = False
-    # Refresh 物理发布账本。enqueue/publish 分别按全局 layer id 置位；
-    # last-layer seal 关闭生产端。只有 sealed 且两个精确 layer mask 相等
-    # 才解除读侧在飞状态，避免“重复层收据 + 漏层”被计数相等误判完成。
+    # Refresh 物理世代 baton。enqueue/publish/retire 分别按全局 layer id
+    # 置位；last-layer seal 关闭生产端。只有 sealed 且每个已 enqueue layer
+    # 都取得 publish 或 retire 终态，才允许下一物理世代接棒。retire 不等于
+    # 成功发布：它保持 dense 保护并触发 lease rearm，但也不能提前释放
+    # owner，
+    # 否则同代剩余 writer 会在 owner 消失后与下一代静默重叠。
     # 该账本不参与 sentence/interval 触发决策，避免把 rank-local GPU
     # 时序注入 TP 决策。
     refresh_publish_key: Optional[Tuple[int, int]] = None
     refresh_publish_enqueued_layer_mask: int = 0
     refresh_publish_published_layer_mask: int = 0
+    refresh_publish_retired_layer_mask: int = 0
     refresh_publish_sealed: bool = False
     # 读侧 reason/policy 与上述账本同生共灭，仅供 dense-consume 防 torn-read。
     inflight_reason_code: int = -1

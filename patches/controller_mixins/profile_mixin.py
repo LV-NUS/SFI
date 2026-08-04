@@ -107,8 +107,6 @@ class ProfileMixin:
         self._sentence_trigger_materialized_profile_emitted_count: int = 0
         self._sentence_trigger_admission_coalesced_total: int = 0
         self._sentence_trigger_admission_coalesced_interval_pending_total: int = 0
-        self._sentence_trigger_admission_coalesced_inflight_total: int = 0
-        self._sentence_trigger_admission_coalesced_pending_rebuild_total: int = 0
         self._sentence_trigger_admission_dropped_finished_total: int = 0
         self._refresh_coalesce_skipped_existing_pending_total: int = 0
 
@@ -368,20 +366,6 @@ class ProfileMixin:
                     0,
                 )
             ),
-            "sentence_trigger_admission_coalesced_inflight_total": int(
-                getattr(
-                    self,
-                    "_sentence_trigger_admission_coalesced_inflight_total",
-                    0,
-                )
-            ),
-            "sentence_trigger_admission_coalesced_pending_rebuild_total": int(
-                getattr(
-                    self,
-                    "_sentence_trigger_admission_coalesced_pending_rebuild_total",
-                    0,
-                )
-            ),
             "sentence_trigger_admission_dropped_finished_total": int(
                 getattr(
                     self,
@@ -609,20 +593,6 @@ class ProfileMixin:
                 getattr(
                     self,
                     "_sentence_trigger_admission_coalesced_interval_pending_total",
-                    0,
-                )
-            ),
-            "sentence_trigger_admission_coalesced_inflight_total": int(
-                getattr(
-                    self,
-                    "_sentence_trigger_admission_coalesced_inflight_total",
-                    0,
-                )
-            ),
-            "sentence_trigger_admission_coalesced_pending_rebuild_total": int(
-                getattr(
-                    self,
-                    "_sentence_trigger_admission_coalesced_pending_rebuild_total",
                     0,
                 )
             ),

@@ -8,7 +8,7 @@ OWNS:
   - _compute_wait_decision(): main/stream wait arbitration
   - _main_stream_wait_for_chunk_done(): CUDA stream synchronization
   - _consume_step_wait_token(): per-step wait token consumption
-  - _stage/_take/_drain/_reset_deferred_bootstrap_*(): launch-intent ownership
+  - _stage/_take/_drain/_retire_deferred_bootstrap_*(): launch-intent ownership
 
 DEPENDS_ON:
   - patches.refresh_runtime.entry.run_refresh_step
@@ -517,6 +517,7 @@ class WaitDeciderMixin:
             raise RuntimeError("deferred bootstrap producer launcher is missing")
         first_launch = not bool(getattr(job, "launched", False))
         before_group_index = int(getattr(job, "next_payload_group_index", 0) or 0)
+        setattr(job, "launch_attempted", True)
         try:
             completed = bool(
                 launch(
@@ -527,6 +528,22 @@ class WaitDeciderMixin:
         except Exception as exc:
             if not str(getattr(job, "failure_reason", "") or ""):
                 setattr(job, "failure_reason", str(exc))
+            # Exception-only terminal receipt.  A producer failure may happen
+            # after CUDA work was enqueued but before a normal group/final
+            # event was published.  Record one event on the producer stream so
+            # a later cold lifecycle reset can order storage retirement instead
+            # of guessing whether the failed launch touched the compact slot.
+            refresh_stream = getattr(self, "refresh_stream", None)
+            if refresh_stream is not None and torch.cuda.is_available():
+                try:
+                    terminal_event = torch.cuda.Event(enable_timing=False)
+                    terminal_event.record(refresh_stream)
+                    setattr(job, "terminal_event", terminal_event)
+                except Exception as terminal_exc:
+                    exc.add_note(
+                        "failed to record deferred producer terminal event: "
+                        f"{terminal_exc}"
+                    )
             raise
         after_group_index = int(getattr(job, "next_payload_group_index", 0) or 0)
         self._record_deferred_producer_launch_state(
@@ -620,6 +637,7 @@ class WaitDeciderMixin:
                     continue
                 if int(job_epoch) >= ep:
                     continue
+                setattr(staged_job, "cancelled", True)
                 if not str(getattr(staged_job, "failure_reason", "") or ""):
                     setattr(staged_job, "failure_reason", str(reason))
 
@@ -637,16 +655,296 @@ class WaitDeciderMixin:
         self._deferred_bootstrap_launch_intents = []
         return tuple(intents_obj)
 
-    def _reset_deferred_bootstrap_launch_state(self, *, reason: str) -> None:
-        """Retire request-owned launch state at an explicit lifecycle boundary."""
-        owned_intents = self._take_staged_deferred_bootstrap_producer_jobs()
-        if owned_intents:
-            self._fail_deferred_bootstrap_launch_intents(
-                owned_intents,
+    def _assert_deferred_bootstrap_lifecycle_owner_idle(
+        self,
+        *,
+        stage: str,
+    ) -> None:
+        """Reject lifecycle reset while model-forward owns a private job batch."""
+        if bool(
+            getattr(
+                self,
+                "_mixed_page_model_forward_refresh_owner_active",
+                False,
+            )
+        ):
+            raise RuntimeError(
+                "E_SFI_DEFERRED_BOOTSTRAP_OWNER_ACTIVE: "
+                f"stage={stage!r}"
+            )
+        stale_ready = getattr(
+            self,
+            "_mixed_page_model_forward_refresh_generation_ready",
+            None,
+        )
+        if stale_ready is not None:
+            raise RuntimeError(
+                "E_SFI_DEFERRED_BOOTSTRAP_READY_OWNER_STALE: "
+                f"stage={stage!r} ready={stale_ready!r}"
+            )
+
+    @staticmethod
+    def _cancel_deferred_bootstrap_job(job: Any, *, reason: str) -> bool:
+        if job is None or bool(getattr(job, "completed", False)):
+            return False
+        setattr(job, "cancelled", True)
+        if not str(getattr(job, "failure_reason", "") or ""):
+            setattr(job, "failure_reason", str(reason))
+        return True
+
+    def _cancel_staged_deferred_bootstrap_request(
+        self,
+        *,
+        request_id: str,
+        current_job: Any,
+        reason: str,
+    ) -> int:
+        """Remove one request from shared intents without disturbing siblings."""
+        intents_obj = getattr(self, "_deferred_bootstrap_launch_intents", None)
+        if intents_obj is None:
+            return int(
+                self._cancel_deferred_bootstrap_job(
+                    current_job,
+                    reason=str(reason),
+                )
+            )
+        if not isinstance(intents_obj, list):
+            raise RuntimeError("deferred producer launch intent queue is invalid")
+
+        rid = str(request_id)
+        cancelled_job_ids: Set[int] = set()
+        filtered_intents: List[_DeferredProducerLaunchIntent] = []
+        for intent in tuple(intents_obj):
+            intent_epoch, only_ids, allow_same, job_snapshot = intent
+            filtered_snapshot = []
+            for entry in tuple(job_snapshot):
+                staged_rid, bridge_count, job_epoch, staged_job = entry
+                if str(staged_rid) == rid or (
+                    current_job is not None and staged_job is current_job
+                ):
+                    if id(staged_job) not in cancelled_job_ids:
+                        self._cancel_deferred_bootstrap_job(
+                            staged_job,
+                            reason=str(reason),
+                        )
+                        cancelled_job_ids.add(id(staged_job))
+                    continue
+                filtered_snapshot.append(
+                    (
+                        str(staged_rid),
+                        int(bridge_count),
+                        int(job_epoch),
+                        staged_job,
+                    )
+                )
+            filtered_intents.append(
+                (
+                    int(intent_epoch),
+                    tuple(str(item) for item in tuple(only_ids)),
+                    bool(allow_same),
+                    tuple(filtered_snapshot),
+                )
+            )
+        self._deferred_bootstrap_launch_intents = filtered_intents
+        if current_job is not None and id(current_job) not in cancelled_job_ids:
+            self._cancel_deferred_bootstrap_job(
+                current_job,
                 reason=str(reason),
             )
+            cancelled_job_ids.add(id(current_job))
+        return len(cancelled_job_ids)
+
+    @staticmethod
+    def _deferred_bootstrap_terminal_events(
+        *,
+        tracking: Any,
+        job: Any,
+    ) -> Tuple[Any, ...]:
+        """Freeze exact producer terminal events before request state is cleared."""
+        events: List[Any] = []
+        seen_event_ids: Set[int] = set()
+
+        def _append(event: Any) -> None:
+            if event is None:
+                raise RuntimeError(
+                    "E_SFI_DEFERRED_BOOTSTRAP_TERMINAL_EVENT_MISSING"
+                )
+            event_id = id(event)
+            if event_id not in seen_event_ids:
+                seen_event_ids.add(event_id)
+                events.append(event)
+
+        for event in tuple(
+            getattr(tracking, "bootstrap_pending_events", tuple()) or tuple()
+        ):
+            _append(event)
+
+        ready_state = getattr(tracking, "producer_ready_state", None)
+        if ready_state is not None:
+            final_event = getattr(ready_state, "final_event", None)
+            if final_event is not None:
+                _append(final_event)
+            else:
+                group_events = getattr(ready_state, "group_done_events", None)
+                if group_events is not None and not isinstance(group_events, dict):
+                    raise RuntimeError(
+                        "E_SFI_DEFERRED_BOOTSTRAP_GROUP_EVENT_LEDGER_DRIFT"
+                    )
+                for event in tuple((group_events or {}).values()):
+                    _append(event)
+
+        if job is not None:
+            job_final_event = getattr(job, "final_event", None)
+            if job_final_event is not None:
+                _append(job_final_event)
+            terminal_event = getattr(job, "terminal_event", None)
+            if terminal_event is not None:
+                _append(terminal_event)
+            failure_reason = str(getattr(job, "failure_reason", "") or "")
+            if (
+                failure_reason
+                and not bool(getattr(job, "completed", False))
+                and bool(getattr(job, "launch_attempted", False))
+                and terminal_event is None
+            ):
+                raise RuntimeError(
+                    "E_SFI_DEFERRED_BOOTSTRAP_FAILED_WITHOUT_TERMINAL_EVENT: "
+                    f"reason={failure_reason!r}"
+                )
+            if bool(getattr(job, "completed", False)) and job_final_event is None:
+                raise RuntimeError(
+                    "E_SFI_DEFERRED_BOOTSTRAP_COMPLETED_WITHOUT_FINAL_EVENT"
+                )
+            submitted_groups = int(
+                getattr(job, "next_payload_group_index", 0) or 0
+            )
+            if submitted_groups > 0 and not events:
+                raise RuntimeError(
+                    "E_SFI_DEFERRED_BOOTSTRAP_SUBMITTED_WITHOUT_TERMINAL_EVENT"
+                )
+        if (
+            bool(getattr(tracking, "bootstrap_pending", False))
+            and job is None
+            and ready_state is None
+            and not events
+        ):
+            raise RuntimeError(
+                "E_SFI_BOOTSTRAP_PENDING_WITHOUT_PHYSICAL_TERMINAL"
+            )
+        return tuple(events)
+
+    def _retire_deferred_bootstrap_request_for_lifecycle(
+        self,
+        *,
+        request_id: str,
+        tracking: Any,
+        reason: str,
+    ) -> int:
+        """Order and retire one request's bootstrap producer on a cold path."""
+        stage = f"request:{str(request_id)}"
+        self._assert_deferred_bootstrap_lifecycle_owner_idle(stage=stage)
+        request_states = getattr(self, "request_states", None)
+        if not isinstance(request_states, dict):
+            raise RuntimeError("deferred bootstrap lifecycle requires request_states")
+        if request_states.get(str(request_id)) is not tracking:
+            raise RuntimeError(
+                "E_SFI_DEFERRED_BOOTSTRAP_REQUEST_OWNER_DRIFT: "
+                f"request={str(request_id)!r}"
+            )
+
+        job = getattr(tracking, "deferred_producer_job", None)
+        events = self._deferred_bootstrap_terminal_events(
+            tracking=tracking,
+            job=job,
+        )
+        if events:
+            if not torch.cuda.is_available():
+                raise RuntimeError(
+                    "deferred bootstrap lifecycle has CUDA events without CUDA"
+                )
+            if _is_stream_capturing_or_raise(
+                stage="retire_deferred_bootstrap_request"
+            ):
+                raise RuntimeError(
+                    "deferred bootstrap lifecycle cannot retire during capture"
+                )
+            device = getattr(self, "device", None)
+            stream = (
+                torch.cuda.current_stream(device=device)
+                if device is not None
+                else torch.cuda.current_stream()
+            )
+            for event in events:
+                stream.wait_event(event)
+
+        cancelled = self._cancel_staged_deferred_bootstrap_request(
+            request_id=str(request_id),
+            current_job=job,
+            reason=str(reason),
+        )
+        had_owner = bool(
+            events
+            or job is not None
+            or getattr(tracking, "producer_ready_state", None) is not None
+            or bool(getattr(tracking, "bootstrap_pending", False))
+            or bool(getattr(tracking, "bootstrap_bridge_active", False))
+            or cancelled
+        )
+        tracking.deferred_producer_job = None
+        tracking.producer_ready_state = None
+        tracking.bootstrap_pending = False
+        tracking.bootstrap_pending_epoch = -1
+        tracking.bootstrap_pending_events = []
+        tracking.bootstrap_bridge_active = False
+        tracking.bridge_token_count = 0
+        tracking.bridge_token_positions = []
+        tracking.bridge_max_tokens = 0
+        tracking.producer_launch_step = -1
+        tracking.bridge_last_counted_epoch = -1
+        self._bootstrap_pending_request_ids.discard(str(request_id))
+        self._bootstrap_submission_boundary_pending_epoch_by_id.pop(
+            str(request_id),
+            None,
+        )
+        return int(had_owner)
+
+    def _retire_all_deferred_bootstrap_requests_for_lifecycle(
+        self,
+        *,
+        reason: str,
+    ) -> int:
+        """Retire every request owner, then reject any orphan launch snapshot."""
+        self._assert_deferred_bootstrap_lifecycle_owner_idle(stage="global")
+        request_states = getattr(self, "request_states", None)
+        if not isinstance(request_states, dict):
+            raise RuntimeError("deferred bootstrap lifecycle requires request_states")
+        retired = 0
+        for request_id, tracking in tuple(request_states.items()):
+            retired += self._retire_deferred_bootstrap_request_for_lifecycle(
+                request_id=str(request_id),
+                tracking=tracking,
+                reason=str(reason),
+            )
+
+        intents_obj = getattr(self, "_deferred_bootstrap_launch_intents", None)
+        if intents_obj is None:
+            intents_obj = []
+        if not isinstance(intents_obj, list):
+            raise RuntimeError("deferred producer launch intent queue is invalid")
+        orphan_entries = tuple(
+            (str(entry[0]), int(entry[2]))
+            for intent in tuple(intents_obj)
+            for entry in tuple(intent[3])
+        )
+        if orphan_entries:
+            raise RuntimeError(
+                "E_SFI_DEFERRED_BOOTSTRAP_ORPHAN_INTENT: "
+                f"entries={orphan_entries!r}"
+            )
+        self._deferred_bootstrap_launch_intents = []
         self._deferred_bootstrap_launch_intent_seen_epoch = -1
         self._deferred_bootstrap_launch_intent_identities = set()
+        return int(retired)
 
     def _drain_staged_deferred_bootstrap_producer_jobs(
         self,
@@ -902,15 +1200,24 @@ class WaitDeciderMixin:
         # bridge 窗内票一律不 materialize ⇒ publish key 恒空；此处 fail-fast 把门破/交错
         # 在源头暴露,替代 parity 守卫的下游兜捕。调用点全部经
         # bootstrap_pending=True 门(ready 后不重复 commit),无误炸面。
-        publish_key = tracking.refresh_publish_key
+        publish_key = getattr(tracking, "refresh_publish_key", None)
         if publish_key is not None:
+            enqueued_layers = int(
+                getattr(tracking, "refresh_publish_enqueued_layer_mask", 0)
+            ).bit_count()
+            published_layers = int(
+                getattr(tracking, "refresh_publish_published_layer_mask", 0)
+            ).bit_count()
+            retired_layers = int(
+                getattr(tracking, "refresh_publish_retired_layer_mask", 0)
+            ).bit_count()
+            sealed = bool(getattr(tracking, "refresh_publish_sealed", False))
             raise RuntimeError(
                 "[BOOTSTRAP-MATERIALIZE-GATE] bootstrap ready commit while a "
                 f"refresh generation is in flight for req={rid!r} "
                 f"(publish_key={publish_key!r}, "
-                f"enqueued={int(tracking.refresh_publish_enqueued_layer_mask).bit_count()}, "
-                f"published={int(tracking.refresh_publish_published_layer_mask).bit_count()}, "
-                f"sealed={bool(tracking.refresh_publish_sealed)}): chunk-round "
+                f"enqueued={enqueued_layers}, published={published_layers}, "
+                f"retired={retired_layers}, sealed={sealed}): chunk-round "
                 "commits would interleave with the bootstrap full-layer commit "
                 "(dual-gen layer parity risk); the planner materialize gate "
                 "must hold tickets of bootstrap_pending requests"

@@ -5,6 +5,8 @@ OWNS:
   - _init_refresh_rebuild_state(): refresh/rebuild state initialization
   - _async_refresh_enabled: refresh feature flag
   - _pending_refresh_rebuild_register / _pending_refresh_rebuild_clear(): rebuild tracking
+  - _terminalize_refresh_generations / _retire_refresh_generation_layers():
+    cold generation transactions and exact layer terminals
   - _submit_pending_refresh_rebuild_batch / _enqueue_pending_refresh_rebuild(): rebuild submission pipeline
   - _compact_pending_refresh_payloads(): payload compaction for chunked refresh
 
@@ -416,6 +418,37 @@ class RefreshRebuildMixin:
             )
         return publish_key
 
+    @staticmethod
+    def _pending_refresh_rebuild_layer_mask(
+        pending: PendingRefreshRebuild,
+    ) -> int:
+        """Return the exact physical layer terminal scope for one pending."""
+        layer_mask = 0
+        payloads: Tuple[Any, ...] = tuple(
+            getattr(pending, "payloads", tuple()) or tuple()
+        )
+        if not payloads:
+            raise RuntimeError(
+                "pending refresh rebuild is missing payloads for generation retirement"
+            )
+        for payload in payloads:
+            layer_index = int(
+                getattr(getattr(payload, "state", None), "layer_index", -1)
+            )
+            if layer_index < 0:
+                raise RuntimeError(
+                    "pending refresh rebuild retirement requires non-negative "
+                    "global layer indices"
+                )
+            layer_bit = 1 << layer_index
+            if layer_mask & layer_bit:
+                raise RuntimeError(
+                    "pending refresh rebuild retirement repeats a physical layer: "
+                    f"layer={layer_index}"
+                )
+            layer_mask |= layer_bit
+        return layer_mask
+
     def _pending_refresh_rebuild_register(
         self,
         req_ids: Optional[Tuple[str, ...]],
@@ -619,9 +652,7 @@ class RefreshRebuildMixin:
     ) -> None:
         """[SELECTED-OUT-RING] 释放 pending 占用的环槽(幂等:属性置 None 防
         重入双释放)。writer_done_event 作为消费序存入槽,下任 acquire 在其
-        run 流上补 wait。调用面=终局漏斗 _pending_refresh_rebuild_clear+两个
-        绕过 clear 的整批丢弃点(release_idle_buffers /
-        begin_kv_cache_generation)
+        run 流上补 wait。调用面=终局漏斗 _pending_refresh_rebuild_clear
         +[RING-RELEASE-ON-WRITER-SUBMIT 2026-07-10] 三个 writer_done_event
         record 点的前移释放(默认档/grouped envelope/split writer):writer 已
         提交且事件已 record ⇒ 槽 buffer 的全部 GPU 消费序已凝固为事件(下任
@@ -838,6 +869,7 @@ class RefreshRebuildMixin:
         status: str,
         lease_reason: str,
         req_ids: Optional[Tuple[str, ...]] = None,
+        rearm_req_ids: Optional[Tuple[str, ...]] = None,
         remaining_pending: Optional[Sequence[PendingRefreshRebuild]] = None,
         pending_buf_ref_counts: Optional[Dict[int, int]] = None,
         wait_recorded_work: bool = True,
@@ -847,9 +879,9 @@ class RefreshRebuildMixin:
             status=str(status),
         )
         if wait_recorded_work:
-            self._wait_pending_refresh_rebuild_writer_done(
-                pending
-            ) or self._wait_pending_refresh_rebuild_selector_done(pending)
+            writer_waited = self._wait_pending_refresh_rebuild_writer_done(pending)
+            if not writer_waited:
+                self._wait_pending_refresh_rebuild_selector_done(pending)
         self._pending_refresh_rebuild_clear_completed_buf_work(
             pending,
             remaining_pending=remaining_pending,
@@ -859,11 +891,21 @@ class RefreshRebuildMixin:
             pending,
             req_ids=req_ids,
         )
-        if drop_req_ids:
-            self._resolve_refresh_lease(
-                req_ids=drop_req_ids,
+        semantic_rearm_req_ids = (
+            drop_req_ids
+            if rearm_req_ids is None
+            else self._normalize_refresh_req_ids(rearm_req_ids)
+        )
+        generation_req_ids = self._normalize_refresh_req_ids(pending.req_ids)
+        if generation_req_ids:
+            self._retire_refresh_generation_layers(
+                generation_req_ids=generation_req_ids,
+                rearm_req_ids=semantic_rearm_req_ids,
                 reason=str(lease_reason),
                 publish_key=self._pending_refresh_rebuild_publish_key(pending),
+                retired_layer_mask=self._pending_refresh_rebuild_layer_mask(
+                    pending
+                ),
             )
         self._pending_refresh_rebuild_clear(pending)
         return drop_req_ids
@@ -884,6 +926,312 @@ class RefreshRebuildMixin:
             kept.append(item)
         self._pending_refresh_rebuilds = kept
         return removed
+
+    def _snapshot_refresh_generation_owners(
+        self,
+        publish_keys: Optional[Sequence[Tuple[int, int]]],
+    ) -> Dict[str, Tuple[int, int]]:
+        """Freeze request owners for cold generation-wide terminal checks."""
+        normalized_keys = (
+            None
+            if publish_keys is None
+            else {(int(key[0]), int(key[1])) for key in tuple(publish_keys)}
+        )
+        if normalized_keys is not None and not normalized_keys:
+            return {}
+        request_states = getattr(self, "request_states")
+        owners: Dict[str, Tuple[int, int]] = {}
+        for request_id, tracking in request_states.items():
+            owner_key = getattr(tracking, "refresh_publish_key", None)
+            if owner_key is None:
+                continue
+            normalized_owner = (int(owner_key[0]), int(owner_key[1]))
+            if normalized_keys is None or normalized_owner in normalized_keys:
+                owners[str(request_id)] = normalized_owner
+        return owners
+
+    def _pending_refresh_generation_owner_pairs(
+        self,
+        pending_items: Sequence[PendingRefreshRebuild],
+    ) -> Set[Tuple[str, Tuple[int, int]]]:
+        """Return exact request/generation coverage for pending producers."""
+        return {
+            (request_id, self._pending_refresh_rebuild_publish_key(pending))
+            for pending in tuple(pending_items)
+            for request_id in self._normalize_refresh_req_ids(
+                getattr(pending, "req_ids", None)
+            )
+        }
+
+    def _terminalize_refresh_generations(
+        self,
+        *,
+        publish_keys: Optional[Sequence[Tuple[int, int]]],
+        stage: str,
+        status: str,
+        lease_reason: str,
+        publish_current: bool,
+        wait_recorded_work: bool,
+        force_handle_id: int = -1,
+        required_owner: Optional[Tuple[str, Tuple[int, int]]] = None,
+    ) -> int:
+        """Run one cold transaction over complete physical generations."""
+        normalized_keys = (
+            None
+            if publish_keys is None
+            else {(int(key[0]), int(key[1])) for key in tuple(publish_keys)}
+        )
+
+        def _matches(pending: PendingRefreshRebuild) -> bool:
+            return normalized_keys is None or (
+                self._pending_refresh_rebuild_publish_key(pending)
+                in normalized_keys
+            )
+
+        queue_snapshot = tuple(self._pending_refresh_rebuilds)
+        matching = tuple(pending for pending in queue_snapshot if _matches(pending))
+        generation_owners = self._snapshot_refresh_generation_owners(
+            None if normalized_keys is None else tuple(normalized_keys)
+        )
+        if required_owner is not None:
+            required_request_id = str(required_owner[0])
+            required_key = (
+                int(required_owner[1][0]),
+                int(required_owner[1][1]),
+            )
+            if generation_owners.get(required_request_id) != required_key:
+                raise RuntimeError(
+                    f"{stage} caller does not own the required generation: "
+                    f"request={required_request_id!r} expected={required_key!r} "
+                    f"actual={generation_owners.get(required_request_id)!r}"
+                )
+        pending_owner_pairs = self._pending_refresh_generation_owner_pairs(matching)
+        missing_owner_pairs = sorted(
+            (owner_request_id, generation_key)
+            for owner_request_id, generation_key in generation_owners.items()
+            if (owner_request_id, generation_key) not in pending_owner_pairs
+        )
+        if missing_owner_pairs:
+            raise RuntimeError(
+                "E_SFI_REFRESH_GENERATION_ORPHAN: "
+                f"{stage} found owner without matching pending work: "
+                f"{missing_owner_pairs!r}"
+            )
+
+        if force_handle_id > 0 and matching:
+            self._submit_due_selector_prepared_refresh_writers(
+                handle_id=int(force_handle_id),
+                force_pending_object_ids=tuple(id(item) for item in matching),
+            )
+            queue_snapshot = tuple(self._pending_refresh_rebuilds)
+            matching = tuple(
+                pending for pending in queue_snapshot if _matches(pending)
+            )
+
+        pending_buf_ref_counts = self._pending_refresh_rebuild_buf_ref_counts(
+            queue_snapshot
+        )
+        completed_ids: Set[int] = set()
+        for pending in matching:
+            publish_pending = publish_current and (
+                self._pending_refresh_rebuild_is_latest(pending)
+                and _pending_refresh_rebuild_matches_current_target_scope(
+                    self,
+                    pending,
+                )
+            )
+            if not publish_pending:
+                self._drop_pending_refresh_rebuild(
+                    pending,
+                    status=str(status),
+                    lease_reason=str(lease_reason),
+                    pending_buf_ref_counts=pending_buf_ref_counts,
+                    wait_recorded_work=bool(wait_recorded_work),
+                )
+                completed_ids.add(id(pending))
+                continue
+
+            writer_event = getattr(pending, "writer_done_event", None)
+            if writer_event is not None:
+                if not self._wait_pending_refresh_rebuild_writer_done(pending):
+                    raise RuntimeError(
+                        f"{stage} lost its recorded writer event"
+                    )
+                self._publish_pending_refresh_rebuild_read_side(pending)
+                self._mark_pending_refresh_rebuild_accepted(pending)
+            else:
+                selector_recorded = bool(
+                    getattr(pending, "selector_done_event_recorded", False)
+                )
+                writer_release_pending = int(
+                    getattr(pending, "writer_release_after_handle_id", -1) or -1
+                ) > 0
+                if selector_recorded or writer_release_pending:
+                    raise RuntimeError(
+                        "E_SFI_REFRESH_GENERATION_WRITER_NOT_SUBMITTED: "
+                        f"stage={stage!r} "
+                        f"pending_id={int(getattr(pending, 'pending_id', -1))}"
+                    )
+                self._run_pending_refresh_rebuild_body(pending)
+                if not bool(getattr(pending, "read_side_published", False)):
+                    raise RuntimeError(
+                        "E_SFI_REFRESH_GENERATION_UNPUBLISHED_SYNC_PRODUCER: "
+                        f"stage={stage!r} "
+                        f"pending_id={int(getattr(pending, 'pending_id', -1))}"
+                    )
+            self._pending_refresh_rebuild_clear_completed_buf_work(
+                pending,
+                pending_buf_ref_counts=pending_buf_ref_counts,
+            )
+            self._pending_refresh_rebuild_clear(pending)
+            completed_ids.add(id(pending))
+
+        if completed_ids:
+            self._pending_refresh_rebuilds = deque(
+                item
+                for item in self._pending_refresh_rebuilds
+                if id(item) not in completed_ids
+            )
+        remaining = sum(
+            1 for pending in self._pending_refresh_rebuilds if _matches(pending)
+        )
+        if remaining:
+            raise RuntimeError(
+                "E_SFI_REFRESH_GENERATION_TERMINAL_INCOMPLETE: "
+                f"stage={stage!r} remaining={remaining}"
+            )
+
+        request_states = getattr(self, "request_states")
+        for owner_request_id, expected_key in generation_owners.items():
+            tracking = request_states.get(owner_request_id)
+            actual_key = getattr(tracking, "refresh_publish_key", None)
+            if actual_key is not None:
+                enqueued_mask = int(
+                    getattr(tracking, "refresh_publish_enqueued_layer_mask", 0)
+                )
+                published_mask = int(
+                    getattr(tracking, "refresh_publish_published_layer_mask", 0)
+                )
+                retired_mask = int(
+                    getattr(tracking, "refresh_publish_retired_layer_mask", 0)
+                )
+                sealed = bool(
+                    getattr(tracking, "refresh_publish_sealed", False)
+                )
+                raise RuntimeError(
+                    "E_SFI_REFRESH_GENERATION_TERMINAL_INCOMPLETE: "
+                    f"stage={stage!r} request={owner_request_id!r} "
+                    f"expected_clear={expected_key!r} actual={actual_key!r} "
+                    f"enqueued={enqueued_mask:#x} "
+                    f"published={published_mask:#x} "
+                    f"retired={retired_mask:#x} sealed={sealed}"
+                )
+        return len(completed_ids)
+
+    def _handoff_prior_refresh_generation(
+        self,
+        *,
+        request_id: str,
+        prior_publish_key: Tuple[int, int],
+        next_publish_key: Tuple[int, int],
+    ) -> int:
+        """Order and retire one prior generation before the next writer claim.
+
+        This runs only on a refresh commit that actually collides with an older
+        physical owner.  It never queries an event and never synchronizes the
+        device: recorded writer events become stream dependencies, then the
+        read-side receipt is published and the preallocated request baton moves
+        to the next generation.
+        """
+        if _is_stream_capturing_or_raise(stage="refresh_generation_handoff"):
+            raise RuntimeError(
+                "refresh generation handoff cannot run during CUDA graph capture"
+            )
+        prior_key = (
+            int(prior_publish_key[0]),
+            int(prior_publish_key[1]),
+        )
+        next_key = (int(next_publish_key[0]), int(next_publish_key[1]))
+        if (
+            prior_key[0] <= 0
+            or prior_key[1] <= 0
+            or next_key[0] <= 0
+            or next_key[1] <= 0
+            or prior_key == next_key
+        ):
+            raise RuntimeError(
+                "refresh generation handoff requires distinct positive owners: "
+                f"prior={prior_key!r} next={next_key!r}"
+            )
+        return self._terminalize_refresh_generations(
+            publish_keys=(prior_key,),
+            stage="refresh_generation_handoff",
+            status="retire_before_generation_handoff",
+            lease_reason="refresh_generation_handoff_retired_stale_producer",
+            publish_current=True,
+            wait_recorded_work=True,
+            force_handle_id=next_key[0],
+            required_owner=(str(request_id), prior_key),
+        )
+
+    def _retire_request_refresh_generations_for_lifecycle(
+        self,
+        *,
+        request_id: str,
+        reason: str,
+    ) -> int:
+        """Quiesce every physical generation touching a lifecycle-reset request."""
+        rid = str(request_id)
+        tracking = getattr(self, "request_states").get(rid)
+        owner_key = getattr(tracking, "refresh_publish_key", None)
+        generation_keys: Set[Tuple[int, int]] = set()
+        if owner_key is not None:
+            generation_keys.add((int(owner_key[0]), int(owner_key[1])))
+        for pending in tuple(self._pending_refresh_rebuilds):
+            pending_req_ids = self._normalize_refresh_req_ids(
+                getattr(pending, "req_ids", None)
+            )
+            if rid in pending_req_ids:
+                generation_keys.add(
+                    self._pending_refresh_rebuild_publish_key(pending)
+                )
+        if not generation_keys:
+            return 0
+        return self._terminalize_refresh_generations(
+            publish_keys=tuple(generation_keys),
+            stage="request_lifecycle_retirement",
+            status="retire_request_lifecycle",
+            lease_reason=str(reason),
+            publish_current=False,
+            wait_recorded_work=True,
+        )
+
+    def _discard_all_pending_refresh_rebuilds(
+        self,
+        *,
+        status: str,
+        lease_reason: str,
+    ) -> int:
+        """Cold global terminal funnel used after the device is quiescent."""
+        if self._pending_refresh_grouped_async_records is not None:
+            raise RuntimeError(
+                "global pending refresh retirement requires a closed async envelope"
+            )
+        completed = self._terminalize_refresh_generations(
+            publish_keys=None,
+            stage="global_refresh_retirement",
+            status=str(status),
+            lease_reason=str(lease_reason),
+            publish_current=False,
+            wait_recorded_work=False,
+        )
+        if self._pending_refresh_rebuilds or self._pending_refresh_rebuild_by_req:
+            raise RuntimeError(
+                "E_SFI_REFRESH_GENERATION_GLOBAL_RETIRE_INCOMPLETE: pending "
+                "queue or request index remains"
+            )
+        self._pending_refresh_rebuild_id = 0
+        return int(completed)
 
     def _record_pending_refresh_rebuild_stream_lifetime(
         self,
@@ -1525,30 +1873,15 @@ class RefreshRebuildMixin:
             if req_set.issubset(finished_ids) and bool(
                 getattr(pending, "can_drop", True)
             ):
-                if self._wait_pending_refresh_rebuild_writer_done(
-                    pending
-                ) or self._wait_pending_refresh_rebuild_selector_done(pending):
-                    self._pending_refresh_rebuild_clear_completed_buf_work(
-                        pending,
-                        pending_buf_ref_counts=pending_buf_ref_counts,
-                    )
-                _mark_pending_selected_scope_terminal(
+                self._drop_pending_refresh_rebuild(
                     pending,
                     status="drop_finished",
-                )
-                drop_req_ids = self._pending_refresh_rebuild_drop_req_ids(
-                    pending,
+                    lease_reason="pending_rebuild_drop_finished",
                     req_ids=req_ids,
+                    rearm_req_ids=tuple(),
+                    pending_buf_ref_counts=pending_buf_ref_counts,
+                    wait_recorded_work=True,
                 )
-                if drop_req_ids:
-                    self._resolve_refresh_lease(
-                        req_ids=drop_req_ids,
-                        reason="pending_rebuild_drop_finished",
-                        publish_key=self._pending_refresh_rebuild_publish_key(
-                            pending
-                        ),
-                    )
-                self._pending_refresh_rebuild_clear(pending)
                 dropped += 1
                 continue
 
@@ -1558,12 +1891,15 @@ class RefreshRebuildMixin:
             # row modes under ordinary asynchronous scheduling. The common
             # drop path waits any already-recorded work before releasing it;
             # dual-gen keeps active rows' previous generation readable, and
-            # the lease resolver rearms only live request states.
+            # the generation terminal funnel rearms only current semantic owners.
             self._drop_pending_refresh_rebuild(
                 pending,
                 status="drop_partial_finished_cohort",
                 lease_reason="pending_rebuild_partial_finished_cohort_invalidated",
                 req_ids=req_ids,
+                rearm_req_ids=tuple(
+                    rid for rid in req_ids if rid not in finished_ids
+                ),
                 pending_buf_ref_counts=pending_buf_ref_counts,
                 wait_recorded_work=True,
             )
@@ -1973,37 +2309,50 @@ class RefreshRebuildMixin:
         )
 
     @staticmethod
-    def _reset_request_refresh_publish_state(tracking: object) -> None:
+    def _reset_request_refresh_publish_state(tracking: Any) -> None:
         tracking.refresh_publish_key = None
         tracking.refresh_publish_enqueued_layer_mask = 0
         tracking.refresh_publish_published_layer_mask = 0
+        tracking.refresh_publish_retired_layer_mask = 0
         tracking.refresh_publish_sealed = False
         tracking.inflight_reason_code = -1
         tracking.inflight_policy = -1
 
     def _finalize_request_refresh_publish_if_complete(
         self,
-        tracking: object,
+        tracking: Any,
     ) -> None:
         if tracking.refresh_publish_key is None:
             return
         enqueued_mask = int(tracking.refresh_publish_enqueued_layer_mask)
         published_mask = int(tracking.refresh_publish_published_layer_mask)
-        unexpected_mask = published_mask & ~enqueued_mask
+        retired_mask = int(tracking.refresh_publish_retired_layer_mask)
+        duplicate_terminal_mask = published_mask & retired_mask
+        if duplicate_terminal_mask:
+            raise RuntimeError(
+                "refresh generation layer has both published and retired terminal "
+                f"receipts: duplicate_mask={duplicate_terminal_mask:#x}"
+            )
+        terminal_mask = published_mask | retired_mask
+        unexpected_mask = terminal_mask & ~enqueued_mask
         if unexpected_mask:
             raise RuntimeError(
-                "refresh publish receipt contains layers outside the producer ledger: "
+                "refresh terminal receipt contains layers outside the producer ledger: "
                 f"unexpected_mask={unexpected_mask:#x} "
                 f"published_mask={published_mask:#x} "
+                f"retired_mask={retired_mask:#x} "
                 f"enqueued_mask={enqueued_mask:#x}"
             )
         if (
             not bool(tracking.refresh_publish_sealed)
             or enqueued_mask == 0
-            or published_mask != enqueued_mask
+            or terminal_mask != enqueued_mask
         ):
             return
-        if bool(tracking.dense_until_compact_ready):
+        if (
+            retired_mask == 0
+            and bool(tracking.dense_until_compact_ready)
+        ):
             # Exact layer coverage and nonempty per-request metadata were
             # proven atomically before the receipt became visible.
             tracking.dense_until_compact_ready = False
@@ -2070,6 +2419,7 @@ class RefreshRebuildMixin:
                 continue
             enqueued_mask = int(tracking.refresh_publish_enqueued_layer_mask)
             published_mask = int(tracking.refresh_publish_published_layer_mask)
+            retired_mask = int(tracking.refresh_publish_retired_layer_mask)
             unexpected_mask = receipt_layer_mask & ~enqueued_mask
             if unexpected_mask:
                 raise RuntimeError(
@@ -2084,15 +2434,23 @@ class RefreshRebuildMixin:
                     "refresh publish receipt repeats an already published layer: "
                     f"request={rid!r} duplicate_mask={duplicate_mask:#x}"
                 )
+            retired_overlap = receipt_layer_mask & retired_mask
+            if retired_overlap:
+                raise RuntimeError(
+                    "refresh publish receipt arrived after the same layer was "
+                    f"retired: request={rid!r} overlap_mask={retired_overlap:#x}"
+                )
             tracking.refresh_publish_published_layer_mask = (
                 published_mask | receipt_layer_mask
             )
             self._finalize_request_refresh_publish_if_complete(tracking)
         if invalidated:
-            self._resolve_refresh_lease(
-                req_ids=tuple(invalidated),
+            self._retire_refresh_generation_layers(
+                generation_req_ids=tuple(invalidated),
+                rearm_req_ids=tuple(invalidated),
                 reason="refresh_publish_slot_ownership_invalidated",
                 publish_key=expected_key,
+                retired_layer_mask=receipt_layer_mask,
             )
 
     def _commit_compact_meta_log_entries(
@@ -3181,11 +3539,16 @@ class RefreshRebuildMixin:
                 current_pending_id=int(getattr(pending, "pending_id", -1)),
             )
         drop_req_ids = self._pending_refresh_rebuild_drop_req_ids(pending)
-        if drop_req_ids:
-            self._resolve_refresh_lease(
-                req_ids=drop_req_ids,
+        generation_req_ids = self._normalize_refresh_req_ids(pending.req_ids)
+        if generation_req_ids:
+            self._retire_refresh_generation_layers(
+                generation_req_ids=generation_req_ids,
+                rearm_req_ids=drop_req_ids,
                 reason=str(reason),
                 publish_key=self._pending_refresh_rebuild_publish_key(pending),
+                retired_layer_mask=self._pending_refresh_rebuild_layer_mask(
+                    pending
+                ),
             )
         self._restore_pending_refresh_rebuild_buf_state(prior_buf_state)
 
@@ -3265,13 +3628,14 @@ class RefreshRebuildMixin:
         self,
         *,
         handle_id: int,
-        force_req_ids: tuple[str, ...] = (),
+        force_pending_object_ids: tuple[int, ...] = (),
     ) -> int:
         handle_id = int(handle_id)
         if handle_id <= 0 or not self._pending_refresh_rebuilds:
             return 0
-        force_req_id_set = {
-            str(req_id) for req_id in tuple(force_req_ids or tuple())
+        force_pending_object_id_set = {
+            int(object_id)
+            for object_id in tuple(force_pending_object_ids or tuple())
         }
         submit_debug = getattr(
             self,
@@ -3304,8 +3668,8 @@ class RefreshRebuildMixin:
                 "handle_id": int(handle_id),
                 "release_after_handle_id": int(release_after),
                 "force_release": bool(
-                    force_req_id_set
-                    and any(req_id in force_req_id_set for req_id in pending_req_ids)
+                    force_pending_object_id_set
+                    and id(pending) in force_pending_object_id_set
                 ),
                 "selector_done_event_recorded": bool(
                     getattr(pending, "selector_done_event_recorded", False)
@@ -3350,14 +3714,8 @@ class RefreshRebuildMixin:
                 else None
             )
             force_release = False
-            if force_req_id_set:
-                pending_req_ids = tuple(
-                    str(req_id)
-                    for req_id in tuple(getattr(pending, "req_ids", tuple()) or tuple())
-                )
-                force_release = any(
-                    req_id in force_req_id_set for req_id in pending_req_ids
-                )
+            if force_pending_object_id_set:
+                force_release = id(pending) in force_pending_object_id_set
             if release_after <= 0 or (release_after > handle_id and not force_release):
                 _append_submit_debug(
                     debug_record,
@@ -3526,11 +3884,16 @@ class RefreshRebuildMixin:
                 status="drop_stale",
             )
             drop_req_ids = self._pending_refresh_rebuild_drop_req_ids(pending)
-            if drop_req_ids:
-                self._resolve_refresh_lease(
-                    req_ids=drop_req_ids,
+            generation_req_ids = self._normalize_refresh_req_ids(pending.req_ids)
+            if generation_req_ids:
+                self._retire_refresh_generation_layers(
+                    generation_req_ids=generation_req_ids,
+                    rearm_req_ids=drop_req_ids,
                     reason="pending_rebuild_target_scope_stale",
                     publish_key=self._pending_refresh_rebuild_publish_key(
+                        pending
+                    ),
+                    retired_layer_mask=self._pending_refresh_rebuild_layer_mask(
                         pending
                     ),
                 )
@@ -3612,11 +3975,16 @@ class RefreshRebuildMixin:
                 status="drop_stale",
             )
             drop_req_ids = self._pending_refresh_rebuild_drop_req_ids(pending)
-            if drop_req_ids:
-                self._resolve_refresh_lease(
-                    req_ids=drop_req_ids,
+            generation_req_ids = self._normalize_refresh_req_ids(pending.req_ids)
+            if generation_req_ids:
+                self._retire_refresh_generation_layers(
+                    generation_req_ids=generation_req_ids,
+                    rearm_req_ids=drop_req_ids,
                     reason="pending_rebuild_target_scope_stale",
                     publish_key=self._pending_refresh_rebuild_publish_key(
+                        pending
+                    ),
+                    retired_layer_mask=self._pending_refresh_rebuild_layer_mask(
                         pending
                     ),
                 )
@@ -4878,17 +5246,24 @@ class RefreshRebuildMixin:
             if ticket is None or (not ticket.pending_refresh):
                 continue
             if tracking.refresh_publish_key is not None:
-                raise RuntimeError(
-                    "refresh producer overlap before prior physical publication: "
-                    f"request={req_id!r} prior={tracking.refresh_publish_key!r} "
-                    f"next={publish_key!r}"
+                self._handoff_prior_refresh_generation(
+                    request_id=req_id,
+                    prior_publish_key=tracking.refresh_publish_key,
+                    next_publish_key=publish_key,
                 )
+                if tracking.refresh_publish_key is not None:
+                    raise RuntimeError(
+                        "refresh generation handoff returned with an occupied "
+                        f"owner: request={req_id!r} "
+                        f"owner={tracking.refresh_publish_key!r}"
+                    )
             pending_step = ticket.pending_decode_step
             if pending_step < 0:
                 pending_step = int(tracking.decode_step) if tracking.decode_step is not None else -1
             tracking.refresh_publish_key = publish_key
             tracking.refresh_publish_enqueued_layer_mask = layer_mask
             tracking.refresh_publish_published_layer_mask = 0
+            tracking.refresh_publish_retired_layer_mask = 0
             tracking.refresh_publish_sealed = False
             # [TP-DET-TRIGGER 2026-07-07] 决策终局提交点化(TP>1 NCCL 发散根修):
             # 触发线的全部决策状态在 enqueue 成功的 commit 点一次性终局——该点
@@ -4998,7 +5373,7 @@ class RefreshRebuildMixin:
         return any(refresh_rows[:step_ctx.num_reqs])
 
     # ------------------------------------------------------------------
-    # Utility: normalize / resolve
+    # Utility: normalization / physical retirement
     # ------------------------------------------------------------------
 
     def _normalize_refresh_req_ids(self, req_ids: Optional[Sequence[object]]) -> Tuple[str, ...]:
@@ -5016,42 +5391,90 @@ class RefreshRebuildMixin:
             out.append(rid_str)
         return tuple(out)
 
-    def _resolve_refresh_lease(
+    def _retire_refresh_generation_layers(
         self,
         *,
-        req_ids: Sequence[str],
+        generation_req_ids: Sequence[str],
+        rearm_req_ids: Sequence[str],
         reason: str,
         publish_key: Tuple[int, int],
+        retired_layer_mask: int,
     ) -> None:
-        normalized_ids = self._normalize_refresh_req_ids(tuple(req_ids) if req_ids is not None else tuple())
-        if not normalized_ids:
+        """Record physical terminals independently from semantic lease policy."""
+        generation_ids = self._normalize_refresh_req_ids(generation_req_ids)
+        if not generation_ids:
             return
+        rearm_ids = set(self._normalize_refresh_req_ids(rearm_req_ids))
+        unknown_rearm_ids = rearm_ids.difference(generation_ids)
+        if unknown_rearm_ids:
+            raise RuntimeError(
+                "refresh generation retirement cannot rearm requests outside "
+                f"the physical cohort: {sorted(unknown_rearm_ids)!r}"
+            )
         expected_key = (int(publish_key[0]), int(publish_key[1]))
         if expected_key[0] <= 0 or expected_key[1] <= 0:
             raise RuntimeError(
-                "refresh lease invalidation requires a positive publication generation"
+                "refresh generation retirement requires a positive publication generation"
+            )
+        layer_mask = int(retired_layer_mask)
+        if layer_mask <= 0:
+            raise RuntimeError(
+                "refresh generation retirement requires a non-empty layer mask"
             )
         changed = False
         reason_str = reason
-        for rid in normalized_ids:
-            tracking = self.request_states.get(rid)
+        request_states = getattr(self, "request_states")
+        set_request_lease_rearm = getattr(self, "_set_request_lease_rearm", None)
+        for rid in generation_ids:
+            tracking = request_states.get(rid)
             if tracking is None:
                 continue
             if tracking.refresh_publish_key != expected_key:
                 continue
-            # Lease 重排作废整个物理世代；旧 writer 之后到达时因 handle
-            # identity 不再匹配，不能终结或污染新世代。
-            RefreshRebuildMixin._reset_request_refresh_publish_state(tracking)
-            try:
-                cur_decode = int(tracking.decode_step) if tracking.decode_step is not None else -1
-            except Exception:
-                _log.warning("failed to read decode_step from tracking for rid=%s", rid)
-                raise
-            changed = self._set_request_lease_rearm(
-                request_id=rid,
-                reason=reason_str,
-                decode_step=cur_decode,
-            ) or changed
+            enqueued_mask = int(tracking.refresh_publish_enqueued_layer_mask)
+            published_mask = int(tracking.refresh_publish_published_layer_mask)
+            retired_mask = int(tracking.refresh_publish_retired_layer_mask)
+            unexpected_mask = layer_mask & ~enqueued_mask
+            if unexpected_mask:
+                raise RuntimeError(
+                    "refresh retirement contains a layer outside the generation: "
+                    f"request={rid!r} unexpected_mask={unexpected_mask:#x} "
+                    f"enqueued_mask={enqueued_mask:#x}"
+                )
+            duplicate_mask = layer_mask & (published_mask | retired_mask)
+            if duplicate_mask:
+                raise RuntimeError(
+                    "refresh generation received a duplicate layer terminal: "
+                    f"request={rid!r} duplicate_mask={duplicate_mask:#x}"
+                )
+            # Retiring one layer-group invalidates the generation semantically,
+            # but it must not release the physical owner while sibling writers
+            # still exist.  The exact terminal mask is the generation baton.
+            tracking.refresh_publish_retired_layer_mask = retired_mask | layer_mask
+            changed = True
+            if rid in rearm_ids:
+                if not callable(set_request_lease_rearm):
+                    raise RuntimeError(
+                        "refresh generation retirement requires the lease rearm owner"
+                    )
+                try:
+                    cur_decode = (
+                        int(tracking.decode_step)
+                        if tracking.decode_step is not None
+                        else -1
+                    )
+                except Exception:
+                    _log.warning(
+                        "failed to read decode_step from tracking for rid=%s",
+                        rid,
+                    )
+                    raise
+                changed = set_request_lease_rearm(
+                    request_id=rid,
+                    reason=reason_str,
+                    decode_step=cur_decode,
+                ) or changed
+            self._finalize_request_refresh_publish_if_complete(tracking)
         if changed:
             self._bump_refresh_nonce()
 

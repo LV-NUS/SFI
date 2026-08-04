@@ -30,6 +30,11 @@ class DeferredProducerJob:
     # post-forward, serialize selector work behind the whole forward.
     source_ready_events: tuple[Any, ...] = ()
     final_event: Any | None = None
+    # Exception-only receipt recorded on refresh_stream when a launch fails
+    # after it may have enqueued CUDA work.  Cold lifecycle retirement waits
+    # this exact event instead of synchronizing the device or guessing.
+    terminal_event: Any | None = None
+    launch_attempted: bool = False
     launched: bool = False
     launched_epoch: int = -1
     last_launch_epoch: int = -1

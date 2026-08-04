@@ -1447,32 +1447,25 @@ class VLLMSparseController(
     def release_idle_buffers(self) -> None:
         """释放 request 生命周期相关的缓存，允许 idle 时显存回落。"""
         # 尽量确保 refresh_stream 的异步写入已完成，避免释放仍在使用的 arena。
-        if self.chunk_done_evt:
-            pending = any(not evt.query() for evt in self.chunk_done_evt)
-            if pending:
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
-        self._reset_deferred_bootstrap_launch_state(
-            reason="idle buffer release retired deferred producer launch",
+        pending_ring_work = bool(self.chunk_done_evt) and any(
+            not evt.query() for evt in self.chunk_done_evt
         )
-        if self._pending_refresh_rebuilds:
-            for pending in self._pending_refresh_rebuilds:
-                # [SELECTED-OUT-RING] 整批丢弃绕过 clear 漏斗:逐个释放环槽。
-                self._selected_out_ring_release_pending_slot(pending)
-                req_ids = self._normalize_refresh_req_ids(pending.req_ids)
-                if req_ids:
-                    self._resolve_refresh_lease(
-                        req_ids=req_ids,
-                        reason="idle_pending_rebuild_release",
-                        publish_key=self._pending_refresh_rebuild_publish_key(
-                            pending
-                        ),
-                    )
-                elif pending.payloads:
-                    raise RuntimeError("pending refresh rebuild missing req_ids during idle release")
-            self._pending_refresh_rebuilds = deque()
-        self._pending_refresh_rebuild_by_req.clear()
-        self._pending_refresh_rebuild_id = 0
+        # Selector-only split producers do not record chunk_done until the
+        # writer is released.  A queued generation is therefore itself a
+        # cold-side quiescence reason, even when every reusable ring event
+        # currently queries done.
+        pending_refresh_generation = bool(self._pending_refresh_rebuilds)
+        if (
+            pending_ring_work or pending_refresh_generation
+        ) and torch.cuda.is_available():
+            torch.cuda.synchronize()
+        self._retire_all_deferred_bootstrap_requests_for_lifecycle(
+            reason="idle buffer release retired deferred bootstrap producer",
+        )
+        self._discard_all_pending_refresh_rebuilds(
+            status="retire_idle_owner",
+            lease_reason="idle_pending_rebuild_release",
+        )
 
         # idle 时清空 request 相关状态（避免 finished_req_ids 缺失导致的粘性增长）
         self.request_states.clear()
@@ -2282,6 +2275,28 @@ class VLLMSparseController(
         # 回到 prompt 中段(computed<prompt_len ∧ tracking.bootstrap_done),纯
         # host 比较零开销;本函数置 bootstrap_done=False 后判据自灭,天然 once。
         # slot 身份保留(请求仍活,不 release/不动 free_slots),仅清压缩状态。
+        # Resume reuses the request/slot identity after KV eviction.  Retire
+        # both physical producer families before clearing compact slots:
+        # deferred bootstrap may still own group/final events even though the
+        # request is not logically ready, and refresh may still own sibling
+        # layer writers.  Logical flags are never a storage terminal receipt.
+        if (
+            bool(getattr(tracking, "bootstrap_pending", False))
+            and getattr(tracking, "refresh_publish_key", None) is not None
+        ):
+            raise RuntimeError(
+                "E_SFI_RESUME_OVERLAPPING_BOOTSTRAP_REFRESH_OWNERS: "
+                f"request={request_id!r}"
+            )
+        self._retire_deferred_bootstrap_request_for_lifecycle(
+            request_id=request_id,
+            tracking=tracking,
+            reason="request resume retired prior deferred bootstrap producer",
+        )
+        self._retire_request_refresh_generations_for_lifecycle(
+            request_id=request_id,
+            reason="request_resume_retired_prior_refresh_generation",
+        )
         for state in self.layer_states.values():
             slot = state.request_id_to_slot.get(request_id)
             if slot is None or slot < 0 or slot >= state.batch_size:
@@ -2310,11 +2325,13 @@ class VLLMSparseController(
             _revoke_slot_selected_truth(state, slot=int(slot))
             _invalidate_page_sparse_step_cache_truth(state)
         tracking.bootstrap_done = False
+        tracking.prefill_done = False
+        tracking.prefill_capture_ready = False
+        tracking.prefill_capture_last_n = 0
         # resume 重新进入 bootstrap 生命周期；旧 short-dense 的决策锁存和
         # 读侧保护都不属于新世代。短 prompt 完成时会按几何重新置位。
         tracking.short_dense_decision_active = False
         tracking.dense_until_compact_ready = False
-        self._reset_request_refresh_publish_state(tracking)
         self._bootstrap_submission_boundary_pending_epoch_by_id.pop(
             request_id,
             None,
@@ -2487,7 +2504,7 @@ class VLLMSparseController(
         ticket.pending_ctrl_step = -1
         ticket.pending_policy = PendingPolicy.COALESCEABLE
         # Ticket 是决定论意图合同，不拥有 writer/metadata 生命周期。物理
-        # 发布账本只能由 publish receipt 或显式 lease invalidation 终结。
+        # 发布账本只能由 publish receipt 或显式 layer retirement 终结。
         return changed
 
     def acquire_global_slot(self, request_id: str) -> int:
@@ -2649,8 +2666,8 @@ class VLLMSparseController(
         layer 注册、compact reserved pages 或 RRP arena，避免破坏 warm graph。
         """
         self._drain_async_work_at_request_run_boundary()
-        self._reset_deferred_bootstrap_launch_state(
-            reason="request-run reset retired deferred producer launch",
+        self._retire_all_deferred_bootstrap_requests_for_lifecycle(
+            reason="request-run reset retired deferred bootstrap producer",
         )
         finished_ids: Set[str] = set()
         for rid in getattr(self, "request_states", {}).keys():
@@ -2675,14 +2692,6 @@ class VLLMSparseController(
                 self._finished_generation += 1
             self._finished_req_ids_step.update(finished_set)
             self._pending_global_slot_releases.update(finished_set)
-            for rid in finished_set:
-                self._bootstrap_pending_request_ids.discard(rid)
-                self._bootstrap_submission_boundary_pending_epoch_by_id.pop(
-                    rid,
-                    None,
-                )
-                self.request_states.pop(rid, None)
-                self._request_intent_tickets.pop(rid, None)
             self._active_step_snapshot = None
             self._active_step_snapshot_epoch = -1
             self._active_step_ticket = None
@@ -2813,11 +2822,15 @@ class VLLMSparseController(
         # Retiring only the controller binding would leave vLLM free to replay
         # a graph captured against the old KV cache.
         _retire_vllm_cudagraphs_for_kv_generation()
-        self._reset_deferred_bootstrap_launch_state(
-            reason="KV generation transition retired deferred producer launch",
+        self._retire_all_deferred_bootstrap_requests_for_lifecycle(
+            reason="KV generation transition retired deferred bootstrap producer",
         )
         if self._pending_refresh_grouped_async_records is not None:
             self._abort_pending_refresh_grouped_async_envelope()
+        self._discard_all_pending_refresh_rebuilds(
+            status="retire_kv_generation",
+            lease_reason="KV generation transition retired refresh producer",
+        )
         self.layer_states.clear()
         self.layer_cache_keys.clear()
         self.layer_index_by_cache_key.clear()
@@ -2890,12 +2903,6 @@ class VLLMSparseController(
         self._should_refresh_cache_step = -1
         self._should_refresh_cache_nonce = -1
         self._should_refresh_cache.clear()
-        # [SELECTED-OUT-RING] 全量 reset 绕过 clear 漏斗:逐个释放环槽。
-        for _srr_pending in self._pending_refresh_rebuilds:
-            self._selected_out_ring_release_pending_slot(_srr_pending)
-        self._pending_refresh_rebuilds = deque()
-        self._pending_refresh_rebuild_by_req.clear()
-        self._pending_refresh_rebuild_id = 0
         self._refresh_nonce = 0
         self._step_refresh_commit_id = 0
         self._step_refresh_commit_handle_id = -1
@@ -3290,16 +3297,11 @@ class VLLMSparseController(
         self._step_global_slot_map_epoch = -1
         self._step_global_slot_map_req_ids = tuple()
         self._step_global_slot_map = {}
-        for rid in pending_new:
-            self._bootstrap_pending_request_ids.discard(rid)
-            self._bootstrap_submission_boundary_pending_epoch_by_id.pop(
-                rid,
-                None,
-            )
-            if rid in self.request_states:
-                del self.request_states[rid]
-            if rid in self._request_intent_tickets:
-                del self._request_intent_tickets[rid]
+        # Keep request owners alive until the step-boundary terminal
+        # transaction has ordered deferred-bootstrap/refresh producers and
+        # released their physical slots.  Deleting tracking here loses the
+        # only exact event/job receipts for a request that finishes while its
+        # bridge producer is still in flight.
 
     def _run_finished_cleanup_at_step_boundary(self) -> None:
         """Step 边界消费 finished cleanup ledger（单写者）。"""
@@ -3322,6 +3324,16 @@ class VLLMSparseController(
                 "finished cleanup cannot run during CUDA graph capture at step boundary"
             )
 
+        for rid in tuple(sorted(finished_ids)):
+            tracking = self.request_states.get(rid)
+            if tracking is None:
+                continue
+            self._retire_deferred_bootstrap_request_for_lifecycle(
+                request_id=rid,
+                tracking=tracking,
+                reason="finished request retired deferred bootstrap producer",
+            )
+
         self._pending_refresh_rebuild_finish_boundary_drain(
             finished_ids=finished_ids,
         )
@@ -3339,6 +3351,31 @@ class VLLMSparseController(
                 f"generation={step_handle_generation} "
                 f"epoch={step_epoch} "
                 f"count={len(finished_pending)} sample={finished_pending[:4]}"
+            )
+
+        refresh_owner_leaks = []
+        for rid in tuple(sorted(finished_ids)):
+            tracking = self.request_states.get(rid)
+            if tracking is None:
+                continue
+            publish_key = tracking.refresh_publish_key
+            if publish_key is None:
+                continue
+            refresh_owner_leaks.append(
+                (
+                    rid,
+                    publish_key,
+                    int(tracking.refresh_publish_enqueued_layer_mask),
+                    int(tracking.refresh_publish_published_layer_mask),
+                    int(tracking.refresh_publish_retired_layer_mask),
+                    bool(tracking.refresh_publish_sealed),
+                )
+            )
+        if refresh_owner_leaks:
+            raise RuntimeError(
+                "E_SFI_FINISHED_REFRESH_OWNER_NOT_TERMINAL: finished cleanup "
+                "cannot release slots while a physical refresh generation "
+                f"is still owned: sample={refresh_owner_leaks[:4]!r}"
             )
 
         if self._async_refresh_enabled():
@@ -3433,6 +3470,14 @@ class VLLMSparseController(
                 "finished cleanup boundary failed to release global slots: "
                 f"sample={leaks[:4]} count={len(leaks)}"
             )
+        for rid in finished_ids:
+            self._bootstrap_pending_request_ids.discard(rid)
+            self._bootstrap_submission_boundary_pending_epoch_by_id.pop(
+                rid,
+                None,
+            )
+            self.request_states.pop(rid, None)
+            self._request_intent_tickets.pop(rid, None)
         self._finished_req_ids_step = set()
 
 
@@ -4149,7 +4194,8 @@ class VLLMSparseController(
             return False
 
         def _record_sentence_trigger_admission_coalesced(
-            detail_counter_attr: str,
+            *,
+            interval_pending: bool = False,
         ) -> None:
             self._sentence_trigger_admission_coalesced_total = (
                 int(
@@ -4161,18 +4207,23 @@ class VLLMSparseController(
                 )
                 + 1
             )
-            setattr(
-                self,
-                detail_counter_attr,
-                int(getattr(self, detail_counter_attr, 0)) + 1,
-            )
+            if interval_pending:
+                self._sentence_trigger_admission_coalesced_interval_pending_total = (
+                    int(
+                        getattr(
+                            self,
+                            "_sentence_trigger_admission_coalesced_interval_pending_total",
+                            0,
+                        )
+                    )
+                    + 1
+                )
 
         for request_ordinal, rid in enumerate(request_ids):
             tracking = tracking_by_req[rid]
             ticket = tickets_plan_by_req[rid]
             decode_step = int(tracking.decode_step) if tracking.decode_step is not None else -1
             decode_step_by_req[rid] = decode_step
-            inflight_refresh = tracking.refresh_publish_key is not None
             inflight_dense_consume_by_row.append(
                 _refresh_publish_requires_dense_consume(tracking)
             )
@@ -4249,12 +4300,7 @@ class VLLMSparseController(
             ):
                 if update_state:
                     self._clear_request_trigger_intent(request_id=rid)
-                    detail_counter_attr = (
-                        "_sentence_trigger_admission_coalesced_pending_rebuild_total"
-                        if inflight_refresh
-                        else "_sentence_trigger_admission_coalesced_inflight_total"
-                    )
-                    _record_sentence_trigger_admission_coalesced(detail_counter_attr)
+                    _record_sentence_trigger_admission_coalesced()
             if not workload_plan_replay_active:
                 intent_step = tracking.trigger_intent_decode_step
                 if intent_step >= 0:
@@ -4266,7 +4312,7 @@ class VLLMSparseController(
                         if update_state:
                             self._clear_request_trigger_intent(request_id=rid)
                             _record_sentence_trigger_admission_coalesced(
-                                "_sentence_trigger_admission_coalesced_interval_pending_total"
+                                interval_pending=True,
                             )
                         continue
                     intent_reason = tracking.trigger_intent_reason or "trigger"
@@ -4316,9 +4362,7 @@ class VLLMSparseController(
                         ):
                             _sentence_drop = True
                             if update_state:
-                                _record_sentence_trigger_admission_coalesced(
-                                    "_sentence_trigger_admission_dropped_spacing_total"
-                                )
+                                _record_sentence_trigger_admission_coalesced()
                     if ticket.pending_refresh:
                         pending_step_cur = ticket.pending_decode_step
                         if pending_step_cur < 0:
@@ -4768,7 +4812,8 @@ class VLLMSparseController(
             for rid in request_ids:
                 if rid in refresh_set:
                     continue
-                # [TP-DET-TRIGGER] inflight 过滤 → 决定论 gap 过滤。
+                # TP 决策只用决定论 gap；若旧物理世代尚未终结，refresh
+                # commit 的冷侧 generation baton 负责排序交接。
                 if _coalesce_bus_interval_shaped:
                     if _refresh_join_floor_blocked(
                         tracking_by_req[rid], decode_step_by_req.get(rid, -1)
@@ -4859,7 +4904,7 @@ class VLLMSparseController(
             )
 
         if refresh_set:
-            # [TP-DET-TRIGGER] 终审过滤 inflight → 决定论 gap。
+            # 终审仍只读决定论 gap；物理 owner 不反馈 TP 计划。
             refresh_set = {
                 rid
                 for rid in refresh_set
