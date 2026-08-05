@@ -4298,7 +4298,7 @@ def _prebuild_capture_buffers(
     *,
     kv_cache_generation: int,
 ) -> None:
-    """Prebuild the bounded capture arena and DEFER scratch before profile work.
+    """Prebuild the bounded capture arena and sealed scratch before profile work.
 
     The caller must run this before the profile ``_dummy_run``.  vLLM derives the
     KV budget from the peak allocated bytes observed during that dummy forward;
@@ -4345,9 +4345,8 @@ def _prebuild_capture_buffers(
     cfg = getattr(controller, "config", None)
     if cfg is None or not bool(getattr(cfg, "enabled", False)):
         return
-    # The DEFER capture scratch only exists for gt1 prefill capture, reached only by
-    # the one_shot_bootstrap_only auto-early path. Gate on both so non-capture /
-    # short-ctx runs are byte-identical to HEAD (no bucket stamped -> EDIT-1 no-op).
+    # Sealed capture scratch is needed only for gt1 prefill capture under the
+    # one-shot ownership plan. Keep non-capture and short-context runs unstamped.
     last_n = int(getattr(cfg, "prefill_last_n_query", 0) or 0)
     if last_n <= 1:
         return
@@ -4691,45 +4690,14 @@ def _prebuild_capture_buffers(
     # (4) Prebuild the exact scratch ownership selected above.  ring_early owns
     # one G*in_flight slab; chunk_cohort owns one C*in_flight slab.  Both use a
     # canonical owner key and the RingWarFence, independent of execution mode.
-    scratch_storage_shape = (
-        int(_CAPTURE_CHUNK),
-        int(producer_rows_worst),
-        int(num_heads),
-        int(last_n),
-        int(kv_max_bucket),
-    )
+    scratch_storage_shape = ownership_plan.scratch_storage_shape
     scratch_dtype = torch.float16
     cache_map = getattr(controller, "_fa3_capture_scratch_cache_by_key", None)
     if not isinstance(cache_map, dict):
         cache_map = {}
         setattr(controller, "_fa3_capture_scratch_cache_by_key", cache_map)
     _reduce_group = int(_CAPTURE_REDUCE_GROUP)
-    _ring_slabs = int(_reduce_group) * int(_CAPTURE_IN_FLIGHT)
-    if ownership_plan.mode == CHUNK_COHORT:
-        scratch_storage_shape = (
-            int(ownership_plan.selected_depth),
-            int(producer_rows_worst),
-            int(num_heads),
-            int(last_n),
-            int(kv_max_bucket),
-        )
-    else:
-        # Per-G ring: one [G*in_flight]-deep slab under one canonical key.
-        scratch_storage_shape = (
-            int(_ring_slabs),
-            int(producer_rows_worst),
-            int(num_heads),
-            int(last_n),
-            int(kv_max_bucket),
-        )
-    if ownership_plan.mode == CHUNK_COHORT:
-        extra_key = (
-            "capture_postprocess_cohort",
-            int(ownership_plan.cohort_size),
-            int(ownership_plan.selected_depth),
-        )
-    else:
-        extra_key = ("capture_postprocess_ring", 0, int(_ring_slabs))
+    extra_key = ownership_plan.scratch_extra_key
     scratch_key = (
         str(dev.type),
         -1 if dev.index is None else int(dev.index),
@@ -7827,7 +7795,7 @@ def _wait_replay_refresh_selectors_before_full_cudagraph_replay(
         writer_done_bufs.difference_update(uncovered_bufs)
     def _run_writer_ready_commit() -> None:
         # Writer-ready CPU commit (unified read-side publish / mark_accepted /
-        # clear_pending + _pending_refresh_rebuilds rebuild +
+        # terminal release + _pending_refresh_rebuilds rebuild +
         # clearable-buf clears). Mutates bookkeeping consumed by FUTURE steps,
         # NOT by this step's original_call (the graph replay). Closes over the
         # wait-phase locals: writer_ready_items, completed_item_ids, pending,
@@ -7839,8 +7807,8 @@ def _wait_replay_refresh_selectors_before_full_cudagraph_replay(
             mark_accepted = _require_pending_terminal_op(
                 "_mark_pending_refresh_rebuild_accepted"
             )
-            clear_pending = _require_pending_terminal_op(
-                "_pending_refresh_rebuild_clear"
+            release_pending = _require_pending_terminal_op(
+                "_release_terminal_pending_refresh_rebuild"
             )
             is_latest = _require_pending_terminal_op(
                 "_pending_refresh_rebuild_is_latest"
@@ -7866,7 +7834,7 @@ def _wait_replay_refresh_selectors_before_full_cudagraph_replay(
                     continue
                 publish_read_side(item)
                 mark_accepted(item)
-                clear_pending(item)
+                release_pending(item)
                 completed_item_ids.add(id(item))
         if completed_item_ids:
             setattr(
@@ -9620,6 +9588,7 @@ def _enqueue_full_cudagraph_refresh_payloads_after_replay(
                 ]
             else:
                 pending_rebuild_ids = []
+            refresh_generation = getattr(tracking, "refresh_generation", None)
             intent_debug.append(
                 {
                     "req_id": str(req_id),
@@ -9627,32 +9596,32 @@ def _enqueue_full_cudagraph_refresh_payloads_after_replay(
                     "last_decode_refresh_step": int(
                         getattr(tracking, "last_decode_refresh_step", -1)
                     ),
-                    "refresh_publish_key": list(
-                        getattr(tracking, "refresh_publish_key", ()) or ()
+                    "refresh_generation_key": list(
+                        getattr(refresh_generation, "key", ()) or ()
                     ),
-                    "refresh_publish_enqueued_layers": int(
+                    "refresh_generation_enqueued_layers": int(
                         getattr(
-                            tracking,
-                            "refresh_publish_enqueued_layer_mask",
+                            refresh_generation,
+                            "enqueued_layer_mask",
                             0,
                         )
                     ).bit_count(),
-                    "refresh_publish_published_layers": int(
+                    "refresh_generation_published_layers": int(
                         getattr(
-                            tracking,
-                            "refresh_publish_published_layer_mask",
+                            refresh_generation,
+                            "published_layer_mask",
                             0,
                         )
                     ).bit_count(),
-                    "refresh_publish_retired_layers": int(
+                    "refresh_generation_retired_layers": int(
                         getattr(
-                            tracking,
-                            "refresh_publish_retired_layer_mask",
+                            refresh_generation,
+                            "retired_layer_mask",
                             0,
                         )
                     ).bit_count(),
-                    "refresh_publish_sealed": bool(
-                        getattr(tracking, "refresh_publish_sealed", False)
+                    "refresh_generation_sealed": bool(
+                        getattr(refresh_generation, "sealed", False)
                     ),
                     "trigger_intent_decode_step": int(
                         getattr(tracking, "trigger_intent_decode_step", -1)
@@ -13343,7 +13312,7 @@ def _run_capture_only_mixed_forward(
         CaptureCohortCoordinator,
         publish_capture_cohort_completion,
     )
-    from patches.fa3_native.capture_ownership import CHUNK_COHORT
+    from patches.fa3_native.capture_ownership import CHUNK_COHORT, RING_EARLY
     from patches.fa3_native.forward_capture import prepare_capture_forward_side_outputs
     from patches.fa3_native.install import load_vendored_flash_attn_bridge
     from patches.fa3_native.postprocess import (
@@ -13684,81 +13653,27 @@ def _run_capture_only_mixed_forward(
             )
         # WAR: order this layer's ring-slot capture AFTER the prior occupant's reduce read.
         torch.cuda.current_stream(device=torch.device(query.device)).wait_event(_prev_evt)
-    defer_capture_postprocess_requested = (
-        os.environ.get("VLLM_SPARSE_DEFER_CAPTURE_POSTPROCESS", "0") == "1"
-    )
-    early_capture_postprocess_requested = (
-        os.environ.get("VLLM_SPARSE_EARLY_CAPTURE_POSTPROCESS", "0") == "1"
-    )
-    async_capture_postprocess_requested = (
-        os.environ.get("VLLM_SPARSE_ASYNC_CAPTURE_POSTPROCESS", "0") == "1"
-    ) and not defer_capture_postprocess_requested
-
-    def _auto_early_capture_postprocess_requested() -> bool:
-        if (
-            defer_capture_postprocess_requested
-            or early_capture_postprocess_requested
-            or async_capture_postprocess_requested
-        ):
-            return False
-        if int(planned_max_capture_last_n) <= 1:
-            return False
-        if prefill_layout is None or refresh_layout is not None:
-            return False
-        one_shot_bootstrap_only = bool(
-            getattr(
-                getattr(controller, "config", None),
-                "one_shot_bootstrap_only",
-                False,
-            )
-        )
-        if not one_shot_bootstrap_only:
-            return False
-        if not torch.cuda.is_available():
-            return False
-        if torch.cuda.is_current_stream_capturing():
-            return False
-        async_refresh_enabled = getattr(controller, "_async_refresh_enabled", None)
-        if not callable(async_refresh_enabled) or not bool(async_refresh_enabled()):
-            return False
-        ensure_refresh_stream = getattr(controller, "_ensure_refresh_stream", None)
-        if not callable(ensure_refresh_stream):
-            return False
-        ensure_refresh_stream(torch.device(query.device))
-        return getattr(controller, "refresh_stream", None) is not None
-
-    # CHUNK_COHORT is an immutable structural plan, not a legacy last_n/layout
-    # heuristic.  Its execution owner is selected once after semantic work is
-    # known; do not let the old prefill-only auto gate infer it independently.
-    auto_early_capture_postprocess_requested = (
-        False
-        if _capture_ownership_mode_value == CHUNK_COHORT
-        else _auto_early_capture_postprocess_requested()
-    )
-    if auto_early_capture_postprocess_requested:
-        defer_capture_postprocess_requested = True
-        early_capture_postprocess_requested = True
+    # The sealed owner is the allocation contract.  Always address its fixed
+    # last_n capacity; per-row write/read counts remain the unmodified CPU truth.
+    # This gives ring and cohort one exact prebuilt key, including decode-only
+    # last_n==1 steps, without allocation or shape selection on the live path.
     # 262k OOM fix (last_n bucketing; symmetric with the EDIT-1 kv_max force-form):
-    # round the DEFER capture-scratch last_n dim UP to the configured
+    # round the sealed capture-scratch last_n dim UP to the configured
     # prefill_last_n_query bucket so scratch_storage_shape[-2] is INVARIANT and the
-    # deferred scratch_key HITS the profile-prebuilt slab. Without this the FINAL
+    # owner scratch_key HITS the profile-prebuilt slab. Without this the FINAL
     # prefill tail chunk (q_len < 16 -> planned_max_capture_last_n = min(16, q_len)
-    # < 16; selector_compute_mixin.py:2255-2264) mints a DISTINCT shape[-2] -> cache
-    # MISS at forward_capture.py:444 -> the ~3GB lazy torch.empty at :459 re-OOMs the
-    # 262k hot path (launch-scale hazard: prompt_len mod chunk in [2,15]). SAFE: the
-    # capture store kernel (FA4 CuTe store_capture_scores / FA3 C++) uses shape[-2]
+    # < 16) mints a DISTINCT shape[-2] -> cache MISS -> a multi-GiB lazy allocation
+    # re-OOMs the 262k hot path (launch-scale hazard: prompt_len mod chunk in [2,15]).
+    # The capture store kernel (FA4 CuTe store_capture_scores / FA3 C++) uses shape[-2]
     # only as the row STRIDE and clamps writes to min(per_row_last_n, shape[-2],
     # seqlen_q); postprocess reads the per-row ACTUAL last_n (postprocess.py:354), so
     # rows [actual:bucket) stay UNWRITTEN + UNREAD -> identical numerics (the same
-    # mechanism the kv_max width bucket relies on). GUARD > 1: never promote a decode
-    # last_n==1 step (the auto-early gate at :12172 already used the RAW planned
-    # value); per-row logits_last_n_by_row (the actual write counts) pass UNCHANGED.
-    # 0 bucket (prebuild skipped) => no-op. A stamped chunk cohort always uses its
-    # prebuilt R capacity, including an actual last_n==1 tail; unused rows remain
-    # unwritten and unread, while preserving the single cache key.
+    # mechanism the kv_max width bucket relies on). Per-row logits_last_n_by_row
+    # (the actual write counts) pass UNCHANGED. 0 bucket (prebuild skipped) =>
+    # no-op. Every stamped owner uses its prebuilt R capacity.
     _capture_last_n_bucket = int(getattr(controller, "_capture_last_n_bucket", 0) or 0)
     _planned_max_capture_last_n_alloc = int(planned_max_capture_last_n)
-    if _capture_ownership_mode_value == CHUNK_COHORT:
+    if _capture_ownership_plan is not None:
         _planned_max_capture_last_n_alloc = int(
             getattr(_capture_ownership_plan, "last_n")
         )
@@ -13783,27 +13698,8 @@ def _run_capture_only_mixed_forward(
         seqused_k_cpu=context_lengths[:batch_size],
         scratch_cache_owner=controller,
         scratch_cache_extra_key=(
-            (
-                "capture_postprocess_cohort",
-                _effective_capture_cohort_size,
-                _effective_capture_scratch_depth,
-            )
-            if _capture_ownership_mode_value == CHUNK_COHORT
-            else (
-                "capture_postprocess_ring",
-                0,
-                _effective_capture_scratch_depth,
-            )
+            _capture_ownership_plan.scratch_extra_key
             if _capture_ownership_plan is not None
-            else (
-                "capture_postprocess_ring",
-                0,
-                _ek_depth,
-            )
-            if (
-                defer_capture_postprocess_requested
-                or async_capture_postprocess_requested
-            )
             else None
         ),
     )
@@ -14055,24 +13951,6 @@ def _run_capture_only_mixed_forward(
         )
 
     capture_postprocess_required = bool(_capture_postprocess_required())
-    # A stamped cohort owns postprocess jobs, not every attention call carrying
-    # a capture route bit. Chunked prefill legitimately emits metadata-not-ready
-    # calls (last_n==0) and direct last-n=1 calls with no postprocess work; those
-    # calls must create neither a deferred job nor a completion event. Conversely,
-    # a mixed prefill/refresh call with real scratch work must keep the immutable
-    # cohort owner even though the legacy prefill-only auto gate is ineligible.
-    # Resolve that distinction once from the semantic work predicate. This adds
-    # no CUDA work and is outside the steady decode path.
-    if (
-        _capture_ownership_mode_value == CHUNK_COHORT
-        and capture_postprocess_required
-        and not defer_capture_postprocess_requested
-        and not early_capture_postprocess_requested
-        and not async_capture_postprocess_requested
-    ):
-        defer_capture_postprocess_requested = True
-        early_capture_postprocess_requested = True
-
     def _run_capture_postprocess() -> bool:
         return run_prefill_capture_postprocess_if_needed(
             direct_capture_phase=str(capture_postprocess_state.get("direct_capture_phase", "")),
@@ -14117,72 +13995,8 @@ def _run_capture_only_mixed_forward(
             debug_layer_index=int(getattr(state, "layer_index", -1)),
         )
 
-    postprocess_profile_metadata = {
-        "epoch": int(getattr(step_authority, "epoch", -1)),
-        "layer": int(getattr(state, "layer_index", -1)),
-        "direct_capture_phase": str(capture_postprocess_state.get("direct_capture_phase", "")),
-        "producer_rows_cpu": tuple(
-            int(v) for v in tuple(getattr(side_outputs, "producer_rows_cpu", tuple()) or tuple())
-        ),
-        "row_capture_last_n_cpu": tuple(
-            int(v) for v in tuple(getattr(side_outputs, "row_capture_last_n_cpu", tuple()) or tuple())
-        ),
-        "skip_postprocess_rows_cpu": tuple(int(v) for v in skip_postprocess_rows),
-    }
-
-    def _profiled_capture_postprocess(*, label: str, async_mode: bool) -> bool:
-        return _run_capture_postprocess()
-
-    def _defer_capture_postprocess_available() -> bool:
-        if not defer_capture_postprocess_requested:
-            return False
-        if not capture_postprocess_required:
-            return False
-        if (
-            refresh_layout is not None
-            and _capture_ownership_mode_value != CHUNK_COHORT
-        ):
-            return False
-        if not bool(getattr(getattr(controller, "config", None), "one_shot_bootstrap_only", False)):
-            return False
-        if not torch.cuda.is_available():
-            return False
-        if torch.cuda.is_current_stream_capturing():
-            return False
-        return True
-
-    def _async_capture_postprocess_available() -> bool:
-        if not async_capture_postprocess_requested:
-            return False
-        if not capture_postprocess_required:
-            return False
-        if not torch.cuda.is_available():
-            return False
-        if torch.cuda.is_current_stream_capturing():
-            return False
-        async_refresh_enabled = getattr(controller, "_async_refresh_enabled", None)
-        if not callable(async_refresh_enabled) or not bool(async_refresh_enabled()):
-            return False
-        ensure_refresh_stream = getattr(controller, "_ensure_refresh_stream", None)
-        if not callable(ensure_refresh_stream):
-            return False
-        ensure_refresh_stream(torch.device(query.device))
-        return getattr(controller, "refresh_stream", None) is not None
-
-    def _early_capture_postprocess_stream_available() -> bool:
-        async_refresh_enabled = getattr(controller, "_async_refresh_enabled", None)
-        if not callable(async_refresh_enabled) or not bool(async_refresh_enabled()):
-            return False
-        ensure_refresh_stream = getattr(controller, "_ensure_refresh_stream", None)
-        if not callable(ensure_refresh_stream):
-            return False
-        ensure_refresh_stream(torch.device(query.device))
-        return getattr(controller, "refresh_stream", None) is not None
-
     _POSTPROCESS_OWNER_NONE = "none"
-    _POSTPROCESS_OWNER_DEFERRED_EARLY = "deferred_early"
-    _POSTPROCESS_OWNER_DEFERRED_LATE = "deferred_late"
-    _POSTPROCESS_OWNER_ASYNC = "async"
+    _POSTPROCESS_OWNER_RING_EARLY = "ring_early"
     _POSTPROCESS_OWNER_INLINE = "inline"
     _POSTPROCESS_OWNER_CHUNK_COHORT_EARLY = "chunk_cohort_early"
 
@@ -14257,20 +14071,6 @@ def _run_capture_only_mixed_forward(
                     "E_SFI_CAPTURE_COHORT_OWNER_UNAVAILABLE: stamped chunk "
                     "cohort requires a valid logical step identity"
                 )
-            if (
-                not defer_capture_postprocess_requested
-                or not early_capture_postprocess_requested
-                or async_capture_postprocess_requested
-            ):
-                raise RuntimeError(
-                    "E_SFI_CAPTURE_COHORT_OWNER: stamped chunk cohort requires "
-                    "the deferred early owner for every live postprocess job"
-                )
-            if not _defer_capture_postprocess_available():
-                raise RuntimeError(
-                    "E_SFI_CAPTURE_COHORT_OWNER_UNAVAILABLE: stamped chunk "
-                    "cohort cannot execute its deferred early owner"
-                )
             if getattr(controller, "refresh_stream", None) is None:
                 raise RuntimeError(
                     "E_SFI_CAPTURE_COHORT_OWNER_UNAVAILABLE: stamped chunk "
@@ -14278,31 +14078,24 @@ def _run_capture_only_mixed_forward(
                 )
             return _bind_owner(_POSTPROCESS_OWNER_CHUNK_COHORT_EARLY)
 
-        # Every reusable scratch owner publishes reduce completion through the
-        # RingWarFence. Validate only live scratch work: no-work/direct steps
-        # must not be rejected by a structural plan they do not execute.
-        if (
-            (defer_capture_postprocess_requested and not early_capture_postprocess_requested)
-            or async_capture_postprocess_requested
-        ):
-            raise RuntimeError(
-                "capture scratch reuse requires the early-reduce fence: "
-                "pure-defer (VLLM_SPARSE_DEFER_CAPTURE_POSTPROCESS=1 without "
-                "VLLM_SPARSE_EARLY_CAPTURE_POSTPROCESS=1) and VLLM_SPARSE_ASYNC_CAPTURE_"
-                "POSTPROCESS modes read reusable scratch without a WAR fence event; "
-                "enable EARLY=1 or use a ring_early ownership plan"
-            )
-        if _defer_capture_postprocess_available():
-            if early_capture_postprocess_requested:
-                if not _early_capture_postprocess_stream_available():
+        if _capture_ownership_mode_value == RING_EARLY:
+            if bool(getattr(_capture_ownership_plan, "async_owner_available", False)):
+                if not binding_identity_valid:
                     raise RuntimeError(
-                        "E_SFI_CAPTURE_POSTPROCESS_OWNER_UNAVAILABLE: deferred "
-                        "early owner requires async refresh_stream"
+                        "E_SFI_CAPTURE_RING_OWNER_UNAVAILABLE: stamped async ring "
+                        "requires a valid logical step identity"
                     )
-                return _bind_owner(_POSTPROCESS_OWNER_DEFERRED_EARLY)
-            return _bind_owner(_POSTPROCESS_OWNER_DEFERRED_LATE)
-        if _async_capture_postprocess_available():
-            return _bind_owner(_POSTPROCESS_OWNER_ASYNC)
+                if getattr(controller, "refresh_stream", None) is None:
+                    raise RuntimeError(
+                        "E_SFI_CAPTURE_RING_OWNER_UNAVAILABLE: stamped async ring "
+                        "requires its pre-established refresh_stream"
+                    )
+                return _bind_owner(_POSTPROCESS_OWNER_RING_EARLY)
+            return _bind_owner(_POSTPROCESS_OWNER_INLINE)
+        if _capture_ownership_plan is not None:
+            raise RuntimeError(
+                "E_SFI_CAPTURE_POSTPROCESS_OWNER: unknown stamped ownership mode"
+            )
         return _bind_owner(_POSTPROCESS_OWNER_INLINE)
 
     capture_postprocess_execution_owner = (
@@ -14313,9 +14106,7 @@ def _run_capture_only_mixed_forward(
         postprocess_ran = False
     elif (
         capture_postprocess_execution_owner
-        == _POSTPROCESS_OWNER_DEFERRED_EARLY
-        or capture_postprocess_execution_owner
-        == _POSTPROCESS_OWNER_DEFERRED_LATE
+        == _POSTPROCESS_OWNER_RING_EARLY
         or capture_postprocess_execution_owner
         == _POSTPROCESS_OWNER_CHUNK_COHORT_EARLY
     ):
@@ -14391,136 +14182,91 @@ def _run_capture_only_mixed_forward(
             lifecycle_lock=threading.Lock(),
         )
         postprocess_ran = False
-        if (
-            capture_postprocess_execution_owner
-            != _POSTPROCESS_OWNER_DEFERRED_LATE
-        ):
-            refresh_stream = getattr(controller, "refresh_stream", None)
-            if refresh_stream is None:
-                raise RuntimeError(
-                    "E_SFI_CAPTURE_POSTPROCESS_OWNER_UNAVAILABLE: frozen early "
-                    "owner requires refresh_stream"
-                )
-
-            if (
-                capture_postprocess_execution_owner
-                == _POSTPROCESS_OWNER_CHUNK_COHORT_EARLY
-            ):
-                coordinator = getattr(
-                    controller, "_capture_cohort_coordinator", None
-                )
-                if coordinator is None:
-                    coordinator = CaptureCohortCoordinator()
-                    setattr(controller, "_capture_cohort_coordinator", coordinator)
-                elif not isinstance(coordinator, CaptureCohortCoordinator):
-                    raise RuntimeError(
-                        "E_SFI_CAPTURE_COHORT_OWNER: controller coordinator "
-                        "has an invalid type"
-                    )
-                total_layers = len(
-                    tuple(getattr(controller, "layer_cache_keys", tuple()) or tuple())
-                )
-                ready_cohort = coordinator.submit(
-                    job=capture_postprocess_job,
-                    handle_id=capture_handle_id,
-                    handle_generation=capture_handle_generation,
-                    epoch=capture_epoch,
-                    plan_signature=_capture_ownership_plan_signature,
-                    global_layer_index=int(global_layer_index),
-                    total_layers=int(total_layers),
-                    chunk_id=int(capture_chunk_id),
-                    slot_in_chunk=int(slot_in_chunk),
-                    scratch_slot=int(_effective_capture_ring_slot),
-                    cohort_size=int(_effective_capture_cohort_size),
-                    selected_depth=int(_effective_capture_scratch_depth),
-                )
-                postprocess_ran = False
-                if ready_cohort is not None:
-                    with torch.cuda.stream(refresh_stream):
-                        (
-                            ran_count,
-                            cohort_terminal_event,
-                        ) = run_capture_postprocess_job_sequence_for_cohort(
-                            ready_cohort.jobs,
-                            meta_cache_owner=controller,
-                        )
-                        fence = getattr(controller, "_ring_war_fence", None)
-                        publish_capture_cohort_completion(
-                            ready_cohort,
-                            ran_count=int(ran_count),
-                            terminal_event=cohort_terminal_event,
-                            fence=fence,
-                        )
-                    postprocess_ran = True
-            else:
-                with torch.cuda.stream(refresh_stream):
-                    postprocess_ran = run_capture_postprocess_job_if_needed(
-                        capture_postprocess_job,
-                        meta_cache_owner=controller,
-                    )
-                    if bool(getattr(capture_postprocess_job, "completed", False)):
-                        completion_event = getattr(
-                            capture_postprocess_job, "completion_event", None
-                        )
-                        if completion_event is None:
-                            raise RuntimeError(
-                                "E_SFI_CAPTURE_POSTPROCESS_EVENT: completed job "
-                                "has no completion event"
-                            )
-                        fence = getattr(controller, "_ring_war_fence", None)
-                        if fence is None:
-                            raise RuntimeError(
-                                "E_SFI_CAPTURE_POSTPROCESS_FENCE: reusable "
-                                "scratch has no WAR fence owner"
-                            )
-                        fence.on_reduce(
-                            int(_effective_capture_ring_slot),
-                            completion_event,
-                            postprocess_ran,
-                        )
-    elif capture_postprocess_execution_owner == _POSTPROCESS_OWNER_ASYNC:
         refresh_stream = getattr(controller, "refresh_stream", None)
         if refresh_stream is None:
             raise RuntimeError(
-                "E_SFI_CAPTURE_ASYNC_OWNER_UNAVAILABLE: frozen async owner "
+                "E_SFI_CAPTURE_POSTPROCESS_OWNER_UNAVAILABLE: frozen owner "
                 "requires refresh_stream"
             )
-        else:
-            main_stream = torch.cuda.current_stream(device=query.device)
-            ready_event = torch.cuda.Event(enable_timing=False)
-            ready_event.record(main_stream)
 
-            def _record_async_postprocess_tensor(tensor: Optional[torch.Tensor]) -> None:
-                if not isinstance(tensor, torch.Tensor):
-                    return
-                try:
-                    tensor.record_stream(refresh_stream)
-                except Exception:
-                    _log.warning("async capture postprocess record_stream failed", exc_info=True)
-                    raise
-
-            _record_async_postprocess_tensor(side_outputs.scratch_capture_scores)
-            _record_async_postprocess_tensor(side_outputs.producer_rows_i32)
-            _record_async_postprocess_tensor(side_outputs.row_capture_last_n_i32)
-            _record_async_postprocess_tensor(side_outputs.row_is_prefill_producer)
-            _record_async_postprocess_tensor(side_outputs.active_capture_row_by_batch_row_i32)
-            _record_async_postprocess_tensor(side_outputs.prefill_out_capture_scores)
-            _record_async_postprocess_tensor(side_outputs.prefill_out_log_f_denoms)
-            _record_async_postprocess_tensor(side_outputs.refresh_out_capture_scores)
-            _record_async_postprocess_tensor(side_outputs.refresh_out_log_f_denoms)
-            _record_async_postprocess_tensor(real_seqused_k)
-
-            with torch.cuda.stream(refresh_stream):
-                torch.cuda.current_stream(device=query.device).wait_event(ready_event)
-                postprocess_ran = _profiled_capture_postprocess(
-                    label="capture_postprocess_async",
-                    async_mode=True,
+        if (
+            capture_postprocess_execution_owner
+            == _POSTPROCESS_OWNER_CHUNK_COHORT_EARLY
+        ):
+            coordinator = getattr(
+                controller, "_capture_cohort_coordinator", None
+            )
+            if coordinator is None:
+                coordinator = CaptureCohortCoordinator()
+                setattr(controller, "_capture_cohort_coordinator", coordinator)
+            elif not isinstance(coordinator, CaptureCohortCoordinator):
+                raise RuntimeError(
+                    "E_SFI_CAPTURE_COHORT_OWNER: controller coordinator "
+                    "has an invalid type"
                 )
+            total_layers = len(
+                tuple(getattr(controller, "layer_cache_keys", tuple()) or tuple())
+            )
+            ready_cohort = coordinator.submit(
+                job=capture_postprocess_job,
+                handle_id=capture_handle_id,
+                handle_generation=capture_handle_generation,
+                epoch=capture_epoch,
+                plan_signature=_capture_ownership_plan_signature,
+                global_layer_index=int(global_layer_index),
+                total_layers=int(total_layers),
+                chunk_id=int(capture_chunk_id),
+                slot_in_chunk=int(slot_in_chunk),
+                scratch_slot=int(_effective_capture_ring_slot),
+                cohort_size=int(_effective_capture_cohort_size),
+                selected_depth=int(_effective_capture_scratch_depth),
+            )
+            postprocess_ran = False
+            if ready_cohort is not None:
+                with torch.cuda.stream(refresh_stream):
+                    (
+                        ran_count,
+                        cohort_terminal_event,
+                    ) = run_capture_postprocess_job_sequence_for_cohort(
+                        ready_cohort.jobs,
+                        meta_cache_owner=controller,
+                    )
+                    fence = getattr(controller, "_ring_war_fence", None)
+                    publish_capture_cohort_completion(
+                        ready_cohort,
+                        ran_count=int(ran_count),
+                        terminal_event=cohort_terminal_event,
+                        fence=fence,
+                    )
+                postprocess_ran = True
+        else:
+            with torch.cuda.stream(refresh_stream):
+                postprocess_ran = run_capture_postprocess_job_if_needed(
+                    capture_postprocess_job,
+                    meta_cache_owner=controller,
+                )
+                if bool(getattr(capture_postprocess_job, "completed", False)):
+                    completion_event = getattr(
+                        capture_postprocess_job, "completion_event", None
+                    )
+                    if completion_event is None:
+                        raise RuntimeError(
+                            "E_SFI_CAPTURE_POSTPROCESS_EVENT: completed job "
+                            "has no completion event"
+                        )
+                    fence = getattr(controller, "_ring_war_fence", None)
+                    if fence is None:
+                        raise RuntimeError(
+                            "E_SFI_CAPTURE_POSTPROCESS_FENCE: reusable "
+                            "scratch has no WAR fence owner"
+                        )
+                    fence.on_reduce(
+                        int(_effective_capture_ring_slot),
+                        completion_event,
+                        postprocess_ran,
+                    )
     elif capture_postprocess_execution_owner == _POSTPROCESS_OWNER_INLINE:
-        postprocess_ran = _profiled_capture_postprocess(
-            label="capture_postprocess",
-            async_mode=False,
-        )
+        postprocess_ran = _run_capture_postprocess()
     else:
         raise AssertionError(
             "unhandled capture postprocess execution owner: "

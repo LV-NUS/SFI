@@ -10,10 +10,10 @@ _selector_topk_graph_stable_active 看到裸 dict 恒 bypass。
 本环 v3:N 个槽,每槽持有一套**按物理槽生命周期持久的 override 容器**(SlotStableOverrides,
 形态与私有 dict 完全同=get-or-alloc,shape 键控),外加 key_norms 有效键集:
 
-1. 私有语义不变:槽绑定 pending(selected_out_ring_slot 字段),终局唯一
-   漏斗 _pending_refresh_rebuild_clear 释放前绝不重用 → 不存在"未终局
-   result/scratch 被后续 run 覆写"(07-07 illegal 案毒源形态;bounds 六元组
-   的 deferred 读者由同一协议覆盖)。
+1. 私有语义不变:槽绑定 pending(selected_out_ring_slot 字段),只有 writer
+   消费序已冻结为 release event 后才释放；下次 acquire 先 wait_event，因而
+   不存在未完成 result/scratch 被后续 run 覆写(07-07 illegal 案毒源形态；
+   bounds 六元组的 deferred 读者由同一协议覆盖)。
 2. 指针稳定:同槽稳态复用同 buffer → graph key 可命中(out/bounds/ws/
    key_norms 指针全在 key 内;logf ws 不在 key 但随槽稳定,shape 变化必然
    带动 key 内字段变化 → 新 key 新捕获,烘焙指针恒一致)。

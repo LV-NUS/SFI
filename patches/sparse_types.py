@@ -1304,6 +1304,58 @@ class StepDispatchPlan:
 # Rebuild types
 # ---------------------------------------------------------------------------
 
+@dataclass(frozen=True, slots=True)
+class RefreshSlotLease:
+    """Immutable physical slot identity held by one refresh generation."""
+
+    request_id: str
+    slot: int
+    slot_generation: int
+
+
+@dataclass(slots=True, eq=False)
+class RefreshGeneration:
+    """Single physical owner for one refresh producer generation.
+
+    Request tracking stores only a pointer to this object. Layer admission and
+    terminal receipts are therefore recorded once per physical producer, not
+    duplicated across every request in the cohort.
+    """
+
+    handle_id: int
+    handle_generation: int
+    req_ids: Tuple[str, ...]
+    slot_leases: Tuple[RefreshSlotLease, ...]
+    enqueued_layer_mask: int = 0
+    registered_layer_mask: int = 0
+    published_layer_mask: int = 0
+    retired_layer_mask: int = 0
+    sealed: bool = False
+    closed: bool = False
+    invalidated_req_ids: Set[str] = field(default_factory=set)
+    children: List["RefreshGenerationChild"] = field(default_factory=list)
+
+    @property
+    def key(self) -> Tuple[int, int]:
+        return (int(self.handle_id), int(self.handle_generation))
+
+    @property
+    def terminal_layer_mask(self) -> int:
+        return int(self.published_layer_mask) | int(self.retired_layer_mask)
+
+
+@dataclass(slots=True, eq=False)
+class RefreshGenerationChild:
+    """Exactly-once terminal child of a refresh generation."""
+
+    generation: RefreshGeneration
+    layer_mask: int
+    owner_kind: str
+    owner: Any = None
+    owner_buf_id: int = -1
+    terminal_status: str = ""
+
+
 @dataclass(slots=True)
 class PendingRefreshRebuild:
     payloads: List[SelectorBatchPayload]
@@ -1321,6 +1373,7 @@ class PendingRefreshRebuild:
     capture_epoch: int = -1
     pending_id: int = -1
     req_ids: Optional[Tuple[str, ...]] = None
+    generation_child: Optional[RefreshGenerationChild] = None
     producer_kind: str = "refresh_rebuild"
     target_layer_start: int = -1
     target_layer_end: int = -1
@@ -1328,7 +1381,6 @@ class PendingRefreshRebuild:
     deadline_epoch: int = -1
     deadline_handle_id: int = -1
     can_drop: bool = True
-    can_coalesce: bool = True
     admission_reason: str = ""
     # Off-loop pre-publish carriers (see
     # docs/superpowers/specs/2026-05-10-sm80-refresh-producer-off-loop-pre-publish-design.md):
@@ -1356,7 +1408,8 @@ class PendingRefreshRebuild:
     read_side_published: bool = False
     compact_meta_commit_log: Optional[List[Dict[str, object]]] = None
     # [SELECTED-OUT-RING 2026-07-09] 本 pending 的 selector run 占用的稳定环
-    # 槽(spill/环关闭=None)。终局唯一漏斗 _pending_refresh_rebuild_clear
+    # 槽(spill/环关闭=None)。终局唯一漏斗
+    # _release_terminal_pending_refresh_rebuild
     # 释放(存 writer_done_event 消费序);释放前该槽绝不被后续 run 重用。
     selected_out_ring_slot: Any = None
 
@@ -1365,10 +1418,20 @@ class PendingRefreshRebuild:
 class RefreshPublishReceipt:
     """Immutable proof for one physically ordered refresh layer set."""
 
-    handle_id: int
-    handle_generation: int
-    req_ids: Tuple[str, ...]
+    child: RefreshGenerationChild
     layer_mask: int
+
+    @property
+    def handle_id(self) -> int:
+        return int(self.child.generation.handle_id)
+
+    @property
+    def handle_generation(self) -> int:
+        return int(self.child.generation.handle_generation)
+
+    @property
+    def req_ids(self) -> Tuple[str, ...]:
+        return self.child.generation.req_ids
 
 
 @dataclass(frozen=True, slots=True)
@@ -1489,19 +1552,10 @@ class RequestTracking:
     # short-dense 首个 compact generation 发布前的读侧保护。该状态只在
     # compact metadata 全层原子发布后清除，不参与 TP trigger 决策。
     dense_until_compact_ready: bool = False
-    # Refresh 物理世代 baton。enqueue/publish/retire 分别按全局 layer id
-    # 置位；last-layer seal 关闭生产端。只有 sealed 且每个已 enqueue layer
-    # 都取得 publish 或 retire 终态，才允许下一物理世代接棒。retire 不等于
-    # 成功发布：它保持 dense 保护并触发 lease rearm，但也不能提前释放
-    # owner，
-    # 否则同代剩余 writer 会在 owner 消失后与下一代静默重叠。
-    # 该账本不参与 sentence/interval 触发决策，避免把 rank-local GPU
-    # 时序注入 TP 决策。
-    refresh_publish_key: Optional[Tuple[int, int]] = None
-    refresh_publish_enqueued_layer_mask: int = 0
-    refresh_publish_published_layer_mask: int = 0
-    refresh_publish_retired_layer_mask: int = 0
-    refresh_publish_sealed: bool = False
+    # Refresh 物理世代只由 slot-generation owner 持有一份 ledger；request
+    # 侧只保存对象指针，避免逐请求 mask 与 pending 索引形成并行真值。
+    # 该指针不参与 sentence/interval 触发决策，只服务读侧保护与生命周期。
+    refresh_generation: Optional[RefreshGeneration] = None
     # 读侧 reason/policy 与上述账本同生共灭，仅供 dense-consume 防 torn-read。
     inflight_reason_code: int = -1
     inflight_policy: int = -1

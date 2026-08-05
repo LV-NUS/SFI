@@ -58,7 +58,6 @@ __all__ = [
     "_REPLAY_REFRESH_NOOP_FAST_SKIP_CACHED",
     "_REFRESH_REBUILD_MAX_DELAY_STEPS_CACHED",
     "_REFRESH_REBUILD_CHECK_CACHED",
-    "_PENDING_REBUILD_MAX_QUEUE_OVERRIDE_CACHED",
     "_PREFILL_RELEASE_GRACE_STEPS",
     "_STEP_PROFILE_CACHED",
     "_STEP_PROFILE_DETAIL_CACHED",
@@ -423,35 +422,6 @@ if _REFRESH_REBUILD_MAX_DELAY_STEPS_CACHED < 0:
     _REFRESH_REBUILD_MAX_DELAY_STEPS_CACHED = 0
 # [WRITER-RELEASE-STAGGER 2026-07-06] opt-in：同一 step 内背靠背入队的多个
 _REFRESH_REBUILD_CHECK_CACHED = os.environ.get("VLLM_SPARSE_REFRESH_REBUILD_CHECK", "0") == "1"
-def _parse_pending_rebuild_max_queue_override(
-    environ: Mapping[str, str],
-) -> Optional[int]:
-    """Return an explicit fail-closed queue ceiling, or runtime auto.
-
-    The default queue capacity is derived from the live request/layer-scope
-    ownership ledger.  A process-global population guess cannot represent
-    different batch sizes, model depths, or producer chunking.  The optional
-    override is retained only as a stricter diagnostic ceiling.
-    """
-    raw = environ.get("VLLM_SPARSE_PENDING_REBUILD_MAX_QUEUE", "").strip()
-    if not raw:
-        return None
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise ValueError(
-            "VLLM_SPARSE_PENDING_REBUILD_MAX_QUEUE must be a positive integer"
-        ) from exc
-    if value <= 0:
-        raise ValueError(
-            "VLLM_SPARSE_PENDING_REBUILD_MAX_QUEUE must be a positive integer"
-        )
-    return value
-
-
-_PENDING_REBUILD_MAX_QUEUE_OVERRIDE_CACHED: Optional[int] = (
-    _parse_pending_rebuild_max_queue_override(os.environ)
-)
 
 # Prefill buffer release grace period
 _PREFILL_RELEASE_GRACE_STEPS: int = 2
@@ -524,10 +494,9 @@ _SELECTOR_TOPK_GRAPH_CACHED = (
 # [SELECTED-OUT-RING 2026-07-09] pending-path selected_indices_out stable ring
 # (default ON). Replaces [SELECTED-PRIVATE-OUT 2026-07-07]'s per-run fresh
 # allocation with a bounded ring of data_ptr-stable buffers guarded by per-slot
-# release events (produce/consume ordering) and released at the pending
-# terminal funnel (_pending_refresh_rebuild_clear). Liveness semantics are
-# unchanged (a slot is never reused before its pending is terminal); what
-# changes is pointer stability, which is what lets the #13 STAGE-0
+# release events (produce/consume ordering) and released only after the writer
+# consumption order has been frozen. A later acquire waits that exact event;
+# what changes is pointer stability, which is what lets the #13 STAGE-0
 # selector-topk captured graph hit on the production pending path (fresh
 # per-run pointers miss the ptr-encoding key forever). Escape:
 # VLLM_SPARSE_SELECTED_OUT_RING=0 restores the per-run private dict verbatim.

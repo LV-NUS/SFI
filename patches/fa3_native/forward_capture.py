@@ -33,7 +33,6 @@ import torch
 from patches.cpu_gpu_staging import cached_sequence_to_device
 from patches.fa3_native.capture_ownership import (
     CAPTURE_OWNERSHIP_POLICY_SCHEMA,
-    CHUNK_COHORT,
     CaptureOwnershipPlan,
 )
 from patches.fa3_native.row_plan import MixedPageRowPlan
@@ -830,21 +829,10 @@ def prepare_capture_forward_side_outputs(
         num_heads = int(refresh_layout.num_heads)
     else:
         raise ValueError("at least one capture layout is required")
-    # 262k OOM fix (dim-1 row bucketing; symmetric with the EDIT-1 kv / EDIT-7 last_n
-    # force-form): the DEFER scratch_key embeds scratch_storage_shape, whose dim-1 is
-    # the producer-row count len(producer_rows_cpu). Under --max-num-seqs N the vLLM
-    # v1 0.19 scheduler may co-schedule up to N prefills in ONE forward (it does NOT
-    # honor max_num_partial_prefills), so this count varies 1..N; a count != the
-    # profile-prebuilt one MISSes the slab -> the ~3GB lazy torch.empty at :459 re-OOMs
-    # the hot path. Round the ALLOCATED/KEYED dim-1 UP to the prebuilt
-    # _capture_rows_bucket (= the prebuild's producer_rows_worst, default max_num_seqs)
-    # so the key is INVARIANT and HITs. The extra rows live ONLY in the allocation +
-    # cache key; the downstream VIEW (scratch_capture_scores) is sliced back to the
-    # actual count below, so every consumer (postprocess.py:122 asserts shape[0] ==
-    # producer rows; the store writes by capture_row) sees the EXACT HEAD shape/strides
-    # -> bit-identical numerics. 0 bucket (prebuild skipped / non-capture run) => no-op
-    # => exact HEAD behaviour (fail-safe). scratch_cache_owner is the controller (the
-    # cache map + bucket are stamped on it by _prebuild_capture_buffers).
+    # The scheduler may co-schedule any row count up to max_num_seqs. Key the
+    # allocation by the sealed rows capacity so every legal live batch hits the
+    # prebuilt slab; slice the returned view back to the actual producer rows.
+    # Unstamped non-capture runs retain their exact live row count.
     _actual_capture_rows = int(len(producer_rows_cpu))
     _capture_rows_bucket = 0
     if scratch_cache_owner is not None:
@@ -906,35 +894,19 @@ def prepare_capture_forward_side_outputs(
                     "capture ownership plan"
                 )
             sealed_cache_required = True
-            key_kind = (
-                "capture_postprocess_cohort"
-                if ownership_plan.mode == CHUNK_COHORT
-                else "capture_postprocess_ring"
-            )
-            key_scope = (
-                int(ownership_plan.cohort_size)
-                if ownership_plan.mode == CHUNK_COHORT
-                else 0
-            )
-            expected_extra_key = (
-                key_kind,
-                key_scope,
-                int(ownership_plan.selected_depth),
-            )
-            expected_shape = (
-                int(ownership_plan.selected_depth),
-                int(ownership_plan.rows_cap),
-                int(ownership_plan.heads_per_rank),
-                int(ownership_plan.last_n),
-                int(ownership_plan.aligned_k),
-            )
+            expected_extra_key = ownership_plan.scratch_extra_key
+            expected_shape = ownership_plan.scratch_storage_shape
             if (
                 scratch_cache_extra_key != expected_extra_key
                 or scratch_storage_shape != expected_shape
             ):
                 raise RuntimeError(
                     "E_SFI_CAPTURE_OWNERSHIP_CACHE_MISS: live scratch "
-                    "key/shape does not match the stamped owner"
+                    "key/shape does not match the stamped owner; "
+                    f"live_extra_key={scratch_cache_extra_key!r}, "
+                    f"expected_extra_key={expected_extra_key!r}, "
+                    f"live_shape={scratch_storage_shape!r}, "
+                    f"expected_shape={expected_shape!r}"
                 )
     scratch_storage = None
     if scratch_cache_owner is not None:

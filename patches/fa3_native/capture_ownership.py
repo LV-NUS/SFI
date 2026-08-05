@@ -88,6 +88,28 @@ class CaptureOwnershipPlan:
     budget_limit_bytes: int
     signature_sha256: str
 
+    @property
+    def scratch_storage_shape(self) -> tuple[int, int, int, int, int]:
+        """Return the sole live/prebuild scratch shape for this owner."""
+        return (
+            int(self.selected_depth),
+            int(self.rows_cap),
+            int(self.heads_per_rank),
+            int(self.last_n),
+            int(self.aligned_k),
+        )
+
+    @property
+    def scratch_extra_key(self) -> tuple[str, int, int]:
+        """Return the sole live/prebuild cache scope for this owner."""
+        if self.mode == CHUNK_COHORT:
+            return (
+                "capture_postprocess_cohort",
+                int(self.cohort_size),
+                int(self.selected_depth),
+            )
+        return ("capture_postprocess_ring", 0, int(self.selected_depth))
+
     def to_dict(self) -> dict[str, Any]:
         """Return the versioned plan in its stable public field order."""
         return {

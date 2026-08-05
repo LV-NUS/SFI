@@ -1222,8 +1222,8 @@ class VLLMSparseController(
         # runs before profile_run, so max_model_len is not yet known here). The
         # cap is consumed at prefill_capture_meta_arena.py:447-449 -> a 262k
         # prefill builds kv_max = _align_up_int(max_model_len, kv_min) = 262144
-        # -> arena head-stride == the EDIT-1 bucketed planned_max_capture_k ->
-        # the DEFER scratch last dim collapses to ONE value (byte-match).
+        # -> arena head-stride == the sealed planned_max_capture_k -> the
+        # scratch width has one prebuilt value (byte-match).
         self.prefill_capture_meta_arena: SparseCaptureMetaArena = SparseCaptureMetaArena(
             budget_bytes=int(
                 os.environ.get(
@@ -1451,10 +1451,10 @@ class VLLMSparseController(
             not evt.query() for evt in self.chunk_done_evt
         )
         # Selector-only split producers do not record chunk_done until the
-        # writer is released.  A queued generation is therefore itself a
-        # cold-side quiescence reason, even when every reusable ring event
-        # currently queries done.
-        pending_refresh_generation = bool(self._pending_refresh_rebuilds)
+        # writer is released, and direct flush receipts need not occupy the
+        # pending queue. The slot-generation owner is the complete cold-side
+        # quiescence authority.
+        pending_refresh_generation = bool(self._refresh_generations_by_key)
         if (
             pending_ring_work or pending_refresh_generation
         ) and torch.cuda.is_available():
@@ -2282,7 +2282,7 @@ class VLLMSparseController(
         # layer writers.  Logical flags are never a storage terminal receipt.
         if (
             bool(getattr(tracking, "bootstrap_pending", False))
-            and getattr(tracking, "refresh_publish_key", None) is not None
+            and getattr(tracking, "refresh_generation", None) is not None
         ):
             raise RuntimeError(
                 "E_SFI_RESUME_OVERLAPPING_BOOTSTRAP_REFRESH_OWNERS: "
@@ -2526,6 +2526,13 @@ class VLLMSparseController(
     def _reset_request_slot_owners_after_idle(self) -> None:
         """Reset allocator and persistent tape leases after idle quiescence."""
 
+        if (
+            getattr(self, "_refresh_generations_by_key", None)
+            or getattr(self, "_refresh_generation_by_slot", None)
+        ):
+            raise RuntimeError(
+                "E_SFI_IDLE_SLOT_RESET_WITH_REFRESH_GENERATION_OWNER"
+            )
         allocator = self._global_slot_allocator
         if not isinstance(allocator, GlobalSlotAllocator):
             raise RuntimeError("E_SFI_GLOBAL_SLOT_ALLOCATOR_OWNER_DRIFT")
@@ -2559,6 +2566,21 @@ class VLLMSparseController(
         rid = request_id.strip()
         if not rid:
             raise ValueError("request_id must be non-empty")
+        tracking = self.request_states.get(rid)
+        generation = getattr(tracking, "refresh_generation", None)
+        slot = self._global_slot_allocator.slot_of(rid)
+        slot_generation = (
+            self._refresh_generation_by_slot.get(int(slot))
+            if slot is not None
+            else None
+        )
+        if generation is not None or slot_generation is not None:
+            raise RuntimeError(
+                "E_SFI_GLOBAL_SLOT_RELEASE_WITH_REFRESH_OWNER: "
+                f"request={rid!r} "
+                f"request_owner={getattr(generation, 'key', None)!r} "
+                f"slot_owner={getattr(slot_generation, 'key', None)!r}"
+            )
         return self._global_slot_allocator.release(rid)
 
     def get_step_global_slot_map(self, request_ids: Sequence[str]) -> Dict[str, int]:
@@ -3338,19 +3360,14 @@ class VLLMSparseController(
             finished_ids=finished_ids,
         )
 
-        finished_pending = [
-            rid
-            for rid in finished_ids
-            if self._pending_refresh_rebuild_has_req(rid)
-        ]
-        if finished_pending:
-            raise RuntimeError(
-                "E_PENDING_REBUILD_ON_FINISH: "
-                "finished cleanup boundary sees pending refresh-rebuild reqs: "
-                f"step_handle_id={step_handle_id} "
-                f"generation={step_handle_generation} "
-                f"epoch={step_epoch} "
-                f"count={len(finished_pending)} sample={finished_pending[:4]}"
+        # Direct flush receipts and pending rebuilds share the same physical
+        # generation object. Resolve any remaining exact owner before slot
+        # release; this is cold step-boundary work and uses stream ordering,
+        # never event polling or device synchronization.
+        for rid in tuple(sorted(finished_ids)):
+            self._retire_request_refresh_generations_for_lifecycle(
+                request_id=rid,
+                reason="finished request retired refresh generation",
             )
 
         refresh_owner_leaks = []
@@ -3358,17 +3375,18 @@ class VLLMSparseController(
             tracking = self.request_states.get(rid)
             if tracking is None:
                 continue
-            publish_key = tracking.refresh_publish_key
-            if publish_key is None:
+            generation_owner = tracking.refresh_generation
+            if generation_owner is None:
                 continue
             refresh_owner_leaks.append(
                 (
                     rid,
-                    publish_key,
-                    int(tracking.refresh_publish_enqueued_layer_mask),
-                    int(tracking.refresh_publish_published_layer_mask),
-                    int(tracking.refresh_publish_retired_layer_mask),
-                    bool(tracking.refresh_publish_sealed),
+                    generation_owner.key,
+                    int(generation_owner.enqueued_layer_mask),
+                    int(generation_owner.registered_layer_mask),
+                    int(generation_owner.published_layer_mask),
+                    int(generation_owner.retired_layer_mask),
+                    bool(generation_owner.sealed),
                 )
             )
         if refresh_owner_leaks:
@@ -4163,7 +4181,7 @@ class VLLMSparseController(
         def _refresh_publish_requires_dense_consume(
             tracking_local: RequestTracking,
         ) -> bool:
-            if tracking_local.refresh_publish_key is None:
+            if tracking_local.refresh_generation is None:
                 return False
             # Ticket 在 host commit 即 consumed。读路由只消费物理账本同生共灭
             # 的 reason/policy，避免后来的 ticket 覆盖当前 writer 世代。
@@ -4988,7 +5006,7 @@ class VLLMSparseController(
         force_dense_while_inflight_by_row_list: List[bool] = []
         for row_idx, rid in enumerate(request_ids):
             ticket = tickets_plan_by_req[rid]
-            is_inflight = tracking_by_req[rid].refresh_publish_key is not None
+            is_inflight = tracking_by_req[rid].refresh_generation is not None
             if rid in refresh_reqs_set:
                 mode = (
                     StepRefreshMode.MUST_NOW

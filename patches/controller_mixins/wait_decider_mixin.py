@@ -1200,18 +1200,19 @@ class WaitDeciderMixin:
         # bridge 窗内票一律不 materialize ⇒ publish key 恒空；此处 fail-fast 把门破/交错
         # 在源头暴露,替代 parity 守卫的下游兜捕。调用点全部经
         # bootstrap_pending=True 门(ready 后不重复 commit),无误炸面。
-        publish_key = getattr(tracking, "refresh_publish_key", None)
-        if publish_key is not None:
+        refresh_generation = getattr(tracking, "refresh_generation", None)
+        if refresh_generation is not None:
+            publish_key = refresh_generation.key
             enqueued_layers = int(
-                getattr(tracking, "refresh_publish_enqueued_layer_mask", 0)
+                refresh_generation.enqueued_layer_mask
             ).bit_count()
             published_layers = int(
-                getattr(tracking, "refresh_publish_published_layer_mask", 0)
+                refresh_generation.published_layer_mask
             ).bit_count()
             retired_layers = int(
-                getattr(tracking, "refresh_publish_retired_layer_mask", 0)
+                refresh_generation.retired_layer_mask
             ).bit_count()
-            sealed = bool(getattr(tracking, "refresh_publish_sealed", False))
+            sealed = bool(refresh_generation.sealed)
             raise RuntimeError(
                 "[BOOTSTRAP-MATERIALIZE-GATE] bootstrap ready commit while a "
                 f"refresh generation is in flight for req={rid!r} "
