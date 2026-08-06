@@ -22,6 +22,14 @@ _SETUP_ASSIGNMENT_RE = re.compile(r'^([A-Z0-9_]+)="([^"]*)"$', re.MULTILINE)
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _TREE_RE = re.compile(r"^[0-9a-f]{40}$")
 _CUDA_RELEASE_RE = re.compile(r"\brelease\s+([0-9]+(?:\.[0-9]+)?)\b")
+_CMAKE_VERSION_RE = re.compile(
+    r"^cmake version ([0-9]+(?:\.[0-9]+){1,2})(?:\s|$)"
+)
+_CMAKE_MINIMUM_RE = re.compile(
+    r"^\s*cmake_minimum_required\s*\(\s*VERSION\s+"
+    r"([0-9]+(?:\.[0-9]+){1,2})(?:\.\.\.[^\s)]+)?(?:\s+FATAL_ERROR)?\s*\)",
+    re.IGNORECASE | re.MULTILINE,
+)
 _ARCH_CONTRACT = {
     "sm80": {
         "backend": "fa3",
@@ -88,6 +96,7 @@ def _setup_assignments(sfi_root: Path) -> dict[str, str]:
         "EXPECTED_PATCHED_TREE",
         "EXPECTED_FA4_PATCH_SHA256",
         "EXPECTED_FA4_PATCHED_TREE",
+        "MINIMUM_CMAKE_VERSION",
     }
     missing = sorted(required - assignments.keys())
     if missing:
@@ -178,6 +187,50 @@ def _nvcc_identity(cudacxx: Path) -> tuple[str, str, str]:
     return version, release, release.split(".", 1)[0]
 
 
+def _numeric_version(version: str) -> tuple[int, int, int]:
+    if re.fullmatch(r"[0-9]+(?:\.[0-9]+){1,2}", version) is None:
+        raise BuildProvenanceError(f"invalid numeric version: {version!r}")
+    components = [int(component) for component in version.split(".")]
+    padded = components + [0, 0]
+    return padded[0], padded[1], padded[2]
+
+
+def _cmake_identity(cmake: Path) -> str:
+    result = subprocess.run(
+        [str(cmake), "--version"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise BuildProvenanceError(
+            f"canonical CMake --version failed: {cmake}: {result.stderr.strip()}"
+        )
+    match = _CMAKE_VERSION_RE.match(result.stdout.strip())
+    if match is None:
+        raise BuildProvenanceError(
+            f"cannot parse CMake version from {cmake}: {result.stdout.strip()!r}"
+        )
+    return match.group(1)
+
+
+def _source_cmake_minimum(target: Path) -> str:
+    cmake_lists = target / "CMakeLists.txt"
+    try:
+        source = cmake_lists.read_text(encoding="utf-8", errors="strict")
+    except (OSError, UnicodeError) as exc:
+        raise BuildProvenanceError(
+            f"cannot read FlashAttention CMake requirement: {cmake_lists}: {exc}"
+        ) from exc
+    match = _CMAKE_MINIMUM_RE.search(source)
+    if match is None:
+        raise BuildProvenanceError(
+            f"cannot parse cmake_minimum_required from {cmake_lists}"
+        )
+    return match.group(1)
+
+
 def _cmake_cache_entries(cache: Path) -> dict[str, str]:
     try:
         lines = cache.read_text(encoding="utf-8", errors="strict").splitlines()
@@ -250,9 +303,16 @@ def validate_build_provenance(
     )
     if _TREE_RE.fullmatch(expected_tree) is None:
         raise BuildProvenanceError(f"invalid expected patched tree: {expected_tree!r}")
+    source_cmake_minimum = _source_cmake_minimum(target)
+    if source_cmake_minimum != assignments["MINIMUM_CMAKE_VERSION"]:
+        raise BuildProvenanceError(
+            "setup CMake minimum differs from the pinned FlashAttention source: "
+            f"setup={assignments['MINIMUM_CMAKE_VERSION']} "
+            f"source={source_cmake_minimum}"
+        )
 
     payload = _strict_json(provenance_path)
-    _require_equal(payload, "schema_version", 4)
+    _require_equal(payload, "schema_version", 5)
     _require_equal(payload, "architecture", architecture)
     _require_equal(payload, "backend", contract["backend"])
     _require_equal(payload, "base_commit", assignments["BASE_COMMIT"])
@@ -321,6 +381,8 @@ def validate_build_provenance(
     cmake_cache_raw = payload.get("cmake_cache_path")
     cmake_compiler_raw = payload.get("cmake_cuda_compiler")
     cmake_root_raw = payload.get("cmake_cuda_toolkit_root")
+    cmake_executable_raw = payload.get("cmake_executable")
+    cmake_version_raw = payload.get("cmake_version")
     if architecture in {"sm80", "sm90"}:
         cmake_build_temp = _canonical_payload_path(
             payload, "cmake_build_temp", directory=True
@@ -332,6 +394,17 @@ def validate_build_provenance(
         cmake_root = _canonical_payload_path(
             payload, "cmake_cuda_toolkit_root", directory=True
         )
+        cmake_executable = _canonical_payload_path(
+            payload, "cmake_executable", executable=True
+        )
+        cmake_version = _cmake_identity(cmake_executable)
+        _require_equal(payload, "cmake_version", cmake_version)
+        minimum_cmake_version = assignments["MINIMUM_CMAKE_VERSION"]
+        if _numeric_version(cmake_version) < _numeric_version(minimum_cmake_version):
+            raise BuildProvenanceError(
+                "CMake is older than the current build contract: "
+                f"actual={cmake_version} minimum={minimum_cmake_version}"
+            )
         expected_build_parent = (target / "build").resolve()
         if (
             cmake_build_temp.parent != expected_build_parent
@@ -394,12 +467,28 @@ def validate_build_provenance(
             raise BuildProvenanceError(
                 f"recorded CMake cache toolkit root drift: {cache_roots} != {{{cmake_root}}}"
             )
+        cache_command_raw = cmake_entries.get("CMAKE_COMMAND", "")
+        if not cache_command_raw:
+            raise BuildProvenanceError("recorded CMake cache has no CMAKE_COMMAND")
+        try:
+            cache_command = Path(cache_command_raw).resolve(strict=True)
+        except OSError as exc:
+            raise BuildProvenanceError(
+                f"recorded CMake command does not exist: {cache_command_raw!r}"
+            ) from exc
+        if cache_command != cmake_executable:
+            raise BuildProvenanceError(
+                "recorded CMake cache command drift: "
+                f"{cache_command} != {cmake_executable}"
+            )
     else:
         for field, actual in (
             ("cmake_build_temp", cmake_build_temp_raw),
             ("cmake_cache_path", cmake_cache_raw),
             ("cmake_cuda_compiler", cmake_compiler_raw),
             ("cmake_cuda_toolkit_root", cmake_root_raw),
+            ("cmake_executable", cmake_executable_raw),
+            ("cmake_version", cmake_version_raw),
         ):
             if actual != "":
                 raise BuildProvenanceError(
@@ -409,6 +498,8 @@ def validate_build_provenance(
         cmake_cache = None
         cmake_compiler = None
         cmake_root = None
+        cmake_executable = None
+        cmake_version = ""
 
     patches = payload.get("patches")
     expected_patch_kinds = ["fa3_sm80_sm90_shared_base"]
@@ -555,6 +646,10 @@ def validate_build_provenance(
             str(cmake_compiler) if cmake_compiler is not None else ""
         ),
         "cmake_cuda_toolkit_root": str(cmake_root) if cmake_root is not None else "",
+        "cmake_executable": (
+            str(cmake_executable) if cmake_executable is not None else ""
+        ),
+        "cmake_version": cmake_version,
         "shared_object": str(so_path) if so_path is not None else "",
         "shared_object_sha256": actual_so_sha,
     }

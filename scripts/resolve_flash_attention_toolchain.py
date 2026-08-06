@@ -18,7 +18,7 @@ from typing import Any, Mapping
 
 IDENTITY_SCHEMA = "sfi.flash_attention_build_identity.v1"
 PROVENANCE_NAME = "sfi_flash_attention_build_provenance.json"
-PROVENANCE_SCHEMA_VERSION = 4
+PROVENANCE_SCHEMA_VERSION = 5
 TOOLCHAIN_FIELDS = (
     "cuda_home",
     "cuda_path",
@@ -32,8 +32,11 @@ CMAKE_FIELDS = (
     "cmake_cache_path",
     "cmake_cuda_compiler",
     "cmake_cuda_toolkit_root",
+    "cmake_executable",
+    "cmake_version",
 )
 _NVCC_RELEASE_RE = re.compile(r"\brelease\s+([0-9]+(?:\.[0-9]+)?)\b")
+_NUMERIC_VERSION_RE = re.compile(r"^[0-9]+(?:\.[0-9]+){1,2}$")
 
 
 class ToolchainPreflightError(ValueError):
@@ -113,7 +116,7 @@ def _require_identity_matches_provenance(
     provenance_value = provenance.get(field)
     if not isinstance(identity_value, str) or not isinstance(provenance_value, str):
         raise ToolchainPreflightError(
-            f"validated build identity is missing schema-v4 field {field}; "
+            f"validated build identity is missing schema-v{PROVENANCE_SCHEMA_VERSION} field {field}; "
             "rerun setup_flash_attention.sh with the current release"
         )
     if identity_value != provenance_value:
@@ -234,7 +237,7 @@ def resolve_toolchain(
     )
     if provenance.get("schema_version") != PROVENANCE_SCHEMA_VERSION:
         raise ToolchainPreflightError(
-            "FlashAttention build provenance predates the canonical CUDA toolchain "
+            "FlashAttention build provenance predates the canonical CUDA/CMake toolchain "
             f"contract (expected schema_version={PROVENANCE_SCHEMA_VERSION}); "
             "rerun setup_flash_attention.sh"
         )
@@ -309,6 +312,14 @@ def resolve_toolchain(
         cmake_root = _canonical_directory(
             fields["cmake_cuda_toolkit_root"], field="cmake_cuda_toolkit_root"
         )
+        _canonical_file(
+            fields["cmake_executable"], field="cmake_executable", executable=True
+        )
+        cmake_version = fields["cmake_version"]
+        if _NUMERIC_VERSION_RE.fullmatch(cmake_version) is None:
+            raise ToolchainPreflightError(
+                f"invalid build provenance cmake_version: {cmake_version!r}"
+            )
         if cmake_cache.parent != cmake_build_temp and cmake_build_temp not in cmake_cache.parents:
             raise ToolchainPreflightError(
                 "build provenance CMake cache is outside its fresh build directory"

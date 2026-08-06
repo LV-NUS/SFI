@@ -11,6 +11,7 @@ EXPECTED_PATCHED_TREE="4329bcb986a5ac0427f126c50aae8164e1f668b0"
 # SM100 shares the same current wrapper/dispatch base as SM80 and SM90.
 EXPECTED_FA4_PATCH_SHA256="d5668e7ed8beb63acc698eadc5ffea01247bf48b154ea042e85b23741698a0c4"
 EXPECTED_FA4_PATCHED_TREE="60a0be233fc416d84774563eac84ae062fd362f3"
+MINIMUM_CMAKE_VERSION="3.26"
 
 TARGET="${SFI_ROOT}/third_party_upstreams/vllm-project-flash-attention"
 PROVENANCE_OUTPUT=""
@@ -98,6 +99,7 @@ if ! command -v realpath >/dev/null 2>&1; then
   echo "FAIL: realpath is required for reproducible target identities" >&2
   exit 69
 fi
+PYTHON_BIN_DIR="$(realpath -e -- "$(dirname "${PY}")")"
 PY="$(realpath -e -- "${PY}")"
 
 detect_capability() {
@@ -251,9 +253,152 @@ resolve_cuda_toolchain() {
   echo "==> CUDA toolkit: home=${CUDA_HOME} nvcc=${CUDACXX} release=${nvcc_release}"
 }
 
+resolve_cmake_toolchain() {
+  local interpreter_cmake
+  local python_package_cmake=""
+  local ambient_cmake=""
+  local -a candidate_labels=()
+  local -a candidate_paths=()
+  local -a rejected_candidates=()
+  local -a seen_candidates=()
+  local candidate_index
+  local candidate_label
+  local candidate_path
+  local canonical_candidate
+  local seen_candidate
+  local candidate_was_seen
+  local version_output
+  local version_line
+  local cmake_major
+  local cmake_tail
+  local cmake_minor
+  local cmake_patch
+  local minimum_major
+  local minimum_tail
+  local minimum_minor
+  local minimum_patch
+
+  interpreter_cmake="${PYTHON_BIN_DIR}/cmake"
+  if [[ -e "${interpreter_cmake}" || -L "${interpreter_cmake}" ]]; then
+    candidate_labels+=("python-bin")
+    candidate_paths+=("${interpreter_cmake}")
+  fi
+  if ! python_package_cmake="$(
+    "${PY}" -c 'from pathlib import Path
+try:
+    import cmake
+except Exception:
+    raise SystemExit(0)
+root = getattr(cmake, "CMAKE_BIN_DIR", "")
+candidate = Path(str(root)) / "cmake" if root else None
+if candidate is not None and candidate.is_file():
+    print(candidate.resolve(strict=True))'
+  )"; then
+    python_package_cmake=""
+  fi
+  if [[ -n "${python_package_cmake}" ]]; then
+    candidate_labels+=("python-package")
+    candidate_paths+=("${python_package_cmake}")
+  fi
+  if command -v cmake >/dev/null 2>&1; then
+    ambient_cmake="$(command -v cmake)"
+    candidate_labels+=("PATH")
+    candidate_paths+=("${ambient_cmake}")
+  fi
+
+  minimum_major="${MINIMUM_CMAKE_VERSION%%.*}"
+  minimum_tail="${MINIMUM_CMAKE_VERSION#*.}"
+  minimum_minor="${minimum_tail%%.*}"
+  minimum_patch="0"
+  if [[ "${minimum_tail}" == *.* ]]; then
+    minimum_patch="${minimum_tail#*.}"
+  fi
+
+  CMAKE_LAUNCHER=""
+  CMAKE_VERSION=""
+  for ((candidate_index = 0; candidate_index < ${#candidate_paths[@]}; candidate_index++)); do
+    candidate_label="${candidate_labels[candidate_index]}"
+    candidate_path="${candidate_paths[candidate_index]}"
+    if [[ "${candidate_path}" != /* || ! -x "${candidate_path}" ]]; then
+      rejected_candidates+=("${candidate_label}=${candidate_path:-<empty>} (not an executable absolute path)")
+      continue
+    fi
+    canonical_candidate="$(realpath -e -- "${candidate_path}")"
+    candidate_was_seen=0
+    for seen_candidate in "${seen_candidates[@]}"; do
+      if [[ "${seen_candidate}" == "${canonical_candidate}" ]]; then
+        candidate_was_seen=1
+        break
+      fi
+    done
+    if [[ "${candidate_was_seen}" == "1" ]]; then
+      continue
+    fi
+    seen_candidates+=("${canonical_candidate}")
+    if ! version_output="$("${canonical_candidate}" --version)"; then
+      rejected_candidates+=("${candidate_label}=${canonical_candidate} (not runnable)")
+      continue
+    fi
+    version_line="${version_output%%$'\n'*}"
+    if [[ ! "${version_line}" =~ ^cmake[[:space:]]+version[[:space:]]+([0-9]+([.][0-9]+){1,2})([[:space:]]|$) ]]; then
+      rejected_candidates+=("${candidate_label}=${canonical_candidate} (unparseable version)")
+      continue
+    fi
+    CMAKE_VERSION="${BASH_REMATCH[1]}"
+    cmake_major="${CMAKE_VERSION%%.*}"
+    cmake_tail="${CMAKE_VERSION#*.}"
+    cmake_minor="${cmake_tail%%.*}"
+    cmake_patch="0"
+    if [[ "${cmake_tail}" == *.* ]]; then
+      cmake_patch="${cmake_tail#*.}"
+    fi
+    if (( 10#${cmake_major} < 10#${minimum_major} \
+       || (10#${cmake_major} == 10#${minimum_major} \
+           && (10#${cmake_minor} < 10#${minimum_minor} \
+               || (10#${cmake_minor} == 10#${minimum_minor} \
+                   && 10#${cmake_patch} < 10#${minimum_patch}))) )); then
+      rejected_candidates+=("${candidate_label}=${canonical_candidate} (${CMAKE_VERSION} < ${MINIMUM_CMAKE_VERSION})")
+      CMAKE_VERSION=""
+      continue
+    fi
+    CMAKE_LAUNCHER="${canonical_candidate}"
+    break
+  done
+
+  if [[ -z "${CMAKE_LAUNCHER}" ]]; then
+    echo "FAIL: no compatible CMake found; FA3 requires >= ${MINIMUM_CMAKE_VERSION}" >&2
+    for candidate_path in "${rejected_candidates[@]}"; do
+      echo "  rejected: ${candidate_path}" >&2
+    done
+    echo "Install a compatible CMake in the build Python environment or expose one on PATH." >&2
+    exit 69
+  fi
+
+  # setup.py invokes the bare name `cmake`.  Pin its owner after CUDA has
+  # normalized PATH, while keeping CUDA first so an obsolete distro nvcc
+  # beside an ambient CMake cannot retake ownership of the build.
+  PATH="${CUDA_HOME}/bin:$(dirname "${CMAKE_LAUNCHER}"):${PATH}"
+  if [[ "$(realpath -e -- "$(command -v cmake)")" != "${CMAKE_LAUNCHER}" ]]; then
+    echo "FAIL: PATH did not resolve to the canonical CMake: $(command -v cmake)" >&2
+    exit 69
+  fi
+  if [[ "$(realpath -e -- "$(command -v nvcc)")" != "${CUDACXX}" ]]; then
+    echo "FAIL: CMake PATH pin displaced the canonical CUDA compiler: $(command -v nvcc)" >&2
+    exit 69
+  fi
+  export PATH
+  echo "==> CMake: launcher=${CMAKE_LAUNCHER} version=${CMAKE_VERSION} minimum=${MINIMUM_CMAKE_VERSION}"
+}
+
 CUDA_COMPILER_RELEASE=""
 CUDA_COMPILER_MAJOR=""
 resolve_cuda_toolchain
+CMAKE_LAUNCHER=""
+CMAKE_EXECUTABLE=""
+CMAKE_VERSION=""
+if [[ "${ARCH}" != "sm100" && "${SKIP_BUILD}" != "1" ]]; then
+  resolve_cmake_toolchain
+fi
 
 if [[ "${TARGET}" != /* ]]; then
   echo "FAIL: --target must be absolute: ${TARGET}" >&2
@@ -436,16 +581,19 @@ elif [[ "${SKIP_BUILD}" != "1" ]]; then
   (cd "${TARGET}" && "${PY}" setup.py build_ext --inplace --build-temp "${BUILD_TEMP}")
 
   if ! CMAKE_IDENTITY_TSV="$(
-    "${PY}" - "${BUILD_TEMP}" "${CUDACXX}" "${CUDA_HOME}" <<'PY'
+    "${PY}" - "${BUILD_TEMP}" "${CUDACXX}" "${CUDA_HOME}" "${CMAKE_VERSION}" <<'PY'
 from __future__ import annotations
 
 from pathlib import Path
+import re
+import subprocess
 import sys
 
 
 build_temp = Path(sys.argv[1]).resolve(strict=True)
 expected_compiler = Path(sys.argv[2]).resolve(strict=True)
 expected_root = Path(sys.argv[3]).resolve(strict=True)
+expected_cmake_version = sys.argv[4]
 caches = sorted(build_temp.rglob("CMakeCache.txt"))
 if len(caches) != 1:
     raise SystemExit(
@@ -487,14 +635,41 @@ if roots != {expected_root}:
         f"fresh CMake cache selected wrong CUDA toolkit root: [{rendered}] != {expected_root}"
     )
 
-print("\t".join((str(cache), str(compiler), str(expected_root))))
+cmake_command_raw = entries.get("CMAKE_COMMAND", "")
+if not cmake_command_raw:
+    raise SystemExit(f"fresh CMake cache has no CMAKE_COMMAND: {cache}")
+cmake_command = Path(cmake_command_raw).resolve(strict=True)
+cmake_version_result = subprocess.run(
+    [str(cmake_command), "--version"],
+    text=True,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    check=False,
+)
+cmake_version_match = re.match(
+    r"^cmake version ([0-9]+(?:\.[0-9]+){1,2})(?:\s|$)",
+    cmake_version_result.stdout.strip(),
+)
+actual_cmake_version = (
+    cmake_version_match.group(1)
+    if cmake_version_result.returncode == 0 and cmake_version_match is not None
+    else ""
+)
+if actual_cmake_version != expected_cmake_version:
+    raise SystemExit(
+        "fresh CMake cache selected a different CMake implementation: "
+        f"{cmake_command} reports {actual_cmake_version or 'unparseable'} "
+        f"!= launcher {expected_cmake_version}"
+    )
+
+print("\t".join((str(cache), str(compiler), str(expected_root), str(cmake_command))))
 PY
   )"; then
-    echo "FAIL: cannot prove the CUDA compiler selected by the fresh FA3 CMake configure" >&2
+    echo "FAIL: cannot prove the CMake/CUDA owners selected by the fresh FA3 configure" >&2
     exit 69
   fi
   IFS=$'\t' read -r \
-    CMAKE_CACHE_PATH CMAKE_CUDA_COMPILER CMAKE_CUDA_TOOLKIT_ROOT \
+    CMAKE_CACHE_PATH CMAKE_CUDA_COMPILER CMAKE_CUDA_TOOLKIT_ROOT CMAKE_EXECUTABLE \
     <<< "${CMAKE_IDENTITY_TSV}"
   SO_PATH="$(find "${TARGET}/vllm_flash_attn" -maxdepth 1 -type f -name '_vllm_fa3_C*.so' -print -quit)"
   if [[ -z "${SO_PATH}" ]]; then
@@ -528,6 +703,8 @@ SFI_PROV_BUILD_TEMP="${BUILD_TEMP}" \
 SFI_PROV_CMAKE_CACHE_PATH="${CMAKE_CACHE_PATH}" \
 SFI_PROV_CMAKE_CUDA_COMPILER="${CMAKE_CUDA_COMPILER}" \
 SFI_PROV_CMAKE_CUDA_TOOLKIT_ROOT="${CMAKE_CUDA_TOOLKIT_ROOT}" \
+SFI_PROV_CMAKE_EXECUTABLE="${CMAKE_EXECUTABLE}" \
+SFI_PROV_CMAKE_VERSION="${CMAKE_VERSION}" \
 SFI_PROV_OUTPUT="${PROVENANCE_OUTPUT}" \
 "${PY}" - <<'PY'
 from __future__ import annotations
@@ -576,7 +753,7 @@ if os.environ["SFI_PROV_FA4_PATCH_PATH"]:
     )
 
 payload = {
-    "schema_version": 4,
+    "schema_version": 5,
     "created_utc": datetime.now(timezone.utc).isoformat(),
     "architecture": os.environ["SFI_PROV_ARCH"],
     "backend": os.environ["SFI_PROV_BACKEND"],
@@ -605,6 +782,8 @@ payload = {
     "cmake_cache_path": os.environ["SFI_PROV_CMAKE_CACHE_PATH"],
     "cmake_cuda_compiler": os.environ["SFI_PROV_CMAKE_CUDA_COMPILER"],
     "cmake_cuda_toolkit_root": os.environ["SFI_PROV_CMAKE_CUDA_TOOLKIT_ROOT"],
+    "cmake_executable": os.environ["SFI_PROV_CMAKE_EXECUTABLE"],
+    "cmake_version": os.environ["SFI_PROV_CMAKE_VERSION"],
     "shared_object": str(so_path) if so_path is not None else "",
     "shared_object_sha256": (
         sha256(so_path.read_bytes()).hexdigest()

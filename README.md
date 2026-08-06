@@ -311,7 +311,7 @@ SFI does not modify the installed vLLM or flash-attention packages; the patched 
 ## Installation
 
 > [!TIP]
-> **Prerequisites:** Python &ge; 3.10 &ensp;&middot;&ensp; CUDA-enabled PyTorch &ensp;&middot;&ensp; vLLM `0.19.x` (v1 engine) &ensp;&middot;&ensp; CUDA toolkit with `nvcc` &ensp;&middot;&ensp; `git` / `cmake` / `ninja` &ensp;&middot;&ensp; a Qwen3 instruction checkpoint (chat-template tokenizer)
+> **Prerequisites:** Python &ge; 3.10 &ensp;&middot;&ensp; CUDA-enabled PyTorch &ensp;&middot;&ensp; vLLM `0.19.x` (v1 engine) &ensp;&middot;&ensp; CUDA toolkit with `nvcc` &ensp;&middot;&ensp; `git` / compatible `cmake` (`ninja` is optional) &ensp;&middot;&ensp; a Qwen3 instruction checkpoint (chat-template tokenizer)
 >
 > PyTorch, the CUDA toolkit, the driver, and the target GPU must be mutually compatible, and one absolute Python executable must own PyTorch, vLLM, the FA3 build or FA4 JIT, and all helper extensions. SFI patches vLLM v1 private interfaces, so stay on the supported vLLM line &mdash; incompatible drift fails at preflight rather than corrupting a run.
 
@@ -324,7 +324,6 @@ cd SFI
 export PYTHON="/absolute/path/to/environment/bin/python"
 export MODEL="/absolute/path/to/qwen3-model"
 export GPU="0"
-export PATH="$(dirname "${PYTHON}"):${PATH}"
 "${PYTHON}" -c 'import torch, vllm; assert torch.cuda.is_available(); print(torch.__version__, torch.version.cuda, vllm.__version__, torch.cuda.get_device_capability(0))'
 # → prints torch/CUDA/vLLM versions and a capability tuple: (8, 0), (9, 0), or (10, 0)
 
@@ -342,6 +341,13 @@ RUN_ID="sfi_$(date +%Y%m%d_%H%M%S)"
 PYTHON="${PYTHON}" TORCH_EXTENSIONS_DIR="${PWD}/tmp/torch_extensions/${RUN_ID}" MML=16384 \
   bash scripts/run_one_shot.sh "${GPU}" "${MODEL}" "oneshot_${RUN_ID}"
 ```
+
+For FA3, setup resolves CMake on the build-only path from the bound Python
+environment, its installed `cmake` package, and then `PATH`; it selects the
+first implementation satisfying the pinned source tree's minimum version. It
+does not require an exact CMake path or version. The fresh CMake cache records
+the executable that actually configured the build, and schema-5 provenance
+binds that executable, version, CUDA compiler, and toolkit root before launch.
 
 On memory-rich cards, `GPU_MEM_UTIL=0.75` may be supplied as a capacity-only
 override; the fixed one-shot workload is unchanged and the effective value is
@@ -384,7 +390,7 @@ export PYTHON="$(python -c 'import os, sys; print(os.path.realpath(sys.executabl
 export CUDA_HOME="$(realpath -e /absolute/path/to/cuda-12.x)"
 export CUDA_PATH="${CUDA_HOME}"
 export CUDACXX="${CUDA_HOME}/bin/nvcc"
-export PATH="${CUDA_HOME}/bin:$(dirname "${PYTHON}"):${PATH}"
+export PATH="${CUDA_HOME}/bin:${PATH}"
 
 "${PYTHON}" - <<'PY'
 import shutil
@@ -871,7 +877,7 @@ An undersized pool triggers the silent request-serialization failure described u
 | Symptom | Cause and action |
 |:--|:--|
 | `PYTHON env required` or wrong extension ABI | export one executable absolute `PYTHON`; do not mix environments or reuse a cache built by another ABI |
-| setup fails before compilation or JIT preparation | verify the selected GPU, `CUDA_HOME`, `nvcc --version`, host compiler, `ninja`, PyTorch CUDA visibility, and writable build paths |
+| setup fails before compilation or JIT preparation | inspect the reported rejected CMake candidates, then verify the selected GPU, `CUDA_HOME`, `nvcc --version`, host compiler, PyTorch CUDA visibility, and writable build paths; `ninja` is optional for FA3 setup |
 | no `_vllm_fa3_C*.so` after SM80/SM90 setup | the FA3 build did not complete; rerun setup and do not launch until the shared object exists |
 | SM100 setup has no `_vllm_fa3_C*.so` | expected: SM100 uses the patched FA4 CuTe runtime-JIT sources; rely on the one-shot/FA4 preflight instead |
 | helper-extension JIT fails | ensure `ninja` exists and `TORCH_EXTENSIONS_DIR` is writable and ABI-isolated |
