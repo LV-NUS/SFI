@@ -8,7 +8,7 @@ from enum import Enum
 from typing import Any
 
 
-_SELECTOR_LOG_S_KERNEL_NAMESPACE = "r2tiled_v12"
+_SELECTOR_LOG_S_KERNEL_NAMESPACE = "r2tiled_v15"
 SELECTOR_LOG_S_EXTENSION_NAME = (
     f"selector_log_s_ext_{_SELECTOR_LOG_S_KERNEL_NAMESPACE}"
 )

@@ -4438,41 +4438,21 @@ def _prebuild_capture_buffers(
         refresh_stream = getattr(controller, "refresh_stream", None)
     async_owner_available = bool(refresh_stream is not None)
 
-    # Both owners submit tiled work through one controller-owned refresh stream.
-    # GPU workspace lifetime is therefore one synchronous host reservation, not
-    # the raw-scratch reuse window.  Pinned H2D sources live until their async
-    # copies complete on that stream, which may lag across a full capture chunk.
-    # Size this small host-only FIFO by chunk generations, independently of the
-    # shorter G-layer raw-scratch ring.  This is a cold-side allocation only.
-    postprocess_meta_carriers = int(_CAPTURE_CHUNK) * int(_CAPTURE_IN_FLIGHT)
-    # A scratch generation may submit one last-n=1 copy plus one gt1 reduce.
-    # Pair i32/i64 metadata and prebuild two carriers per generation instead
-    # of retaining four shape-growing live pools.
-    ring_meta_staging_resources = (
+    # CPU-authored metadata is copied into CUDA launch parameters by value.
+    # Both owners therefore need only one stream-ordered device descriptor:
+    # there is no pinned-source FIFO or host lifetime to size from an unrelated
+    # scratch-generation count.
+    meta_staging_resources = (
         plan_capture_postprocess_meta_staging_resources(
-            meta_carrier_count=2 * int(postprocess_meta_carriers),
-            num_rows_capacity=int(producer_rows_worst),
-        )
-    )
-    cohort_meta_staging_resources = (
-        plan_capture_postprocess_meta_staging_resources(
-            meta_carrier_count=(
-                2 * int(_CAPTURE_CHUNK) * int(_CAPTURE_IN_FLIGHT)
-            ),
             num_rows_capacity=int(producer_rows_worst),
         )
     )
     ring_tiled_resources = plan_tiled_capture_postprocess_resources(
-        meta_carrier_count=int(postprocess_meta_carriers),
         num_rows_capacity=int(producer_rows_worst),
         num_query_heads=int(num_heads),
         logical_k_capacity=int(kv_max_bucket),
     )
     cohort_tiled_resources = plan_tiled_capture_postprocess_resources(
-        # Mixed cohorts may split tiled work into as many as one submission per
-        # layer.  Size pinned lifetime by scratch generations, not by cohort
-        # lane count; compatible runs still coalesce onto one GPU workspace.
-        meta_carrier_count=int(postprocess_meta_carriers),
         num_rows_capacity=int(producer_rows_worst) * int(_CAPTURE_CHUNK),
         num_query_heads=int(num_heads),
         logical_k_capacity=int(kv_max_bucket),
@@ -4520,10 +4500,10 @@ def _prebuild_capture_buffers(
         tape_slot_count=int(cohort_tape_report.slot_capacity),
         baseline_reduce_group=int(_CAPTURE_REDUCE_GROUP),
         baseline_meta_staging_device_bytes=int(
-            ring_meta_staging_resources.device_bytes
+            meta_staging_resources.device_bytes
         ),
         target_meta_staging_device_bytes=int(
-            cohort_meta_staging_resources.device_bytes
+            meta_staging_resources.device_bytes
         ),
         baseline_tiled_postprocess_device_bytes=int(
             ring_tiled_resources.total_device_bytes
@@ -4538,17 +4518,9 @@ def _prebuild_capture_buffers(
     if (
         int(ring_tiled_resources.submission_slot_count) != 1
         or int(cohort_tiled_resources.submission_slot_count) != 1
-        or int(ring_tiled_resources.meta_carrier_count)
-        != int(postprocess_meta_carriers)
-        or int(cohort_tiled_resources.meta_carrier_count)
-        != int(postprocess_meta_carriers)
-        or int(ring_meta_staging_resources.meta_carrier_count)
-        != 2 * int(postprocess_meta_carriers)
-        or int(cohort_meta_staging_resources.meta_carrier_count)
-        != 2 * int(postprocess_meta_carriers)
     ):
         raise RuntimeError(
-            "E_SFI_CAPTURE_POSTPROCESS_OWNERSHIP: workspace or metadata "
+            "E_SFI_CAPTURE_POSTPROCESS_OWNERSHIP: workspace submission "
             "capacity disagrees with the immutable owner plan"
         )
 
@@ -4570,7 +4542,6 @@ def _prebuild_capture_buffers(
                 "refresh stream"
             )
         postprocess_stream = refresh_stream
-        selected_meta_staging_resources = cohort_meta_staging_resources
         selected_tiled_resources = cohort_tiled_resources
     else:
         postprocess_stream = (
@@ -4578,7 +4549,6 @@ def _prebuild_capture_buffers(
             if refresh_stream is not None
             else torch.cuda.current_stream(device=dev)
         )
-        selected_meta_staging_resources = ring_meta_staging_resources
         selected_tiled_resources = ring_tiled_resources
 
     prepared_meta_staging_resources = (
@@ -4586,12 +4556,11 @@ def _prebuild_capture_buffers(
             controller,
             dev,
             postprocess_stream,
-            int(selected_meta_staging_resources.meta_carrier_count),
-            int(selected_meta_staging_resources.num_rows_capacity),
+            int(meta_staging_resources.num_rows_capacity),
         )
     )
     if (
-        prepared_meta_staging_resources != selected_meta_staging_resources
+        prepared_meta_staging_resources != meta_staging_resources
         or int(prepared_meta_staging_resources.device_bytes)
         != int(ownership_plan.selected_meta_staging_device_bytes)
     ):
@@ -4605,7 +4574,6 @@ def _prebuild_capture_buffers(
             controller,
             dev,
             postprocess_stream,
-            int(selected_tiled_resources.meta_carrier_count),
             int(selected_tiled_resources.num_rows_capacity),
             int(selected_tiled_resources.num_query_heads_capacity),
             int(selected_tiled_resources.logical_k_capacity),

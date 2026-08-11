@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Sequence, Tuple
 
 import torch
 from torch.utils.cpp_extension import load_inline
@@ -28,6 +28,7 @@ _REQUIRED_EXT_SYMBOLS = (
     "reduce_log_f_pre_scratch_r2_alpha0p5_fp16_resident",
     "reduce_log_f_pre_scratch_r2_alpha0p5_fp16_tiled",
     "reduce_log_f_pre_scratch_r2_alpha0p5_fp16_tiled_workspace_nbytes",
+    "pack_log_f_postprocess_meta",
     "copy_log_f_lastn1_scratch",
     "copy_log_f_lastn1_scratch_scalar",
     "reduce_log_f_pre_scratch_scalar",
@@ -283,9 +284,9 @@ def _load_ext(*, force: bool = False) -> Optional[torch.nn.Module]:
         return _MODULE
 
     # A native extension name is a process-lifetime ABI namespace.  A valid
-    # v12 prebuilt is reusable; an invalid/unimportable v12 artifact is
-    # terminal.  Compilation is allowed only when this fresh namespace has no
-    # artifact yet.
+    # identity-matched prebuilt is reusable; an invalid or unimportable artifact
+    # is terminal.  Compilation is allowed only when this fresh namespace has
+    # no artifact yet.
     prebuilt_artifact = _prebuilt_extension_artifact()
     prebuilt = load_prebuilt_extension(SELECTOR_LOG_S_EXTENSION_NAME)
     if prebuilt is not None:
@@ -309,9 +310,34 @@ def _load_ext(*, force: bool = False) -> Optional[torch.nn.Module]:
 
     cpp_source = r"""
 #include <torch/extension.h>
+#include <algorithm>
+#include <cstdint>
 #include <cstdlib>
+#include <limits>
 #include <string>
 #include <vector>
+
+namespace py = pybind11;
+
+namespace sfi_postprocess_meta {
+
+constexpr int kRowsPerLaunch = 40;
+constexpr int kI32Columns = 10;
+constexpr int kI64Columns = 4;
+
+struct LaunchPayload {
+    int32_t i32[kRowsPerLaunch][kI32Columns];
+    int64_t i64[kRowsPerLaunch][kI64Columns];
+};
+
+static_assert(
+    sizeof(LaunchPayload) == 2880,
+    "postprocess metadata launch payload layout drift");
+static_assert(
+    sizeof(LaunchPayload) < 3072,
+    "postprocess metadata payload must preserve portable kernel-ABI headroom");
+
+} // namespace sfi_postprocess_meta
 
 std::vector<torch::Tensor> fused_log_f_prior_logits_cuda(
     torch::Tensor scores,
@@ -382,6 +408,15 @@ int64_t reduce_log_f_pre_scratch_r2_alpha0p5_fp16_tiled_workspace_nbytes_cuda(
     int64_t num_seqs_capacity,
     int64_t num_query_heads_capacity,
     int64_t logical_k_capacity);
+
+void launch_log_f_postprocess_meta_cuda(
+    torch::Tensor req_meta_i32,
+    torch::Tensor req_meta_i64,
+    const sfi_postprocess_meta::LaunchPayload& payload,
+    int64_t row_base,
+    int64_t row_count,
+    int64_t meta_i32_cols,
+    int64_t meta_i64_cols);
 
 void copy_log_f_lastn1_scratch_cuda(
     torch::Tensor req_meta_i32,
@@ -551,6 +586,97 @@ int64_t reduce_log_f_pre_scratch_r2_alpha0p5_fp16_tiled_workspace_nbytes(
         logical_k_capacity);
 }
 
+void pack_log_f_postprocess_meta(
+    torch::Tensor req_meta_i32,
+    torch::Tensor req_meta_i64,
+    py::sequence meta_i32_rows,
+    py::sequence meta_i64_rows) {
+    using namespace sfi_postprocess_meta;
+
+    TORCH_CHECK(req_meta_i32.is_cuda(), "postprocess req_meta_i32 must be CUDA");
+    TORCH_CHECK(req_meta_i64.is_cuda(), "postprocess req_meta_i64 must be CUDA");
+    TORCH_CHECK(
+        req_meta_i32.get_device() == req_meta_i64.get_device(),
+        "postprocess metadata tensors must share one CUDA device");
+    TORCH_CHECK(
+        req_meta_i32.scalar_type() == torch::kInt32,
+        "postprocess req_meta_i32 must be int32");
+    TORCH_CHECK(
+        req_meta_i64.scalar_type() == torch::kInt64,
+        "postprocess req_meta_i64 must be int64");
+    TORCH_CHECK(
+        req_meta_i32.dim() == 2 && req_meta_i64.dim() == 2,
+        "postprocess metadata tensors must be two-dimensional");
+
+    const int64_t num_rows = py::len(meta_i32_rows);
+    TORCH_CHECK(
+        num_rows > 0 && num_rows <= std::numeric_limits<int32_t>::max(),
+        "postprocess metadata row count must fit positive int32");
+    TORCH_CHECK(
+        py::len(meta_i64_rows) == num_rows,
+        "postprocess metadata rows must be aligned");
+    py::sequence first_i32 = py::reinterpret_borrow<py::sequence>(
+        meta_i32_rows[0]);
+    py::sequence first_i64 = py::reinterpret_borrow<py::sequence>(
+        meta_i64_rows[0]);
+    const int64_t meta_i32_cols = py::len(first_i32);
+    const int64_t meta_i64_cols = py::len(first_i64);
+    TORCH_CHECK(
+        meta_i32_cols > 0 && meta_i32_cols <= kI32Columns,
+        "postprocess int32 metadata width must be in [1,10]");
+    TORCH_CHECK(
+        meta_i64_cols > 0 && meta_i64_cols <= kI64Columns,
+        "postprocess int64 metadata width must be in [1,4]");
+    TORCH_CHECK(
+        req_meta_i32.size(0) >= num_rows
+            && req_meta_i32.size(1) >= meta_i32_cols,
+        "postprocess req_meta_i32 capacity is smaller than the launch descriptor");
+    TORCH_CHECK(
+        req_meta_i64.size(0) >= num_rows
+            && req_meta_i64.size(1) >= meta_i64_cols,
+        "postprocess req_meta_i64 capacity is smaller than the launch descriptor");
+
+    for (int64_t row_base = 0; row_base < num_rows;
+         row_base += kRowsPerLaunch) {
+        const int64_t chunk_rows = std::min<int64_t>(
+            kRowsPerLaunch,
+            num_rows - row_base);
+        LaunchPayload payload{};
+        for (int64_t local_row = 0; local_row < chunk_rows; ++local_row) {
+            const int64_t source_row = row_base + local_row;
+            py::sequence row_i32 = py::reinterpret_borrow<py::sequence>(
+                meta_i32_rows[source_row]);
+            py::sequence row_i64 = py::reinterpret_borrow<py::sequence>(
+                meta_i64_rows[source_row]);
+            TORCH_CHECK(
+                py::len(row_i32) == meta_i32_cols,
+                "postprocess int32 metadata rows must have fixed width");
+            TORCH_CHECK(
+                py::len(row_i64) == meta_i64_cols,
+                "postprocess int64 metadata rows must have fixed width");
+            for (int64_t col = 0; col < meta_i32_cols; ++col) {
+                const int64_t value = py::cast<int64_t>(row_i32[col]);
+                TORCH_CHECK(
+                    value >= std::numeric_limits<int32_t>::min()
+                        && value <= std::numeric_limits<int32_t>::max(),
+                    "postprocess int32 launch descriptor value is out of range");
+                payload.i32[local_row][col] = static_cast<int32_t>(value);
+            }
+            for (int64_t col = 0; col < meta_i64_cols; ++col) {
+                payload.i64[local_row][col] = py::cast<int64_t>(row_i64[col]);
+            }
+        }
+        launch_log_f_postprocess_meta_cuda(
+            req_meta_i32,
+            req_meta_i64,
+            payload,
+            row_base,
+            chunk_rows,
+            meta_i32_cols,
+            meta_i64_cols);
+    }
+}
+
 void copy_log_f_lastn1_scratch(
     torch::Tensor req_meta_i32,
     torch::Tensor req_meta_i64,
@@ -630,6 +756,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("reduce_log_f_pre_scratch_r2_alpha0p5_fp16_tiled_workspace_nbytes",
           &reduce_log_f_pre_scratch_r2_alpha0p5_fp16_tiled_workspace_nbytes,
           "Caller-owned byte workspace required by the dynamic tiled reduce");
+    m.def("pack_log_f_postprocess_meta", &pack_log_f_postprocess_meta,
+          "Pack CPU-authored postprocess metadata by-value on the current CUDA stream");
     m.def("reduce_log_f_pre_scratch_accum_supported",
           &reduce_log_f_pre_scratch_accum_supported,
           "Marker: reduce supports chunked-prefill accumulate meta "
@@ -658,10 +786,64 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <algorithm>
 #include <vector>
 #include <cmath>
+#include <limits>
+
+namespace sfi_postprocess_meta {
+
+constexpr int kRowsPerLaunch = 40;
+constexpr int kI32Columns = 10;
+constexpr int kI64Columns = 4;
+
+struct LaunchPayload {
+    int32_t i32[kRowsPerLaunch][kI32Columns];
+    int64_t i64[kRowsPerLaunch][kI64Columns];
+};
+
+static_assert(
+    sizeof(LaunchPayload) == 2880,
+    "postprocess metadata launch payload layout drift");
+static_assert(
+    sizeof(LaunchPayload) < 3072,
+    "postprocess metadata payload must preserve portable kernel-ABI headroom");
+
+} // namespace sfi_postprocess_meta
 
 namespace {
+
+__global__ void pack_log_f_postprocess_meta_kernel(
+    int32_t* __restrict__ req_meta_i32,
+    int64_t* __restrict__ req_meta_i64,
+    int64_t meta_i32_stride_row,
+    int64_t meta_i32_stride_col,
+    int64_t meta_i64_stride_row,
+    int64_t meta_i64_stride_col,
+    const __grid_constant__ sfi_postprocess_meta::LaunchPayload payload,
+    int32_t row_base,
+    int32_t row_count,
+    int32_t meta_i32_cols,
+    int32_t meta_i64_cols) {
+    for (int linear = static_cast<int>(threadIdx.x);
+         linear < row_count * meta_i32_cols;
+         linear += static_cast<int>(blockDim.x)) {
+        const int row = linear / meta_i32_cols;
+        const int col = linear - row * meta_i32_cols;
+        req_meta_i32[
+            static_cast<int64_t>(row_base + row) * meta_i32_stride_row
+            + static_cast<int64_t>(col) * meta_i32_stride_col] = payload.i32[row][col];
+    }
+    for (int linear = static_cast<int>(threadIdx.x);
+         linear < row_count * meta_i64_cols;
+         linear += static_cast<int>(blockDim.x)) {
+        const int row = linear / meta_i64_cols;
+        const int col = linear - row * meta_i64_cols;
+        req_meta_i64[
+            static_cast<int64_t>(row_base + row) * meta_i64_stride_row
+            + static_cast<int64_t>(col) * meta_i64_stride_col] = payload.i64[row][col];
+    }
+}
 
 __device__ __forceinline__ float warp_reduce_sum(float val) {
     for (int offset = 16; offset > 0; offset >>= 1) {
@@ -787,6 +969,35 @@ __device__ __forceinline__ float sigmoid_tanh_clip(float x) {
 }
 
 } // namespace
+
+
+void launch_log_f_postprocess_meta_cuda(
+    torch::Tensor req_meta_i32,
+    torch::Tensor req_meta_i64,
+    const sfi_postprocess_meta::LaunchPayload& payload,
+    int64_t row_base,
+    int64_t row_count,
+    int64_t meta_i32_cols,
+    int64_t meta_i64_cols) {
+    const c10::cuda::CUDAGuard device_guard(req_meta_i32.device());
+    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    // CUDA copies by-value kernel arguments before this launch call returns.
+    // The host payload therefore has no asynchronous lifetime and no carrier
+    // pool, completion event, or stream-relative reuse contract.
+    pack_log_f_postprocess_meta_kernel<<<1, 128, 0, stream>>>(
+        req_meta_i32.data_ptr<int32_t>(),
+        req_meta_i64.data_ptr<int64_t>(),
+        req_meta_i32.stride(0),
+        req_meta_i32.stride(1),
+        req_meta_i64.stride(0),
+        req_meta_i64.stride(1),
+        payload,
+        static_cast<int32_t>(row_base),
+        static_cast<int32_t>(row_count),
+        static_cast<int32_t>(meta_i32_cols),
+        static_cast<int32_t>(meta_i64_cols));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
 
 
 // [FLFP-ILP4 2026-07-10] Pass2/3 的 log_r_raw 单点取值 helper:cache 命中读
@@ -4336,11 +4547,14 @@ void reduce_log_f_pre_scratch_scalar_cuda(
 
     try:
         configure_jit_toolchain_or_raise(ext_name=SELECTOR_LOG_S_EXTENSION_NAME)
+        # The C++ TU now owns the metadata hot-path loop.  Optimize that host
+        # marshaling without changing the established CUDA device flags.
         loaded_module = load_inline(
             name=SELECTOR_LOG_S_EXTENSION_NAME,
             cpp_sources=cpp_source,
             cuda_sources=cuda_source,
             functions=None,
+            extra_cflags=["-O3"],
             extra_cuda_cflags=extra_cuda_cflags,
             verbose=False,
         )
@@ -4551,6 +4765,24 @@ def reduce_log_f_pre_scratch_r2_alpha0p5_fp16_tiled_cuda(
     )
 
 
+def pack_log_f_postprocess_meta_cuda(
+    *,
+    req_meta_i32: torch.Tensor,
+    req_meta_i64: torch.Tensor,
+    meta_i32_rows: Sequence[Sequence[int]],
+    meta_i64_rows: Sequence[Sequence[int]],
+) -> None:
+    """Materialize one CPU-authored descriptor without asynchronous host storage."""
+
+    mod = _require_ext(force=True)
+    mod.pack_log_f_postprocess_meta(
+        req_meta_i32,
+        req_meta_i64,
+        meta_i32_rows,
+        meta_i64_rows,
+    )
+
+
 def copy_log_f_lastn1_scratch_cuda(
     *,
     req_meta_i32: torch.Tensor,
@@ -4632,6 +4864,7 @@ __all__ = [
     "log_f_r2_tiled_contract_reasons",
     "log_f_r2_tiled_workspace_layout",
     "log_f_r2_tiled_workspace_nbytes",
+    "pack_log_f_postprocess_meta_cuda",
     "copy_log_f_lastn1_scratch_cuda",
     "copy_log_f_lastn1_scratch_scalar_cuda",
     "reduce_log_f_pre_scratch_scalar_cuda",

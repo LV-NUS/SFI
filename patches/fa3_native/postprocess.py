@@ -139,40 +139,34 @@ class TiledCapturePostprocessResourceReport:
     """Profile-time geometry and exact structural GPU resource report.
 
     One controller-owned stream serializes complete tiled submissions, so one
-    GPU workspace is sufficient.  Pinned H2D carriers have a longer lifetime
-    and are separately bounded by raw-scratch reuse distance.  Both footprints
-    are resident before profile work; live acquisition never grows either one.
+    GPU workspace and one metadata descriptor are sufficient.  CPU-authored
+    metadata is copied into CUDA launch parameters by value, so it has no
+    asynchronous host-storage lifetime.
     """
 
     num_rows_capacity: int
     num_query_heads_capacity: int
     logical_k_capacity: int
     submission_slot_count: int
-    meta_carrier_count: int
     workspace_bytes_per_slot: int
     device_meta_bytes_per_slot: int
-    host_meta_bytes_per_carrier: int
     device_bytes_per_slot: int
     total_workspace_bytes: int
     total_device_meta_bytes: int
-    total_host_meta_bytes: int
     total_device_bytes: int
 
 
 @dataclass(frozen=True, slots=True)
 class CapturePostprocessMetaStagingReport:
-    """Fixed metadata staging footprint for every non-tiled submission.
+    """Fixed device metadata footprint for every non-tiled submission.
 
-    GPU metadata is reused immediately by same-stream order.  Pinned H2D
-    sources live longer, so their fixed FIFO is sized independently from the
-    single GPU submission slot.
+    GPU metadata is reused by same-stream order.  Host values are launch
+    parameters, not asynchronously referenced storage.
     """
 
     num_rows_capacity: int
-    meta_carrier_count: int
     device_bytes: int
-    host_bytes_per_carrier: int
-    total_host_bytes: int
+
 
 @dataclass(frozen=True, slots=True)
 class _PreparedTiledResourceSnapshot:
@@ -1111,42 +1105,31 @@ def _tiled_n_capacity(num_rows: int) -> int:
 
 def plan_capture_postprocess_meta_staging_resources(
     *,
-    meta_carrier_count: int,
     num_rows_capacity: int,
 ) -> CapturePostprocessMetaStagingReport:
     """Plan the sealed non-tiled metadata staging footprint."""
 
-    carriers = int(meta_carrier_count)
     rows = int(num_rows_capacity)
-    if carriers <= 0:
-        raise ValueError("metadata carrier count must be positive")
     if rows <= 0:
         raise ValueError("metadata row capacity must be positive")
     bytes_per_row = _META_I32_CAPACITY * 4 + _META_I64_CAPACITY * 8
     bytes_per_pair = rows * bytes_per_row
     return CapturePostprocessMetaStagingReport(
         num_rows_capacity=rows,
-        meta_carrier_count=carriers,
         device_bytes=bytes_per_pair,
-        host_bytes_per_carrier=bytes_per_pair,
-        total_host_bytes=bytes_per_pair * carriers,
     )
 
 
 def plan_tiled_capture_postprocess_resources(
     *,
-    meta_carrier_count: int,
     num_rows_capacity: int,
     num_query_heads: int,
     logical_k_capacity: int,
 ) -> TiledCapturePostprocessResourceReport:
-    """Return canonical geometry for one stream and fixed H2D carriers."""
+    """Return canonical geometry for one stream-owned tiled submission."""
 
     from utils import selector_log_s_ext
 
-    carriers = int(meta_carrier_count)
-    if carriers <= 0:
-        raise ValueError("tiled metadata carrier count must be positive")
     submission_slots = int(_TILED_SUBMISSION_SLOT_COUNT)
     n_capacity = _tiled_n_capacity(num_rows_capacity)
     h_capacity = int(num_query_heads)
@@ -1160,7 +1143,7 @@ def plan_tiled_capture_postprocess_resources(
             logical_k_capacity=k_capacity,
         )
     )
-    # Each slot owns [N,10] int32 + [N,4] int64 on host and device.
+    # Each slot owns one device descriptor: [N,10] int32 + [N,4] int64.
     meta_bytes = n_capacity * (
         _META_I32_CAPACITY * 4 + _META_I64_CAPACITY * 8
     )
@@ -1170,14 +1153,11 @@ def plan_tiled_capture_postprocess_resources(
         num_query_heads_capacity=h_capacity,
         logical_k_capacity=k_capacity,
         submission_slot_count=submission_slots,
-        meta_carrier_count=carriers,
         workspace_bytes_per_slot=workspace_bytes,
         device_meta_bytes_per_slot=meta_bytes,
-        host_meta_bytes_per_carrier=meta_bytes,
         device_bytes_per_slot=device_bytes,
         total_workspace_bytes=workspace_bytes * submission_slots,
         total_device_meta_bytes=meta_bytes * submission_slots,
-        total_host_meta_bytes=meta_bytes * carriers,
         total_device_bytes=device_bytes * submission_slots,
     )
 
@@ -1308,7 +1288,6 @@ def _allocate_tiled_resource_slot(
     n_capacity: int,
     h_capacity: int,
     k_capacity: int,
-    meta_carrier_count: int,
 ) -> dict[str, Any]:
     from utils import selector_log_s_ext
 
@@ -1325,39 +1304,10 @@ def _allocate_tiled_resource_slot(
             num_query_heads_capacity=h_capacity,
             logical_k_capacity=k_capacity,
         ),
-        # GPU storage is same-stream reusable as soon as its launch sequence is
-        # enqueued.  Pinned sources cannot be rewritten until H2D completes, so
-        # profile prebuild owns a distinct fixed FIFO for that longer lifetime.
-        "meta_carriers": [
-            _allocate_meta_carrier(n_capacity=n_capacity)
-            for _ in range(int(meta_carrier_count))
-        ],
-        "meta_carrier_count": int(meta_carrier_count),
-        "meta_next": 0,
         "reserved": False,
         "reservation_id": None,
         "next_reservation_id": 1,
         "reservation_stream": None,
-    }
-
-
-def _allocate_meta_carrier(*, n_capacity: int) -> dict[str, Any]:
-    return {
-        "cpu_i32": torch.empty(
-            (int(n_capacity), 10),
-            dtype=torch.int32,
-            device="cpu",
-            pin_memory=True,
-        ),
-        "cpu_i64": torch.empty(
-            (int(n_capacity), 4),
-            dtype=torch.int64,
-            device="cpu",
-            pin_memory=True,
-        ),
-        "copy_event": torch.cuda.Event(enable_timing=False),
-        "copy_recorded": False,
-        "reserved": False,
     }
 
 
@@ -1378,10 +1328,11 @@ def prepare_capture_postprocess_meta_staging_resources(
     meta_cache_owner: object,
     device: torch.device,
     stream: torch.cuda.Stream,
-    meta_carrier_count: int,
     num_rows_capacity: int,
 ) -> CapturePostprocessMetaStagingReport:
     """Preallocate the complete non-tiled metadata path before publication."""
+
+    from utils import selector_log_s_ext
 
     if meta_cache_owner is None:
         raise ValueError("sealed metadata staging requires an explicit owner")
@@ -1389,7 +1340,6 @@ def prepare_capture_postprocess_meta_staging_resources(
     if device.type != "cuda":
         raise ValueError("sealed metadata staging requires a CUDA device")
     report = plan_capture_postprocess_meta_staging_resources(
-        meta_carrier_count=meta_carrier_count,
         num_rows_capacity=num_rows_capacity,
     )
     key = _meta_staging_resource_key(
@@ -1397,6 +1347,7 @@ def prepare_capture_postprocess_meta_staging_resources(
         stream=stream,
         rows_capacity=report.num_rows_capacity,
     )
+    selector_log_s_ext._require_ext(force=True)
     with _POSTPROCESS_RESOURCE_PREPARE_LOCK:
         seal = getattr(
             meta_cache_owner, "_capture_postprocess_meta_staging_seal", None
@@ -1414,10 +1365,6 @@ def prepare_capture_postprocess_meta_staging_resources(
             if (
                 not isinstance(state, dict)
                 or bool(state.get("reserved", False))
-                or int(state.get("meta_carrier_count", -1))
-                != report.meta_carrier_count
-                or len(state.get("meta_carriers", ()))
-                != report.meta_carrier_count
             ):
                 raise RuntimeError(
                     "E_CAPTURE_POSTPROCESS_META_STAGING_SEAL_DRIFT"
@@ -1435,14 +1382,6 @@ def prepare_capture_postprocess_meta_staging_resources(
                     dtype=torch.int64,
                     device=device,
                 ),
-                "meta_carriers": [
-                    _allocate_meta_carrier(
-                        n_capacity=report.num_rows_capacity
-                    )
-                    for _ in range(report.meta_carrier_count)
-                ],
-                "meta_carrier_count": report.meta_carrier_count,
-                "meta_next": 0,
                 "reserved": False,
                 "reservation_id": None,
                 "next_reservation_id": 1,
@@ -1494,12 +1433,6 @@ def _acquire_capture_postprocess_meta_staging(
         raise RuntimeError(
             "E_CAPTURE_POSTPROCESS_META_STAGING_CAPACITY_EXCEEDED"
         )
-    if (
-        int(state.get("meta_carrier_count", -1))
-        != report.meta_carrier_count
-        or len(state.get("meta_carriers", ())) != report.meta_carrier_count
-    ):
-        raise RuntimeError("E_CAPTURE_POSTPROCESS_META_STAGING_STATE_DRIFT")
     if bool(state.get("reserved", False)):
         raise RuntimeError("E_CAPTURE_POSTPROCESS_META_STAGING_REENTRY")
     reservation_id = int(state.get("next_reservation_id", 0))
@@ -1537,7 +1470,6 @@ def prepare_tiled_capture_postprocess_resources(
     meta_cache_owner: object,
     device: torch.device,
     stream: torch.cuda.Stream,
-    meta_carrier_count: int,
     num_rows_capacity: int,
     num_query_heads: int,
     logical_k_capacity: int,
@@ -1552,7 +1484,6 @@ def prepare_tiled_capture_postprocess_resources(
     if device.type != "cuda":
         raise ValueError("sealed tiled resources require a CUDA device")
     report = plan_tiled_capture_postprocess_resources(
-        meta_carrier_count=meta_carrier_count,
         num_rows_capacity=num_rows_capacity,
         num_query_heads=num_query_heads,
         logical_k_capacity=logical_k_capacity,
@@ -1579,10 +1510,6 @@ def prepare_tiled_capture_postprocess_resources(
             if (
                 seal.get("report") != report
                 or not isinstance(state, dict)
-                or int(state.get("meta_carrier_count", -1))
-                != report.meta_carrier_count
-                or len(state.get("meta_carriers", ()))
-                != report.meta_carrier_count
                 or bool(state.get("reserved", False))
                 or state.get("reservation_id") is not None
             ):
@@ -1593,7 +1520,6 @@ def prepare_tiled_capture_postprocess_resources(
             n_capacity=report.num_rows_capacity,
             h_capacity=report.num_query_heads_capacity,
             k_capacity=report.logical_k_capacity,
-            meta_carrier_count=report.meta_carrier_count,
         )
         # Publish only after the complete resource has been allocated.  A
         # failed cold-side allocation therefore leaves no observable state.
@@ -1660,12 +1586,6 @@ def _acquire_tiled_resource_slot(
         raise RuntimeError(
             "E_SELECTOR_LOG_F_TILED_RESOURCE_SEALED_CAPACITY_EXCEEDED"
         )
-    if (
-        int(state.get("meta_carrier_count", -1))
-        != report.meta_carrier_count
-        or len(state.get("meta_carriers", ())) != report.meta_carrier_count
-    ):
-        raise RuntimeError("E_SELECTOR_LOG_F_TILED_RESOURCE_STATE_DRIFT")
     if bool(state.get("reserved", False)):
         raise RuntimeError(
             "E_SELECTOR_LOG_F_TILED_RESOURCE_OWNERSHIP_CAPACITY_DRIFT"
@@ -1682,90 +1602,43 @@ def _acquire_tiled_resource_slot(
     return state, reservation_id, n_capacity, h_capacity, k_capacity
 
 
-def _acquire_meta_carrier(slot: dict[str, Any]) -> dict[str, Any]:
-    """Reserve one pinned H2D source with one oldest-event query at steady state."""
-
-    carriers = slot.get("meta_carriers")
-    carrier_count = int(slot.get("meta_carrier_count", -1))
-    if (
-        not isinstance(carriers, list)
-        or carrier_count <= 0
-        or len(carriers) != carrier_count
-    ):
-        raise RuntimeError("E_CAPTURE_POSTPROCESS_META_CARRIER_STATE_DRIFT")
-    oldest_index = int(slot.get("meta_next", 0)) % carrier_count
-    carrier = carriers[oldest_index]
-    if not isinstance(carrier, dict):
-        raise RuntimeError("E_CAPTURE_POSTPROCESS_META_CARRIER_DRIFT")
-    copy_event = carrier.get("copy_event")
-    if copy_event is None:
-        raise RuntimeError("E_CAPTURE_POSTPROCESS_META_EVENT_MISSING")
-    if bool(carrier.get("reserved", False)):
-        raise RuntimeError("E_CAPTURE_POSTPROCESS_META_CARRIER_STATE_DRIFT")
-    if bool(carrier.get("copy_recorded", False)) and not bool(copy_event.query()):
-        # Scratch reuse cannot legally reach this carrier until the matching
-        # prior postprocess is complete.  Exhaustion is ownership drift, never
-        # permission to allocate an unprofiled live-path fallback.
-        raise RuntimeError("E_CAPTURE_POSTPROCESS_META_CARRIER_CAPACITY_DRIFT")
-    slot["meta_next"] = (oldest_index + 1) % carrier_count
-    carrier["reserved"] = True
-    return carrier
-
-
 def _stage_prebuilt_meta_rows(
     slot: dict[str, Any],
     *,
     meta_i32_rows: Sequence[Sequence[int]],
     meta_i64_rows: Sequence[Sequence[int]],
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Bulk-stage one metadata pair into its exclusively reserved slot."""
+    """Materialize CPU truth as stream-ordered, by-value CUDA launch metadata."""
 
     row_count = len(meta_i32_rows)
     if row_count <= 0 or len(meta_i64_rows) != row_count:
-        raise ValueError("tiled metadata rows must be non-empty and aligned")
+        raise ValueError("postprocess metadata rows must be non-empty and aligned")
     i32_cols = len(meta_i32_rows[0])
     i64_cols = len(meta_i64_rows[0])
-    if (
-        i32_cols <= 0
-        or i64_cols <= 0
-        or any(len(row) != i32_cols for row in meta_i32_rows)
-        or any(len(row) != i64_cols for row in meta_i64_rows)
-    ):
-        raise ValueError("metadata rows must have fixed non-empty widths")
+    if i32_cols <= 0 or i64_cols <= 0:
+        raise ValueError("metadata rows must have non-empty widths")
     gpu_i32 = slot["gpu_i32"]
     gpu_i64 = slot["gpu_i64"]
     reservation_stream = slot.get("reservation_stream")
     if reservation_stream is None:
         raise RuntimeError("E_CAPTURE_POSTPROCESS_META_RESERVATION_STREAM_MISSING")
-    carrier = _acquire_meta_carrier(slot)
-    cpu_i32 = carrier["cpu_i32"]
-    cpu_i64 = carrier["cpu_i64"]
-    copy_event = carrier.get("copy_event")
-    if copy_event is None:
-        raise RuntimeError("E_CAPTURE_POSTPROCESS_META_EVENT_MISSING")
-    try:
-        if (
-            row_count > int(cpu_i32.shape[0])
-            or row_count > int(cpu_i64.shape[0])
-            or i32_cols > int(cpu_i32.shape[1])
-            or i64_cols > int(cpu_i64.shape[1])
-        ):
-            raise RuntimeError("E_CAPTURE_POSTPROCESS_META_CAPACITY_DRIFT")
-        req_meta_i32 = gpu_i32[:row_count, :i32_cols]
-        req_meta_i64 = gpu_i64[:row_count, :i64_cols]
-        cpu_i32_view = cpu_i32[:row_count, :i32_cols]
-        cpu_i64_view = cpu_i64[:row_count, :i64_cols]
-        cpu_i32_view.copy_(torch.tensor(meta_i32_rows, dtype=torch.int32))
-        cpu_i64_view.copy_(torch.tensor(meta_i64_rows, dtype=torch.int64))
-        req_meta_i32.copy_(cpu_i32_view, non_blocking=True)
-        req_meta_i64.copy_(cpu_i64_view, non_blocking=True)
-    finally:
-        # This record must follow both H2D enqueues.  Recording even on an
-        # exceptional partial-copy path fences whatever reached the stream
-        # before the pinned source can become reusable.
-        copy_event.record(reservation_stream)
-        carrier["copy_recorded"] = True
-        carrier["reserved"] = False
+    if (
+        row_count > int(gpu_i32.shape[0])
+        or row_count > int(gpu_i64.shape[0])
+        or i32_cols > int(gpu_i32.shape[1])
+        or i64_cols > int(gpu_i64.shape[1])
+    ):
+        raise RuntimeError("E_CAPTURE_POSTPROCESS_META_CAPACITY_DRIFT")
+    req_meta_i32 = gpu_i32[:row_count, :i32_cols]
+    req_meta_i64 = gpu_i64[:row_count, :i64_cols]
+    from utils import selector_log_s_ext
+
+    selector_log_s_ext.pack_log_f_postprocess_meta_cuda(
+        req_meta_i32=req_meta_i32,
+        req_meta_i64=req_meta_i64,
+        meta_i32_rows=meta_i32_rows,
+        meta_i64_rows=meta_i64_rows,
+    )
     return req_meta_i32, req_meta_i64
 
 
@@ -1802,8 +1675,8 @@ def _publish_tiled_resource_completion(
     A completion event escapes through deferred jobs and may be waited long
     after this storage slot becomes reusable.  Re-recording a slot-owned event
     would make such a delayed wait observe a later publication.  Publication
-    events are therefore one-shot identities; only each private pinned
-    metadata carrier's copy-lifetime event is persistent.
+    events are therefore one-shot identities.  Metadata has no separate host
+    lifetime because its launch descriptor is copied by value.
     """
 
     event = torch.cuda.Event(enable_timing=False)
@@ -3583,7 +3456,7 @@ def _run_tiled_capture_postprocess_job_cohort(
     finally:
         if not resource_published:
             # Partial GPU work remains ordered before reuse on this same stream;
-            # metadata staging independently fenced its pinned source event.
+            # metadata launch values have no asynchronous host-side lifetime.
             _release_tiled_resource_slot(
                 slot,
                 stream=stream,
