@@ -5,12 +5,12 @@ set -euo pipefail
 SFI_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 UPSTREAM_URL="https://github.com/vllm-project/flash-attention.git"
 BASE_COMMIT="f5bc33cfc02c744d24a2e9d50e6db656de40611c"
-EXPECTED_PATCH_SHA256="bea3e377f7335e9ebde7e6d50a9c5ab2c5dc6ed950eca2dcc0fb73c25116d500"
-EXPECTED_PATCHED_TREE="4329bcb986a5ac0427f126c50aae8164e1f668b0"
+EXPECTED_PATCH_SHA256="3c86344cd5c4a43a53e0e172163e270edcf7d812bb887be94625ef34746bf504"
+EXPECTED_PATCHED_TREE="b46578a758d4030ff08b808f692fc9cec60d6888"
 # Filled from the checked-in rebased FA4 patch.  FA4 is applied after FA3 so
 # SM100 shares the same current wrapper/dispatch base as SM80 and SM90.
 EXPECTED_FA4_PATCH_SHA256="d5668e7ed8beb63acc698eadc5ffea01247bf48b154ea042e85b23741698a0c4"
-EXPECTED_FA4_PATCHED_TREE="60a0be233fc416d84774563eac84ae062fd362f3"
+EXPECTED_FA4_PATCHED_TREE="3a117db15dd72f5f7f1636145ee40a1bf7711d5d"
 MINIMUM_CMAKE_VERSION="3.26"
 
 TARGET="${SFI_ROOT}/third_party_upstreams/vllm-project-flash-attention"

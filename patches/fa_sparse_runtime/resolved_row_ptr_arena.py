@@ -1,8 +1,10 @@
-"""Graph-stable row-pointer arena for the ResolvedRowPtr resolver.
+"""Graph-stable row-table arena for the ResolvedRowPtr resolver family.
 
 The i32 row table remains the owned backing storage for compact+recent page
-ids. The production graph ABI captures a stable u64 pointer vector plus visible
-lengths, so replay can redirect rows without copying a SelectedTable carrier.
+ids. SM8x and generic per-head layouts use the stable u64 pointer vector. SM90
+production layouts use a zero-copy batch-row view when every KV head shares the
+same pages, allowing the owned kind4 kernel to reuse FA3's common page-table
+address chain without changing resolver ownership.
 """
 
 from __future__ import annotations
@@ -17,6 +19,7 @@ import torch
 from patches.fa3_native.mixed_page_graph_descriptor import (
     MixedPageResolverCarrierSet,
     PageResolverKind,
+    PageResolverSubkind,
     ResolverGraphDescriptor,
 )
 from patches.fa3_native.row_consume_modes import (
@@ -665,6 +668,7 @@ def apply_arena_writes_from_descriptors(
     # readiness boolean below.
     arena._direct_affine_ready = bool(derived["affine_rows_by_batch"])
     arena._direct_affine_row_mode_required = False
+    arena._batch_row_table_head_identical = True
 
     _b1_last_pages_by_row = getattr(arena, "_b1_last_pages_by_row", None)
     if _b1_last_pages_by_row is not None:
@@ -1223,6 +1227,13 @@ class ResolvedRowPtrArena:
     _direct_affine_scalar_batch_stride: int | None = field(default=None, init=False, repr=False)
     _direct_affine_batch_bases: tuple[int, ...] | None = field(default=None, init=False, repr=False)  # fa3_sm90_perbatch_base
     _carrier_points_to_own_row_table: bool = field(default=True, init=False, repr=False)
+    # Production publishers materialize one batch row and fan it out to every
+    # KV head. On SM90 that invariant lets the head-0 rows form a zero-copy
+    # batch-row DirectTable carrier for the owned kind4 kernel's common
+    # page-table address chain.
+    # Generic per-head writers invalidate the invariant before binding.
+    _batch_row_table_head_identical: bool = field(default=True, init=False, repr=False)
+    _batch_row_direct_binding_active: bool = field(default=False, init=False, repr=False)
     _last_debug_pointer_signature: tuple[int | None, ...] = field(default=(), init=False, repr=False)
     _resolved_seqused_source_kind: str = field(default="arena_batch_seqused", init=False, repr=False)
     # B1 incremental-column-write per-batch-row baseline (page ids last
@@ -1399,6 +1410,22 @@ class ResolvedRowPtrArena:
             tuple(int(x) for x in self._direct_affine_batch_bases),
         )
 
+    def sm90_batch_row_direct_table(self) -> torch.Tensor | None:
+        """Return the zero-copy production batch-row carrier on SM90."""
+        if not self._carrier_points_to_own_row_table:
+            return None
+        if not self._batch_row_table_head_identical:
+            return None
+        if self.row_table_i32.device.type != "cuda":
+            return None
+        if int(torch.cuda.get_device_capability(self.row_table_i32.device)[0]) != 9:
+            return None
+        return self.row_table_i32.view(
+            self.batch_size,
+            self.num_kv_heads,
+            self.max_pages_per_row,
+        )[:, 0, :]
+
     def bind_resolved_seqused_source(
         self,
         seqused_k_i32: torch.Tensor,
@@ -1504,6 +1531,13 @@ class ResolvedRowPtrArena:
         if coverage_count_i < 0 or coverage_count_i > self.max_pages_per_row:
             raise ValueError("coverage_count must be in 0..max_pages_per_row")
 
+        if self.num_kv_heads > 1:
+            if self._batch_row_direct_binding_active:
+                raise RuntimeError(
+                    "per-head row write would invalidate an active SM90 "
+                    "batch-row DirectTable binding"
+                )
+            self._batch_row_table_head_identical = False
         self.row_table_i32[flat_row_i].copy_(pages, non_blocking=True)
         # [ARENA-AFFINE-DEVICE-RETIRED 2026-07-03] per-flat-row affine_i32
         # fallback-sentinel device write removed.
@@ -3165,6 +3199,7 @@ class ResolvedRowPtrArena:
         # above and the readiness boolean below.
         self._direct_affine_ready = bool(affine_rows_by_batch)
         self._direct_affine_row_mode_required = False
+        self._batch_row_table_head_identical = True
         _mark_row_table_phase("rrp_row_table_affine_refresh")
         # B1 stale-baseline guard: this heavy re-bind rewrote the whole
         # row_table_i32 from the canonical block table, so every cached
@@ -3232,6 +3267,10 @@ def bind_resolved_row_ptr_replay_metadata(
             max_pages_per_row=max_pages_i,
         )
 
+    replay_visible = replay_arena.carriers.resolver_visible_seqused_k_by_head_i32
+    if not isinstance(replay_visible, torch.Tensor):
+        raise RuntimeError("ResolvedRowPtr binding requires visible seqused tensor")
+    sm90_direct_table = replay_arena.sm90_batch_row_direct_table()
     descriptor = ResolverGraphDescriptor(
         resolver_kind=PageResolverKind.RESOLVED_ROW_PTR,
         batch=batch_size_i,
@@ -3244,20 +3283,37 @@ def bind_resolved_row_ptr_replay_metadata(
         kv_cache_addr=0,
         capture_buffer_shape_key=str(capture_buffer_shape_key),
         producer_stream_key=str(producer_stream_key),
+        resolver_subkind=(
+            PageResolverSubkind.DIRECT_TABLE
+            if sm90_direct_table is not None
+            else PageResolverSubkind.ROWPTR
+        ),
         max_seqlen_q_bucket=_bucket_max_seqlen_q(max_seqlen_q),
         max_seqlen_k_bucket=_bucket_max_seqlen_k(max_seqlen_k),
     )
-    replay_visible = replay_arena.carriers.resolver_visible_seqused_k_by_head_i32
-    if not isinstance(replay_visible, torch.Tensor):
-        raise RuntimeError("ResolvedRowPtr binding requires visible seqused tensor")
     disable_direct_affine = _RRP_DISABLE_DIRECT_AFFINE_CACHED
     use_direct_affine = (
-        not disable_direct_affine
+        sm90_direct_table is None
+        and not disable_direct_affine
         and replay_arena.direct_affine_ready
         and not replay_arena.direct_affine_row_mode_required
     )
     scalar_affine = replay_arena.direct_affine_scalar if use_direct_affine else None
-    if scalar_affine is not None:
+    if sm90_direct_table is not None:
+        replay_carriers = MixedPageResolverCarrierSet(
+            row_consume_mode_i32=None,
+            resolver_visible_seqused_k_by_head_i32=replay_visible,
+            selected_page_table_i32=None,
+            effective_row_slot_i32=None,
+            compact_base_page_i32=None,
+            compact_page_count_i32=None,
+            recent_first_logical_page_i32=None,
+            resolved_page_table_row_ptr_u64=None,
+            resolved_page_table_i32=sm90_direct_table,
+            resolved_page_table_affine_i32=None,
+            resolver_subkind=PageResolverSubkind.DIRECT_TABLE,
+        )
+    elif scalar_affine is not None:
         # AFFINE_CONST_DIRECT: scalar base/stride/batch_stride only. row_ptr_u64 and
         # affine_i32 MUST be None (carrier exclusivity); head_stride 0 and segment/second
         # cleared so runtime_bridge has_affine_const_direct passes -> the free resolve.
@@ -3334,6 +3390,7 @@ def bind_resolved_row_ptr_replay_metadata(
             resolved_page_table_affine_i32=None,
             resolved_page_table_affine_batch_stride=None,
         )
+    replay_arena._batch_row_direct_binding_active = sm90_direct_table is not None
     replay_arena._direct_affine_binding_active = bool(use_direct_affine)
     binding = ResolvedRowPtrReplayMetadataBinding(
         descriptor=descriptor,
@@ -3394,6 +3451,16 @@ def attach_resolved_row_ptr_replay_metadata(
         attn_metadata,
         "mixed_page_resolver_replay_row_ptr_source_u64",
         source_carriers.resolved_page_table_row_ptr_u64,
+    )
+    setattr(
+        attn_metadata,
+        "mixed_page_resolver_replay_direct_table_i32",
+        replay_carriers.resolved_page_table_i32,
+    )
+    setattr(
+        attn_metadata,
+        "mixed_page_resolver_replay_direct_table_source_i32",
+        source_carriers.resolved_page_table_i32,
     )
     setattr(attn_metadata, "mixed_page_resolver_replay_affine_i32", replay_carriers.resolved_page_table_affine_i32)
     setattr(

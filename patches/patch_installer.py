@@ -2703,6 +2703,7 @@ def _run_profile_resolved_row_ptr_mixed_forward(
         k_descale=common_kwargs["k_descale"],
     )
     row_ptr = getattr(carriers, "resolved_page_table_row_ptr_u64", None)
+    direct_i32 = getattr(carriers, "resolved_page_table_i32", None)
     affine_i32 = getattr(carriers, "resolved_page_table_affine_i32", None)
     affine_base = getattr(carriers, "resolved_page_table_affine_base", None)
     affine_stride = getattr(carriers, "resolved_page_table_affine_stride", None)
@@ -2710,7 +2711,21 @@ def _run_profile_resolved_row_ptr_mixed_forward(
     affine_cols = int(getattr(carriers, "resolved_page_table_affine_cols", 0))
     has_affine_const = affine_base is not None or affine_stride is not None
     has_affine = affine_i32 is not None or has_affine_const
-    if isinstance(affine_i32, torch.Tensor):
+    active_resolved_carriers = sum(
+        (
+            isinstance(row_ptr, torch.Tensor),
+            isinstance(direct_i32, torch.Tensor),
+            bool(has_affine),
+        )
+    )
+    if active_resolved_carriers != 1:
+        raise RuntimeError(
+            "vLLM profile ResolvedRowPtr mixed forward requires exactly one "
+            "row-pointer, direct-table, or affine carrier"
+        )
+    if isinstance(direct_i32, torch.Tensor):
+        resolver_subkind_i = int(PageResolverSubkind.DIRECT_TABLE)
+    elif isinstance(affine_i32, torch.Tensor):
         resolver_subkind_i = int(PageResolverSubkind.AFFINE_TENSOR)
     elif has_affine_const:
         resolver_subkind_i = int(
@@ -2774,6 +2789,9 @@ def _run_profile_resolved_row_ptr_mixed_forward(
                         common_kwargs["graph_replay_carriers"]
                     ),
                     "has_resolved_affine": bool(has_affine),
+                    "has_resolved_direct_table": isinstance(
+                        direct_i32, torch.Tensor
+                    ),
                     "has_resolved_affine_direct": affine_direct,
                     "profile_max_seqlen_k_attr": int(
                         getattr(attn_metadata, "mixed_page_profile_max_seqlen_k", -1)
@@ -2786,10 +2804,6 @@ def _run_profile_resolved_row_ptr_mixed_forward(
             )
         except Exception:
             pass
-    if row_ptr is None and not has_affine:
-        raise RuntimeError(
-            "vLLM profile ResolvedRowPtr mixed forward requires row-pointer or affine carrier plus visible lengths"
-        )
     _record_mixed_page_actual_route_family(
         _get_global_controller(),
         "resolved_row_ptr",
@@ -2802,6 +2816,7 @@ def _run_profile_resolved_row_ptr_mixed_forward(
         row_consume_mode_i32=getattr(carriers, "row_consume_mode_i32", None) if has_affine else None,
         selected_seqused_k_by_head_i32=None,
         resolved_page_table_row_ptr_u64=row_ptr,
+        resolved_page_table_i32=direct_i32,
         resolved_page_table_affine_i32=affine_i32,
         resolved_page_table_affine_base=affine_base,
         resolved_page_table_affine_stride=affine_stride,

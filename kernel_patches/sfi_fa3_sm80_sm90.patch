@@ -1,5 +1,5 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 88c334b..65f2e9b 100644
+index 88c334b..ec3f36e 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -6,6 +6,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
@@ -10,7 +10,7 @@ index 88c334b..65f2e9b 100644
  
  # CUDA by default, can be overridden by using -DVLLM_TARGET_DEVICE=... (used by setup.py)
  set(VLLM_TARGET_DEVICE "cuda" CACHE STRING "Target device backend for vLLM")
-@@ -178,6 +179,38 @@ endif ()
+@@ -178,6 +179,64 @@ endif ()
  
  # FA3 requires CUDA 12.0 or later
  if (FA3_ENABLED AND ${CMAKE_CUDA_COMPILER_VERSION} GREATER_EQUAL 12.0)
@@ -46,10 +46,36 @@ index 88c334b..65f2e9b 100644
 +    endforeach()
 +    # [COMPACT-RECENT-REMOVED 2026-07-02] flash_fwd_hdim128_bf16_sm80_compact_recent.cu deleted.
 +
++    # Release-effective SM90 surface: Qwen3 uses BF16, hdim=128, PackGQA,
++    # paged KV, and both split/non-split launches. Keep the source contract
++    # explicit so compile definitions cannot leave unused FP16/FP8/softcap
++    # translation units in the target. CUDA 12.4 otherwise spends substantial
++    # time compiling those unused templates and can fail inside cicc.
++    set(FA3_SM90_RELEASE_GEN_SRCS
++        hopper/instantiations/flash_fwd_hdim128_bf16_packgqa_sm90.cu
++        hopper/instantiations/flash_fwd_hdim128_bf16_split_sm90.cu
++        hopper/instantiations/flash_fwd_hdim128_bf16_paged_sm90.cu
++        hopper/instantiations/flash_fwd_hdim128_bf16_paged_split_sm90.cu)
++    list(LENGTH FA3_SM90_RELEASE_GEN_SRCS FA3_SM90_RELEASE_GEN_SRCS_COUNT)
++    if (NOT FA3_SM90_RELEASE_GEN_SRCS_COUNT EQUAL 4)
++        message(FATAL_ERROR
++            "SM90 release source contract requires exactly four BF16 hdim128 TUs")
++    endif()
++    foreach(FA3_SM90_RELEASE_SRC IN LISTS FA3_SM90_RELEASE_GEN_SRCS)
++        if (NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${FA3_SM90_RELEASE_SRC}")
++            message(FATAL_ERROR "Missing SM90 release source: ${FA3_SM90_RELEASE_SRC}")
++        endif()
++        if (NOT FA3_SM90_RELEASE_SRC MATCHES "hdim128_bf16"
++            OR FA3_SM90_RELEASE_SRC MATCHES "fp16|e4m3|softcap")
++            message(FATAL_ERROR
++                "SM90 release source must be BF16 hdim128 and non-softcap: ${FA3_SM90_RELEASE_SRC}")
++        endif()
++    endforeach()
++
      # BF16 source files
      file(GLOB FA3_BF16_GEN_SRCS
          "hopper/instantiations/flash_fwd_hdim64_bf16_*packgqa_sm90.cu"
-@@ -249,22 +282,58 @@ if (FA3_ENABLED AND ${CMAKE_CUDA_COMPILER_VERSION} GREATER_EQUAL 12.0)
+@@ -249,22 +308,60 @@ if (FA3_ENABLED AND ${CMAKE_CUDA_COMPILER_VERSION} GREATER_EQUAL 12.0)
          "hopper/instantiations/flash_fwd_hdim192_128_e4m3*_sm90.cu")
      list(APPEND FA3_FP8_GEN_SRCS ${FA3_FP8_GEN_SRCS_})
  
@@ -84,7 +110,9 @@ index 88c334b..65f2e9b 100644
 +                "FA3 SM80 release source contract: ${FA3_SM80_RELEASE_GEN_SRCS_COUNT} generated TUs")
 +        endif()
 +        if (FA3_SM90_ARCHS)
-+            list(APPEND FA3_GEN_SRCS ${FA3_BF16_GEN_SRCS} ${FA3_FP16_GEN_SRCS} ${FA3_FP8_GEN_SRCS})
++            set(FA3_GEN_SRCS ${FA3_SM90_RELEASE_GEN_SRCS})
++            message(STATUS
++                "FA3 SM90 release source contract: ${FA3_SM90_RELEASE_GEN_SRCS_COUNT} generated TUs")
 +        endif()
 +        if (FA3_SM90_MIXED_PAGE_FAST_BUILD)
 +            if (NOT FA3_SM90_ARCHS)
@@ -100,25 +128,25 @@ index 88c334b..65f2e9b 100644
 +        else()
 +            set(FA3_SM80_GENCODE_SRCS ${FA3_SM80_RELEASE_GEN_SRCS})
 +        endif()
++        set_gencode_flags_for_srcs(
++            SRCS "${FA3_SM80_GENCODE_SRCS}"
++            CUDA_ARCHS "${FA3_SM80_ARCHS}")
          set_gencode_flags_for_srcs(
 -            SRCS "${FA3_GEN_SRCS}"
 -            CUDA_ARCHS "${FA3_ARCHS}")
-+            SRCS "${FA3_SM80_GENCODE_SRCS}"
-+            CUDA_ARCHS "${FA3_SM80_ARCHS}")
++            SRCS "${FA3_BF16_GEN_SRCS};${FA3_FP16_GEN_SRCS};${FA3_FP8_GEN_SRCS}"
++            CUDA_ARCHS "${FA3_SM90_ARCHS}")
          set_gencode_flags_for_srcs(
 -            SRCS 
 -                hopper/flash_fwd_combine.cu
 -                hopper/flash_prepare_scheduler.cu
 -            CUDA_ARCHS "${FA3_ARCHS}")
-+            SRCS "${FA3_BF16_GEN_SRCS};${FA3_FP16_GEN_SRCS};${FA3_FP8_GEN_SRCS}"
-+            CUDA_ARCHS "${FA3_SM90_ARCHS}")
-+        set_gencode_flags_for_srcs(
 +            SRCS "${FA3_COMMON_CUDA_SRCS}"
 +            CUDA_ARCHS "${FA3_COMMON_ARCHS}")
      endif()
  
      define_gpu_extension_target(
-@@ -272,8 +341,7 @@ if (FA3_ENABLED AND ${CMAKE_CUDA_COMPILER_VERSION} GREATER_EQUAL 12.0)
+@@ -272,8 +369,7 @@ if (FA3_ENABLED AND ${CMAKE_CUDA_COMPILER_VERSION} GREATER_EQUAL 12.0)
          DESTINATION vllm_flash_attn
          LANGUAGE ${VLLM_GPU_LANG}
          SOURCES
@@ -128,7 +156,7 @@ index 88c334b..65f2e9b 100644
              hopper/flash_api.cpp
              hopper/flash_api_torch_lib.cpp
              ${FA3_GEN_SRCS}
-@@ -287,8 +355,7 @@ if (FA3_ENABLED AND ${CMAKE_CUDA_COMPILER_VERSION} GREATER_EQUAL 12.0)
+@@ -287,8 +383,7 @@ if (FA3_ENABLED AND ${CMAKE_CUDA_COMPILER_VERSION} GREATER_EQUAL 12.0)
          csrc/common
          csrc/cutlass/include)
  
@@ -138,7 +166,7 @@ index 88c334b..65f2e9b 100644
          FLASHATTENTION_DISABLE_BACKWARD
          FLASHATTENTION_DISABLE_DROPOUT
          # FLASHATTENTION_DISABLE_ALIBI
-@@ -299,12 +366,59 @@ if (FA3_ENABLED AND ${CMAKE_CUDA_COMPILER_VERSION} GREATER_EQUAL 12.0)
+@@ -299,12 +394,54 @@ if (FA3_ENABLED AND ${CMAKE_CUDA_COMPILER_VERSION} GREATER_EQUAL 12.0)
          FLASHATTENTION_VARLEN_ONLY # Custom flag to save on binary size
          FLASHATTENTION_PACKGQA_ONLY # Custom flag to save on binary size
          FLASHATTENTION_DISABLE_CLUSTER # disabled for varlen in any case
@@ -168,6 +196,11 @@ index 88c334b..65f2e9b 100644
 +        list(APPEND FA3_TARGET_COMPILE_DEFINITIONS
 +            CUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED
 +            CUTLASS_ENABLE_GDC_FOR_SM90
++            FLASHATTENTION_DISABLE_SM8x
++            FLASHATTENTION_DISABLE_FP16
++            FLASHATTENTION_DISABLE_FP8
++            FLASHATTENTION_DISABLE_HDIMDIFF64
++            FLASHATTENTION_DISABLE_HDIMDIFF192
 +        )
 +    else()
 +        list(APPEND FA3_TARGET_COMPILE_DEFINITIONS
@@ -181,16 +214,6 @@ index 88c334b..65f2e9b 100644
 +    endif()
 +    if (FA3_SM90_MIXED_PAGE_FAST_BUILD)
 +        list(APPEND FA3_TARGET_COMPILE_DEFINITIONS
-+            FLASHATTENTION_DISABLE_SM8x
-+            FLASHATTENTION_DISABLE_FP16
-+            FLASHATTENTION_DISABLE_FP8
-+            FLASHATTENTION_DISABLE_SOFTCAP
-+            FLASHATTENTION_DISABLE_HDIM64
-+            FLASHATTENTION_DISABLE_HDIM96
-+            FLASHATTENTION_DISABLE_HDIM192
-+            FLASHATTENTION_DISABLE_HDIM256
-+            FLASHATTENTION_DISABLE_HDIMDIFF64
-+            FLASHATTENTION_DISABLE_HDIMDIFF192
 +            FLASHATTENTION_DISABLE_SPLIT
 +        )
 +    endif()
@@ -406,7 +429,7 @@ index 0000000..049684d
 +
 +#endif
 diff --git a/hopper/flash.h b/hopper/flash.h
-index e5c6d62..a19a32a 100644
+index e5c6d62..9b80a80 100644
 --- a/hopper/flash.h
 +++ b/hopper/flash.h
 @@ -5,6 +5,7 @@
@@ -470,7 +493,7 @@ index e5c6d62..a19a32a 100644
      int page_size;
      int num_pages;
      bool pagedkv_tma;
-@@ -168,11 +202,46 @@ struct Flash_fwd_params : public Qkv_params {
+@@ -168,11 +202,52 @@ struct Flash_fwd_params : public Qkv_params {
  
      // The S extra matrix, (num_heads)
      void *__restrict__ s_aux_ptr;
@@ -514,10 +537,16 @@ index e5c6d62..a19a32a 100644
 +    int const* resolved_seqused_k_by_head = nullptr;
 +    int64_t resolved_seqused_k_batch_stride = 0;
 +    int64_t resolved_seqused_k_head_stride = 0;
++    // Host-only launch receipt. The selected run_flash_fwd template writes
++    // these fields before launching so qualification can prove the compiled
++    // resolver route instead of trusting only the public entry arguments.
++    int launched_page_resolver_kind = -1;
++    int launched_page_resolver_subkind = -1;
++    int launched_page_resolver_plan = -1;
  };
  
  ////////////////////////////////////////////////////////////////////////////////////////////////////
-@@ -225,7 +294,13 @@ struct Flash_bwd_params : public Flash_fwd_params {
+@@ -225,7 +300,13 @@ struct Flash_bwd_params : public Flash_fwd_params {
  
  template <int Arch, typename T, int kHeadDim, int kHeadDimV, bool Split, bool PagedKVNonTMA, bool Has_softcap, bool PackGQA>
  void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream);
@@ -532,7 +561,7 @@ index e5c6d62..a19a32a 100644
  void run_mha_bwd_(Flash_bwd_params &params, cudaStream_t stream);
  template <typename T, typename Tpartial, int kBlockK>
 diff --git a/hopper/flash_api.cpp b/hopper/flash_api.cpp
-index 9e0baff..1415c56 100644
+index 9e0baff..7909407 100644
 --- a/hopper/flash_api.cpp
 +++ b/hopper/flash_api.cpp
 @@ -7,6 +7,12 @@
@@ -556,7 +585,7 @@ index 9e0baff..1415c56 100644
  
  // Copied from https://github.com/pytorch/pytorch/commit/7931eee5c5ebcdf468bff4d308510b03355cd909
  // This is so that we can pass in torch.dtype as a parameter to the function.
-@@ -61,12 +68,206 @@ namespace pybind11::detail {
+@@ -61,12 +68,214 @@ namespace pybind11::detail {
  
  #define PREPARE_VARLEN_MAX_BATCHES_1CTA 992
  
@@ -631,6 +660,10 @@ index 9e0baff..1415c56 100644
 +    int use_dynamic_split = 0;
 +    int is_pagedkv_tma = 0;
 +    int tile_n = 0;
++    int launched_page_resolver_kind = -1;
++    int launched_page_resolver_subkind = -1;
++    int launched_page_resolver_plan = -1;
++    int skip_scheduler_metadata_computation = 0;
 +};
 +
 +thread_local FwdLastLaunchDebugState g_fwd_last_launch_debug_state;
@@ -748,6 +781,10 @@ index 9e0baff..1415c56 100644
 +            static_cast<int64_t>(g_fwd_last_launch_debug_state.use_dynamic_split),
 +            static_cast<int64_t>(g_fwd_last_launch_debug_state.is_pagedkv_tma),
 +            static_cast<int64_t>(g_fwd_last_launch_debug_state.tile_n),
++            static_cast<int64_t>(g_fwd_last_launch_debug_state.launched_page_resolver_kind),
++            static_cast<int64_t>(g_fwd_last_launch_debug_state.launched_page_resolver_subkind),
++            static_cast<int64_t>(g_fwd_last_launch_debug_state.launched_page_resolver_plan),
++            static_cast<int64_t>(g_fwd_last_launch_debug_state.skip_scheduler_metadata_computation),
 +        },
 +        torch::TensorOptions().dtype(torch::kInt64));
 +}
@@ -763,7 +800,7 @@ index 9e0baff..1415c56 100644
  void set_params_fprop(Flash_fwd_params &params,
                        // sizes
                        const size_t b,
-@@ -97,6 +298,53 @@ void set_params_fprop(Flash_fwd_params &params,
+@@ -97,6 +306,53 @@ void set_params_fprop(Flash_fwd_params &params,
  
      // Reset the parameters
      params = {};
@@ -817,7 +854,7 @@ index 9e0baff..1415c56 100644
  
      params.is_bf16 = q.dtype() == torch::kBFloat16;
      params.is_e4m3 = q.dtype() == torch::kFloat8_e4m3fn;
-@@ -173,8 +421,9 @@ void set_params_fprop(Flash_fwd_params &params,
+@@ -173,8 +429,9 @@ void set_params_fprop(Flash_fwd_params &params,
      params.window_size_left = window_size_left;
      params.window_size_right = window_size_right;
  
@@ -829,7 +866,7 @@ index 9e0baff..1415c56 100644
  
      #ifdef FLASHATTENTION_DISABLE_LOCAL
          TORCH_CHECK(!params.is_local, "This flash attention build does not support local attention.");
-@@ -269,6 +518,10 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
+@@ -269,6 +526,10 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
      //     run_mha_fwd_<cutlass::half_t, kHeadSize>(params, stream);
      // });
      TORCH_CHECK(params.num_splits >= 1);
@@ -840,7 +877,7 @@ index 9e0baff..1415c56 100644
      ARCH_SWITCH(params.arch, Arch, [&] {
          SPLIT_SWITCH(params.num_splits > 1, Split, [&] {
              PAGEDKV_SWITCH(params.page_table && !params.pagedkv_tma, PagedKVNonTMA, [&] {
-@@ -431,6 +684,38 @@ void run_mha_fwd_combine(Flash_fwd_params &params, cudaStream_t stream, bool ena
+@@ -431,6 +692,38 @@ void run_mha_fwd_combine(Flash_fwd_params &params, cudaStream_t stream, bool ena
      #endif
  }
  
@@ -879,7 +916,7 @@ index 9e0baff..1415c56 100644
  inline bool get_pagedkv_tma(Flash_fwd_params const& params) {
      // disable for local since we move k_ptr to start of sliding window by m_block
      if (params.arch < 90 || !params.page_table || params.leftpad_k || params.knew_ptr || params.is_local) { return false; }
-@@ -438,9 +723,10 @@ inline bool get_pagedkv_tma(Flash_fwd_params const& params) {
+@@ -438,9 +731,10 @@ inline bool get_pagedkv_tma(Flash_fwd_params const& params) {
      auto kBlockMN_kernel_args_sm90 = tile_size_fwd_sm90(params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, false /*paged_kv_non_TMA*/, params.softcap > 0.f, use_one_mma_wg(params));
      int const kBlockM = std::get<0>(kBlockMN_kernel_args_sm90);
      int const kBlockN = std::get<1>(kBlockMN_kernel_args_sm90);
@@ -891,7 +928,7 @@ index 9e0baff..1415c56 100644
  }
  
  inline bool get_pack_gqa(Flash_fwd_params const& params) {
-@@ -502,6 +788,26 @@ inline int get_num_splits(Flash_fwd_params const& params) {
+@@ -502,6 +796,26 @@ inline int get_num_splits(Flash_fwd_params const& params) {
      #endif
  }
  
@@ -918,7 +955,7 @@ index 9e0baff..1415c56 100644
  inline int get_max_headdim() {
      #ifndef FLASHATTENTION_DISABLE_HDIM256
      return 256;
-@@ -574,15 +880,39 @@ mha_fwd_get_scheduler_metadata(
+@@ -574,15 +888,39 @@ mha_fwd_get_scheduler_metadata(
          bool has_softcap,
          int num_splits,
          std::optional<bool> pack_gqa_,
@@ -959,7 +996,7 @@ index 9e0baff..1415c56 100644
      params.is_bf16 = qkv_dtype == at::ScalarType::BFloat16;
      params.is_e4m3 = qkv_dtype == at::ScalarType::Float8_e4m3fn;
      params.b = batch_size;
-@@ -622,8 +952,18 @@ mha_fwd_get_scheduler_metadata(
+@@ -622,8 +960,18 @@ mha_fwd_get_scheduler_metadata(
      if (window_size_left >= 0 && window_size_right < 0) { window_size_right = max_seqlen_q - 1; }
      params.window_size_left = window_size_left;
      params.window_size_right = window_size_right;
@@ -980,7 +1017,7 @@ index 9e0baff..1415c56 100644
      params.softcap = has_softcap ? 1.0f : 0.0f;
  
      params.page_size = page_size.has_value() ? page_size.value() : 1;
-@@ -635,7 +975,7 @@ mha_fwd_get_scheduler_metadata(
+@@ -635,7 +983,7 @@ mha_fwd_get_scheduler_metadata(
      params.num_splits_dynamic_ptr = reinterpret_cast<int*>(1);
  
      params.pagedkv_tma = get_pagedkv_tma(params);
@@ -989,7 +1026,7 @@ index 9e0baff..1415c56 100644
      params.pack_gqa = pack_gqa_.has_value() ? pack_gqa_.value() : get_pack_gqa(params);
      // Always enable PackGQA for Split
      params.pack_gqa |= params.num_splits > 1;
-@@ -644,30 +984,30 @@ mha_fwd_get_scheduler_metadata(
+@@ -644,30 +992,30 @@ mha_fwd_get_scheduler_metadata(
      params.pack_gqa |= params.d == params.dv;
      #endif
  
@@ -1029,7 +1066,7 @@ index 9e0baff..1415c56 100644
          int tile_count_semaphore_offset = b_rounded * num_prepare_batch_vectors;
          // printf("(Metadata) num prepare batch vectors = %d.\n", num_prepare_batch_vectors);
          tile_count_semaphore = torch::empty(
-@@ -677,8 +1017,9 @@ mha_fwd_get_scheduler_metadata(
+@@ -677,8 +1025,9 @@ mha_fwd_get_scheduler_metadata(
          params.prepare_seqlen_q_ptr =  use_prepare_varlen ? tile_count_semaphore.data_ptr<int>() : nullptr;
          params.num_splits_dynamic_ptr = use_prepare_varlen && use_dynamic_split ? tile_count_semaphore.data_ptr<int>() + b_rounded : nullptr;
          params.varlen_batch_idx_ptr =  use_prepare_varlen && params.varlen_sort_batches ? tile_count_semaphore.data_ptr<int>() + sort_offset : nullptr;
@@ -1041,7 +1078,7 @@ index 9e0baff..1415c56 100644
          if (scheduler_needs_semaphore) {
              if (!use_prepare_varlen) { tile_count_semaphore.zero_(); }  // If varlen we'll manually do the zero-ing
              params.tile_count_semaphore = tile_count_semaphore.data_ptr<int>() + tile_count_semaphore_offset;
-@@ -693,7 +1034,16 @@ mha_fwd_get_scheduler_metadata(
+@@ -693,7 +1042,16 @@ mha_fwd_get_scheduler_metadata(
          int const kBlockM = params.arch >= 90 ? std::get<0>(kBlockMN_kernel_args_sm90) : std::get<0>(kBlockMN_kernel_args_sm8x);
          int const kBlockN = params.arch >= 90 ? std::get<1>(kBlockMN_kernel_args_sm90) : std::get<1>(kBlockMN_kernel_args_sm8x);
          auto stream = at::cuda::getCurrentCUDAStream().stream();
@@ -1059,7 +1096,7 @@ index 9e0baff..1415c56 100644
          CHECK_CUDA_KERNEL_LAUNCH();
      }
      return tile_count_semaphore;
-@@ -745,9 +1095,16 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
+@@ -745,9 +1103,16 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
          std::optional<const at::Tensor> &s_aux_, // (h)
          int const cp_world_size,  // context parallelism (cp) world size
          int const cp_rank,         // cp rank
@@ -1079,7 +1116,7 @@ index 9e0baff..1415c56 100644
      auto dprops = at::cuda::getCurrentDeviceProperties();
      bool is_sm8x = dprops->major >= 8;
      TORCH_CHECK(is_sm8x, "FlashAttention only supports Ampere GPUs or newer.");
-@@ -872,26 +1229,26 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
+@@ -872,26 +1237,26 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
      }
  
      if (seqused_q_.has_value()){
@@ -1110,7 +1147,7 @@ index 9e0baff..1415c56 100644
          TORCH_CHECK(leftpad_k.dtype() == torch::kInt32, "leftpad_k must have dtype int32");
          CHECK_DEVICE(leftpad_k); CHECK_CONTIGUOUS(leftpad_k);
          CHECK_SHAPE(leftpad_k, batch_size);
-@@ -937,13 +1294,29 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
+@@ -937,13 +1302,29 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
      auto device_guard = make_cuda_guard_from_tensor(q);
  
      at::Tensor softmax_lse;
@@ -1142,7 +1179,7 @@ index 9e0baff..1415c56 100644
      set_params_fprop(params,
                       batch_size,
                       seqlen_q, seqlen_k,
-@@ -1025,13 +1398,48 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
+@@ -1025,13 +1406,48 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
          }
      }
  
@@ -1193,7 +1230,7 @@ index 9e0baff..1415c56 100644
      // printf("Num splits = %d.\n", params.num_splits);
      params.pack_gqa = pack_gqa_.has_value() ? pack_gqa_.value() : get_pack_gqa(params);
      // Always enable PackGQA for Split
-@@ -1040,9 +1448,17 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
+@@ -1040,9 +1456,17 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
      params.pack_gqa |= params.d == params.dv;
      #endif
  
@@ -1213,7 +1250,7 @@ index 9e0baff..1415c56 100644
  
      // This needs to be set after get_num_splits
      at::Tensor tile_count_semaphore;  // Contains the semaphore and optionally num_splits_dynamic
-@@ -1051,22 +1467,33 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
+@@ -1051,22 +1475,33 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
          ? (((params.is_causal || params.is_local) && (params.num_splits == 1)) || is_varlen)
          : ((params.is_causal && !is_varlen) || (is_varlen && params.num_splits > 1));
      // params.varlen_sort_batches = !params.is_local; // Use this value for Sort in scheduler template
@@ -1255,7 +1292,7 @@ index 9e0baff..1415c56 100644
              CHECK_DEVICE(scheduler_metadata);
              CHECK_SHAPE(scheduler_metadata, metadata_size);
              CHECK_CONTIGUOUS(scheduler_metadata);
-@@ -1079,14 +1506,41 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
+@@ -1079,14 +1514,43 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
              tile_count_semaphore.zero_();  // If varlen we'll manually do the zero-ing
          }
          // ORDER: {prepare_seqlen_q, num_splits_dynamic, varlen_batch_idx, num_nheads_in_l2}
@@ -1292,6 +1329,8 @@ index 9e0baff..1415c56 100644
          params.tile_count_semaphore = scheduler_needs_semaphore ? tile_count_semaphore.data_ptr<int>() + tile_count_semaphore_offset : nullptr;
          params.tile_count_semaphore_offset = tile_count_semaphore_offset; // might need to zero out semaphore later
      }
++    g_fwd_last_launch_debug_state.skip_scheduler_metadata_computation =
++        params.skip_scheduler_metadata_computation ? 1 : 0;
 +    // No early prepare launch here (matches upstream): run_flash_fwd in
 +    // flash_fwd_launch_template.h issues prepare_varlen_num_blocks /
 +    // prepare_prefill_active_varlen_num_blocks exactly once with template-exact
@@ -1302,7 +1341,7 @@ index 9e0baff..1415c56 100644
  
      if (q_v_.has_value()) {
          TORCH_CHECK(head_size <= 64, "q_v is only supported for head_size <= 64");
-@@ -1094,7 +1548,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
+@@ -1094,7 +1558,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
          TORCH_CHECK(q_type == at::ScalarType::Half || q_type == at::ScalarType::BFloat16,
                      "q_v is only supported for fp16 and bf16 data type");
          TORCH_CHECK(params.arch == 90, "q_v is only supported for Hopper GPUs");
@@ -1311,7 +1350,7 @@ index 9e0baff..1415c56 100644
          TORCH_CHECK(q_v.dtype() == q_type, "q_v must have the same dtype as query");
          CHECK_DEVICE(q_v);
          TORCH_CHECK(q_v.stride(-1) == 1, "q_v tensor must have contiguous last dimension");
-@@ -1114,7 +1568,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
+@@ -1114,7 +1578,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
  
      if (rotary_cos_.has_value()) {
          TORCH_CHECK(k_new_.has_value(), "If rotary cos/sin are provided, new key / value to be appended to KV cache must also be provided");
@@ -1320,7 +1359,7 @@ index 9e0baff..1415c56 100644
          CHECK_DEVICE(rotary_cos); CHECK_CONTIGUOUS(rotary_cos);
          params.rotary_dim = rotary_cos.size(1) * 2;
          TORCH_CHECK(params.rotary_dim <= head_size, "rotary_dim must be <= headdim");
-@@ -1127,7 +1581,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
+@@ -1127,7 +1591,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
          TORCH_CHECK(rotary_cos.scalar_type() == q_type, "rotary_cos must have the same dtype as query");
  
          TORCH_CHECK(rotary_sin_.has_value(), "If rotary cos is provided, rotary sin must also be provided");
@@ -1329,7 +1368,7 @@ index 9e0baff..1415c56 100644
          CHECK_DEVICE(rotary_sin); CHECK_CONTIGUOUS(rotary_sin);
          CHECK_SHAPE(rotary_sin, seqlen_ro, params.rotary_dim / 2);
          TORCH_CHECK(rotary_sin.scalar_type() == q_type, "rotary_cos must have the same dtype as query");
-@@ -1135,7 +1589,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
+@@ -1135,7 +1599,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
          params.rotary_sin_ptr = rotary_sin.data_ptr();
          params.is_rotary_interleaved = is_rotary_interleaved;
          if (seqlens_rotary_.has_value()) {
@@ -1338,7 +1377,7 @@ index 9e0baff..1415c56 100644
              CHECK_DEVICE(seqlens_rotary); CHECK_CONTIGUOUS(seqlens_rotary);
              TORCH_CHECK(seqlens_rotary.dtype() == torch::kInt32, "seqlens_rotary must have dtype torch.int32");
              CHECK_SHAPE(seqlens_rotary, batch_size);
-@@ -1146,38 +1600,32 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
+@@ -1146,38 +1610,32 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
      }
  
      if (kv_batch_idx_.has_value()) {
@@ -1394,7 +1433,7 @@ index 9e0baff..1415c56 100644
              CHECK_DEVICE(q_descale);
              CHECK_SHAPE(q_descale, batch_size, num_heads_k);
              params.q_descale_ptr = q_descale.data_ptr<float>();
-@@ -1187,7 +1635,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
+@@ -1187,7 +1645,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
              params.q_descale_ptr = nullptr;
          }
          if (k_descale_.has_value()) {
@@ -1403,7 +1442,7 @@ index 9e0baff..1415c56 100644
              CHECK_DEVICE(k_descale);
              CHECK_SHAPE(k_descale, batch_size, num_heads_k);
              params.k_descale_ptr = k_descale.data_ptr<float>();
-@@ -1197,7 +1645,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
+@@ -1197,7 +1655,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
              params.k_descale_ptr = nullptr;
          }
          if (v_descale_.has_value()) {
@@ -1412,7 +1451,7 @@ index 9e0baff..1415c56 100644
              CHECK_DEVICE(v_descale);
              CHECK_SHAPE(v_descale, batch_size, num_heads_k);
              params.v_descale_ptr = v_descale.data_ptr<float>();
-@@ -1212,7 +1660,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
+@@ -1212,7 +1670,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
          TORCH_CHECK(params.arch == 90, "S aux is currently only supported for Hopper GPUs");
          TORCH_CHECK(num_heads <= 64, "We only support query heads <= 64 with S aux");
          TORCH_CHECK(head_size == head_size_v, "We don't support S aux with hdim != hdim_v");
@@ -1421,7 +1460,7 @@ index 9e0baff..1415c56 100644
          TORCH_CHECK(s_aux.scalar_type() == at::ScalarType::BFloat16,
              "We only support bf16 dtype for S aux.");
          CHECK_DEVICE(s_aux);
-@@ -1255,11 +1703,25 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
+@@ -1255,11 +1713,31 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
  
      if (total_q > 0 && (total_k + params.total_knew) > 0 && num_heads_k > 0) {
          auto stream = at::cuda::getCurrentCUDAStream().stream();
@@ -1440,6 +1479,12 @@ index 9e0baff..1415c56 100644
 +        }
          run_mha_fwd(params, stream);
 -        if (params.num_splits > 1) {
++        g_fwd_last_launch_debug_state.launched_page_resolver_kind =
++            params.launched_page_resolver_kind;
++        g_fwd_last_launch_debug_state.launched_page_resolver_subkind =
++            params.launched_page_resolver_subkind;
++        g_fwd_last_launch_debug_state.launched_page_resolver_plan =
++            params.launched_page_resolver_plan;
 +        Flash_fwd_params combine_params = params;
 +        if (combine_params.num_splits > 1) {
              if (out_type == at::ScalarType::BFloat16) {
@@ -1449,7 +1494,7 @@ index 9e0baff..1415c56 100644
              }
              // Unless there's seqused_q, for the purpose of attn_combine, we can just treat it as batch=1
              // and seqlen = total_q, and don't need to dispatch to Varlen there.
-@@ -1271,11 +1733,12 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
+@@ -1271,11 +1749,12 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
              //     params.seqlen_q = total_q;
              // }
              // This will zero out the semaphore if needed
@@ -1463,7 +1508,7 @@ index 9e0baff..1415c56 100644
      } else if (total_q > 0 && num_heads_k > 0) {
          // If seqlen_k == 0, then we have an empty tensor. We need to set the output to 0.
          out.zero_();
-@@ -1286,6 +1749,607 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
+@@ -1286,6 +1765,607 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
      return {out, softmax_lse, out_accum, softmax_lse_accum};
  }
  
@@ -1899,9 +1944,9 @@ index 9e0baff..1415c56 100644
 +        auto const &selected_page_table_i32 = selected_page_table_i32_.value();
 +        overrides.selected_page_table = static_cast<int const *>(selected_page_table_i32.data_ptr());
 +        overrides.selected_page_table_batch_stride =
-+            selected_page_table_batch_stride * selected_page_table_i32.size(-1);
++            selected_page_table_batch_stride * selected_page_table_i32.stride(0);
 +        overrides.selected_page_table_head_stride =
-+            selected_page_table_head_stride * selected_page_table_i32.size(-1);
++            selected_page_table_head_stride * selected_page_table_i32.stride(0);
 +        overrides.selected_page_table_num_cols = selected_page_table_num_cols;
 +    }
 +    if (resolved_page_table_row_ptr_u64_.has_value()) {
@@ -1930,9 +1975,9 @@ index 9e0baff..1415c56 100644
 +        overrides.resolved_page_table_i32 =
 +            reinterpret_cast<int const *>(resolved_page_table_i32.data_ptr<int32_t>());
 +        overrides.resolved_page_table_batch_stride =
-+            resolved_page_table_batch_stride * resolved_page_table_i32.size(-1);
++            resolved_page_table_batch_stride * resolved_page_table_i32.stride(0);
 +        overrides.resolved_page_table_head_stride =
-+            resolved_page_table_head_stride * resolved_page_table_i32.size(-1);
++            resolved_page_table_head_stride * resolved_page_table_i32.stride(0);
 +    }
 +    // fa3_sm90_dtable_rowptr_lean: a DirectTable request that carries a RowPtr-style u64 base
 +    // array (and no row-consume modes) is canonicalized to the LEAN ResolvedRowPtr/RowPtr resolve
@@ -1955,9 +2000,9 @@ index 9e0baff..1415c56 100644
 +        overrides.resolved_page_table_affine_i32 =
 +            reinterpret_cast<int const *>(resolved_page_table_affine_i32.data_ptr<int32_t>());
 +        overrides.resolved_page_table_affine_batch_stride =
-+            resolved_page_table_affine_batch_stride * resolved_page_table_affine_i32.size(-1);
++            resolved_page_table_affine_batch_stride * resolved_page_table_affine_i32.stride(0);
 +        overrides.resolved_page_table_affine_head_stride =
-+            resolved_page_table_affine_head_stride * resolved_page_table_affine_i32.size(-1);
++            resolved_page_table_affine_head_stride * resolved_page_table_affine_i32.stride(0);
 +    }
 +    overrides.resolved_page_table_affine_base = int(resolved_page_table_affine_base);
 +    overrides.resolved_page_table_affine_stride = int(resolved_page_table_affine_stride);
@@ -2071,7 +2116,7 @@ index 9e0baff..1415c56 100644
  void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {
      #ifndef FLASHATTENTION_DISABLE_BACKWARD
          // FP16_SWITCH(!params.is_bf16, [&] {
-@@ -1747,7 +2811,35 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+@@ -1747,7 +2827,35 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
      m.def("fwd", &mha_fwd, "Forward pass");
      m.def("bwd", &mha_bwd, "Backward pass");
      m.def("fwd_combine", &mha_combine, "Combine partial attention outputs");
@@ -2413,29 +2458,33 @@ index b308d2d..c337bf3 100644
              if constexpr (AppendKV) {
                  bool tile_new_valid = mainloop.store_kv_new(
 diff --git a/hopper/flash_fwd_kernel_sm90.h b/hopper/flash_fwd_kernel_sm90.h
-index df41638..07f353d 100644
+index df41638..4083784 100644
 --- a/hopper/flash_fwd_kernel_sm90.h
 +++ b/hopper/flash_fwd_kernel_sm90.h
-@@ -116,6 +116,12 @@ public:
+@@ -116,6 +116,10 @@ public:
              alignas(16) typename CollectiveMainloop::MainloopPipelineKVNew::SharedStorage pipeline_k_new;
              alignas(16) typename CollectiveMainloop::MainloopPipelineKVNew::SharedStorage pipeline_v_new;
              alignas(16) typename TileScheduler::SharedStorage smem_scheduler;
-+            // fa3_sm90_consumer_resolve_precompute: one-shot prologue-resolved page
-+            // table for the tile, read by the producer steady loop. Only meaningful
-+            // when CollectiveMainloop::kConsumerResolve; small (kMaxTilePages ints,
-+            // 4KB after [K2-TILEPAGES-1024]) -- safely below the 228KB smem cliff
-+            // (see :94-96).
++            // [SM90-HYBRID-PAGE-RESOLVE 2026-08-12] One-shot page-table storage
++            // for small-page loaded-deref carriers. Large pages keep the
++            // warp-cooperative resolver and never access this buffer.
 +            alignas(16) int smem_resolved_page_table[CollectiveMainloop::kMaxTilePages];
          } pipelines;
  
      };
-@@ -342,17 +348,28 @@ public:
+@@ -342,17 +346,34 @@ public:
                   work_tile_info = SingleProducerWarp || warp_idx_in_warpgroup == 0 ? scheduler.template get_next_work</*IsProducerWarp=*/true>(params.scheduler, work_tile_info) : scheduler.template get_next_work</*IsProducerWarp=*/false>(params.scheduler, work_tile_info)) {
  
                  auto block_coord = work_tile_info.get_block_coord(params.scheduler);
 +                int const bidb = get<2>(block_coord);
 +                int const resolver_bidb =
 +                    params.mainloop.kv_batch_idx == nullptr ? bidb : params.mainloop.kv_batch_idx[bidb];
++                int const bidh_kv = !PackGQA
++                    ? params.mainloop.qhead_per_khead_divmod.divide(get<1>(block_coord))
++                    : get<1>(block_coord);
++                int const* const prefetched_table_row =
++                    mainloop.resolve_table_row_before_seqlen(
++                        params.mainloop, resolver_bidb, bidh_kv);
                  SeqlenInfo_t seqlen_info{
 -                    get<2>(block_coord) /*bidb*/,
 +                    bidb,
@@ -2451,7 +2500,7 @@ index df41638..07f353d 100644
 +                    params.mainloop.page_resolver_seqlen_args.resolved_seqused_k_by_head(),
 +                    params.mainloop.page_resolver_seqlen_args.resolved_seqused_k_batch_stride(),
 +                    get<2>(params.mainloop.shape_K),
-+                    !PackGQA ? params.mainloop.qhead_per_khead_divmod.divide(get<1>(block_coord)) : get<1>(block_coord),
++                    bidh_kv,
                      params.mainloop.cp_world_size,
                      params.mainloop.cp_rank,
 -                    params.mainloop.cp_tot_seqused_k
@@ -2460,7 +2509,17 @@ index df41638..07f353d 100644
                  };
                  if constexpr (AppendKV) {
                      bool tile_new_valid = mainloop.load_kv_new(
-@@ -394,6 +411,8 @@ public:
+@@ -369,7 +390,8 @@ public:
+                 };
+                 // pipeline_vt won't be used if we don't need to transpose V.
+                 mainloop.load(params.mainloop, pipeline_k, pipeline_v, pipeline_vt, smem_pipe_write,
+-                                         shared_storage, scheduler_prefetch, seqlen_info, block_coord, work_idx);
++                                         shared_storage, scheduler_prefetch, seqlen_info, block_coord, work_idx,
++                        prefetched_table_row);
+             }
+             mainloop.load_tail(pipeline_k, pipeline_v, pipeline_vt, smem_pipe_write, shared_storage, work_idx);
+         } else {  // Consumer
+@@ -394,6 +416,8 @@ public:
                   ) {
                  auto block_coord = work_tile_info.get_block_coord(params.scheduler);
                  int const bidb = get<2>(block_coord);
@@ -2469,7 +2528,7 @@ index df41638..07f353d 100644
                  SeqlenInfo_t seqlen_info{
                      bidb,
                      get<0>(params.mainloop.shape_Q),
-@@ -401,9 +420,18 @@ public:
+@@ -401,9 +425,18 @@ public:
                      get<0>(params.mainloop.shape_K_new),
                      params.mainloop.cu_seqlens_q, params.mainloop.cu_seqlens_k, params.mainloop.cu_seqlens_k_new,
                      params.mainloop.seqused_q, params.mainloop.seqused_k, params.mainloop.leftpad_k,
@@ -2491,7 +2550,7 @@ index df41638..07f353d 100644
                  if constexpr (AppendKV) {
                      bool tile_new_valid = mainloop.store_kv_new(
 diff --git a/hopper/flash_fwd_launch_template.h b/hopper/flash_fwd_launch_template.h
-index e8db360..20c111a 100644
+index e8db360..ef6aa86 100644
 --- a/hopper/flash_fwd_launch_template.h
 +++ b/hopper/flash_fwd_launch_template.h
 @@ -11,9 +11,12 @@
@@ -2507,7 +2566,7 @@ index e8db360..20c111a 100644
  #include "tile_size.h"
  #include "tile_scheduler.hpp"
  #include "flash_fwd_kernel_sm90.h"
-@@ -27,13 +30,25 @@ using namespace cute;
+@@ -27,13 +30,28 @@ using namespace cute;
  
  template <int Arch, int kHeadDim, int kHeadDimV, int ClusterM, typename Element, typename ElementOut,
            bool Is_causal, bool Is_local, bool Has_softcap, bool Varlen, bool PagedKVNonTMA, bool AppendKV, bool HasQv,
@@ -2528,13 +2587,16 @@ index e8db360..20c111a 100644
      static_assert(!(Is_causal && Is_local), "Causal and Local cannot be enabled at the same time");
      static_assert(!(AppendKV && V_colmajor), "AppendKV and V_colmajor cannot be enabled at the same time");
      static_assert(!(AppendKV && !Varlen), "AppendKV requires Varlen");
++    params.launched_page_resolver_kind = int(ResolverKind);
++    params.launched_page_resolver_subkind = int(ResolverSubkind);
++    params.launched_page_resolver_plan = int(ResolverPlan);
      static constexpr bool Is_FP8 = cute::is_same_v<Element, cutlass::float_e4m3_t> || cute::is_same_v<Element, cutlass::float_e5m2_t>;
      static constexpr bool FP8_TransposeV = Is_FP8 && !V_colmajor;
 +    static_assert(!(CompactRecent && Arch >= 90), "compact_recent v1 is only implemented for Sm8x");
      using ArchTag = std::conditional_t<Arch >= 90, cutlass::arch::Sm90, cutlass::arch::Sm80>;
      using ElementS = cutlass::bfloat16_t;
  
-@@ -51,10 +66,40 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
+@@ -51,10 +69,40 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
      using TileShape_MNK = cute::Shape<Int<kBlockM>, Int<kBlockN>, Int<kHeadDim>>;
      using TileShape_MNK_PV = cute::Shape<Int<kBlockM>, Int<kHeadDimV>, Int<kBlockN>>;
      using ClusterShape = cute::Shape<Int<ClusterM>, _1, _1>;
@@ -2577,7 +2639,7 @@ index e8db360..20c111a 100644
      >;
      using CollectiveEpilogue = flash::CollectiveEpilogueFwd<TileShape_MNK_PV, ClusterShape, ElementOut, ArchTag, CollectiveMainloop::NumMmaThreads, Varlen, PackGQA, Split, FP8_TransposeV, kBlockH>;
  
-@@ -74,7 +119,8 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
+@@ -74,7 +122,8 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
      // However, if Varlen (e.g., during decode where we have max_seqlens), using PersistentScheduler is better
      // since we'll avoid launching a bunch of thread blocks that immediately exit.
      // On Sm80, noncausal persistent seems a bit slower.
@@ -2587,7 +2649,7 @@ index e8db360..20c111a 100644
      using Scheduler = std::conditional_t<!UsePersistentScheduler, SchedulerSingleTile, SchedulerPersistent>;
      using AttnKernel = std::conditional_t<
          Arch >= 90,
-@@ -88,53 +134,243 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
+@@ -88,53 +137,257 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
      int seqlen_q = !is_varlen_q ? params.seqlen_q : params.total_q;
      int batch_q = !is_varlen_q ? params.b : 1;
      int batch_k = !is_varlen_k ? (params.kv_batch_idx ? params.b_k : params.b) : 1;
@@ -2659,6 +2721,26 @@ index e8db360..20c111a 100644
 -        params.leftpad_k, params.seqlens_rotary,
 -        static_cast<ElementS const*>(params.s_aux_ptr),
 -        params.cp_world_size, params.cp_rank, params.cp_tot_seqused_k
++    // DirectTable remains an owned kind4 specialization, but its contiguous
++    // i32 carrier is native-shaped. Put that carrier in the common page-table
++    // slots so kind0 and kind4 execute the same base/stride address chain.
++    static constexpr bool UseOwnedDirectTablePageTable =
++        Arch >= 90 &&
++        ResolverKind == PageResolverKind::ResolvedRowPtr &&
++        ResolverSubkind == PageResolverSubkind::DirectTable &&
++        ResolverPlan == flash::PageResolverPlan::DirectTable &&
++        !UseRowConsumeMode;
++    int const* const effective_page_table = UseOwnedDirectTablePageTable
++        ? params.resolved_page_table_i32
++        : params.page_table;
++    int64_t const effective_page_table_row_stride = UseOwnedDirectTablePageTable
++        ? (UseCarrierHeadStride
++            ? params.resolved_page_table_head_stride
++            : params.resolved_page_table_batch_stride)
++        : params.page_table_batch_stride;
++    int const effective_page_table_rows =
++        (params.kv_batch_idx ? params.b_k : params.b) *
++        (UseOwnedDirectTablePageTable && UseCarrierHeadStride ? params.h_k : 1);
 +    int const resolved_seqused_k_batch_stride =
 +        int(params.resolved_seqused_k_batch_stride);
 +    auto make_page_resolver_args = [&]() {
@@ -2688,15 +2770,7 @@ index e8db360..20c111a 100644
 +                        params.resolved_page_table_row_ptr_head_stride,
 +                    };
 +                } else if constexpr (ResolverSubkind == PageResolverSubkind::DirectTable) {
-+                    return PageResolverArguments_t{
-+                        params.row_consume_mode,
-+                        params.resolved_page_table_i32,
-+                        params.resolved_page_table_batch_stride,
-+                        params.resolved_page_table_head_stride,
-+                        params.resolved_page_table_row_ptr_u64,
-+                        params.resolved_page_table_row_ptr_batch_stride,
-+                        params.resolved_page_table_row_ptr_head_stride,
-+                    };
++                    return PageResolverArguments_t{};
 +                } else if constexpr (ResolverSubkind == PageResolverSubkind::AffineTensor) {
 +                    return PageResolverArguments_t{
 +                        params.row_consume_mode,
@@ -2734,7 +2808,7 @@ index e8db360..20c111a 100644
 +        } else {
 +            return PageResolverArguments_t{};
 +        }
-     };
++    };
 +    auto make_mainloop_args = [&]() {
 +        if constexpr (Arch >= 90) {
 +            auto make_page_resolver_seqlen_args = [&]() {
@@ -2747,7 +2821,9 @@ index e8db360..20c111a 100644
 +                            params.resolved_seqused_k_by_head,
 +                            resolved_seqused_k_batch_stride,
 +                        };
-+                    } else if constexpr (ResolverSpecialization == flash::PageResolverSpecialization::Generic) {
++                    } else if constexpr (
++                        ResolverSpecialization == flash::PageResolverSpecialization::Generic &&
++                        UseRowConsumeMode) {
 +                        return PageResolverSeqlenArguments_t{params.row_consume_mode};
 +                    } else {
 +                        return PageResolverSeqlenArguments_t{};
@@ -2780,9 +2856,9 @@ index e8db360..20c111a 100644
 +                static_cast<Element const*>(params.rotary_sin_ptr),
 +                {params.rotary_dim / 2, _1{}},  // stride_rotary_sin
 +                params.is_rotary_interleaved,
-+                params.page_table,
-+                {params.kv_batch_idx ? params.b_k : params.b, !params.page_table ? 0 : params.seqlen_k / params.page_size},  // shape_page_table
-+                {params.page_table_batch_stride, _1{}},  // stride_pagetable
++                effective_page_table,
++                {effective_page_table_rows, !effective_page_table ? 0 : params.seqlen_k / params.page_size},  // shape_page_table
++                {effective_page_table_row_stride, _1{}},  // stride_pagetable
 +                make_page_resolver_args(),
 +                make_page_resolver_seqlen_args(),
 +                static_cast<cutlass::half_t*>(params.capture_scores_ptr),
@@ -2836,9 +2912,9 @@ index e8db360..20c111a 100644
 +                static_cast<Element const*>(params.rotary_sin_ptr),
 +                {params.rotary_dim / 2, _1{}},  // stride_rotary_sin
 +                params.is_rotary_interleaved,
-+                params.page_table,
-+                {params.kv_batch_idx ? params.b_k : params.b, !params.page_table ? 0 : params.seqlen_k / params.page_size},  // shape_page_table
-+                {params.page_table_batch_stride, _1{}},  // stride_pagetable
++                effective_page_table,
++                {effective_page_table_rows, !effective_page_table ? 0 : params.seqlen_k / params.page_size},  // shape_page_table
++                {effective_page_table_row_stride, _1{}},  // stride_pagetable
 +                make_page_resolver_args(),
 +                compact_recent_args,
 +                params.row_consume_mode,
@@ -2868,12 +2944,12 @@ index e8db360..20c111a 100644
 +                params.cp_world_size, params.cp_rank, params.cp_tot_seqused_k
 +            };
 +        }
-+    };
+     };
 +    typename CollectiveMainloop::Arguments mainloop_args = make_mainloop_args();
      typename CollectiveEpilogue::Arguments epilogue_args {
          static_cast<ElementOut*>(params.o_ptr),
          {seqlen_q, params.dv, params.h, batch_q, params.num_splits},  // shape_O
-@@ -144,7 +380,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
+@@ -144,7 +397,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
          static_cast<float*>(params.softmax_lse_ptr),
          {_1{}, seqlen_q, !is_varlen_q ? params.h * seqlen_q : 0, 0},  // stride_LSE
          static_cast<float*>(params.softmax_lseaccum_ptr),
@@ -2882,7 +2958,7 @@ index e8db360..20c111a 100644
          params.h_k,
          params.cu_seqlens_q, params.seqused_q
      };
-@@ -162,12 +398,31 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
+@@ -162,12 +415,31 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
          params.prepare_seqlen_q_ptr,
          params.varlen_batch_idx_ptr,
          params.num_nheads_in_l2_ptr,
@@ -2916,7 +2992,7 @@ index e8db360..20c111a 100644
          CHECK_CUDA_KERNEL_LAUNCH();
      }
  
-@@ -188,7 +443,13 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
+@@ -188,7 +460,13 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
      if constexpr (size(ClusterShape{}) > 1) {
          void const* kernel = (void const*) cutlass::device_kernel<AttnKernel>;
          if (smem_size >= 48 * 1024) {
@@ -2931,7 +3007,7 @@ index e8db360..20c111a 100644
          }
          dim3 cluster_dims(size<0>(ClusterShape{}), size<1>(ClusterShape{}), size<2>(ClusterShape{}));
          cutlass::ClusterLaunchParams launch_params{grid_dims, block_dims, cluster_dims, smem_size, stream};
-@@ -196,7 +457,13 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
+@@ -196,7 +474,13 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
      } else {
          auto kernel = cutlass::device_kernel<AttnKernel>;
          if (smem_size >= 48 * 1024) {
@@ -2946,7 +3022,7 @@ index e8db360..20c111a 100644
          }
          // kernel<<<grid_dims, block_dims, smem_size, stream>>>(kernel_params);
          cutlass::kernel_launch<AttnKernel>(grid_dims, block_dims, smem_size, stream, kernel_params,
-@@ -205,11 +472,99 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
+@@ -205,11 +489,144 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
      CHECK_CUDA_KERNEL_LAUNCH();
  }
  
@@ -2963,6 +3039,51 @@ index e8db360..20c111a 100644
 +          bool UseRowConsumeMode=true,
 +          bool UseCarrierHeadStride=true>
 +void run_flash_fwd_resolved_row_ptr(Flash_fwd_params &params, cudaStream_t stream) {
++    // A batch-shared DirectTable visible length is semantically identical to
++    // seqused_k. Normalize it before template selection so the owned kind4
++    // kernel reuses the common seqlen load instead of carrying a second
++    // pointer, stride, predicate chain, and persistent-loop reload. Keep the
++    // original resolved path for every layout whose indexing semantics differ.
++    static constexpr bool CanUseCommonBatchSeqlen =
++        Arch >= 90 &&
++        Varlen &&
++        !AppendKV &&
++        ResolverSubkind == PageResolverSubkind::DirectTable &&
++        ResolverSpecialization == flash::PageResolverSpecialization::Generic &&
++        ResolverPlan == flash::PageResolverPlan::DirectTable &&
++        !UseRowConsumeMode;
++    if constexpr (CanUseCommonBatchSeqlen) {
++        bool const has_batch_shared_resolved_seqlen =
++            params.resolved_seqused_k_by_head != nullptr &&
++            params.resolved_seqused_k_batch_stride == 1 &&
++            params.resolved_seqused_k_head_stride == 0 &&
++            params.row_consume_mode == nullptr &&
++            params.kv_batch_idx == nullptr &&
++            params.leftpad_k == nullptr &&
++            params.cp_world_size == 1 &&
++            params.cp_tot_seqused_k == nullptr;
++        if (has_batch_shared_resolved_seqlen) {
++            Flash_fwd_params common_seqlen_params = params;
++            common_seqlen_params.seqused_k =
++                const_cast<int*>(params.resolved_seqused_k_by_head);
++            common_seqlen_params.resolved_seqused_k_by_head = nullptr;
++            run_flash_fwd<
++                Arch, kHeadDim, kHeadDimV, ClusterM, Element, ElementOut,
++                Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV, HasQv,
++                PackGQA, Split, V_colmajor, Use_one_mma_wg,
++                kBlockH, CompactRecent, UseContiguousCompactLoader, ForcePersistentScheduler,
++                PageResolverKind::ResolvedRowPtr, ResolverSubkind, false, ResolverSpecialization, ResolverPlan,
++                UseRowConsumeMode, UseCarrierHeadStride>(
++                    common_seqlen_params, stream);
++            params.launched_page_resolver_kind =
++                common_seqlen_params.launched_page_resolver_kind;
++            params.launched_page_resolver_subkind =
++                common_seqlen_params.launched_page_resolver_subkind;
++            params.launched_page_resolver_plan =
++                common_seqlen_params.launched_page_resolver_plan;
++            return;
++        }
++    }
 +    if (params.resolved_seqused_k_by_head != nullptr) {
 +        return run_flash_fwd<
 +            Arch, kHeadDim, kHeadDimV, ClusterM, Element, ElementOut,
@@ -3046,7 +3167,7 @@ index e8db360..20c111a 100644
      CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
          VCOLMAJOR_SWITCH(params.v_dim_stride != 1, V_colmajor_, [&] {
              static constexpr bool V_colmajor = V_colmajor_ && sizeof(T) == 1;
-@@ -219,6 +574,7 @@ void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream) {
+@@ -219,6 +636,7 @@ void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream) {
                      static constexpr bool Use_one_mma_wg = Use_one_mma_wg_ && Arch >= 90 && (kHeadDim == 128 || kHeadDim == 64) && (kHeadDimV == kHeadDim) && !Is_local;
                      // Only needed here to decide if we should use cluster
                      static constexpr int kBlockM = Arch >= 90 ? std::get<0>(tile_size_fwd_sm90(kHeadDim, kHeadDimV, Is_causal, Is_local, sizeof(T) /*element_size*/, V_colmajor, PagedKVNonTMA, Has_softcap, Use_one_mma_wg)) : 128;
@@ -3054,7 +3175,7 @@ index e8db360..20c111a 100644
                      static constexpr bool Enable_cluster = Arch == 90 && (sizeof(T) == 2 ? (kHeadDim >= 128) : (kHeadDim == 192)) && !Is_causal && !Is_local && !Split && !PagedKVNonTMA && !Varlen && !Use_one_mma_wg;
                      QV_SWITCH(params.qv_ptr, HasQV_, [&] {
                          static constexpr bool HasQv = HasQV_ && Arch == 90 && !Is_FP8 && kHeadDim == 64 && kHeadDimV >= 256;
-@@ -231,7 +587,100 @@ void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream) {
+@@ -231,7 +649,132 @@ void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream) {
                                      // Non-unary values of kBlockH can improve GQA perf for specific ratios (4, 8, 16) by enabling TMA for loading Q
                                      // Disable for hdim diff, fp16, 1 mma wg or split to shrink build
                                      static constexpr int kBlockH = !PackGQA || Arch < 90 || (kHeadDim != kHeadDimV) || cute::is_same_v<T, cutlass::half_t> || Use_one_mma_wg || Split ? 1 : kBlockH_;
@@ -3082,11 +3203,43 @@ index e8db360..20c111a 100644
 +                                                            use_row_consume_mode,
 +                                                            params.resolved_page_table_row_ptr_head_stride != 0);
 +                                                case PageResolverSubkind::DirectTable:
-+                                                    // [TU-INSTANCE-DIET 2026-07-02] DirectTable is not emitted by the
-+                                                    // production host (RowPtr carries per-head selection); its carrier
-+                                                    // values are expressible through the RowPtr u64 carrier. Excluded
-+                                                    // from the TU to keep cicc on the healthy small-module code shape.
-+                                                    TORCH_CHECK(false, "DirectTable subkind is retired from the SM8x TU (instance diet); use the RowPtr carrier");
++                                                    // H20/SM90 production arenas own one contiguous int32 row table.
++                                                    // Keep exactly one no-row-mode DirectTable layout so that this
++                                                    // native-shaped carrier does not pay the RowPtr u64 dependent load.
++                                                    // SM80/SM86 retain the instance diet and their proven RowPtr path.
++                                                    if constexpr (Arch == 90) {
++                                                        TORCH_CHECK(
++                                                            !use_row_consume_mode,
++                                                            "SM90 DirectTable does not accept row-consume mode");
++                                                        if (params.resolved_page_table_head_stride != 0) {
++                                                            return run_flash_fwd_resolved_row_ptr<
++                                                                Arch, kHeadDim, kHeadDimV, ClusterM, T, T_out,
++                                                                Is_causal, Is_local, Has_softcap, Varlen,
++                                                                PagedKVNonTMA, AppendKV && Varlen, HasQv,
++                                                                PackGQA, Split, V_colmajor, Use_one_mma_wg,
++                                                                kBlockH, false, true, false,
++                                                                PageResolverSubkind::DirectTable,
++                                                                flash::PageResolverSpecialization::Generic,
++                                                                flash::PageResolverPlan::DirectTable,
++                                                                false, true>(params, stream);
++                                                        }
++                                                        // Batch-row DirectTable stays on the owned resolver template.
++                                                        // Raw native FA3 is an external benchmark baseline only and must
++                                                        // never be used as an implementation fallback for kind4.
++                                                        return run_flash_fwd_resolved_row_ptr<
++                                                            Arch, kHeadDim, kHeadDimV, ClusterM, T, T_out,
++                                                            Is_causal, Is_local, Has_softcap, Varlen,
++                                                            PagedKVNonTMA, AppendKV && Varlen, HasQv,
++                                                            PackGQA, Split, V_colmajor, Use_one_mma_wg,
++                                                            kBlockH, false, true, false,
++                                                            PageResolverSubkind::DirectTable,
++                                                            flash::PageResolverSpecialization::Generic,
++                                                            flash::PageResolverPlan::DirectTable,
++                                                            false, false>(params, stream);
++                                                    }
++                                                    TORCH_CHECK(
++                                                        false,
++                                                        "DirectTable subkind is retired from the SM8x TU (instance diet); use the RowPtr carrier");
 +                                                case PageResolverSubkind::AffineConst:
 +                                                    // [TU-INSTANCE-DIET 2026-07-02] AffineConst is not emitted by the
 +                                                    // production host (scalar-collapse uses AffineConstDirect; loaded
@@ -3156,7 +3309,7 @@ index e8db360..20c111a 100644
                                  });
                              });
                          });
-@@ -241,3 +690,11 @@ void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream) {
+@@ -241,3 +784,11 @@ void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream) {
          });
      });
  }
@@ -4189,7 +4342,7 @@ index a7c42fe..26af90b 100644
  
          static_assert(std::is_same_v<GmemLayoutAtomAppend, typename Rotary_t::LayoutAtom>);
 diff --git a/hopper/mainloop_fwd_sm90_tma_gmma_ws.hpp b/hopper/mainloop_fwd_sm90_tma_gmma_ws.hpp
-index 6e0d8b7..df2ebd0 100644
+index 6e0d8b7..32c2cbc 100644
 --- a/hopper/mainloop_fwd_sm90_tma_gmma_ws.hpp
 +++ b/hopper/mainloop_fwd_sm90_tma_gmma_ws.hpp
 @@ -30,7 +30,17 @@ using namespace cute;
@@ -4211,7 +4364,7 @@ index 6e0d8b7..df2ebd0 100644
  struct CollectiveMainloopFwdSm90 {
  
      static constexpr int kStages = Stages;
-@@ -54,6 +64,57 @@ struct CollectiveMainloopFwdSm90 {
+@@ -54,6 +64,58 @@ struct CollectiveMainloopFwdSm90 {
      static constexpr bool PackGQA_TMA = PackGQA && kBlockH_ > 1;
      static constexpr bool Split = Split_;
      static constexpr bool V_colmajor = V_colmajor_;
@@ -4223,16 +4376,25 @@ index 6e0d8b7..df2ebd0 100644
 +    static constexpr bool UseCarrierHeadStride = UseCarrierHeadStride_;
 +    static constexpr bool IsDirectPhysicalPlan =
 +        ResolverPlan == PageResolverPlan::DirectPhysicalUnit;
++    static constexpr bool IsRowPtrPlan =
++        ResolverPlan == PageResolverPlan::RowPtrGeneric;
++    static constexpr bool IsDirectTablePlan =
++        ResolverPlan == PageResolverPlan::DirectTable;
++    static constexpr bool IsNativeDirectTablePlan =
++        ResolverKind == PageResolverKind::Native && IsDirectTablePlan;
++    // [SM90-NONTMA-NATIVE-LIKE 2026-08-13] DirectTable uses the general
++    // manager so its producer structure matches the native page-table path.
++    // RowPtr and DirectPhysical retain the lightweight manager because their
++    // carrier setup is not representable by the native path.
++    static constexpr bool kUseLiteNonTMA =
++        PagedKVNonTMA && !UseRowConsumeMode &&
++        (IsRowPtrPlan || IsDirectPhysicalPlan);
 +    static constexpr bool IsGenericRRPPlan =
 +        ResolverPlan == PageResolverPlan::GenericRRP ||
 +        ResolverPlan == PageResolverPlan::RowPtrGeneric;
-+    // fa3_sm90_page_idx_prefetch (FA4 SM100 f29cc95 port): non-TMA AffineTensor2
-+    // RRP only. Per-block resolve is an indirect page-table LDG worth hiding behind
-+    // the in-flight cp.async. Compiled out (discarded if constexpr) for native/dense,
-+    // TMA (PagedKVNonTMA==false), and every other resolver plan.
-+    // fa3_sm90_loaded_deref_prefetch: also pipeline the EXPOSED loaded-deref carriers
-+    // (RowPtr/DirectTable, !UseRowConsumeMode) -- SM90 WS producer can't hide their resolve
-+    // behind compute (SM80 can), so overlap it with the in-flight cp.async instead.
++    // fa3_sm90_page_idx_prefetch (FA4 SM100 f29cc95 port): keep the register
++    // prefetch only for AffineTensor2 and row-consume RowPtr/DirectTable. Loaded
++    // non-row-consume carriers use the warp-cooperative resolve below instead.
 +    // fa3_sm90_rowconsume_prefetch (A-iter1-rowconsume): the row-consume RowPtr/DirectTable
 +    // carrier (SELECTED_TABLE / COMPACT_RECENT_NATIVE per-row visible-len production path)
 +    // pays the SAME exposed indirect resolve __ldg(meta.ptr_page_table_row + page_idx), so
@@ -4243,33 +4405,25 @@ index 6e0d8b7..df2ebd0 100644
 +        PagedKVNonTMA && (ResolverPlan == PageResolverPlan::AffineTensor2 ||
 +            (ResolverKind == PageResolverKind::ResolvedRowPtr &&
 +             (ResolverSubkind == PageResolverSubkind::RowPtr ||
-+              ResolverSubkind == PageResolverSubkind::DirectTable)));  // RC_PREFETCH_MARK_A0
-+    // fa3_sm90_consumer_resolve_precompute: same loaded-deref predicate as the
-+    // kEnablePageIdxPrefetch clause above. When ON, the per-block producer LDG is
-+    // hoisted to a one-shot prologue smem precompute (supersedes the pf staging).
++              ResolverSubkind == PageResolverSubkind::DirectTable) &&
++             UseRowConsumeMode));  // RC_PREFETCH_MARK_A0
++    // Generic loaded AffineTensor keeps the established shared-table path.
++    // RowPtr/DirectTable use the lightweight native-like manager below and must
++    // stay on its barrier-free per-row path.
 +    static constexpr bool kConsumerResolve =
 +        PagedKVNonTMA &&
 +        ResolverKind == PageResolverKind::ResolvedRowPtr &&
-+        ((ResolverSubkind == PageResolverSubkind::RowPtr ||
-+          ResolverSubkind == PageResolverSubkind::DirectTable) ||
-+         // fa3_sm90_consumer_resolve_affine_tensor (ITER2): loaded-deref Generic-plan
-+         // AffineTensor (exclude AffineTensor2 fast path; affine_direct excluded at
-+         // runtime via paged_kv_manager.consumer_resolve_uses_smem()).
-+         (ResolverSubkind == PageResolverSubkind::AffineTensor &&
-+          ResolverPlan != PageResolverPlan::AffineTensor2)) &&
++        ResolverSubkind == PageResolverSubkind::AffineTensor &&
++        ResolverPlan != PageResolverPlan::AffineTensor2 &&
 +        !UseRowConsumeMode;
-+    // Re-export the PagedKVManager smem-buffer bound for SharedStorage sizing.
-+    // [K2-TILEPAGES-1024 2026-07-11] 256 -> 1024 (4KB) for hdim <= 128: covers
-+    // sel 16k / page16 single-split tiles. hdim > 128 keeps the legacy 256
-+    // (hdim256 paged tile smem is within ~2KB of the 227KB opt-in ceiling; see
-+    // PagedKVManager::kMaxTilePages in paged_kv.h -- keep the two in sync).
++    // Keep in sync with PagedKVManager::kMaxTilePages.
 +    static constexpr int kMaxTilePages =
 +        !kConsumerResolve ? 1
 +                          : (CUTE_STATIC_V(get<2>(TileShape_MNK{})) <= 128 ? 1024 : 256);
      static constexpr bool Transpose_V = Is_FP8 && !V_colmajor;
      static constexpr bool Use_TMA_Q = !PackGQA || PackGQA_TMA;
      static constexpr bool Use_TMA_KV = !PagedKVNonTMA;
-@@ -72,7 +133,17 @@ struct CollectiveMainloopFwdSm90 {
+@@ -72,7 +134,29 @@ struct CollectiveMainloopFwdSm90 {
      static constexpr int kHeadDim = get<2>(TileShape_MNK{});
      static constexpr int kBlockH = kBlockH_;
  
@@ -4277,8 +4431,20 @@ index 6e0d8b7..df2ebd0 100644
 +    using PageResolverArguments_t =
 +        flash::PageResolverArguments<ResolverKind, ResolverSubkind, ResolverSpecialization>;
 +    static constexpr bool UseResolvedSeqlenByHead = UseResolvedSeqlenByHead_;
-+    using PageResolverSeqlenArguments_t =
-+        flash::PageResolverSeqlenArguments<ResolverKind, ResolverSpecialization, UseResolvedSeqlenByHead>;
++    // DirectTable without row-consume or per-head visible lengths has no
++    // resolver-owned seqlen state. Keep its argument type empty so the owned
++    // kind4 kernel does not carry a dead pointer that shifts every following
++    // kernel parameter.
++    using PageResolverSeqlenArguments_t = std::conditional_t<
++        IsDirectTablePlan && !UseRowConsumeMode && !UseResolvedSeqlenByHead,
++        flash::PageResolverSeqlenArguments<
++            PageResolverKind::Native,
++            PageResolverSpecialization::Generic,
++            false>,
++        flash::PageResolverSeqlenArguments<
++            ResolverKind,
++            ResolverSpecialization,
++            UseResolvedSeqlenByHead>>;
 +    using SeqlenInfo_t = flash::SeqlenInfoQKNewK<
 +        Varlen,
 +        AppendKV,
@@ -4288,7 +4454,7 @@ index 6e0d8b7..df2ebd0 100644
      using BlockMN_t = flash::BlockMN<SeqlenInfo_t, kBlockM, kBlockN, Is_causal, Is_local, PackGQA, Split>;
  
      static_assert(!LargeHeadDimV || kHeadDimV % 256 == 0);
-@@ -397,6 +468,14 @@ struct CollectiveMainloopFwdSm90 {
+@@ -397,6 +481,14 @@ struct CollectiveMainloopFwdSm90 {
          int const* const ptr_pagetable;
          ShapePageTable const shape_pagetable;
          StridePageTable const stride_pagetable;
@@ -4303,7 +4469,7 @@ index 6e0d8b7..df2ebd0 100644
          float const softmax_scale;
          float const* ptr_q_descale, *ptr_k_descale, *ptr_v_descale;
          StrideDescale const stride_q_descale, stride_k_descale, stride_v_descale;
-@@ -449,6 +528,14 @@ struct CollectiveMainloopFwdSm90 {
+@@ -449,6 +541,14 @@ struct CollectiveMainloopFwdSm90 {
          int const* const ptr_pagetable;
          ShapePageTable const shape_pagetable;
          StridePageTable const stride_pagetable;
@@ -4318,7 +4484,7 @@ index 6e0d8b7..df2ebd0 100644
          cutlass::FastDivmod page_size_divmod;
          cutlass::FastDivmod blockN_per_page_size_divmod;
          cutlass::FastDivmod qhead_per_khead_divmod;
-@@ -577,7 +664,12 @@ struct CollectiveMainloopFwdSm90 {
+@@ -577,7 +677,12 @@ struct CollectiveMainloopFwdSm90 {
                  args.ptr_Qv, args.stride_Qv, shape_Qv_packed, stride_Qv_packed,
                  args.ptr_rotary_cos, args.shape_rotary, args.stride_rotary_cos,
                  args.ptr_rotary_sin, args.stride_rotary_sin, args.is_rotary_interleaved,
@@ -4332,44 +4498,117 @@ index 6e0d8b7..df2ebd0 100644
                  cutlass::FastDivmod(page_size),  // page_size_divmod
                  cutlass::FastDivmod(!args.ptr_pagetable ? 1 : cute::ceil_div(page_size, kBlockN)),  // blockN_per_page_size_divmod
                  cutlass::FastDivmod(cute::ceil_div(get<2>(args.shape_Q), get<2>(args.shape_K))),
-@@ -728,13 +820,18 @@ struct CollectiveMainloopFwdSm90 {
+@@ -614,6 +719,36 @@ struct CollectiveMainloopFwdSm90 {
+         }
+     }
+ 
++    CUTLASS_DEVICE
++    static int const* resolve_table_row_before_seqlen(
++        Params const& params, int const resolver_bidb, int const bidh_kv) {
++        if constexpr (PagedKVNonTMA && IsRowPtrPlan && !UseRowConsumeMode) {
++            int64_t const row_ptr_index =
++                resolver_bidb *
++                    params.page_resolver_args.resolved_page_table_row_ptr_batch_stride
++                + (UseCarrierHeadStride
++                    ? bidh_kv *
++                        params.page_resolver_args.resolved_page_table_row_ptr_head_stride
++                    : int64_t(0));
++            uint64_t raw_row_ptr;
++            // Keep this load ahead of SeqlenInfo construction. The memory
++            // clobber prevents the compiler from sinking it back next to the
++            // first dependent page-table load in the mainloop.
++            asm volatile(
++                "ld.global.u64 %0, [%1];"
++                : "=l"(raw_row_ptr)
++                : "l"(params.page_resolver_args.ptr_resolved_page_table_row_ptr_u64
++                      + row_ptr_index)
++                : "memory");
++            return reinterpret_cast<int const*>(raw_row_ptr);
++        } else {
++            static_cast<void>(params);
++            static_cast<void>(resolver_bidb);
++            static_cast<void>(bidh_kv);
++            return nullptr;
++        }
++    }
++
+     template <typename SchedulerPrefetch, typename SharedStorage>
+     CUTLASS_DEVICE void
+     load(Params const& params,
+@@ -625,7 +760,8 @@ struct CollectiveMainloopFwdSm90 {
+          SchedulerPrefetch const& scheduler_prefetch,
+          SeqlenInfo_t const& seqlen_info,
+          cute::tuple<int32_t, int32_t, int32_t, int32_t> block_coord,
+-         int &work_idx
++         int &work_idx,
++         int const* const prefetched_row_ptr
+          ) {
+ 
+         // some of these are captured in lambda so can't use structured binding
+@@ -728,14 +864,46 @@ struct CollectiveMainloopFwdSm90 {
          // This is used to index into the batch dimension of mK and mV
          int const bidb_kv_idx = !is_varlen_k && !params.ptr_pagetable ? bidb_kv : 0;
  
 -        using PagedKVManager_t = PagedKVManager<get<1>(TileShape_MNK{}), get<2>(TileShape_MNK{}), get<1>(TileShape_MNK_PV{}), NumProducerThreads, Element, Transpose_V || !IntraWGOverlap /*KV_Same_Iter*/>;
+-        PagedKVManager_t paged_kv_manager(
+-            params.ptr_pagetable, params.shape_pagetable, params.stride_pagetable,
+-            params.ptr_K, params.shape_K, params.stride_K,
+-            params.ptr_V, params.headdim_v, params.stride_V,
+-            params.page_size_divmod, params.blockN_per_page_size_divmod,
+-            bidb_kv, bidh_kv, thread_idx, seqlen_info.seqlen_k - n_offset, seqlen_info.leftpad_k + n_offset, bidb_kv_idx
+-        );
++        using GeneralPagedKVManager_t =
++            PagedKVManager<get<1>(TileShape_MNK{}), get<2>(TileShape_MNK{}), get<1>(TileShape_MNK_PV{}), NumProducerThreads, Element, Transpose_V || !IntraWGOverlap /*KV_Same_Iter*/, 1 /*LoadsPerRow_LB*/, ResolverKind, ResolverSubkind, ResolverSpecialization, UseRowConsumeMode, UseCarrierHeadStride, IsNativeDirectTablePlan && UseCarrierHeadStride /*FlattenNativePageTableByHead*/>;
++        using LitePagedKVManager_t =
++            PagedKVManagerSm8x<get<1>(TileShape_MNK{}), get<2>(TileShape_MNK{}), get<1>(TileShape_MNK_PV{}), NumProducerThreads, Element, Transpose_V || !IntraWGOverlap /*KV_Same_Iter*/, 1 /*LoadsPerRow_LB*/, ResolverKind, ResolverSubkind, ResolverSpecialization, UseRowConsumeMode, UseCarrierHeadStride, false /*EnableWarpPageResolve*/, IsRowPtrPlan /*UsePrefetchedTableRow*/>;
 +        using PagedKVManager_t = std::conditional_t<
 +            IsDirectPhysicalPlan && !PagedKVNonTMA,
 +            DirectPhysicalTmaKVManager<PageResolverArguments_t, Transpose_V || !IntraWGOverlap /*KV_Same_Iter*/>,
-+            PagedKVManager<get<1>(TileShape_MNK{}), get<2>(TileShape_MNK{}), get<1>(TileShape_MNK_PV{}), NumProducerThreads, Element, Transpose_V || !IntraWGOverlap /*KV_Same_Iter*/, 1 /*LoadsPerRow_LB*/, ResolverKind, ResolverSubkind, ResolverSpecialization, UseRowConsumeMode, UseCarrierHeadStride>>;
-         PagedKVManager_t paged_kv_manager(
--            params.ptr_pagetable, params.shape_pagetable, params.stride_pagetable,
-+            params.ptr_pagetable, params.stride_pagetable,
-+            params.page_resolver_args,
-             params.ptr_K, params.shape_K, params.stride_K,
-             params.ptr_V, params.headdim_v, params.stride_V,
-             params.page_size_divmod, params.blockN_per_page_size_divmod,
--            bidb_kv, bidh_kv, thread_idx, seqlen_info.seqlen_k - n_offset, seqlen_info.leftpad_k + n_offset, bidb_kv_idx
-+            bidb_kv, bidb_kv, bidh_kv, thread_idx, seqlen_info.seqlen_k - n_offset, seqlen_info.leftpad_k + n_offset, bidb_kv_idx,
-+            seqlen_info.row_consume_mode_value
-         );
++            std::conditional_t<
++                IsRowPtrPlan && !PagedKVNonTMA,
++                RowPtrTmaKVManager<PageResolverArguments_t, UseCarrierHeadStride, Transpose_V || !IntraWGOverlap /*KV_Same_Iter*/>,
++                std::conditional_t<
++                    kUseLiteNonTMA,
++                    LitePagedKVManager_t,
++                    GeneralPagedKVManager_t>>>;
++        int const manager_seqlen_k = seqlen_info.seqlen_k - n_offset;
++        int const manager_leftpad_k = seqlen_info.leftpad_k + n_offset;
++        auto paged_kv_manager = [&] {
++            if constexpr (kUseLiteNonTMA) {
++                return PagedKVManager_t(
++                    params.ptr_pagetable, params.stride_pagetable,
++                    params.page_resolver_args,
++                    params.ptr_K, params.shape_K, params.stride_K,
++                    params.ptr_V, params.headdim_v, params.stride_V,
++                    params.page_size_divmod, params.blockN_per_page_size_divmod,
++                    bidb_kv, bidb_kv, bidh_kv, thread_idx,
++                    manager_seqlen_k, manager_leftpad_k,
++                    bidb_kv_idx, seqlen_info.row_consume_mode_value,
++                    prefetched_row_ptr);
++            } else {
++                return PagedKVManager_t(
++                    params.ptr_pagetable, params.stride_pagetable,
++                    params.page_resolver_args,
++                    params.ptr_K, params.shape_K, params.stride_K,
++                    params.ptr_V, params.headdim_v, params.stride_V,
++                    params.page_size_divmod, params.blockN_per_page_size_divmod,
++                    bidb_kv, bidb_kv, bidh_kv, thread_idx,
++                    manager_seqlen_k, manager_leftpad_k,
++                    bidb_kv_idx, seqlen_info.row_consume_mode_value);
++            }
++        }();
  
          // Set up for transposing V, only used if Transpose_V
-@@ -830,13 +927,60 @@ struct CollectiveMainloopFwdSm90 {
+         S2RTiledCopyVt s2r_tiled_copy_vt;
+@@ -830,13 +998,44 @@ struct CollectiveMainloopFwdSm90 {
  
          int n_block = n_block_max - 1;
  
-+        // fa3_sm90_consumer_resolve_precompute: precompute the tile's page table into
-+        // smem (overlapped with the Q TMA + barrier_O idle window) and read it from
-+        // smem in the steady loop, hoisting the per-block producer LDG out of the
-+        // issue-bound steady loop. Runtime fit-check: take the smem path only when the
-+        // tile's logical-page span fits kMaxTilePages; else fall back to inline __ldg.
 +        int cr_tile_base_page = 0;
 +        bool cr_use_smem = false;
 +        if constexpr (kConsumerResolve) {
 +            auto [base_page, num_pages] = paged_kv_manager.tile_page_span(n_block_min, n_block_max);
 +            cr_tile_base_page = base_page;
-+            // fa3_sm90_consumer_resolve_affine_tensor (ITER2): exclude the arithmetic-
-+            // only affine_direct AffineTensor case (no producer load to hoist).
 +            cr_use_smem = (num_pages <= kMaxTilePages) &&
 +                          paged_kv_manager.consumer_resolve_uses_smem();
 +        }
@@ -4381,26 +4620,17 @@ index 6e0d8b7..df2ebd0 100644
  
 +        if constexpr (kConsumerResolve) {
 +            if (cr_use_smem) {
-+                // Cooperative one-shot resolve into smem (all producer threads), then
-+                // publish to the steady-loop readers via a producer-warpgroup-only
-+                // named barrier. Reuses FwdNamedBarriers::AppendKV (id 4): the AppendKV
-+                // store path uses the same id with a different arrival count, so the two
-+                // must never coexist in one instantiation -- enforced at compile time by
-+                // the static_assert below (kConsumerResolve requires !AppendKV). No free
-+                // user barrier id remains (0-7 in use, +8 reserved = hardware max 16).
 +                static_assert(!AppendKV, "kConsumerResolve reuses the AppendKV named barrier id; "
 +                    "AppendKV and consumer-resolve must not be instantiated together");
-+                // Pre-write rendezvous: under a persistent scheduler the lead producer
-+                // warp can reach this point for tile r+1 while lagging producer warps are
-+                // still reading tile r's page ids from the same smem buffer inside the
-+                // steady loop (get_next_work only synchronizes work-info pickup, not
-+                // load() completion). Rendezvous BEFORE overwriting to close the WAR race.
++                // Persistent CTAs can start the next tile before all producer
++                // warps finish reading this buffer. Rendezvous before overwrite,
++                // then rendezvous again to publish the newly resolved table.
 +                cutlass::arch::NamedBarrier::sync(NumProducerThreads,
-+                    static_cast<uint32_t>(FwdNamedBarriers::AppendKV) /*pre-write rendezvous*/);
++                    static_cast<uint32_t>(FwdNamedBarriers::AppendKV));
 +                paged_kv_manager.precompute_page_table_to_smem(
 +                    n_block_min, n_block_max, shared_storage.pipelines.smem_resolved_page_table);
 +                cutlass::arch::NamedBarrier::sync(NumProducerThreads,
-+                    static_cast<uint32_t>(FwdNamedBarriers::AppendKV) /*producer publish*/);
++                    static_cast<uint32_t>(FwdNamedBarriers::AppendKV));
 +            }
 +        }
          if (should_load_KV) {
@@ -4416,14 +4646,12 @@ index 6e0d8b7..df2ebd0 100644
                  paged_kv_manager.template load_page_table<true /*Seqlenk_mask*/, true /*First_iter*/>(n_block);
              } else {
                  paged_kv_manager.template load_page_table_TMA<true /*First_iter*/>(n_block);
-@@ -893,6 +1037,21 @@ struct CollectiveMainloopFwdSm90 {
+@@ -893,6 +1092,19 @@ struct CollectiveMainloopFwdSm90 {
          if constexpr (!Transpose_V && !IntraWGOverlap) {
              if (should_load_KV) { load_V(n_block, smem_pipe_write, cute::true_type{} /*Seqlenk_mask*/); }
          }
 +        if constexpr (kEnablePageIdxPrefetch) {
-+            // fa3_sm90_consumer_resolve_precompute: skip pf staging when the smem
-+            // precompute is driving these carriers (mutual exclusion).
-+            if (should_load_KV && !cr_use_smem) {
++            if (should_load_KV) {
 +                int const pf_seed = (n_block - 1 >= n_block_min) ? (n_block - 1) : n_block_min;
 +                paged_kv_manager.template load_page_table_prefetch<false /*Seqlenk_mask*/>(pf_seed);
 +                // fa3_sm90_deepen_prefetch: also seed the 2-ahead buffer so block n's resolve is
@@ -4438,19 +4666,15 @@ index 6e0d8b7..df2ebd0 100644
          int n_block_prev = n_block;
          --n_block;
          #pragma unroll (!Transpose_V && Use_TMA_KV ? 2 : 1)
-@@ -900,7 +1059,23 @@ struct CollectiveMainloopFwdSm90 {
+@@ -900,7 +1112,19 @@ struct CollectiveMainloopFwdSm90 {
              PipelineState smem_pipe_write_v = smem_pipe_write; // copy the state, write_v is always 1 step behind
              ++smem_pipe_write;
              if (should_load_KV) {
 -                if constexpr (PagedKVNonTMA) {
 +                if constexpr (kConsumerResolve) {
 +                    if (cr_use_smem) {
-+                        // fa3_sm90_consumer_resolve_precompute: read the prologue-resolved
-+                        // smem table -- no per-block producer LDG.
 +                        paged_kv_manager.template load_page_table_from_smem<false /*Seqlenk_mask*/>(
 +                            n_block, shared_storage.pipelines.smem_resolved_page_table, cr_tile_base_page);
-+                    } else if constexpr (kEnablePageIdxPrefetch) {
-+                        paged_kv_manager.commit_prefetched_page_table();
 +                    } else {
 +                        paged_kv_manager.template load_page_table<false /*Seqlenk_mask*/>(n_block);
 +                    }
@@ -4463,13 +4687,11 @@ index 6e0d8b7..df2ebd0 100644
                      paged_kv_manager.template load_page_table<false /*Seqlenk_mask*/>(n_block);
                  } else {
                      paged_kv_manager.load_page_table_TMA(n_block);
-@@ -914,6 +1089,21 @@ struct CollectiveMainloopFwdSm90 {
+@@ -914,6 +1138,18 @@ struct CollectiveMainloopFwdSm90 {
                          load_V(n_block, smem_pipe_write, cute::false_type{} /*Seqlenk_mask*/);
                      }
                  }
 +                if constexpr (kEnablePageIdxPrefetch) {
-+                  // fa3_sm90_consumer_resolve_precompute: skip pf shifting under the smem path.
-+                  if (!cr_use_smem) {
 +                    // fa3_sm90_deepen_prefetch: 2-ahead pipeline. The 1-ahead buffer was already
 +                    // committed above; shift the 2-ahead buffer into it, then kick the resolve TWO
 +                    // blocks ahead AFTER this block's K/V cp.async issue, so the cold loaded-deref
@@ -4480,12 +4702,11 @@ index 6e0d8b7..df2ebd0 100644
 +                    paged_kv_manager.shift_prefetched_page_table2();
 +                    int const pf_next3 = (n_block - 3 >= n_block_min) ? (n_block - 3) : n_block_min;
 +                    paged_kv_manager.template load_page_table_prefetch3<false /*Seqlenk_mask*/>(pf_next3);
-+                  }  // fa3_sm90_consumer_resolve_precompute: end !cr_use_smem
 +                }
              }
              n_block_prev = n_block;
              if constexpr (Transpose_V) { copy_Vt_to_V(smem_pipe_write_v); }
-@@ -1104,6 +1294,85 @@ struct CollectiveMainloopFwdSm90 {
+@@ -1104,6 +1340,85 @@ struct CollectiveMainloopFwdSm90 {
              params.qhead_per_khead_divmod,
              params.cp_world_size, params.cp_rank, seqlen_info.tot_seqlen_k
          );
@@ -4571,7 +4792,7 @@ index 6e0d8b7..df2ebd0 100644
  
          float softcap_val = params.softcap_val;
          if constexpr (Has_softcap && Is_FP8) {
-@@ -1226,6 +1495,7 @@ struct CollectiveMainloopFwdSm90 {
+@@ -1226,6 +1541,7 @@ struct CollectiveMainloopFwdSm90 {
              Tensor scores_scale = softmax.template max_get_scale</*Is_first=*/true, /*Check_inf=*/true>(tSrS);
              // Don't need to store scales to send to WG1 (in the case of LargeHeadDimV) since it's 1.f
  
@@ -4579,7 +4800,7 @@ index 6e0d8b7..df2ebd0 100644
              softmax.template online_softmax</*Is_first=*/true, /*Check_inf=*/true>(tSrS);
              if constexpr (Is_FP8 && !V_colmajor) { flash::permute_Cregs_fp8(tSrS); }
              Tensor tOrP_acc = make_tensor(tSrS.data(), flash::convert_layout_acc_Aregs<TiledMmaPV>(tSrS.layout()));
-@@ -1267,6 +1537,7 @@ struct CollectiveMainloopFwdSm90 {
+@@ -1267,6 +1583,7 @@ struct CollectiveMainloopFwdSm90 {
                  mask_fn(tSrS, n_block);
                  cute::copy(softmax.template max_get_scale</*Is_first=*/false, Check_inf>(tSrS), scores_scale);
                  if constexpr (LargeHeadDimV) { store_scales(scores_scale, smem_pipe_read_v.index()); }
@@ -4587,7 +4808,7 @@ index 6e0d8b7..df2ebd0 100644
                  softmax.template online_softmax</*Is_first=*/false, Check_inf>(tSrS);
                  if constexpr (!HasQv) {
                      warpgroup_wait<0>();
-@@ -1371,6 +1642,7 @@ struct CollectiveMainloopFwdSm90 {
+@@ -1371,6 +1688,7 @@ struct CollectiveMainloopFwdSm90 {
                  mask_fn(tSrS, n_block);
                  Tensor scores_scale = softmax.template max_get_scale</*Is_first=*/Is_first_iter, Check_inf>(tSrS);
                  if constexpr (LargeHeadDimV && !Is_first_iter) { store_scales(scores_scale, smem_pipe_read_prev.index()); }
@@ -4595,7 +4816,7 @@ index 6e0d8b7..df2ebd0 100644
                  softmax.template online_softmax</*Is_first=*/Is_first_iter, Check_inf>(tSrS);
                  if constexpr (Is_FP8 && !V_colmajor) { flash::permute_Cregs_fp8(tSrS); }
                  Tensor tOrP_acc = make_tensor(tSrS.data(), flash::convert_layout_acc_Aregs<TiledMmaPV>(tSrS.layout()));
-@@ -1692,14 +1964,23 @@ struct CollectiveMainloopFwdSm90 {
+@@ -1692,14 +2010,23 @@ struct CollectiveMainloopFwdSm90 {
          // This is used to index into the batch dimension of mK and mV
          int const bidb_kv_idx = !is_varlen_k && !params.ptr_pagetable ? bidb_kv : 0;
  
@@ -4635,10 +4856,10 @@ index c3cba01..16ec4ad 100644
  
  } // namespace flash
 diff --git a/hopper/paged_kv.h b/hopper/paged_kv.h
-index 9ea59bc..dbed5d4 100644
+index 9ea59bc..32bcc4e 100644
 --- a/hopper/paged_kv.h
 +++ b/hopper/paged_kv.h
-@@ -8,13 +8,701 @@
+@@ -8,13 +8,777 @@
  
  #include "cutlass/fast_math.h"  // For cutlass::FastDivmod
  
@@ -4724,16 +4945,7 @@ index 9ea59bc..dbed5d4 100644
 +struct PageResolverArguments<
 +    PageResolverKind::ResolvedRowPtr,
 +    PageResolverSubkind::DirectTable,
-+    PageResolverSpecialization::Generic> {
-+    int const* const ptr_row_consume_mode = nullptr;
-+    int const* const ptr_resolved_page_table_i32 = nullptr;
-+    int64_t const resolved_page_table_batch_stride = 0;
-+    int64_t const resolved_page_table_head_stride = 0;
-+    // fa3_sm90_dtable_u64_base: optional RowPtr-style u64 base array (fast path).
-+    uint64_t const* const ptr_dtable_row_ptr_u64 = nullptr;
-+    int64_t const dtable_row_ptr_batch_stride = 0;
-+    int64_t const dtable_row_ptr_head_stride = 0;
-+};
++    PageResolverSpecialization::Generic> {};
 +
 +template <>
 +struct PageResolverArguments<
@@ -4915,8 +5127,6 @@ index 9ea59bc..dbed5d4 100644
 +    PageResolverKind::ResolvedRowPtr,
 +    PageResolverSubkind::DirectTable,
 +    PageResolverSpecialization::Generic> {
-+    int const* const ptr_page_table_row = nullptr;
-+
 +    template <bool UseRowConsumeMode=true, bool UseCarrierHeadStride=true>
 +    CUTLASS_DEVICE
 +    static PageResolverRuntimeMetadata make(
@@ -4928,26 +5138,15 @@ index 9ea59bc..dbed5d4 100644
 +	        int const bidh,
 +	        int const* const native_page_table_row = nullptr,
 +	        int const row_consume_mode_value = 0) {
-+	        if constexpr (!UseRowConsumeMode) {
-+	            static_cast<void>(args);
-+	            static_cast<void>(resolver_bidb);
-+	            static_cast<void>(bidh);
-+	            static_cast<void>(row_consume_mode_value);
-+	            return {native_page_table_row};
-+	        }
-+	        bool use_native = false;
-+	        use_native =
-+	            args.ptr_row_consume_mode != nullptr && row_consume_mode_value == 0 &&
-+	            native_page_table_row != nullptr;
-+	        int const* const direct_row =
-+	            args.ptr_resolved_page_table_i32 == nullptr
-+	                ? nullptr
-+                : args.ptr_resolved_page_table_i32
-+                    + resolver_bidb * args.resolved_page_table_batch_stride
-+                    + (UseCarrierHeadStride
-+                        ? bidh * args.resolved_page_table_head_stride
-+                        : int64_t(0));
-+        return {use_native ? native_page_table_row : direct_row};
++	        static_assert(!UseRowConsumeMode,
++	                      "DirectTable does not support row-consume mode");
++	        static_cast<void>(args);
++	        static_cast<void>(resolver_bidb);
++	        static_cast<void>(bidh);
++	        static_cast<void>(native_page_table_row);
++	        static_cast<void>(row_consume_mode_value);
++	        static_cast<void>(UseCarrierHeadStride);
++	        return {};
 +    }
 +};
 +
@@ -5210,9 +5409,9 @@ index 9ea59bc..dbed5d4 100644
 +    template <typename Params>
 +    CUTLASS_DEVICE static int resolve(Params const& params, int const logical_page) {
 +        auto const& meta = params.page_resolver_metadata;
-+        if constexpr (Subkind == PageResolverSubkind::DirectTable || Subkind == PageResolverSubkind::RowPtr) {
-+            // RowPtr's metadata row is semantically the same native-shaped table row:
-+            // return params.ptr_page_table_row[logical_page];
++        if constexpr (Subkind == PageResolverSubkind::DirectTable) {
++            return params.ptr_page_table_row[logical_page];
++        } else if constexpr (Subkind == PageResolverSubkind::RowPtr) {
 +            return meta.ptr_page_table_row[logical_page];
 +        } else if constexpr (Subkind == PageResolverSubkind::AffineConstDirect) {
 +            return meta.affine_base + meta.affine_stride * logical_page;
@@ -5329,6 +5528,103 @@ index 9ea59bc..dbed5d4 100644
 +    }
 +};
 +
++// The SM90 TMA path only needs a physical page and an in-page block index.
++// Keeping RowPtr on the general PagedKVManager also materializes the non-TMA
++// cp.async tensors and resolver fragments, which spills the producer state to
++// local memory. This manager keeps the TMA responsibility isolated without
++// carrying non-TMA tensors or cross-iteration prefetch state.
++template <typename PageResolverArguments, bool UseCarrierHeadStride=true,
++          bool KV_Same_Iter=false>
++struct RowPtrTmaKVManager {
++    int const* const ptr_page_table_row;
++    cutlass::FastDivmod const& blockN_per_page_size_divmod;
++    int bidb_kv_idx;
++    int bidb_kv_idx_prev;
++    int n_block_idx = 0;
++    int n_block_idx_prev = 0;
++
++    CUTLASS_DEVICE
++    static int const* resolved_page_table_row(
++        PageResolverArguments const& page_resolver_args,
++        int const resolver_bidb,
++        int const bidh) {
++        int64_t const row_ptr_index =
++            resolver_bidb * page_resolver_args.resolved_page_table_row_ptr_batch_stride
++            + (UseCarrierHeadStride
++                ? bidh * page_resolver_args.resolved_page_table_row_ptr_head_stride
++                : int64_t(0));
++        return page_resolver_args.ptr_resolved_page_table_row_ptr_u64 != nullptr
++            ? reinterpret_cast<int const*>(
++                page_resolver_args.ptr_resolved_page_table_row_ptr_u64[row_ptr_index])
++            : nullptr;
++    }
++
++    template <typename StridePageTable, typename Element, typename ShapeKV, typename StrideKV>
++    CUTLASS_DEVICE
++    RowPtrTmaKVManager(int const* const,
++                       StridePageTable const&,
++                       PageResolverArguments const& page_resolver_args,
++                       Element* const, ShapeKV const&, StrideKV const&,
++                       Element* const, int const, StrideKV const&,
++                       cutlass::FastDivmod const&,
++                       cutlass::FastDivmod const& blockN_per_page_size_divmod,
++                       int const, int const resolver_bidb, int const bidh, int const,
++                       int const, int const,
++                       int bidb_kv_idx,
++                       int const = 0)
++        : ptr_page_table_row(
++            resolved_page_table_row(page_resolver_args, resolver_bidb, bidh))
++        , blockN_per_page_size_divmod(blockN_per_page_size_divmod)
++        , bidb_kv_idx(bidb_kv_idx)
++        , bidb_kv_idx_prev(bidb_kv_idx)
++    {}
++
++    CUTLASS_DEVICE
++    void resolve_indices(int const n_block, int& resolved_n_block_idx,
++                         int& resolved_bidb_kv_idx) const {
++        if (ptr_page_table_row == nullptr) {
++            resolved_n_block_idx = n_block;
++            return;
++        }
++        int logical_page;
++        if (blockN_per_page_size_divmod.divisor == 1) {
++            resolved_n_block_idx = 0;
++            logical_page = n_block;
++        } else {
++            logical_page = blockN_per_page_size_divmod.divmod(
++                resolved_n_block_idx, n_block);
++        }
++        resolved_bidb_kv_idx = ptr_page_table_row[logical_page];
++    }
++
++    template <bool First_iter=false>
++    CUTLASS_DEVICE
++    void load_page_table_TMA(int const n_block) {
++        resolve_indices(n_block, n_block_idx, bidb_kv_idx);
++        if constexpr (First_iter && !KV_Same_Iter) {
++            bidb_kv_idx_prev = bidb_kv_idx;
++            n_block_idx_prev = n_block_idx;
++        }
++    }
++
++    CUTLASS_DEVICE
++    cute::tuple<int, int> get_indices_for_K_TMA() {
++        return {n_block_idx, bidb_kv_idx};
++    }
++
++    CUTLASS_DEVICE
++    cute::tuple<int, int> get_indices_for_V_TMA() {
++        if constexpr (KV_Same_Iter) {
++            return {n_block_idx, bidb_kv_idx};
++        } else {
++            cute::tuple<int, int> const indices = {n_block_idx_prev, bidb_kv_idx_prev};
++            bidb_kv_idx_prev = bidb_kv_idx;
++            n_block_idx_prev = n_block_idx;
++            return indices;
++        }
++    }
++};
++
 +template <int kBlockN, int kHeadDim, int kHeadDimV, int NumThreads, typename Element,
 +          bool KV_Same_Iter=false, int LoadsPerRow_LB=1,
 +          // fa3_sm90_selected_table_device_delete: default kind moved off the
@@ -5337,11 +5633,12 @@ index 9ea59bc..dbed5d4 100644
 +          PageResolverSubkind ResolverSubkind=PageResolverSubkind::RowPtr,
 +          PageResolverSpecialization ResolverSpecialization=PageResolverSpecialization::Generic,
 +          bool UseRowConsumeMode=true,
-+          bool UseCarrierHeadStride=true>
++          bool UseCarrierHeadStride=true,
++          bool FlattenNativePageTableByHead=false>
  struct PagedKVManager {
      // If KV_Same_Iter=false, then we do load_page_table(0), load_K(0), load_page_table(1), load_K(1), load_V(0),
      // load_page_table(2), load_K(2), load_V(1), etc.
-@@ -25,6 +713,24 @@ struct PagedKVManager {
+@@ -25,6 +789,24 @@ struct PagedKVManager {
  
      static constexpr bool SameHeadDim = (kHeadDim == kHeadDimV);
      static constexpr int kHeadDimGCD = cute::gcd(kHeadDim, kHeadDimV);
@@ -5366,7 +5663,7 @@ index 9ea59bc..dbed5d4 100644
  
      // We use CpAsync for K and V if PagedKV, since TMA doesn't work there
      static constexpr int kGmemElemsPerLoad = sizeof(cute::uint128_t) / sizeof(Element);
-@@ -74,46 +780,198 @@ struct PagedKVManager {
+@@ -74,46 +856,179 @@ struct PagedKVManager {
      static_assert(CUTE_STATIC_V(size<1>(TensortKcK{})) == CUTE_STATIC_V(size<1>(TensortVcV{})));
      static constexpr int kPageEntryPerThread = cute::ceil_div(size<1>(TensortKcK{}), kGmemThreadsPerRow);
      using TensorPageOffset = decltype(make_tensor<cute::tuple<int, int>>(Shape<Int<kPageEntryPerThread>>{}));
@@ -5379,46 +5676,26 @@ index 9ea59bc..dbed5d4 100644
 +        IsAffineTensor2Plan ||
 +        (ResolverKind == PageResolverKind::ResolvedRowPtr &&
 +         (ResolverSubkind == PageResolverSubkind::RowPtr ||
-+          ResolverSubkind == PageResolverSubkind::DirectTable));  // RC_PREFETCH_MARK_A1
++          ResolverSubkind == PageResolverSubkind::DirectTable) &&
++         UseRowConsumeMode);  // RC_PREFETCH_MARK_A1
 +    using PrefetchFrag = cute::conditional_t<kHasPrefetchFrag, TensorPageOffset, cute::tuple<>>;
      using TensorKVPtr = decltype(make_tensor<Element*>(Shape<Int<kPageEntryPerThread>>{}));
  
-+    // fa3_sm90_consumer_resolve_precompute: carriers whose per-block resolve is an
-+    // explicit producer-side global LDG (RowPtr / DirectTable loaded-deref, no
-+    // row-consume mode). EXACT predicate of the loaded-deref kEnablePageIdxPrefetch
-+    // clause; everything precompute-related is gated on this so all other plans are
-+    // byte-identical.
-+    static constexpr bool kConsumerResolve =
++    // [SM90-HYBRID-PAGE-RESOLVE 2026-08-13] Indirect non-row-consume carriers
++    // use the warp-cooperative resolver. DirectTable stays on the per-row path
++    // so the owned producer structure matches the native page-table path.
++    static constexpr bool kEnableWarpPageResolve =
 +        ResolverKind == PageResolverKind::ResolvedRowPtr &&
-+        ((ResolverSubkind == PageResolverSubkind::RowPtr ||
-+          ResolverSubkind == PageResolverSubkind::DirectTable) ||
-+         // fa3_sm90_consumer_resolve_affine_tensor (ITER2): the loaded-deref
-+         // Generic-plan AffineTensor carrier (slow inline else-block). The
-+         // AffineTensor2 specialization keeps its own prefetch fast path, so
-+         // exclude it here; affine_direct is excluded at RUNTIME (no load to
-+         // hoist) via consumer_resolve_uses_smem().
++        (ResolverSubkind == PageResolverSubkind::RowPtr ||
++         // The Generic AffineTensor arm may be loaded or arithmetic-only at
++         // runtime; the warp helper rejects affine_direct before doing work.
 +         (ResolverSubkind == PageResolverSubkind::AffineTensor &&
 +          !IsAffineTensor2Plan)) &&
 +        !UseRowConsumeMode;
-+    // Compile-time bound on the smem page-table buffer. A tile spans rows
-+    // [n_block_min*kBlockN, n_block_max*kBlockN); with the smallest legal page_size
-+    // (1) every row is its own logical page, so the absolute worst case scales with
-+    // the (runtime) number of blocks and is NOT statically bounded. We therefore size
-+    // the buffer for the COMMON case (page_size >= kBlockN -> <=2 pages per block, and
-+    // a small page span across the whole tile) and gate the smem path on a one-time
-+    // RUNTIME fit-check in the prologue; when the span exceeds kMaxTilePages we fall
-+    // back to the original inline __ldg path (fail-closed, identical numerics).
-+    // [K2-TILEPAGES-1024 2026-07-11] 1024 ints = 4KB. Sized to the largest
-+    // production tile span: 16k selected tokens at page_size 16 = 1024 logical
-+    // pages (single-split whole-tile range); sel 8k = 512. The previous 256
-+    // bound silently pushed sel > 4k low-split tiles onto the per-block __ldg
-+    // fallback. Larger spans still fail closed to that path.
-+    // hdim > 128 keeps the legacy 256: the hdim256 PagedKVNonTMA SM90 tile
-+    // (128x80, kStages 2) already sits at ~224KB tensor smem, within ~2KB of
-+    // the 227KB per-block opt-in ceiling -- +3KB would turn a launchable
-+    // kernel into a runtime launch failure. hdim <= 128 paged tiles top out
-+    // ~164KB, leaving >60KB headroom. (Production kind4 is hdim128.)
-+    // Keep in sync with the mainloop re-export (mainloop_fwd_sm90_tma_gmma_ws.hpp).
++    static constexpr bool kConsumerResolve = kEnableWarpPageResolve;
++    // 1024 ints covers the production 16K-token/page16 single-split tile.
++    // Head dimensions above 128 retain the legacy 256-entry limit to stay
++    // below Hopper's per-block shared-memory launch ceiling.
 +    static constexpr int kMaxTilePages =
 +        !kConsumerResolve ? 1 : (kHeadDim <= 128 ? 1024 : 256);
 +
@@ -5460,6 +5737,7 @@ index 9ea59bc..dbed5d4 100644
 +	        int const bidb,
 +	        int const resolver_bidb,
 +	        int const bidh,
++	        int const num_kv_heads,
 +	        int const) {
 +        if constexpr (ResolverKind == PageResolverKind::ResolvedRowPtr &&
 +                      ResolverSubkind == PageResolverSubkind::AffineConstDirect) {
@@ -5472,28 +5750,15 @@ index 9ea59bc..dbed5d4 100644
 +        }
 +        if constexpr (ResolverKind == PageResolverKind::ResolvedRowPtr &&
 +                      ResolverSubkind == PageResolverSubkind::DirectTable &&
-+                      !UseRowConsumeModeForRow) {
-+            static_cast<void>(ptr_page_table_);
-+            static_cast<void>(stride_pagetable);
-+            // fa3_sm90_dtable_u64_base: if a RowPtr-style u64 base array is provided, LOAD the
-+            // per-head base exactly like RowPtr (the fast carrier reading the same addresses);
-+            // else fall back to the computed i32-table base.
-+            if (page_resolver_args.ptr_dtable_row_ptr_u64 != nullptr) {
-+                int64_t const u64_index =
-+                    resolver_bidb * page_resolver_args.dtable_row_ptr_batch_stride
-+                    + (UseCarrierHeadStrideForRow
-+                        ? bidh * page_resolver_args.dtable_row_ptr_head_stride
-+                        : int64_t(0));
-+                return reinterpret_cast<int const*>(
-+                    page_resolver_args.ptr_dtable_row_ptr_u64[u64_index]);
-+            }
-+            return page_resolver_args.ptr_resolved_page_table_i32 == nullptr
++                      !UseRowConsumeModeForRow &&
++                      UseCarrierHeadStrideForRow) {
++            static_cast<void>(page_resolver_args);
++            int const row_index = resolver_bidb * num_kv_heads + bidh;
++            return ptr_page_table_ == nullptr
 +                ? nullptr
-+                : page_resolver_args.ptr_resolved_page_table_i32
-+                    + resolver_bidb * page_resolver_args.resolved_page_table_batch_stride
-+                    + (UseCarrierHeadStrideForRow
-+                        ? bidh * page_resolver_args.resolved_page_table_head_stride
-+                        : int64_t(0));
++                : ptr_page_table_
++                    + int64_t(row_index) *
++                        int64_t(get<0>(stride_pagetable));
 +        }
 +        if constexpr (ResolverKind == PageResolverKind::ResolvedRowPtr &&
 +                      ResolverSubkind == PageResolverSubkind::RowPtr &&
@@ -5508,6 +5773,18 @@ index 9ea59bc..dbed5d4 100644
 +            return page_resolver_args.ptr_resolved_page_table_row_ptr_u64 != nullptr
 +                ? reinterpret_cast<int const*>(
 +                    page_resolver_args.ptr_resolved_page_table_row_ptr_u64[row_ptr_index])
++                : nullptr;
++        }
++        if constexpr (ResolverKind == PageResolverKind::Native &&
++                      FlattenNativePageTableByHead) {
++            static_assert(
++                UseCarrierHeadStrideForRow,
++                "flattened native page-table rows require a head stride");
++            static_cast<void>(page_resolver_args);
++            int const row_index = resolver_bidb * num_kv_heads + bidh;
++            return ptr_page_table_ != nullptr
++                ? ptr_page_table_ +
++                    int64_t(row_index) * int64_t(get<0>(stride_pagetable))
 +                : nullptr;
 +        }
 +        static_cast<void>(page_resolver_args);
@@ -5551,6 +5828,7 @@ index 9ea59bc..dbed5d4 100644
 +                bidb,
 +                resolver_bidb,
 +                bidh,
++                int(get<2>(shape_K)),
 +                row_consume_mode_value)
 +        )
 +        , page_resolver_metadata(
@@ -5572,35 +5850,30 @@ index 9ea59bc..dbed5d4 100644
          mK_paged = make_tensor(make_gmem_ptr(ptr_K), shape_K, stride_K)(_, _, bidh, _);
          auto shape_V = make_shape(get<0>(shape_K), headdim_v, get<2>(shape_K), get<3>(shape_K));
          mV_paged = make_tensor(make_gmem_ptr(ptr_V), shape_V, stride_V)(_, _, bidh, _);
-@@ -130,6 +988,210 @@ struct PagedKVManager {
+@@ -130,9 +1045,243 @@ struct PagedKVManager {
          tVpV = cute::conditional_return<SameHeadDim>(tKpK, tVpV_);
      };
  
 +    // fa3_sm90_selected_table_device_delete: legacy active-page-table ctor
 +    // removed (only built SelectedTable args; SelectedTable launch arm gone).
 +
-+    // fa3_sm90_consumer_resolve_affine_tensor (ITER2): RUNTIME gate for the smem
-+    // path. The load-based precompute only applies to carriers that actually LOAD
-+    // ptr_page_table_row. The arithmetic-only affine_direct AffineTensor case
-+    // resolves source_page_idx with no load (already native-fast, nothing to
-+    // hoist), so it must stay on the inline path. RowPtr/DirectTable always load,
-+    // so they are always eligible. affine_direct is only a field on the
-+    // AffineTensor metadata, hence the if constexpr guard (keeps RowPtr/DirectTable
-+    // instantiations compiling and byte-identical).
++    // The shared-table path is worthwhile when one 128-row block spans at
++    // least four pages. Larger pages stay on the barrier-free warp resolver.
 +    CUTLASS_DEVICE
 +    bool consumer_resolve_uses_smem() const {
-+        if constexpr (kConsumerResolve &&
-+                      ResolverSubkind == PageResolverSubkind::AffineTensor) {
-+            return !page_resolver_metadata.affine_direct;
++        if constexpr (!kConsumerResolve) {
++            return false;
++        } else if constexpr (ResolverSubkind == PageResolverSubkind::AffineTensor) {
++            return page_size_divmod.divisor <= 32 && !page_resolver_metadata.affine_direct;
 +        } else {
-+            return true;
++            return page_size_divmod.divisor <= 32;
 +        }
 +    };
 +
 +    // [SM90-RESOLVE-MERGE 2026-07-02] The ONE copy of the resolver decision tree.
 +    // load_page_table / load_page_table_prefetch{,2,3} (via load_page_table_prefetch_to)
-+    // / precompute_page_table_to_smem (non-AffineTensor arm) / load_page_table_TMA all
-+    // call this; previously the same tree was expanded inline at all six sites (same
++    // / load_page_table_warp_resolve / load_page_table_TMA all call this; previously
++    // the same tree was expanded inline at all six sites (same
 +    // consolidation the SM8x Lite manager already applies). Arm order matches the
 +    // original load_page_table chain exactly and values are bit-identical. UseLdg
 +    // selects the table-read flavor (__ldg vs plain) so each call site keeps its
@@ -5674,40 +5947,24 @@ index 9ea59bc..dbed5d4 100644
 +        }
 +    };
 +
-+    // fa3_sm90_consumer_resolve_precompute: minimum / maximum absolute logical page
-+    // the tile [n_block_min, n_block_max) can reference, using the SAME divmod the
-+    // resolve loop uses. Used both to size the runtime fit-check and to derive
-+    // tile_base_page for smem indexing. Returns {base_page, num_pages}.
 +    CUTLASS_DEVICE
 +    cute::tuple<int, int> tile_page_span(int n_block_min, int n_block_max) const {
 +        int dummy;
 +        int const first_row = n_block_min * kBlockN + leftpad_k;
-+        int const last_row  = (n_block_max * kBlockN - 1) + leftpad_k;
++        int const last_row = (n_block_max * kBlockN - 1) + leftpad_k;
 +        int const base_page = page_size_divmod.divmod(dummy, first_row);
 +        int const last_page = page_size_divmod.divmod(dummy, last_row);
 +        return {base_page, last_page - base_page + 1};
 +    };
 +
-+    // fa3_sm90_consumer_resolve_precompute: cooperatively (all NumThreads producer
-+    // threads) load the native page-table entries ptr_page_table_row[p] for every
-+    // logical page p the tile references into smem_pt[p - tile_base_page]. Uses the
-+    // SAME ptr_page_table_row base as the inline __ldg path so the values are
-+    // byte-identical. Real body only for kConsumerResolve carriers; no-op otherwise.
-+    // Caller MUST publish smem (producer barrier) before any from-smem read, and MUST
-+    // have runtime-confirmed num_pages <= kMaxTilePages.
++    // Resolve each logical page once, cooperatively across the producer
++    // warpgroup. The caller owns the pre-write and publish barriers.
 +    CUTLASS_DEVICE
 +    void precompute_page_table_to_smem(int n_block_min, int n_block_max, int* smem_pt) {
 +        if constexpr (kConsumerResolve) {
 +            auto [tile_base_page, num_pages] = tile_page_span(n_block_min, n_block_max);
-+            // Coalesced strided cooperative load over the producer warpgroup.
 +            for (int p = thread_idx; p < num_pages; p += NumThreads) {
 +                if constexpr (ResolverSubkind == PageResolverSubkind::AffineTensor) {
-+                    // fa3_sm90_consumer_resolve_affine_tensor (ITER2): bake the affine
-+                    // into smem. `logical_page` is the LOGICAL page this slot maps to;
-+                    // source_page_idx is the EXACT load_page_table else-block transform
-+                    // (per-(batch,head) ptr_affine_row override + 2-segment variant).
-+                    // Reached only when consumer_resolve_uses_smem() is true, i.e.
-+                    // !affine_direct, so the resolve is always the LOADED form.
 +                    auto const& meta = page_resolver_metadata;
 +                    int const logical_page = tile_base_page + p;
 +                    int base = meta.affine_base;
@@ -5717,9 +5974,7 @@ index 9ea59bc..dbed5d4 100644
 +                    if (meta.ptr_affine_row != nullptr) {
 +                        base = meta.ptr_affine_row[0];
 +                        stride = meta.ptr_affine_row[1];
-+                        if (meta.affine_cols >= 5) {
-+                            segment_pages = meta.ptr_affine_row[2];
-+                        }
++                        if (meta.affine_cols >= 5) { segment_pages = meta.ptr_affine_row[2]; }
 +                    }
 +                    if (segment_pages > 0 && logical_page >= segment_pages) {
 +                        if (meta.ptr_affine_row != nullptr) {
@@ -5734,9 +5989,10 @@ index 9ea59bc..dbed5d4 100644
 +                    int const source_page_idx = base + stride * page;
 +                    smem_pt[p] = __ldg(ptr_page_table_row + source_page_idx);
 +                } else {
-+                    // [SM90-RESOLVE-MERGE 2026-07-02] RowPtr/DirectTable (!RCM) arm of
-+                    // the single resolve expression; __ldg flavor unchanged.
-+                    smem_pt[p] = resolve_page_entry</*UseLdg=*/true>(tile_base_page + p);
++                    // [SM90-H20-LOADED-PLAIN 2026-08-12] Keep the precompute
++                    // load on the same plain-load path as native/TMA. On SM90,
++                    // __ldg emits LDG.E.CI and regresses the load-only producer.
++                    smem_pt[p] = resolve_page_entry</*UseLdg=*/false>(tile_base_page + p);
 +                }
 +            }
 +        } else {
@@ -5746,44 +6002,99 @@ index 9ea59bc..dbed5d4 100644
 +        }
 +    };
 +
-+    // fa3_sm90_consumer_resolve_precompute: steady-loop reader. EXACT body of
-+    // load_page_table EXCEPT the loaded-deref branch reads the prologue-resolved
-+    // smem table (smem_pt[page_idx - tile_base_page]) instead of issuing a per-block
-+    // __ldg. tile_base_page is recomputed from n_block_min/n_block_max via the SAME
-+    // divmod so the index matches what precompute stored. Only the RowPtr/DirectTable
-+    // !UseRowConsumeMode branch differs from load_page_table; all other branches are
-+    // unreachable here (gated by kConsumerResolve at the call site) but kept verbatim
-+    // so the function is a faithful clone.
 +    template <bool Seqlenk_mask=false, bool First_iter=false>
 +    CUTLASS_DEVICE
 +    void load_page_table_from_smem(const int n_block, int const* smem_pt,
 +                                   int const tile_base_page) {
 +        #pragma unroll
 +        for (int i = 0; i < kPageEntryPerThread; ++i) {
-+            int const row = i * NumThreads + (thread_idx % kGmemThreadsPerRow) * (NumThreads / kGmemThreadsPerRow) + (thread_idx / kGmemThreadsPerRow);
++            int const row = i * NumThreads +
++                (thread_idx % kGmemThreadsPerRow) * (NumThreads / kGmemThreadsPerRow) +
++                (thread_idx / kGmemThreadsPerRow);
 +            int const row_idx = n_block * kBlockN + row;
 +            int page_idx, page_offset;
 +            page_idx = page_size_divmod.divmod(page_offset, row_idx + leftpad_k);
 +            bool const should_resolve =
 +                ((i + 1) * NumThreads <= kBlockN || row < kBlockN) &&
 +                (!Seqlenk_mask || row_idx < seqlen_k);
-+            int resolved_page = 0;
-+            if (should_resolve) {
-+                // kConsumerResolve carrier: the page was resolved in the prologue.
-+                resolved_page = smem_pt[page_idx - tile_base_page];
-+            }
-+            tPrPageOffset[i] = {
-+                should_resolve ? resolved_page : 0,
-+                page_offset
-+            };
++            int const resolved_page = should_resolve
++                ? smem_pt[page_idx - tile_base_page]
++                : 0;
++            tPrPageOffset[i] = {resolved_page, page_offset};
 +        }
 +        if constexpr (First_iter && !KV_Same_Iter) { compute_V_ptr(); }
++    };
++
++    // Resolve each K/V block's distinct
++    // logical pages once per warp, then broadcast the resolved page id from the
++    // owning lane. This branch has no shared memory and no cross-warp ordering
++    // surface, matching the proven SM8x design.
++    // A block that spans more than one warp of pages falls back to the unchanged
++    // per-row loop below; correctness never depends on the optimization.
++    template <bool Seqlenk_mask>
++    CUTLASS_DEVICE
++    bool load_page_table_warp_resolve(const int n_block) {
++        if constexpr (!kEnableWarpPageResolve) {
++            static_cast<void>(n_block);
++            return false;
++        } else {
++            if constexpr (ResolverSubkind == PageResolverSubkind::AffineTensor) {
++                // affine_direct has no table load to deduplicate.
++                if (page_resolver_metadata.affine_direct) { return false; }
++            }
++            int dummy;
++            int const tile_first_row_idx = n_block * kBlockN;
++            int const tile_last_row_idx = !Seqlenk_mask
++                ? tile_first_row_idx + kBlockN - 1
++                : std::min(tile_first_row_idx + kBlockN - 1, seqlen_k - 1);
++            int const tile_base_page =
++                page_size_divmod.divmod(dummy, tile_first_row_idx + leftpad_k);
++            int const tile_last_page =
++                page_size_divmod.divmod(dummy, tile_last_row_idx + leftpad_k);
++            int const num_pages = tile_last_page - tile_base_page + 1;
++            if (tile_last_row_idx < tile_first_row_idx ||
++                num_pages > cutlass::NumThreadsPerWarp) {
++                return false;
++            }
++            int const lane = thread_idx % cutlass::NumThreadsPerWarp;
++            int const lane_page = lane < num_pages
++                ? resolve_page_entry</*UseLdg=*/false>(tile_base_page + lane)
++                : 0;
++            #pragma unroll
++            for (int i = 0; i < kPageEntryPerThread; ++i) {
++                int const row = i * NumThreads +
++                    (thread_idx % kGmemThreadsPerRow) * (NumThreads / kGmemThreadsPerRow) +
++                    (thread_idx / kGmemThreadsPerRow);
++                int const row_idx = n_block * kBlockN + row;
++                int page_idx, page_offset;
++                page_idx = page_size_divmod.divmod(page_offset, row_idx + leftpad_k);
++                int const resolved_page = __shfl_sync(
++                    0xffffffff, lane_page, page_idx - tile_base_page);
++                bool const should_resolve =
++                    ((i + 1) * NumThreads <= kBlockN || row < kBlockN) &&
++                    (!Seqlenk_mask || row_idx < seqlen_k);
++                tPrPageOffset[i] = {
++                    should_resolve ? resolved_page : 0,
++                    page_offset
++                };
++            }
++            return true;
++        }
 +    };
 +
      template <bool Seqlenk_mask=false, bool First_iter=false>
      CUTLASS_DEVICE
      void load_page_table(const int n_block) {
-@@ -145,19 +1207,159 @@ struct PagedKVManager {
++        if constexpr (kEnableWarpPageResolve) {
++            if (load_page_table_warp_resolve<Seqlenk_mask>(n_block)) {
++                if constexpr (First_iter && !KV_Same_Iter) { compute_V_ptr(); }
++                return;
++            }
++        }
+         // The uncoalesced gmem load is intentional. This is so that each thread only loads the page table entries
+         // it needs, and we don't need any sync between warps.
+         // Assuming 8 threads per row, and 176 rows, then the rows from 0 to 175 are loaded by
+@@ -145,19 +1294,150 @@ struct PagedKVManager {
              page_idx = page_size_divmod.divmod(page_offset, row_idx + leftpad_k);
              // Add the condition (i + 1) * NumThreads <= kBlockN since that is an upper bound of row
              // and is known at compile time. It avoids branching when e.g., kBlockN = 176 and i = 0.
@@ -5858,10 +6169,7 @@ index 9ea59bc..dbed5d4 100644
 +    // (register move) at the top of an interior iteration, replacing the inline resolve.
 +    CUTLASS_DEVICE
 +    void commit_prefetched_page_table() {
-+        if constexpr (IsAffineTensor2Plan ||
-+                      (ResolverKind == PageResolverKind::ResolvedRowPtr &&
-+                       (ResolverSubkind == PageResolverSubkind::RowPtr ||
-+                        ResolverSubkind == PageResolverSubkind::DirectTable))) {  // fa3_sm90_loaded_deref_prefetch_commit + fa3_sm90_rowconsume_prefetch (A-iter1-rowconsume)
++        if constexpr (kHasPrefetchFrag) {  // fa3_sm90_loaded_deref_prefetch_commit + fa3_sm90_rowconsume_prefetch (A-iter1-rowconsume)
 +            #pragma unroll
 +            for (int i = 0; i < kPageEntryPerThread; ++i) {
 +                tPrPageOffset[i] = tPrPageOffset_pf[i];
@@ -5883,10 +6191,7 @@ index 9ea59bc..dbed5d4 100644
 +    // fa3_sm90_deepen_prefetch: shift the 2-ahead buffer into the 1-ahead buffer (register move).
 +    CUTLASS_DEVICE
 +    void shift_prefetched_page_table() {
-+        if constexpr (IsAffineTensor2Plan ||
-+                      (ResolverKind == PageResolverKind::ResolvedRowPtr &&
-+                       (ResolverSubkind == PageResolverSubkind::RowPtr ||
-+                        ResolverSubkind == PageResolverSubkind::DirectTable))) {  // + fa3_sm90_rowconsume_prefetch (A-iter1-rowconsume)
++        if constexpr (kHasPrefetchFrag) {  // + fa3_sm90_rowconsume_prefetch (A-iter1-rowconsume)
 +            #pragma unroll
 +            for (int i = 0; i < kPageEntryPerThread; ++i) {
 +                tPrPageOffset_pf[i] = tPrPageOffset_pf2[i];
@@ -5905,10 +6210,7 @@ index 9ea59bc..dbed5d4 100644
 +    // fa3_sm90_deepen3_prefetch: shift the 3-ahead buffer into the 2-ahead buffer (register move).
 +    CUTLASS_DEVICE
 +    void shift_prefetched_page_table2() {
-+        if constexpr (IsAffineTensor2Plan ||
-+                      (ResolverKind == PageResolverKind::ResolvedRowPtr &&
-+                       (ResolverSubkind == PageResolverSubkind::RowPtr ||
-+                        ResolverSubkind == PageResolverSubkind::DirectTable))) {  // + fa3_sm90_rowconsume_prefetch (A-iter1-rowconsume)
++        if constexpr (kHasPrefetchFrag) {  // + fa3_sm90_rowconsume_prefetch (A-iter1-rowconsume)
 +            #pragma unroll
 +            for (int i = 0; i < kPageEntryPerThread; ++i) {
 +                tPrPageOffset_pf2[i] = tPrPageOffset_pf3[i];
@@ -5947,12 +6249,13 @@ index 9ea59bc..dbed5d4 100644
          } else {
              n_block_idx = n_block;
          }
-@@ -348,7 +1550,629 @@ struct PagedKVManager {
+@@ -348,7 +1628,629 @@ struct PagedKVManager {
          if constexpr (!KV_Same_Iter) { compute_V_ptr(); }
      };
  
-+};
-+
+-
+ };
+ 
 +// [SM8X-LITE-MANAGER 2026-07-02] Single lightweight paged-KV manager for ALL SM8x
 +// resolver arms (no fallback: this replaces the full PagedKVManager on the SM80
 +// mainloop; SM90 keeps the full manager until its own port). Root cause being fixed:
@@ -5982,7 +6285,8 @@ index 9ea59bc..dbed5d4 100644
 +          // with existing stack spill, where ANY extra prologue state just moves
 +          // spill bytes (J2 resource gate demands those kernels stay
 +          // byte-identical). All other instantiations keep the rider.
-+          bool EnableWarpPageResolve=true>
++          bool EnableWarpPageResolve=true,
++          bool UsePrefetchedTableRow=false>
 +struct PagedKVManagerSm8x {
 +
 +    static constexpr bool IsNative = ResolverKind == PageResolverKind::Native;
@@ -6106,7 +6410,8 @@ index 9ea59bc..dbed5d4 100644
 +                   int const bidb, int const resolver_bidb, int const bidh, int const thread_idx,
 +                   int const seqlen_k, int const leftpad_k,
 +                   int /*bidb_kv_idx*/,
-+                   int const row_consume_mode_value = 0
++                   int const row_consume_mode_value = 0,
++                   int const* const prefetched_table_row = nullptr
 +                   )
 +        : page_size_divmod(page_size_divmod)
 +        , thread_idx(thread_idx)
@@ -6127,16 +6432,21 @@ index 9ea59bc..dbed5d4 100644
 +            static_cast<void>(row_consume_mode_value);
 +            ptr_page_table_row = native_row;
 +        } else if constexpr (IsRowPtr) {
-+            int64_t const row_ptr_index =
-+                resolver_bidb * args.resolved_page_table_row_ptr_batch_stride
-+                    + (UseCarrierHeadStride
-+                        ? bidh * args.resolved_page_table_row_ptr_head_stride
-+                        : int64_t(0));
-+            int const* const rowptr_row =
-+                args.ptr_resolved_page_table_row_ptr_u64 == nullptr
-+                    ? nullptr
-+                    : reinterpret_cast<int const*>(
-+                        args.ptr_resolved_page_table_row_ptr_u64[row_ptr_index]);
++            int const* rowptr_row = nullptr;
++            if constexpr (UsePrefetchedTableRow) {
++                rowptr_row = prefetched_table_row;
++            } else {
++                int64_t const row_ptr_index =
++                    resolver_bidb * args.resolved_page_table_row_ptr_batch_stride
++                        + (UseCarrierHeadStride
++                            ? bidh * args.resolved_page_table_row_ptr_head_stride
++                            : int64_t(0));
++                rowptr_row =
++                    args.ptr_resolved_page_table_row_ptr_u64 == nullptr
++                        ? nullptr
++                        : reinterpret_cast<int const*>(
++                            args.ptr_resolved_page_table_row_ptr_u64[row_ptr_index]);
++            }
 +            if constexpr (UseRowConsumeMode) {
 +                bool const un =
 +                    args.ptr_row_consume_mode != nullptr && row_consume_mode_value == 0 &&
@@ -6147,22 +6457,15 @@ index 9ea59bc..dbed5d4 100644
 +                ptr_page_table_row = rowptr_row;
 +            }
 +        } else if constexpr (IsDTable) {
-+            int const* dtable_row = nullptr;
-+            if (args.ptr_dtable_row_ptr_u64 != nullptr) {
-+                int64_t const u64_index =
-+                    resolver_bidb * args.dtable_row_ptr_batch_stride
-+                    + (UseCarrierHeadStride
-+                        ? bidh * args.dtable_row_ptr_head_stride
-+                        : int64_t(0));
-+                dtable_row = reinterpret_cast<int const*>(
-+                    args.ptr_dtable_row_ptr_u64[u64_index]);
-+            } else if (args.ptr_resolved_page_table_i32 != nullptr) {
-+                dtable_row = args.ptr_resolved_page_table_i32
-+                    + resolver_bidb * args.resolved_page_table_batch_stride
-+                    + (UseCarrierHeadStride
-+                        ? bidh * args.resolved_page_table_head_stride
-+                        : int64_t(0));
-+            }
++            static_cast<void>(args);
++            static_cast<void>(prefetched_table_row);
++            int const row_index = UseCarrierHeadStride
++                ? resolver_bidb * int(get<2>(shape_K)) + bidh
++                : resolver_bidb;
++            int const* const dtable_row = ptr_page_table_ == nullptr
++                ? nullptr
++                : ptr_page_table_
++                    + int64_t(row_index) * int64_t(get<0>(stride_pagetable));
 +            if constexpr (UseRowConsumeMode) {
 +                bool const un =
 +                    args.ptr_row_consume_mode != nullptr && row_consume_mode_value == 0 &&
@@ -6572,9 +6875,9 @@ index 9ea59bc..dbed5d4 100644
 +        }
 +        if constexpr (!KV_Same_Iter) { compute_V_ptr(); }
 +    };
- 
- };
- 
++
++};
++
 +
  } // namespace flash
 diff --git a/hopper/scheduler_num_splits.h b/hopper/scheduler_num_splits.h
@@ -7234,7 +7537,7 @@ index d0c595d..a0e10a0 100644
 \ No newline at end of file
 +)
 diff --git a/vllm_flash_attn/flash_attn_interface.py b/vllm_flash_attn/flash_attn_interface.py
-index a61d0f9..0cfcbfe 100644
+index a61d0f9..a295da6 100644
 --- a/vllm_flash_attn/flash_attn_interface.py
 +++ b/vllm_flash_attn/flash_attn_interface.py
 @@ -1,5 +1,10 @@
@@ -7385,7 +7688,7 @@ index a61d0f9..0cfcbfe 100644
      return True, None
  
  def _is_fa4_supported(device = None) -> Tuple[bool, Optional[str]]:
-@@ -90,6 +175,1206 @@ def fa_version_unsupported_reason(fa_version: int, device = None) \
+@@ -90,6 +175,1217 @@ def fa_version_unsupported_reason(fa_version: int, device = None) \
  def maybe_contiguous(x):
      return x.contiguous() if x is not None and x.stride(-1) != 1 else x
  
@@ -8506,9 +8809,10 @@ index a61d0f9..0cfcbfe 100644
 +        device_anchor = torch.empty(0, device="cuda")
 +    raw = torch.ops._vllm_fa3_C.fwd_last_launch_debug_state(device_anchor)
 +    slot_count = int(raw.numel())
-+    if slot_count not in {8, 10, 12}:
++    if slot_count not in {8, 10, 12, 15, 16}:
 +        raise ValueError(
-+            f"stale fwd_last_launch_debug_state ABI: expected 8, 10, or 12 slots, got {slot_count}"
++            "stale fwd_last_launch_debug_state ABI: expected 8, 10, 12, 15, "
++            f"or 16 slots, got {slot_count}"
 +        )
 +    if slot_count == 8:
 +        num_splits_dynamic_min = -1
@@ -8526,8 +8830,14 @@ index a61d0f9..0cfcbfe 100644
 +        is_paged_kv_slot = 7
 +        use_prepare_varlen_slot = 8
 +        use_dynamic_split_slot = 9
-+        is_pagedkv_tma = slot_count == 12 and bool(int(raw[10].item()))
-+        tile_n = int(raw[11].item()) if slot_count == 12 else 0
++        is_pagedkv_tma = slot_count >= 12 and bool(int(raw[10].item()))
++        tile_n = int(raw[11].item()) if slot_count >= 12 else 0
++    launched_page_resolver_kind = int(raw[12].item()) if slot_count >= 15 else -1
++    launched_page_resolver_subkind = int(raw[13].item()) if slot_count >= 15 else -1
++    launched_page_resolver_plan = int(raw[14].item()) if slot_count >= 15 else -1
++    skip_scheduler_metadata_computation = (
++        bool(int(raw[15].item())) if slot_count == 16 else False
++    )
 +    return {
 +        "requested_num_splits": int(raw[0].item()),
 +        "resolved_num_splits": int(raw[1].item()),
@@ -8541,6 +8851,10 @@ index a61d0f9..0cfcbfe 100644
 +        "use_dynamic_split": bool(int(raw[use_dynamic_split_slot].item())),
 +        "is_pagedkv_tma": is_pagedkv_tma,
 +        "tile_n": tile_n,
++        "launched_page_resolver_kind": launched_page_resolver_kind,
++        "launched_page_resolver_subkind": launched_page_resolver_subkind,
++        "launched_page_resolver_plan": launched_page_resolver_plan,
++        "skip_scheduler_metadata_computation": skip_scheduler_metadata_computation,
 +    }
 +
 +
@@ -8592,7 +8906,7 @@ index a61d0f9..0cfcbfe 100644
  # NOTE only used in FA3
  def get_scheduler_metadata(
      batch_size, max_seqlen_q, max_seqlen_k, num_heads_q, num_heads_kv, headdim,
-@@ -107,11 +1392,19 @@ def get_scheduler_metadata(
+@@ -107,11 +1403,19 @@ def get_scheduler_metadata(
      num_splits=0,    # Can be tuned for speed
      pack_gqa=None,   # Can be tuned for speed
      sm_margin=0,     # Can be tuned if some SMs are used for communication
@@ -8613,7 +8927,7 @@ index a61d0f9..0cfcbfe 100644
          batch_size, max_seqlen_q, max_seqlen_k, num_heads_q, num_heads_kv, headdim, headdim_v,
          qkv_dtype,
          cache_seqlens,
-@@ -129,8 +1422,25 @@ def get_scheduler_metadata(
+@@ -129,8 +1433,25 @@ def get_scheduler_metadata(
          pack_gqa,
          sm_margin,
      )
@@ -8641,7 +8955,7 @@ index a61d0f9..0cfcbfe 100644
  
  
  def flash_attn_varlen_func(
-@@ -276,7 +1586,7 @@ def flash_attn_varlen_func(
+@@ -276,7 +1597,7 @@ def flash_attn_varlen_func(
          )
      elif fa_version == 3:
          assert alibi_slopes is None, "Alibi is not supported in FA3"
@@ -8650,7 +8964,7 @@ index a61d0f9..0cfcbfe 100644
              q, k, v,
              None, None,       # k_new, v_new
              q_v,
-@@ -305,6 +1615,7 @@ def flash_attn_varlen_func(
+@@ -305,6 +1626,7 @@ def flash_attn_varlen_func(
              cp_rank,
              cp_tot_seqused_k,
          )
