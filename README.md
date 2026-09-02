@@ -10,8 +10,8 @@
 
 <a href="https://arxiv.org/abs/2603.12038"><img src="https://img.shields.io/badge/arXiv-2603.12038-b31b1b?style=for-the-badge&logo=arxiv&logoColor=white" alt="Paper"></a>&nbsp;&nbsp;
 <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-blue?style=for-the-badge" alt="License"></a>&nbsp;&nbsp;
-<a href="https://github.com/vllm-project/vllm"><img src="https://img.shields.io/badge/vLLM-0.10-blueviolet?style=for-the-badge" alt="vLLM"></a>&nbsp;&nbsp;
-<a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/Python-%E2%89%A53.10-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python"></a>
+<a href="https://github.com/vllm-project/vllm"><img src="https://img.shields.io/badge/H20_Runtime-vLLM_0.22.1-blueviolet?style=for-the-badge" alt="H20 runtime vLLM 0.22.1"></a>&nbsp;&nbsp;
+<a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/H20_Runtime-Python_3.12-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="H20 runtime Python 3.12"></a>
 
 <br><br>
 
@@ -19,6 +19,7 @@
 <a href="#demo">Demo</a>&ensp;&middot;&ensp;
 <a href="#method">Method</a>&ensp;&middot;&ensp;
 <a href="#results">Results</a>&ensp;&middot;&ensp;
+<a href="#supported-models">Models</a>&ensp;&middot;&ensp;
 <a href="#installation">Installation</a>&ensp;&middot;&ensp;
 <a href="#running-experiments">Experiments</a>&ensp;&middot;&ensp;
 <a href="#citation">Citation</a>
@@ -190,27 +191,107 @@ SFI matches the full-KV baseline at medium and large scales, with only minor var
 
 <br>
 
+## Supported Models
+
+SFI supports the **text-only causal-LM members of the Qwen3 family**. Runtime
+support and benchmark qualification are reported separately: a compatible
+checkpoint can use the runtime, but it does not inherit accuracy or speed
+numbers measured on another checkpoint.
+
+| Runtime architecture | Supported checkpoints |
+|:---|:---|
+| `Qwen3ForCausalLM` | Qwen3-0.6B, 1.7B, 4B, 8B, 14B, 32B; Qwen3-4B-Instruct-2507; Qwen3-4B-Thinking-2507 |
+| `Qwen3MoeForCausalLM` | Qwen3-30B-A3B and Qwen3-235B-A22B, including their Instruct-2507 and Thinking-2507 variants; Qwen3-Coder-30B-A3B-Instruct; Qwen3-Coder-480B-A35B-Instruct |
+| `Qwen3NextForCausalLM` | Qwen3-Next-80B-A3B-Instruct; Qwen3-Next-80B-A3B-Thinking |
+| `Qwen3_5MoeForConditionalGeneration` (hybrid) | Qwen3.6-35B-A3B-FP8 |
+
+Evidence levels:
+
+- **r53 exact-wheel H20 qualification:** Qwen3.6-35B-A3B-FP8. The r53
+  LongBench V2 and H20 B/A/B numbers apply only to this checkpoint.
+- **Existing project evaluation:** Qwen3-4B, Qwen3-30B-A3B,
+  Qwen3-235B-A22B and their evaluated Thinking configurations.
+- **Architecture-compatible:** the remaining checkpoints in the table share a
+  supported attention/runtime contract, but still require checkpoint-specific
+  accuracy and speed qualification before production deployment.
+
+Qwen3-VL, Omni, Audio, Embedding, Reranker, multimodal requests, and non-Qwen3
+architectures are not included in this release's support claim. Model size,
+GPU count, tensor parallelism, and available KV-cache memory remain deployment
+capacity constraints; r53 performance qualification used one NVIDIA H20 96GB.
+
+<br>
+
 ## Installation
 
-> [!TIP]
-> **Prerequisites:** Python &ge; 3.10 &ensp;&middot;&ensp; PyTorch &ge; 2.4 with CUDA &ensp;&middot;&ensp; [vLLM](https://docs.vllm.ai/en/latest/getting_started/installation.html) (tested v0.10) &ensp;&middot;&ensp; Triton (tested v3.4)
+### H20 binary runtime (recommended for deployment)
+
+The source-free r53 wheel is available from the
+**[SFI Runtime H20 r53 release](https://github.com/LV-NUS/SFI/releases/tag/sfi-runtime-h20-r53-20260902)**.
+It contains prebuilt SM90 CUDA objects and compiled Python extensions; no SFI
+source build or custom SFI Triton package is required on the deployment host.
+
+| Component | Required version |
+|:---|:---|
+| GPU | NVIDIA H20 / SM90 |
+| Python | CPython 3.12 |
+| PyTorch | 2.11.0+cu130 |
+| PyTorch CUDA | 13.0 |
+| vLLM | 0.22.1 |
 
 ```bash
-# 1. Clone
-git clone https://github.com/LV-NUS/SFI.git && cd SFI
+# Download and unpack the single r53 delivery asset.
+curl -fLO \
+  "https://github.com/LV-NUS/SFI/releases/download/sfi-runtime-h20-r53-20260902/sfi-runtime-h20-r53-20260902.tar.gz"
+tar -xzf "sfi-runtime-h20-r53-20260902.tar.gz"
+cd "sfi-runtime-h20-r53-20260902"
 
-# 2. Add to PYTHONPATH
+# Verify the README, manifest, and wheel.
+sha256sum -c "SHA256SUMS"
+
+# Install into an isolated environment that already contains the exact
+# PyTorch/vLLM stack above. Do not install globally.
+SFI_VENV="/path/to/py312-vllm-0.22.1-env"
+"${SFI_VENV}/bin/python" -m pip install --no-deps \
+  "./sfi_runtime-1.0.53.dev20260902-cp312-cp312-linux_x86_64.whl"
+
+# The runtime fails closed if the binary, dependency, or GPU contract differs.
+env -u PYTHONPATH -u PYTHONHOME \
+  PYTHONNOUSERSITE=1 \
+  "${SFI_VENV}/bin/sfi-runtime" selfcheck --json
+```
+
+> [!NOTE]
+> Acceleration is disabled by default. Enable exactly one qualified rail:
+> `prefill_h20_stable` (sparse prefill + dense decode) or
+> `decode_h20_stable` (dense prefill + SFI decode). The two rails must not be
+> enabled in the same service process.
+
+Complete activation, serving, health-check, rollback, accuracy, and speed
+instructions are in **[docs/INSTALL.md](docs/INSTALL.md)** and in the
+`README_CN.md` bundled with the release.
+
+<details>
+<summary>&ensp;<b>Research/source installation</b></summary>
+
+<br>
+
+The public source tree remains available for paper reproduction and
+development. This path is separate from the protected H20 binary runtime and
+uses its own historical dependency matrix.
+
+```bash
+git clone https://github.com/LV-NUS/SFI.git
+cd SFI
 export PYTHONPATH="$(pwd):${PYTHONPATH}"
 
-# 3. Compile CUDA extensions (~1 min, one-time)
 python -c "
 from utils.bounds_kernel_ext import _require_ext as _require_bounds
 from utils.selector_pipeline_ext import _require_ext as _require_pipeline
 _require_bounds(); _require_pipeline()
-print('Done.')
+print('CUDA extensions compiled successfully.')
 "
 
-# 4. Verify — end-to-end throughput sweep (download any Qwen3 model)
 CUDA_VISIBLE_DEVICES=0 VLLM_WORKER_MULTIPROC_METHOD=spawn \
   python benchmarks/run_sweep.py --mode sparse \
     --model <MODEL_PATH> \
@@ -219,8 +300,7 @@ CUDA_VISIBLE_DEVICES=0 VLLM_WORKER_MULTIPROC_METHOD=spawn \
     --warmup-runs 1 --measure-runs 1
 ```
 
-> [!NOTE]
-> If you see a throughput summary table, the installation is complete. For detailed configuration, regression testing, and troubleshooting, see **[docs/INSTALL.md](docs/INSTALL.md)**.
+</details>
 
 <details>
 <summary>&ensp;<b>How SFI integrates into vLLM</b></summary>

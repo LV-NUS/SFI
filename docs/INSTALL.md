@@ -1,10 +1,189 @@
 # Installation Guide
 
-SFI is a set of Python modules that integrate into an existing vLLM installation via runtime patching &mdash; no vLLM source modification is required.
+SFI has two distinct installation paths. Use the binary runtime for H20
+deployment and the public source tree for paper reproduction or development.
 
 <br>
 
-## Prerequisites
+| Path | Intended use | Dependency contract |
+|:---|:---|:---|
+| **H20 binary runtime r53** | Protected deployment package; recommended for H20 canary | H20/SM90, CPython 3.12, PyTorch 2.11.0+cu130, CUDA 13.0, vLLM 0.22.1 |
+| **Research/source tree** | Reproduction, inspection, and development | Historical public stack documented below |
+
+Do not mix commands, environment variables, wheels, or compiled caches between
+these two paths.
+
+<br>
+
+## H20 Binary Runtime r53
+
+The binary package contains prebuilt SM90 CUDA objects and compiled Python
+extensions. It does not contain SFI Python/C/CUDA source and does not require
+compiling or installing a custom SFI Triton package on the deployment host.
+PyTorch or vLLM may still carry their own upstream Triton dependency.
+
+### 1. Download and verify
+
+```bash
+curl -fLO \
+  "https://github.com/LV-NUS/SFI/releases/download/sfi-runtime-h20-r53-20260902/sfi-runtime-h20-r53-20260902.tar.gz"
+tar -xzf "sfi-runtime-h20-r53-20260902.tar.gz"
+cd "sfi-runtime-h20-r53-20260902"
+
+sha256sum -c "SHA256SUMS"
+```
+
+The checksum command must report `OK` for `README_CN.md`,
+`RELEASE_MANIFEST.json`, and the wheel.
+
+### 2. Install into the qualified environment
+
+Use an isolated environment that already contains the exact dependency stack.
+Do not install the wheel globally and do not use `--force-reinstall` on PyTorch
+or vLLM.
+
+```bash
+SFI_VENV="/path/to/py312-vllm-0.22.1-env"
+
+"${SFI_VENV}/bin/python" -m pip install --no-deps \
+  "./sfi_runtime-1.0.53.dev20260902-cp312-cp312-linux_x86_64.whl"
+
+env -u PYTHONPATH -u PYTHONHOME \
+  PYTHONNOUSERSITE=1 \
+  "${SFI_VENV}/bin/sfi-runtime" selfcheck --json
+```
+
+Continue only when `selfcheck` returns `status: PASS`. This verifies the
+binary, dependency, and GPU contract; it is not a substitute for
+checkpoint-specific accuracy qualification.
+
+### 3. Select exactly one acceleration rail
+
+Sparse prefill with dense decode:
+
+```bash
+export CUDA_VISIBLE_DEVICES=0
+export SFI_ENABLE=1
+export SFI_PREFILL_ACCEL=1
+export SFI_DECODE_ACCEL=0
+export SFI_BUDGET_PROFILE=prefill_h20_stable
+
+env -u PYTHONPATH -u PYTHONHOME \
+  PYTHONNOUSERSITE=1 \
+  "${SFI_VENV}/bin/sfi-runtime" show-config --json
+```
+
+Dense prefill with SFI decode:
+
+```bash
+export CUDA_VISIBLE_DEVICES=0
+export SFI_ENABLE=1
+export SFI_PREFILL_ACCEL=0
+export SFI_DECODE_ACCEL=1
+export SFI_BUDGET_PROFILE=decode_h20_stable
+
+env -u PYTHONPATH -u PYTHONHOME \
+  PYTHONNOUSERSITE=1 \
+  "${SFI_VENV}/bin/sfi-runtime" show-config --json
+```
+
+The two rails are independently qualified and must not be enabled in the same
+service process.
+
+### 4. Start the service
+
+Set `MODEL_PATH` to any supported Qwen3 text checkpoint that fits the selected
+GPU/TP deployment. The exact published r53 qualification used
+`Qwen3.6-35B-A3B-FP8` on one H20.
+
+```bash
+MODEL_PATH="/models/Qwen3.6-35B-A3B-FP8"
+MODEL_NAME="qwen36-35b"
+PORT="8000"
+
+exec env -u PYTHONPATH -u PYTHONHOME \
+  PYTHONNOUSERSITE=1 \
+  PYTHONDONTWRITEBYTECODE=1 \
+  VLLM_NO_USAGE_STATS=1 \
+  "${SFI_VENV}/bin/sfi-runtime" serve -- \
+    --model "${MODEL_PATH}" \
+    --served-model-name "${MODEL_NAME}" \
+    --port "${PORT}" \
+    --max-model-len 165888 \
+    --gpu-memory-utilization 0.92 \
+    --max-num-seqs 8 \
+    --max-num-batched-tokens 73728 \
+    --long-prefill-token-threshold 8192 \
+    --kv-cache-memory-bytes 32590397440 \
+    --block-size 32 \
+    --no-enable-prefix-caching \
+    --attention-config '{"backend":"FLASH_ATTN","flash_attn_version":3}' \
+    --no-async-scheduling
+```
+
+The memory and batching values above are the one-H20 qualification settings,
+not universal values for every Qwen3 size. Adjusting them requires a new
+capacity and performance check.
+
+### 5. Health check and rollback
+
+```bash
+curl -fsS "http://127.0.0.1:${PORT}/health"
+```
+
+Return to dense by stopping the service and restarting with:
+
+```bash
+export SFI_ENABLE=0
+export SFI_PREFILL_ACCEL=0
+export SFI_DECODE_ACCEL=0
+export SFI_BUDGET_PROFILE=frozen
+```
+
+Do not replace the wheel while a service process is running. The bundled
+`README_CN.md` contains the frozen parameters, r53 accuracy boundary, B/A/B
+speed results, log checks, and binary-protection boundary.
+
+<br>
+
+## Supported Qwen3 Models
+
+The H20 runtime supports the following text-only causal-LM architectures.
+“Supported” means runtime-compatible; it does not mean that every checkpoint
+inherits the exact r53 H20 accuracy and speed numbers.
+
+| Runtime architecture | Supported checkpoints |
+|:---|:---|
+| `Qwen3ForCausalLM` | Qwen3-0.6B, 1.7B, 4B, 8B, 14B, 32B; Qwen3-4B-Instruct-2507; Qwen3-4B-Thinking-2507 |
+| `Qwen3MoeForCausalLM` | Qwen3-30B-A3B and Qwen3-235B-A22B, including Instruct-2507 and Thinking-2507; Qwen3-Coder-30B-A3B-Instruct; Qwen3-Coder-480B-A35B-Instruct |
+| `Qwen3NextForCausalLM` | Qwen3-Next-80B-A3B-Instruct; Qwen3-Next-80B-A3B-Thinking |
+| `Qwen3_5MoeForConditionalGeneration` (hybrid) | Qwen3.6-35B-A3B-FP8 |
+
+- **Exact r53/H20 qualification:** Qwen3.6-35B-A3B-FP8.
+- **Existing project evaluation:** Qwen3-4B, Qwen3-30B-A3B,
+  Qwen3-235B-A22B and their evaluated Thinking configurations.
+- **Other models in the table:** supported through the same runtime
+  architecture, but require model-specific ACC and speed validation before
+  production use.
+
+Excluded from the current support claim: Qwen3-VL/Omni/Audio,
+Embedding/Reranker, multimodal requests, and non-Qwen3 architectures. Large
+MoE/Coder/Next checkpoints may require multiple GPUs; TP topology and memory
+capacity are separate from model-architecture support.
+
+<br>
+
+---
+
+<br>
+
+## Research / Source Installation
+
+The public source tree integrates into an existing vLLM installation via
+runtime patching. No vLLM source modification is required. This is the
+historical research path, not the r53 H20 binary contract.
+
+### Source prerequisites
 
 | Dependency | Version | Link |
 |:-----------|:--------|:-----|
@@ -17,7 +196,7 @@ SFI itself has no additional Python package requirements beyond what vLLM provid
 
 <br>
 
-## Step 1 &ensp; Clone
+### Step 1 &ensp; Clone
 
 ```bash
 git clone https://github.com/LV-NUS/SFI.git
@@ -26,7 +205,7 @@ cd SFI
 
 <br>
 
-## Step 2 &ensp; Set PYTHONPATH
+### Step 2 &ensp; Set PYTHONPATH
 
 SFI uses Python's `sitecustomize` mechanism to auto-patch vLLM worker processes. The SFI repo root must be on `PYTHONPATH`:
 
@@ -44,7 +223,7 @@ When `PYTHONPATH` includes the SFI repo root, Python automatically imports `site
 
 <br>
 
-## Step 3 &ensp; Compile CUDA Extensions
+### Step 3 &ensp; Compile CUDA Extensions
 
 SFI includes custom CUDA kernels that must be compiled once (~1 minute):
 
@@ -62,7 +241,7 @@ print('CUDA extensions compiled successfully.')
 
 <br>
 
-## Step 4 &ensp; Quick Verify
+### Step 4 &ensp; Quick Verify
 
 Run a throughput sweep to verify the full pipeline. Download any Qwen3 model from HuggingFace:
 
@@ -79,7 +258,7 @@ If you see a throughput summary table with `AllDecode tok/s` values, the full pi
 
 <br>
 
-## Step 5 &ensp; Smoke Test (Optional)
+### Step 5 &ensp; Smoke Test (Optional)
 
 For a more thorough check, the bs=2 parity harness runs both dense and sparse decoding and validates that both complete without error:
 
@@ -104,7 +283,7 @@ CUDA_VISIBLE_DEVICES=0 VLLM_WORKER_MULTIPROC_METHOD=spawn \
 
 <br>
 
-## Configuration
+## Research Runtime Configuration
 
 SFI is configured via the `VLLM_SPARSE_CONTROLLER_JSON` environment variable.
 
@@ -167,7 +346,7 @@ These are set automatically by `scripts/run_longbench_sparse.sh` and `benchmarks
 
 <br>
 
-## LongBench Setup
+## Research LongBench Setup
 
 1. Clone [LongBench](https://github.com/THUDM/LongBench) and configure `LongBench/config/model2path.json` with your model path.
 
